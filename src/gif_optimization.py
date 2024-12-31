@@ -12,101 +12,19 @@ from logging_system import log_function_call, run_ffmpeg_command
 failed_files = []
 
 
-def calculate_new_dimensions(current_width, current_height, scale_factor):
-    """
-    Calculate new dimensions while maintaining aspect ratio.
-    Uses the larger dimension to determine scaling to ensure proper size reduction.
-
-    Args:
-        current_width (int): Original width of the image/video
-        current_height (int): Original height of the image/video
-        scale_factor (float): Factor to scale the dimensions by
-
-    Returns:
-        tuple: New width and height maintaining aspect ratio
-    """
-    if current_width is None or current_height is None:
-        return 320, 240  # Default fallback dimensions
-
-    # Calculate new dimensions
-    new_width = max(int(current_width * scale_factor), 1)
-    new_height = max(int(current_height * scale_factor), 1)
-
-    # If either dimension is below minimum, scale up maintaining aspect ratio
-    min_dimension = 120
-    if new_width < min_dimension or new_height < min_dimension:
-        # Calculate scaling factors for both dimensions
-        width_scale = min_dimension / new_width
-        height_scale = min_dimension / new_height
-
-        # Use the larger scaling factor to ensure minimum dimension is met
-        final_scale = max(width_scale, height_scale)
-
-        new_width = max(int(new_width * final_scale), min_dimension)
-        new_height = max(int(new_height * final_scale), min_dimension)
-
-    # Ensure even dimensions for video encoding
-    new_width += new_width % 2
-    new_height += new_height % 2
-
-    return new_width, new_height
-
-
-def get_gif_dimensions(gif_path):
-    """
-    Get the dimensions of a GIF file using ffprobe.
-
-    Args:
-        gif_path (Path): Path to the GIF file
-
-    Returns:
-        tuple: Width and height of the GIF, or None if dimensions cannot be determined
-    """
-    command = [
-        'ffprobe', '-v', 'error', '-select_streams', 'v:0',
-        '-show_entries', 'stream=width,height', '-of', 'csv=s=x:p=0',
-        str(gif_path)
-    ]
-    try:
-        output = subprocess.check_output(command, text=True).strip()
-        width, height = map(int, output.split('x'))
-        return width, height
-    except (subprocess.CalledProcessError, ValueError) as e:
-        logging.error(f"Error getting GIF dimensions: {e}")
-        return None, None
-
-
 def has_audio_stream(video_path):
-    """
-    Check if a video has an audio stream using ffprobe.
-    Uses a more robust method to detect audio streams.
-
-    Args:
-        video_path (Path): Path to the video file
-
-    Returns:
-        bool: True if the video has an audio stream, False otherwise
-    """
-    command = [
-        'ffprobe',
-        '-v', 'error',
-        '-select_streams', 'a',
-        '-show_entries', 'stream=codec_type',
-        '-of', 'default=noprint_wrappers=1:nokey=1',
-        str(video_path)
-    ]
+    """Check if a video has an audio stream using ffmpeg."""
+    command = ['ffprobe', '-v', 'error', '-select_streams', 'a', '-show_entries',
+               'stream=codec_type', '-of', 'default=noprint_wrappers=1:nokey=1', str(video_path)]
     try:
-        result = subprocess.run(
-            command, capture_output=True, text=True, check=True)
-        # Check if any audio stream was found
-        has_audio = bool(result.stdout.strip())
-        logging.info(f"Audio stream detection for {video_path}: {
-                     'Found' if has_audio else 'Not found'}")
-        return has_audio
+        result = subprocess.run(command, check=True,
+                                text=True, capture_output=True)
+        # Check if 'audio' is mentioned in the output
+        return 'audio' in result.stdout
     except subprocess.CalledProcessError as e:
         logging.error(f"Error checking audio stream for video {
                       video_path}: {e.stderr}")
-        return False
+        return False  # Assume no audio if there's an error
 
 
 def get_file_size(file_path):
@@ -164,20 +82,8 @@ def optimize_gif_with_gifsicle(input_gif, output_gif, colors, lossy):
 
 @log_function_call
 def process_single_gif(file_path, output_path, min_dimensions, *, is_video=False):
-    """
-    Process a single gif or video by iterating over fps and scaling options.
-    Maintains aspect ratio throughout the optimization process.
-    """
-    # Get initial dimensions
-    if is_video:
-        width, height = get_video_dimensions(file_path)
-    else:
-        width, height = get_gif_dimensions(file_path)
-
-    if width is None or height is None:
-        logging.error(f"Could not get dimensions for {file_path}")
-        return False
-
+    """Process a single gif or video by iterating over fps and scaling options."""
+    width, height = min_dimensions
     temp_dir = Path(TEMP_FILE_DIR)
     output_dir = Path(OUTPUT_DIR)
 
@@ -195,12 +101,11 @@ def process_single_gif(file_path, output_path, min_dimensions, *, is_video=False
 
         if is_video:
             # Generate palette and create GIF from video
-            if not generate_palette(file_path, palette_path, fps, (width, height)):
-                return False
-            if not create_gif_from_video(file_path, palette_path, temp_gif, fps, (width, height)):
-                return False
+            generate_palette(file_path, palette_path, fps, (width, height))
+            create_gif_from_video(file_path, palette_path,
+                                  temp_gif, fps, (width, height))
         else:
-            # If the input is already a gif, use it directly for the first iteration
+            # If the input is already a gif, use it directly
             temp_gif = file_path
 
         size = get_file_size(temp_gif)
@@ -208,6 +113,9 @@ def process_single_gif(file_path, output_path, min_dimensions, *, is_video=False
 
         # Loop until the gif is under target size or minimum size is reached
         while size > target_size:
+            logging.warning(
+                f"GIF exceeds {target_size}MB, attempting to scale down (fps={fps}).")
+
             # Calculate scaling factor based on file size
             if size > 50:
                 scale_factor = 0.3
@@ -217,32 +125,56 @@ def process_single_gif(file_path, output_path, min_dimensions, *, is_video=False
                 scale_factor = 0.5
             elif size > 20:
                 scale_factor = 0.8
-            else:
+            elif size > 10:
                 scale_factor = 0.9
+            else:
+                scale_factor = 0.95
 
-            # Calculate new dimensions maintaining aspect ratio
-            width, height = calculate_new_dimensions(
-                width, height, scale_factor)
+            # Scale both dimensions
+            new_width = int(width * scale_factor)
+            new_height = int(height * scale_factor)
+
+            # Ensure minimum dimension of 120px but adjust proportionally
+            if min(new_width, new_height) < 120:
+                scale = 120 / min(new_width, new_height)
+                if new_width < new_height:
+                    # Ensure at least 121 width
+                    new_width = max(int(width * scale), 121)
+                    # Scale height proportionally
+                    new_height = max(
+                        int(height * scale * (new_width / width)), 121)
+                else:
+                    # Ensure at least 121 height
+                    new_height = max(int(height * scale), 121)
+                    # Scale width proportionally
+                    new_width = max(
+                        int(width * scale * (new_height / height)), 121)
+
+            # Avoid exact 120 if possible
+            if new_height == 120:
+                new_height += 1  # Increment by 1 to avoid exact 120
+            if new_width == 120:
+                new_width += 1  # Increment by 1 to avoid exact 120
+
+            width, height = new_width, new_height
 
             if is_video:
-                if not generate_palette(file_path, palette_path, fps, (width, height)):
-                    return False
-                if not create_gif_from_video(file_path, palette_path, temp_gif, fps, (width, height)):
-                    return False
+                generate_palette(file_path, palette_path, fps, (width, height))
+                create_gif_from_video(
+                    file_path, palette_path, temp_gif, fps, (width, height))
 
             size = get_file_size(temp_gif)
 
-            # Break if we can't reduce size further while maintaining minimum dimensions
-            if min(width, height) <= 120:
-                break
-
-        if size <= target_size:
-            optimize_gif_with_gifsicle(
-                temp_gif,
-                output_path,
+        if size <= target_size or min(width, height) < 120:
+            logging.info(f"GIF is under target size or at minimum dimensions: {
+                         output_path}, size: {size:.2f} MB")
+            optimized_size = optimize_gif_with_gifsicle(
+                temp_gif, output_path,
                 colors=GIF_COMPRESSION['colors'],
                 lossy=GIF_COMPRESSION['lossy_value']
             )
+            logging.info(f"Optimized GIF saved: {
+                         output_path}, size: {optimized_size:.2f} MB")
             return True
 
         return False

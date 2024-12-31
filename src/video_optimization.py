@@ -180,12 +180,8 @@ def compress_video_pass2(input_path, final_output_path, scale_factor, crf, use_g
     return compress_video(input_path, final_output_path, scale_factor, crf, use_gpu)
 
 
-@log_function_call
 def process_videos(gpu_supported=False):
-    """
-    Process all videos in the input directory for compression.
-    Only deletes videos with no audio after successful GIF creation.
-    """
+    """Process all videos in the input directory for compression."""
     failed_files = []
     input_dir = Path(INPUT_DIR)
     temp_dir = Path(TEMP_FILE_DIR)
@@ -193,78 +189,91 @@ def process_videos(gpu_supported=False):
     min_size_mb = VIDEO_COMPRESSION['min_size_mb']
 
     for video_file in input_dir.glob('*.mp4'):
-        # Store audio status early
+        # Check if the video has an audio stream
         has_audio = has_audio_stream(video_file)
-        logging.info(f"Processing video {
-                     video_file.name} - Has audio: {has_audio}")
 
         # Prepare names for potential output files
-        compressed_video_name = video_file.stem + "_compressed.mp4"
-        compressed_video_path = output_dir / compressed_video_name
-        gif_output_path = output_dir / (video_file.stem + "_fps.gif")
+        compressed_video_name = video_file.stem + ".mp4"
 
-        # Check if files already exist
-        video_exists = compressed_video_path.exists()
-        gif_exists = gif_output_path.exists()
+        if has_audio and (output_dir / compressed_video_name).exists():
+            logging.info(f"Video {
+                         video_file.name} already has a compressed version in the output directory. Skipping.")
+            continue
 
-        if has_audio:
-            # For videos with audio, keep both video and gif
-            if video_exists and gif_exists:
-                logging.info(f"Both compressed video and GIF already exist for {
-                             video_file.name}. Skipping.")
-                continue
-        else:
-            # For videos without audio, we only need the gif
-            if gif_exists:
-                logging.info(
-                    f"GIF already exists for no-audio video {video_file.name}. Skipping.")
-                continue
+        original_size = get_file_size(video_file)
+        logging.info(f"Processing video: {video_file}")
+        logging.info(f"Original size: {original_size:.2f} MB")
 
-        # Process video if needed
-        if not video_exists:
-            original_size = get_file_size(video_file)
-            logging.info(f"Processing video: {video_file}")
-            logging.info(f"Original size: {original_size:.2f} MB")
+        # Initial compression settings
+        crf = VIDEO_COMPRESSION['crf']
+        scale_factor = VIDEO_COMPRESSION['scale_factor']
 
-            success = compress_video(
-                video_file,
-                compressed_video_path,
-                VIDEO_COMPRESSION['scale_factor'],
-                VIDEO_COMPRESSION['crf'],
-                gpu_supported
-            )
+        best_size = float('inf')
+        temp_file_1 = temp_dir / f"temp_pass1_{video_file.name}"
+        temp_file_2 = temp_dir / f"temp_pass2_{video_file.name}"
+        final_output = output_dir / compressed_video_name
 
+        while best_size > min_size_mb:
+            # First Pass: Quality over size but less aggressive
+            success, size_pass1 = compress_video_pass1(
+                video_file, temp_file_1, scale_factor, crf, gpu_supported)
             if not success:
+                logging.error(
+                    f"First pass compression failed for {video_file}")
                 failed_files.append(video_file)
-                continue
+                break
 
-        # Process GIF if needed
-        if not gif_exists:
-            source_video = compressed_video_path if video_exists else video_file
-            logging.info(f"Creating GIF from video: {source_video}")
-
-            success = process_single_gif(
-                source_video,
-                gif_output_path,
-                (0, 120),  # min dimensions
-                is_video=True
-            )
-
-            if not success:
+            # Second Pass: Size reduction but less aggressive
+            success, size_pass2 = compress_video_pass2(
+                temp_file_1, temp_file_2, scale_factor, crf, gpu_supported)
+            if success:
+                if size_pass2 < best_size:
+                    best_size = size_pass2
+                    # Clean up previous best if exists
+                    if final_output.exists():
+                        final_output.unlink()
+                    # Only move the file if it's below min_size_mb
+                    if best_size <= min_size_mb:
+                        shutil.move(str(temp_file_2), str(final_output))
+                        logging.info(f"Video encoded to {
+                                     best_size:.2f} MB, moved to {final_output}")
+                    else:
+                        logging.info(f"Current compression to {
+                                     best_size:.2f} MB, not moving as it exceeds {min_size_mb} MB")
+                else:
+                    logging.info(f"Current compression did not improve size. Best size: {
+                                 best_size:.2f} MB")
+                # Clean up temp file from first pass
+                if temp_file_1.exists():
+                    temp_file_1.unlink()
+            else:
+                logging.error(
+                    f"Second pass compression failed for {video_file}")
                 failed_files.append(video_file)
-                continue
+                # Clean up both temp files if failure occurred
+                if temp_file_1.exists():
+                    temp_file_1.unlink()
+                if temp_file_2.exists():
+                    temp_file_2.unlink()
+                break
 
-            # Only delete the compressed video if:
-            # 1. The video has no audio
-            # 2. GIF creation was successful
-            # 3. The compressed video exists
-            if not has_audio and video_exists and compressed_video_path.exists():
-                try:
-                    compressed_video_path.unlink()
-                    logging.info(f"Deleted video with no audio after successful GIF creation: {
-                                 compressed_video_path}")
-                except Exception as e:
-                    logging.error(f"Error deleting video {
-                                  compressed_video_path}: {e}")
+            # If we've hit the minimum size or can't compress further, break
+            if best_size <= min_size_mb:
+                break
+
+            # Adjust compression parameters if needed
+            if crf < 35:
+                crf += 2
+                logging.info(f"Trying higher CRF: {crf}")
+            else:
+                scale_factor -= 0.1
+                crf = VIDEO_COMPRESSION['crf']  # Reset CRF when changing scale
+                logging.info(f"Trying smaller scale: {scale_factor:.1f}")
+
+        # Ensure cleanup if the loop was broken due to failure or if the size constraint wasn't met
+        if temp_file_1.exists():
+            temp_file_1.unlink()
+        if temp_file_2.exists():
+            temp_file_2.unlink()
 
     return failed_files
