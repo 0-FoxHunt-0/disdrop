@@ -1,0 +1,4 @@
+ffmpeg-python
+gifsicle
+opencv-python
+numpy
