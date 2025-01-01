@@ -154,7 +154,7 @@ def compress_video(input_path, output_path, scale_factor, crf, use_gpu=True):
         ]
 
     try:
-        success = run_ffmpeg_command(command, str(LOG_DIR / 'ffmpeg.log'))
+        success = run_ffmpeg_command(command)
         if success:
             final_size = get_file_size(output_path)
             logging.info(f"Video compressed to {
@@ -203,6 +203,12 @@ def process_videos(gpu_supported=False):
         original_size = get_file_size(video_file)
         logging.info(f"Processing video: {video_file}")
         logging.info(f"Original size: {original_size:.2f} MB")
+
+        if original_size < min_size_mb:
+            logging.info(f"Video is already smaller than {
+                         min_size_mb} MB. Copying to output directory.")
+            shutil.copy2(video_file, output_dir / compressed_video_name)
+            continue
 
         # Initial compression settings
         crf = VIDEO_COMPRESSION['crf']

@@ -7,7 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from default_config import INPUT_DIR, LOG_DIR, LOG_FILE, OUTPUT_DIR, TEMP_FILE_DIR
+from default_config import (INPUT_DIR, LOG_DIR, LOG_FILE, OUTPUT_DIR,
+                            TEMP_FILE_DIR)
 from gif_optimization import process_gifs
 from gpu_acceleration import setup_gpu_acceleration
 from logging_system import setup_logger
@@ -63,13 +64,57 @@ def check_requirements(requirements_file):
         sys.exit(1)
 
 
+def process_failed_gifs(failed_files, pass_over_index):
+    """
+    Process failed GIFs with more aggressive settings for optimization.
+    """
+    logging.info(f"Starting additional pass for failed GIFs with pass over {
+                 pass_over_index + 1}")
+
+    # Update global GIF_COMPRESSION with pass over settings
+    pass_over = GIF_PASS_OVERS[pass_over_index]
+    GIF_COMPRESSION.update(pass_over)
+
+    new_failed_files = []
+    for file_path in failed_files:
+        source_file = Path(file_path)
+
+        if source_file.suffix == '.gif' and source_file.parent == Path(INPUT_DIR):
+            output_gif = OUTPUT_DIR / \
+                (source_file.stem + "_pass_" + str(pass_over_index + 1) + ".gif")
+            process_file(source_file, output_gif, is_video=False)
+        elif source_file.suffix == '.mp4' and source_file.parent == Path(OUTPUT_DIR):
+            output_gif = OUTPUT_DIR / \
+                (source_file.stem + "_pass_" + str(pass_over_index + 1) + ".gif")
+            process_file(source_file, output_gif, is_video=True)
+        else:
+            logging.warning(
+                f"File {file_path} does not match expected input or output format, skipping.")
+
+        # If processing still fails, add to new_failed_files
+        if file_path in failed_files:  # Check if the file was still not processed successfully
+            new_failed_files.append(file_path)
+
+    # Reset GIF_COMPRESSION to default settings for next pass or normal operation
+    GIF_COMPRESSION.update({
+        'fps_range': (15, 10),
+        'colors': 256,
+        'lossy_value': 55,
+        'min_size_mb': 10,
+        'min_width': 120,
+        'min_height': 120
+    })  # Assuming these are your default settings
+
+    return new_failed_files
+
+
 def main():
     # Ensure directories exist
     for directory in [INPUT_DIR, OUTPUT_DIR, LOG_DIR]:
         directory.mkdir(parents=True, exist_ok=True)
 
     # Set up logging
-    setup_logger(LOG_FILE)
+    setup_logger()
 
     logging.info("Starting the script")
 
@@ -88,11 +133,23 @@ def main():
     all_failed_files = failed_videos + failed_gifs
 
     if all_failed_files:
-        logging.error("Failed files:")
+        logging.error("Failed files in initial pass:")
         for file in set(all_failed_files):  # Using set to remove duplicates
             logging.error(file)
+
+        # Process failed files with additional passes
+        for i in range(len(GIF_PASS_OVERS)):
+            all_failed_files = process_failed_gifs(all_failed_files, i)
+            if not all_failed_files:
+                logging.info(
+                    f"All failed files processed successfully after pass {i + 1}")
+                break
+            else:
+                logging.warning(f"Remaining failed files after pass {i + 1}:")
+                for file in set(all_failed_files):
+                    logging.warning(file)
     else:
-        logging.info("All files processed successfully")
+        logging.info("All files processed successfully in initial pass")
 
     logging.info("Script finished successfully")
 

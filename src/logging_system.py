@@ -6,6 +6,7 @@ import logging
 import subprocess
 import sys
 from pathlib import Path
+from default_config import LOG_FILE, FFPMEG_LOG_FILE
 
 
 class TeeLogger:
@@ -40,10 +41,21 @@ class FFmpegFilter(logging.Filter):
         return not record.getMessage().startswith('frame=')
 
 
-def setup_logger(log_file_path):
-    """Set up logging configuration."""
+def setup_logger():
+    """Set up logging configuration and clear existing log files."""
+    # Clear existing log files
+    log_files = [Path(LOG_FILE), Path(FFPMEG_LOG_FILE).parent / 'ffmpeg.log']
+    for log_file in log_files:
+        try:
+            if log_file.exists():
+                log_file.unlink()  # Delete the file if it exists
+        except PermissionError:
+            logging.warning(f"Could not clear {log_file}: Permission denied")
+        except Exception as e:
+            logging.error(f"Error clearing {log_file}: {e}")
+
     # Create a file handler for the log file
-    file_handler = logging.FileHandler(log_file_path)
+    file_handler = logging.FileHandler(LOG_FILE)
     file_handler.setLevel(logging.DEBUG)
     file_formatter = logging.Formatter(
         '%(asctime)s - %(levelname)s - %(message)s')
@@ -70,6 +82,7 @@ def setup_logger(log_file_path):
 def log_exception(exc_type, exc_value, exc_traceback):
     """Log uncaught exceptions."""
     if issubclass(exc_type, KeyboardInterrupt):
+        logging.warning("Script interrupted by user.")
         sys.__excepthook__(exc_type, exc_value, exc_traceback)
         return
     logging.critical("Uncaught exception", exc_info=(
@@ -91,9 +104,9 @@ def log_function_call(func):
     return wrapper
 
 
-def run_ffmpeg_command(command, log_file):
+def run_ffmpeg_command(command):
     """Run an FFmpeg command and redirect output to log file."""
-    log_path = Path(log_file).parent / 'ffmpeg.log'
+    log_path = Path(FFPMEG_LOG_FILE).parent / 'ffmpeg.log'
     with open(log_path, 'a') as ffmpeg_log:
         try:
             process = subprocess.run(

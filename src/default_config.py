@@ -60,3 +60,4 @@ GIF_SIZE_TO_SKIP = 90  # Max size for gifs before skipping gif optimization with
 
 # File naming and logging settings
 LOG_FILE = LOG_DIR / 'disdrop.log'
+FFPMEG_LOG_FILE = LOG_DIR / 'ffmpeg.log'
