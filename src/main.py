@@ -7,12 +7,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-from default_config import (INPUT_DIR, LOG_DIR, LOG_FILE, OUTPUT_DIR,
-                            TEMP_FILE_DIR)
+from default_config import (GIF_PASS_OVERS, INPUT_DIR, LOG_DIR, OUTPUT_DIR,
+                            TEMP_FILE_DIR, GIF_COMPRESSION)
 from gif_optimization import process_gifs
 from gpu_acceleration import setup_gpu_acceleration
 from logging_system import setup_logger
 from video_optimization import process_videos
+from gif_optimization import process_file
 
 
 def create_and_activate_venv(venv_dir, requirements_file):
