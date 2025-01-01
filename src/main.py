@@ -67,32 +67,35 @@ def check_requirements(requirements_file):
 
 
 def process_failed_gifs(failed_files, pass_over_index):
-    logging.info(f"Starting additional pass for failed GIFs with pass over {
+    logging.info(f"Starting additional pass for failed GIFs: Pass {
                  pass_over_index + 1}")
-
-    # Update global GIF_COMPRESSION with pass over settings
     pass_over = GIF_PASS_OVERS[pass_over_index]
     GIF_COMPRESSION.update(pass_over)
 
     new_failed_files = []
     for file_path in failed_files:
-        source_file = Path(file_path)
+        try:
+            source_file = Path(file_path)
+            output_gif = OUTPUT_DIR / f"{source_file.stem}.gif"
+            TempFileManager.register(output_gif)
 
-        if source_file.suffix == '.gif' and source_file.parent == Path(INPUT_DIR):
-            output_gif = OUTPUT_DIR / f"{source_file.stem}.gif"  # Changed here
-            process_file(source_file, output_gif, is_video=False)
-        elif source_file.suffix == '.mp4' and source_file.parent == Path(OUTPUT_DIR):
-            output_gif = OUTPUT_DIR / f"{source_file.stem}.gif"  # Changed here
-            process_file(source_file, output_gif, is_video=True)
-        else:
-            logging.warning(
-                f"File {file_path} does not match expected input or output format, skipping.")
+            if source_file.suffix == '.gif':
+                process_file(source_file, output_gif, is_video=False)
+            elif source_file.suffix == '.mp4':
+                process_file(source_file, output_gif, is_video=True)
+            else:
+                logging.warning(
+                    f"File {file_path} not in expected formats, skipping.")
 
-        # If processing still fails, add to new_failed_files
-        if file_path in failed_files:  # Check if the file was still not processed successfully
+            if not output_gif.exists():
+                logging.error(f"Failed to process file: {file_path}")
+                new_failed_files.append(file_path)
+            else:
+                TempFileManager.unregister(output_gif)
+        except Exception as e:
+            logging.error(f"Error processing file {file_path}: {e}")
             new_failed_files.append(file_path)
 
-    # Reset GIF_COMPRESSION to default settings for next pass or normal operation
     GIF_COMPRESSION.update({
         'fps_range': (15, 10),
         'colors': 256,
@@ -107,71 +110,52 @@ def process_failed_gifs(failed_files, pass_over_index):
 
 def main():
     try:
-        # Ensure directories exist
         for directory in [INPUT_DIR, OUTPUT_DIR, LOG_DIR]:
             directory.mkdir(parents=True, exist_ok=True)
 
-        # Set up logging
         setup_logger()
-        setup_error_termination()  # Add this line to enable error termination
+        setup_error_termination()
 
-        logging.info("Starting the script")
-
-        # Check for GPU setup
+        logging.info("Script starting...")
         gpu_supported = setup_gpu_acceleration()
 
-        # First process videos
-        logging.info("Starting video processing...")
+        logging.info("Processing videos...")
         failed_videos = process_videos(gpu_supported)
 
-        # Then process GIFs (including those created from videos)
-        logging.info("Starting GIF processing...")
+        logging.info("Processing GIFs...")
         failed_gifs = process_gifs()
 
-        # Combine all failed files
         all_failed_files = failed_videos + failed_gifs
 
+        for i in range(len(GIF_PASS_OVERS)):
+            if not all_failed_files:
+                logging.info(f"All files processed successfully by pass {i}.")
+                break
+            all_failed_files = process_failed_gifs(all_failed_files, i)
+
         if all_failed_files:
-            logging.warning("Failed files in initial pass:")
-            for file in set(all_failed_files):  # Using set to remove duplicates
+            logging.warning(
+                "Some files could not be processed after all passes:")
+            for file in all_failed_files:
                 logging.warning(file)
 
-            # Process failed files with additional passes
-            for i in range(len(GIF_PASS_OVERS)):
-                all_failed_files = process_failed_gifs(all_failed_files, i)
-                if not all_failed_files:
-                    logging.info(
-                        f"All failed files processed successfully after pass {i + 1}")
-                    break
-                else:
-                    logging.warning(
-                        f"Remaining failed files after pass {i + 1}:")
-                    for file in set(all_failed_files):
-                        logging.warning(file)
-        else:
-            logging.info("All files processed successfully in initial pass")
-
-        logging.info("Script finished successfully")
-
+        logging.info("Script completed successfully.")
     finally:
-        # Clean up all temporary files
-        logging.info("Cleaning up temporary files...")
+        logging.info("Performing cleanup...")
         TempFileManager.cleanup()
         TempFileManager.cleanup_dir(TEMP_FILE_DIR)
-        logging.info("Temporary file cleanup completed")
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        logging.warning("Script interrupted by user.")
+        logging.warning("Interrupted by user. Cleaning up...")
         TempFileManager.cleanup()
         TempFileManager.cleanup_dir(TEMP_FILE_DIR)
         sys.exit(0)
     except Exception as e:
         logging.error(f"Unexpected error: {e}")
-        # Still try to clean up on error
         TempFileManager.cleanup()
         TempFileManager.cleanup_dir(TEMP_FILE_DIR)
         sys.exit(1)
