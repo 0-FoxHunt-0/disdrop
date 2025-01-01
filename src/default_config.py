@@ -27,7 +27,9 @@ VIDEO_COMPRESSION = {
     'crf': 23,            # Constant Rate Factor for video compression
     # Use GPU for video optimization, set to False for CPU fallback
     'gpu_acceleration': True,
-    'min_size_mb': 10
+    'min_size_mb': 10,
+    'min_width': 0,
+    'min_height': 120
 }
 
 GIF_COMPRESSION = {
@@ -67,3 +69,5 @@ GIF_SIZE_TO_SKIP = 90  # Max size for gifs before skipping gif optimization with
 # File naming and logging settings
 LOG_FILE = LOG_DIR / 'disdrop.log'
 FFPMEG_LOG_FILE = LOG_DIR / 'ffmpeg.log'
+SUPPORTED_VIDEO_FORMATS = ['.mp4', '.mkv',
+                           '.m4v', '.avi', '.mov', '.wmv', '.flv']

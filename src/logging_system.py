@@ -116,7 +116,7 @@ def setup_error_termination():
 def log_function_call(func):
     """Decorator to log function calls and their results."""
     def wrapper(*args, **kwargs):
-        logging.info(f"Calling function: {func.__name__}")
+        logging.debug(f"Calling function: {func.__name__}")
         try:
             result = func(*args, **kwargs)
             logging.debug(f"Function {func.__name__} returned: {result}")

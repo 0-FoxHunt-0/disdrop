@@ -14,6 +14,7 @@ from gpu_acceleration import setup_gpu_acceleration
 from logging_system import setup_logger, setup_error_termination
 from video_optimization import process_videos
 from gif_optimization import process_file
+from temp_file_manager import TempFileManager  # Added import
 
 
 def create_and_activate_venv(venv_dir, requirements_file):
@@ -105,50 +106,59 @@ def process_failed_gifs(failed_files, pass_over_index):
 
 
 def main():
-    # Ensure directories exist
-    for directory in [INPUT_DIR, OUTPUT_DIR, LOG_DIR]:
-        directory.mkdir(parents=True, exist_ok=True)
+    try:
+        # Ensure directories exist
+        for directory in [INPUT_DIR, OUTPUT_DIR, LOG_DIR]:
+            directory.mkdir(parents=True, exist_ok=True)
 
-    # Set up logging
-    setup_logger()
-    setup_error_termination()  # Add this line to enable error termination
+        # Set up logging
+        setup_logger()
+        setup_error_termination()  # Add this line to enable error termination
 
-    logging.info("Starting the script")
+        logging.info("Starting the script")
 
-    # Check for GPU setup
-    gpu_supported = setup_gpu_acceleration()
+        # Check for GPU setup
+        gpu_supported = setup_gpu_acceleration()
 
-    # First process videos
-    logging.info("Starting video processing...")
-    failed_videos = process_videos(gpu_supported)
+        # First process videos
+        logging.info("Starting video processing...")
+        failed_videos = process_videos(gpu_supported)
 
-    # Then process GIFs (including those created from videos)
-    logging.info("Starting GIF processing...")
-    failed_gifs = process_gifs()
+        # Then process GIFs (including those created from videos)
+        logging.info("Starting GIF processing...")
+        failed_gifs = process_gifs()
 
-    # Combine all failed files
-    all_failed_files = failed_videos + failed_gifs
+        # Combine all failed files
+        all_failed_files = failed_videos + failed_gifs
 
-    if all_failed_files:
-        logging.warning("Failed files in initial pass:")
-        for file in set(all_failed_files):  # Using set to remove duplicates
-            logging.warning(file)
+        if all_failed_files:
+            logging.warning("Failed files in initial pass:")
+            for file in set(all_failed_files):  # Using set to remove duplicates
+                logging.warning(file)
 
-        # Process failed files with additional passes
-        for i in range(len(GIF_PASS_OVERS)):
-            all_failed_files = process_failed_gifs(all_failed_files, i)
-            if not all_failed_files:
-                logging.info(
-                    f"All failed files processed successfully after pass {i + 1}")
-                break
-            else:
-                logging.warning(f"Remaining failed files after pass {i + 1}:")
-                for file in set(all_failed_files):
-                    logging.warning(file)
-    else:
-        logging.info("All files processed successfully in initial pass")
+            # Process failed files with additional passes
+            for i in range(len(GIF_PASS_OVERS)):
+                all_failed_files = process_failed_gifs(all_failed_files, i)
+                if not all_failed_files:
+                    logging.info(
+                        f"All failed files processed successfully after pass {i + 1}")
+                    break
+                else:
+                    logging.warning(
+                        f"Remaining failed files after pass {i + 1}:")
+                    for file in set(all_failed_files):
+                        logging.warning(file)
+        else:
+            logging.info("All files processed successfully in initial pass")
 
-    logging.info("Script finished successfully")
+        logging.info("Script finished successfully")
+
+    finally:
+        # Clean up all temporary files
+        logging.info("Cleaning up temporary files...")
+        TempFileManager.cleanup()
+        TempFileManager.cleanup_dir(TEMP_FILE_DIR)
+        logging.info("Temporary file cleanup completed")
 
 
 if __name__ == "__main__":
@@ -156,9 +166,12 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         logging.warning("Script interrupted by user.")
-        for file in TEMP_FILE_DIR.glob('*'):
-            file.unlink()
+        TempFileManager.cleanup()
+        TempFileManager.cleanup_dir(TEMP_FILE_DIR)
         sys.exit(0)
     except Exception as e:
         logging.error(f"Unexpected error: {e}")
+        # Still try to clean up on error
+        TempFileManager.cleanup()
+        TempFileManager.cleanup_dir(TEMP_FILE_DIR)
         sys.exit(1)

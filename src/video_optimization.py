@@ -6,9 +6,10 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from default_config import (INPUT_DIR, LOG_DIR, OUTPUT_DIR, TEMP_FILE_DIR,
-                            VIDEO_COMPRESSION)
+from default_config import (INPUT_DIR, OUTPUT_DIR, SUPPORTED_VIDEO_FORMATS,
+                            TEMP_FILE_DIR, VIDEO_COMPRESSION)
 from logging_system import log_function_call, run_ffmpeg_command
+from temp_file_manager import TempFileManager  # Added import
 
 
 def get_video_dimensions(video_path):
@@ -166,18 +167,91 @@ def compress_video(input_path, output_path, scale_factor, crf, use_gpu=True):
         return False, float('inf')
 
 
+def convert_to_mp4(input_path, output_path, use_gpu=True):
+    """Convert video to MP4 format while maintaining quality."""
+    try:
+        if use_gpu:
+            command = [
+                'ffmpeg', '-hwaccel', 'cuda',
+                '-i', str(input_path),
+                '-c:v', 'h264_nvenc',
+                '-preset', 'p7',
+                '-c:a', 'aac',
+                '-b:a', '192k',
+                '-movflags', '+faststart',
+                '-y', str(output_path)
+            ]
+        else:
+            command = [
+                'ffmpeg', '-i', str(input_path),
+                '-c:v', 'libx264',
+                '-preset', 'medium',
+                '-crf', '18',
+                '-c:a', 'aac',
+                '-b:a', '192k',
+                '-movflags', '+faststart',
+                '-y', str(output_path)
+            ]
+
+        logging.info(f"Converting {input_path.name} to MP4...")
+        success = run_ffmpeg_command(command)
+        if success:
+            logging.info(f"Successfully converted {input_path.name} to MP4")
+            return True
+        return False
+    except Exception as e:
+        logging.error(f"Error converting video to MP4: {e}")
+        return False
+
+
 def compress_video_pass1(input_path, temp_output_path, scale_factor, crf, use_gpu=True):
-    # This pass focuses on keeping quality relatively high while reducing size
-    # Use a slightly lower CRF for better quality in first pass
-    crf -= 1  # Less aggressive than before
+    """First pass focuses on analyzing the video and creating a quality baseline."""
+    width, height = get_video_dimensions(input_path)
+    if not width or not height:
+        return False, float('inf')
+
+    # Calculate bitrate based on scaled dimensions
+    new_width = int(width * scale_factor)
+    new_height = int(height * scale_factor)
+    target_bitrate = calculate_target_bitrate(new_width, new_height)
+
+    # First pass uses 2-pass encoding to analyze the video
+    if use_gpu:
+        command = [
+            'ffmpeg', '-hwaccel', 'cuda', '-i', str(input_path),
+            '-vf', f'scale={new_width}:{new_height}',
+            '-c:v', 'h264_nvenc',
+            '-preset', 'p7',
+            '-b:v', f'{target_bitrate}k',
+            '-pass', '1',
+            '-f', 'null',
+            '/dev/null'  # Use NUL on Windows
+        ]
+    else:
+        command = [
+            'ffmpeg', '-i', str(input_path),
+            '-vf', f'scale={new_width}:{new_height}',
+            '-c:v', 'libx264',
+            '-preset', 'medium',
+            '-b:v', f'{target_bitrate}k',
+            '-pass', '1',
+            '-f', 'null',
+            '/dev/null'  # Use NUL on Windows
+        ]
+
+    success = run_ffmpeg_command(command)
+    if not success:
+        return False, float('inf')
+
+    # Now do the actual first pass encode
     return compress_video(input_path, temp_output_path, scale_factor, crf, use_gpu)
 
 
 def compress_video_pass2(input_path, final_output_path, scale_factor, crf, use_gpu=True):
-    # This pass focuses on reducing size further but less aggressively
-    # Use a slightly higher CRF for more compression in second pass
-    crf += 1  # Less aggressive than before
-    return compress_video(input_path, final_output_path, scale_factor, crf, use_gpu)
+    """Second pass focuses on achieving target size with quality constraints."""
+    # Increase CRF more significantly for second pass
+    adjusted_crf = min(crf + 4, 51)  # Ensure we don't exceed max CRF of 51
+    return compress_video(input_path, final_output_path, scale_factor, adjusted_crf, use_gpu)
 
 
 def process_videos(gpu_supported=False):
@@ -187,15 +261,49 @@ def process_videos(gpu_supported=False):
     temp_dir = Path(TEMP_FILE_DIR)
     output_dir = Path(OUTPUT_DIR)
     min_size_mb = VIDEO_COMPRESSION['min_size_mb']
+    min_width = VIDEO_COMPRESSION['min_width']
+    min_height = VIDEO_COMPRESSION['min_height']
 
-    for video_file in input_dir.glob('*.mp4'):
+    logging.info("Starting video scanning and conversion to MP4...")
+    for format in SUPPORTED_VIDEO_FORMATS:
+        if format != '.mp4':  # We'll handle .mp4 separately below
+            for video_file in input_dir.glob(f'*{format}'):
+                # Temporary file for conversion to mp4
+                temp_file = temp_dir / f"temp_{video_file.stem}.mp4"
+                final_output = input_dir / (video_file.stem + '.mp4')
+
+                if not has_audio_stream(video_file):
+                    continue  # Skip if no audio stream for conversion to MP4
+
+                if not final_output.exists():
+                    # Convert video to MP4
+                    success = convert_to_mp4(
+                        video_file, temp_file, gpu_supported)
+                    if success:
+                        shutil.move(str(temp_file), str(final_output))
+                    else:
+                        failed_files.append(video_file)
+                else:
+                    logging.info(
+                        f"Video {video_file.name} already converted to MP4. Skipping.")
+
+    for video_file in input_dir.glob('*.[mM][pP]4'):
+        # Temporary files for compression passes
+        temp_file_1 = temp_dir / f"temp_pass1_{video_file.name}"
+        temp_file_2 = temp_dir / f"temp_pass2_{video_file.name}"
+
+        # Register temporary files
+        TempFileManager.register(temp_file_1)
+        TempFileManager.register(temp_file_2)
+
         # Check if the video has an audio stream
         has_audio = has_audio_stream(video_file)
 
-        # Prepare names for potential output files
+        # Output as MP4 for better compatibility
         compressed_video_name = video_file.stem + ".mp4"
+        final_output = output_dir / compressed_video_name
 
-        if has_audio and (output_dir / compressed_video_name).exists():
+        if has_audio and final_output.exists():
             logging.info(f"Video {
                          video_file.name} already has a compressed version in the output directory. Skipping.")
             continue
@@ -206,77 +314,90 @@ def process_videos(gpu_supported=False):
 
         if original_size < min_size_mb:
             logging.info(f"Video is already smaller than {
-                         min_size_mb} MB. Copying to output directory.")
-            shutil.copy2(video_file, output_dir / compressed_video_name)
+                         min_size_mb} MB. Converting to MP4 format.")
+            success = convert_to_mp4(video_file, temp_file_1, gpu_supported)
+            if success:
+                shutil.move(str(temp_file_1), str(final_output))
+            else:
+                failed_files.append(video_file)
             continue
 
-        # Initial compression settings
+        # Compression strategy
         crf = VIDEO_COMPRESSION['crf']
         scale_factor = VIDEO_COMPRESSION['scale_factor']
-
         best_size = float('inf')
-        temp_file_1 = temp_dir / f"temp_pass1_{video_file.name}"
-        temp_file_2 = temp_dir / f"temp_pass2_{video_file.name}"
-        final_output = output_dir / compressed_video_name
+        attempts = 0
+
+        # Get original dimensions
+        width, height = get_video_dimensions(video_file)
+        if not width or not height:
+            logging.error(f"Failed to get dimensions for {video_file}")
+            failed_files.append(video_file)
+            continue
 
         while best_size > min_size_mb:
-            # First Pass: Quality over size but less aggressive
             success, size_pass1 = compress_video_pass1(
                 video_file, temp_file_1, scale_factor, crf, gpu_supported)
+
             if not success:
                 logging.warning(
                     f"First pass compression failed for {video_file}")
                 failed_files.append(video_file)
                 break
 
-            # Second Pass: Size reduction but less aggressive
             success, size_pass2 = compress_video_pass2(
                 temp_file_1, temp_file_2, scale_factor, crf, gpu_supported)
-            if success:
-                if size_pass2 < best_size:
-                    best_size = size_pass2
-                    # Clean up previous best if exists
-                    if final_output.exists():
-                        final_output.unlink()
-                    # Only move the file if it's below min_size_mb
-                    if best_size <= min_size_mb:
-                        shutil.move(str(temp_file_2), str(final_output))
-                        logging.info(f"Video encoded to {
-                                     best_size:.2f} MB, moved to {final_output}")
-                    else:
-                        logging.info(f"Current compression to {
-                                     best_size:.2f} MB, not moving as it exceeds {min_size_mb} MB")
-                else:
-                    logging.info(f"Current compression did not improve size. Best size: {
-                                 best_size:.2f} MB")
-                # Clean up temp file from first pass
-                if temp_file_1.exists():
-                    temp_file_1.unlink()
-            else:
+
+            if not success:
                 logging.warning(
                     f"Second pass compression failed for {video_file}")
                 failed_files.append(video_file)
-                # Clean up both temp files if failure occurred
-                if temp_file_1.exists():
-                    temp_file_1.unlink()
-                if temp_file_2.exists():
-                    temp_file_2.unlink()
                 break
 
-            # If we've hit the minimum size or can't compress further, break
-            if best_size <= min_size_mb:
-                break
+            if size_pass2 < best_size:
+                best_size = size_pass2
+                if best_size <= min_size_mb:
+                    # Check if dimensions meet the minimum requirements
+                    new_width = int(width * scale_factor)
+                    new_height = int(height * scale_factor)
+                    if new_width >= min_width and new_height >= min_height:
+                        shutil.move(str(temp_file_2), str(final_output))
+                        logging.info(f"Video successfully compressed to {
+                                     best_size:.2f} MB")
+                        break
+                    else:
+                        logging.warning(
+                            f"Video dimensions after scaling do not meet minimum size requirements. Continuing compression.")
 
-            # Adjust compression parameters if needed
-            if crf < 35:
-                crf += 2
-                logging.info(f"Trying higher CRF: {crf}")
+            # Adjust compression parameters dynamically
+            attempts += 1
+
+            if best_size > min_size_mb * 1.5:  # If significantly over target
+                if crf < 35:  # Gradually increase CRF for quality reduction
+                    crf += 2
+                else:
+                    scale_factor *= 0.9  # Reduce scale if CRF is already high
+            elif best_size > min_size_mb:  # If slightly over target
+                if crf < 31:  # Moderate increase in CRF
+                    crf += 1
+                elif scale_factor > 0.5:  # Moderate scale reduction if CRF increase isn't enough
+                    scale_factor *= 0.95
             else:
-                scale_factor -= 0.1
-                crf = VIDEO_COMPRESSION['crf']  # Reset CRF when changing scale
-                logging.info(f"Trying smaller scale: {scale_factor:.1f}")
+                # If under target or just right, we might slightly improve quality or maintain
+                # If we've increased CRF, try to lower it back
+                if crf > VIDEO_COMPRESSION['crf']:
+                    # But not below initial value
+                    crf = max(crf - 1, VIDEO_COMPRESSION['crf'])
+                elif scale_factor < 1.0:  # If scale was reduced, try to increase slightly
+                    # But not above original scale
+                    scale_factor = min(scale_factor * 1.05, 1.0)
 
-        # Ensure cleanup if the loop was broken due to failure or if the size constraint wasn't met
+            logging.info(f"Attempt {attempts}: CRF={
+                         crf}, scale={scale_factor:.2f}")
+
+        # Cleanup
+        TempFileManager.unregister(temp_file_1)
+        TempFileManager.unregister(temp_file_2)
         if temp_file_1.exists():
             temp_file_1.unlink()
         if temp_file_2.exists():
