@@ -224,7 +224,7 @@ def process_videos(gpu_supported=False):
             success, size_pass1 = compress_video_pass1(
                 video_file, temp_file_1, scale_factor, crf, gpu_supported)
             if not success:
-                logging.error(
+                logging.warning(
                     f"First pass compression failed for {video_file}")
                 failed_files.append(video_file)
                 break
@@ -253,7 +253,7 @@ def process_videos(gpu_supported=False):
                 if temp_file_1.exists():
                     temp_file_1.unlink()
             else:
-                logging.error(
+                logging.warning(
                     f"Second pass compression failed for {video_file}")
                 failed_files.append(video_file)
                 # Clean up both temp files if failure occurred

@@ -66,9 +66,6 @@ def check_requirements(requirements_file):
 
 
 def process_failed_gifs(failed_files, pass_over_index):
-    """
-    Process failed GIFs with more aggressive settings for optimization.
-    """
     logging.info(f"Starting additional pass for failed GIFs with pass over {
                  pass_over_index + 1}")
 
@@ -81,12 +78,10 @@ def process_failed_gifs(failed_files, pass_over_index):
         source_file = Path(file_path)
 
         if source_file.suffix == '.gif' and source_file.parent == Path(INPUT_DIR):
-            output_gif = OUTPUT_DIR / \
-                (source_file.stem + "_pass_" + str(pass_over_index + 1) + ".gif")
+            output_gif = OUTPUT_DIR / f"{source_file.stem}.gif"  # Changed here
             process_file(source_file, output_gif, is_video=False)
         elif source_file.suffix == '.mp4' and source_file.parent == Path(OUTPUT_DIR):
-            output_gif = OUTPUT_DIR / \
-                (source_file.stem + "_pass_" + str(pass_over_index + 1) + ".gif")
+            output_gif = OUTPUT_DIR / f"{source_file.stem}.gif"  # Changed here
             process_file(source_file, output_gif, is_video=True)
         else:
             logging.warning(
@@ -104,7 +99,7 @@ def process_failed_gifs(failed_files, pass_over_index):
         'min_size_mb': 10,
         'min_width': 120,
         'min_height': 120
-    })  # Assuming these are your default settings
+    })
 
     return new_failed_files
 
@@ -134,9 +129,9 @@ def main():
     all_failed_files = failed_videos + failed_gifs
 
     if all_failed_files:
-        logging.error("Failed files in initial pass:")
+        logging.warning("Failed files in initial pass:")
         for file in set(all_failed_files):  # Using set to remove duplicates
-            logging.error(file)
+            logging.warning(file)
 
         # Process failed files with additional passes
         for i in range(len(GIF_PASS_OVERS)):

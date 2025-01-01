@@ -48,6 +48,12 @@ GIF_PASS_OVERS = [
         'scale_factor': 0.8,
     },
     {
+        'fps_range': (10, 15),
+        'colors': 64,
+        'lossy_value': 80,
+        'scale_factor': 0.8,
+    },
+    {
         'fps_range': (5, 10),
         'colors': 64,
         'lossy_value': 80,

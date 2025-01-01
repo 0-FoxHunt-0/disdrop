@@ -7,7 +7,7 @@ from functools import partial
 from multiprocessing import Pool
 from pathlib import Path
 
-from default_config import (GIF_COMPRESSION, INPUT_DIR, OUTPUT_DIR,
+from default_config import (GIF_COMPRESSION, GIF_SIZE_TO_SKIP, INPUT_DIR, OUTPUT_DIR,
                             TEMP_FILE_DIR)
 from logging_system import log_function_call, run_ffmpeg_command
 from video_optimization import get_video_dimensions
@@ -81,11 +81,9 @@ def optimize_gif_with_gifsicle(input_gif, output_gif, colors, lossy):
         return float('inf')
 
 
+# Inside gif_optimization.py
+
 def process_file(file_path, output_path, is_video):
-    """
-    Process a single file (video or GIF) into an optimized GIF.
-    Includes early termination if first optimization exceeds size limit.
-    """
     MIN_HEIGHT = GIF_COMPRESSION['min_height']
 
     # Get video dimensions, handling potential None values
@@ -121,6 +119,20 @@ def process_file(file_path, output_path, is_video):
                 first_result = next(async_results)
                 if first_result[2] is not None:  # If processing succeeded
                     first_size = first_result[1]
+
+                    if first_size > 50:
+                        scale_factor *= 0.3
+                    elif first_size > 40:
+                        scale_factor *= 0.4
+                    elif first_size > 30:
+                        scale_factor *= 0.5
+                    elif first_size > 20:
+                        scale_factor *= 0.8
+                    elif first_size > 10:
+                        scale_factor *= 0.9
+                    else:
+                        scale_factor *= 0.95
+
                     if first_size > GIF_COMPRESSION['min_size_mb']:
                         logging.info(f"First optimization resulted in {first_size:.2f}MB, "
                                      f"exceeding limit of {
@@ -133,7 +145,6 @@ def process_file(file_path, output_path, is_video):
                         pool.terminate()
                         pool.join()
                         # Adjust scale factor and continue to next iteration
-                        scale_factor *= 0.7
                         continue
 
                 # If we get here, first result was good or failed
@@ -149,12 +160,18 @@ def process_file(file_path, output_path, is_video):
 
         valid_results = [res for res in results if res[2] is not None]
 
+        new_height = int(height * scale_factor)
+        if new_height < MIN_HEIGHT:
+            logging.warning(f"Failed to optimize {
+                          file_path} due to minimum dimension constraints")
+            failed_files.append(file_path)
+            break  # Exit the loop if we can't meet the minimum height requirement
+
         if not valid_results:
             if scale_factor < 0.1:
                 logging.error(f"Could not create GIF for {file_path}")
                 failed_files.append(file_path)
                 break
-            scale_factor *= 0.7
             continue
 
         smallest_size = min(size for _, size, _ in valid_results)
@@ -172,6 +189,10 @@ def process_file(file_path, output_path, is_video):
             logging.info(f"GIF optimized: {output_path}, size={
                          best_gif[1]:.2f}MB, fps={best_gif[0]}")
 
+            # Remove from failed_files if successful
+            if file_path in failed_files:
+                failed_files.remove(file_path)
+
             # Clean up temporary files
             for _, _, path in valid_results:
                 if path != best_gif[2]:
@@ -181,15 +202,9 @@ def process_file(file_path, output_path, is_video):
                         pass
             break
         else:
-            scale_factor *= 0.7
-
-        # Check minimum height constraint
-        new_height = int(height * scale_factor)
-        if new_height < MIN_HEIGHT:
-            logging.error(f"Failed to optimize {
-                          file_path} due to minimum dimension constraints")
-            failed_files.append(file_path)
-            break
+            # If no valid GIF was created, keep in failed_files
+            if file_path not in failed_files:
+                failed_files.append(file_path)
 
 
 def process_gif(input_args):
@@ -263,7 +278,6 @@ def process_gif(input_args):
 
 
 def process_gifs():
-    """Process all gifs and videos for optimization, skipping existing outputs."""
     global failed_files
     failed_files = []
 
@@ -276,6 +290,7 @@ def process_gifs():
 
     # Process video files from output directory
     for video_file in output_dir.glob('*.mp4'):
+        # Ensure original name here
         output_gif = output_dir / f"{video_file.stem}.gif"
         if not output_gif.exists():
             process_file(video_file, output_gif, is_video=True)
@@ -285,6 +300,7 @@ def process_gifs():
 
     # Process GIF files from input directory
     for gif_file in input_dir.glob('*.gif'):
+        # Ensure original name here
         output_gif = output_dir / f"{gif_file.stem}.gif"
         if not output_gif.exists():
             process_file(gif_file, output_gif, is_video=False)
@@ -292,5 +308,4 @@ def process_gifs():
             logging.info(f"Skipping {gif_file.name} as {
                          output_gif.name} already exists.")
 
-    # Remove duplicates before returning the list
     return list(set(failed_files))
