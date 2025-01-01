@@ -48,6 +48,8 @@ def generate_palette(file_path, palette_path, fps, dimensions):
                                   }:{dimensions[1]}:flags=lanczos,palettegen',
         '-y', str(palette_path)
     ]
+    logging.info(f"GENERATED_PALETTE: {fps}fps - ({dimensions[0]}x{
+        dimensions[1]}) - {Path(file_path).name}")
     return run_ffmpeg_command(command)
 
 
@@ -60,6 +62,9 @@ def create_gif_from_video(file_path, palette_path, output_gif, fps, dimensions):
             dimensions[1]}:flags=lanczos[x];[x][1:v]paletteuse=dither=bayer',
         '-y', str(output_gif)
     ]
+    gif_size = get_file_size(output_gif)
+    logging.info(f"GENERATED_GIF: {fps}fps - {gif_size:.2f} MB - ({dimensions[0]}x{
+        dimensions[1]}) - {Path(file_path).name}")
     return run_ffmpeg_command(command)
 
 
@@ -163,7 +168,7 @@ def process_file(file_path, output_path, is_video):
         new_height = int(height * scale_factor)
         if new_height < MIN_HEIGHT:
             logging.warning(f"Failed to optimize {
-                          file_path} due to minimum dimension constraints")
+                file_path} due to minimum dimension constraints")
             failed_files.append(file_path)
             break  # Exit the loop if we can't meet the minimum height requirement
 
@@ -186,8 +191,11 @@ def process_file(file_path, output_path, is_video):
         if valid_gifs:
             best_gif = max(valid_gifs, key=lambda x: x[0])
             shutil.move(best_gif[2], output_path)
-            logging.info(f"GIF optimized: {output_path}, size={
-                         best_gif[1]:.2f}MB, fps={best_gif[0]}")
+            # Assuming 'width' and 'height' are available here
+            dimensions = (int(width * scale_factor),
+                          int(height * scale_factor))
+            logging.info(f"{best_gif[0]}fps - ({dimensions[0]
+                                                }x{dimensions[1]}) - {Path(file_path).name}")
 
             # Remove from failed_files if successful
             if file_path in failed_files:
@@ -259,14 +267,18 @@ def process_gif(input_args):
 
         if initial_size > 90:
             logging.info(f"GIF_OVERSIZED initial_size={initial_size:.2f}MB for {
-                         Path(file_path).name}, skipping optimization")
+                fps}fps - ({new_width}x{new_height}) - {GIF_COMPRESSION['colors']} - {GIF_COMPRESSION['lossy_value']}, skipping optimization")
             return (fps, initial_size, str(temp_gif_path))
 
         optimized_size = optimize_gif_with_gifsicle(
             temp_gif_path, temp_gif_path, GIF_COMPRESSION['colors'], GIF_COMPRESSION['lossy_value'])
 
-        logging.info(f"GIF_OPTIMIZED size={optimized_size:.2f}MB fps={
-                     fps} for {Path(file_path).name}")
+        if optimized_size:
+            logging.info(f"GIF_OPTIMIZED size={optimized_size:.2f}MB fps={
+                fps} - ({new_width}x{new_height}) - {GIF_COMPRESSION['colors']} - {GIF_COMPRESSION['lossy_value']}")
+        else:
+            logging.error(f"GIF_OPTIMIZATION_FAILED for {
+                          fps}fps - {Path(file_path).name}")
         return (fps, optimized_size, str(temp_gif_path))
 
     except Exception as e:

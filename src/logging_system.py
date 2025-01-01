@@ -5,8 +5,10 @@ import atexit
 import logging
 import subprocess
 import sys
+from functools import partial
 from pathlib import Path
-from default_config import LOG_FILE, FFPMEG_LOG_FILE
+
+from default_config import FFPMEG_LOG_FILE, LOG_FILE
 
 
 class TeeLogger:
@@ -87,6 +89,28 @@ def log_exception(exc_type, exc_value, exc_traceback):
         return
     logging.critical("Uncaught exception", exc_info=(
         exc_type, exc_value, exc_traceback))
+
+
+def error_handler(logger, *args, **kwargs):
+    """Custom error handler to terminate the program on logging.error."""
+    message = args[0]
+    logger._log(logging.ERROR, message, args, **kwargs)
+    logging.warning("A critical error occurred. Terminating execution.")
+    # Clean up resources or perform any necessary shutdown tasks here
+    # For example:
+    for file in Path(TEMP_FILE_DIR).glob('*'):
+        try:
+            file.unlink()
+        except Exception as e:
+            logging.warning(f"Failed to remove temporary file {file}: {e}")
+    sys.exit(1)  # Exit with error status
+
+
+def setup_error_termination():
+    """Set up error handler to terminate on logging.error."""
+    logger = logging.getLogger()
+    error_handler_func = partial(error_handler, logger)
+    logger.error = error_handler_func
 
 
 def log_function_call(func):

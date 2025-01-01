@@ -11,7 +11,7 @@ from default_config import (GIF_PASS_OVERS, INPUT_DIR, LOG_DIR, OUTPUT_DIR,
                             TEMP_FILE_DIR, GIF_COMPRESSION)
 from gif_optimization import process_gifs
 from gpu_acceleration import setup_gpu_acceleration
-from logging_system import setup_logger
+from logging_system import setup_logger, setup_error_termination
 from video_optimization import process_videos
 from gif_optimization import process_file
 
@@ -111,6 +111,7 @@ def main():
 
     # Set up logging
     setup_logger()
+    setup_error_termination()  # Add this line to enable error termination
 
     logging.info("Starting the script")
 
