@@ -20,9 +20,12 @@ def get_video_dimensions(video_path):
         str(video_path)
     ]
     try:
-        output = subprocess.check_output(command, text=True).strip()
-        width, height = map(int, output.split('x'))
-        return width, height
+        # Replace direct subprocess call with run_ffmpeg_command
+        if run_ffmpeg_command(command):
+            output = subprocess.check_output(command, text=True).strip()
+            width, height = map(int, output.split('x'))
+            return width, height
+        return None, None
     except subprocess.CalledProcessError:
         logging.error(f"Failed to get dimensions for {video_path}")
         return None, None
@@ -38,8 +41,11 @@ def has_audio_stream(video_path):
     command = ['ffprobe', '-i', str(video_path), '-show_streams',
                '-select_streams', 'a', '-loglevel', 'error']
     try:
-        output = subprocess.check_output(command, stderr=subprocess.STDOUT)
-        return len(output) > 0
+        # Replace direct subprocess call with run_ffmpeg_command
+        if run_ffmpeg_command(command):
+            output = subprocess.check_output(command, stderr=subprocess.STDOUT)
+            return len(output) > 0
+        return False
     except subprocess.CalledProcessError:
         return False
 
@@ -61,10 +67,12 @@ def get_frame_rate(video_path):
         str(video_path)
     ]
     try:
-        output = subprocess.check_output(command, text=True).strip()
-        num, den = map(int, output.split('/'))
-        # Handle cases where frame rate is an integer
-        return num / den if den != 0 else num
+        # Replace direct subprocess call with run_ffmpeg_command
+        if run_ffmpeg_command(command):
+            output = subprocess.check_output(command, text=True).strip()
+            num, den = map(int, output.split('/'))
+            return num / den if den != 0 else num
+        return None
     except subprocess.CalledProcessError:
         logging.error(f"Failed to get frame rate for {video_path}")
         return None

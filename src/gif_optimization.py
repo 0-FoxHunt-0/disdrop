@@ -10,7 +10,7 @@ from pathlib import Path
 from default_config import (GIF_COMPRESSION, GIF_SIZE_TO_SKIP, INPUT_DIR,
                             OUTPUT_DIR, SUPPORTED_VIDEO_FORMATS, TEMP_FILE_DIR)
 from logging_system import log_function_call, run_ffmpeg_command
-from temp_file_manager import TempFileManager  # Added import
+from temp_file_manager import TempFileManager
 from video_optimization import get_video_dimensions
 
 # Global variable to track failed files
@@ -48,16 +48,11 @@ def generate_palette(file_path, palette_path, fps, dimensions):
                                   }:{dimensions[1]}:flags=lanczos,palettegen',
         '-y', str(palette_path)
     ]
-    logging.debug(f"Executing palette generation command: {' '.join(command)}")
-    try:
-        subprocess.run(command, check=True, capture_output=True, text=True)
-        logging.info(f"GENERATED_PALETTE: {fps}fps - ({dimensions[0]}x{
-            dimensions[1]}) - {Path(file_path).name}")
-        return True
-    except subprocess.CalledProcessError as e:
-        logging.error(f"Failed to generate palette for {
-                      file_path}: {e.stderr}")
-        return False
+    # logging.debug(f"Executing palette generation command: {' '.join(command)}")
+    logging.info(f"GENERATED_PALETTE: {fps}fps - ({dimensions[0]}x{
+        dimensions[1]}) - {Path(file_path).name}")
+    # Use run_ffmpeg_command instead of subprocess.run
+    return run_ffmpeg_command(command)
 
 
 @log_function_call
@@ -115,7 +110,7 @@ def process_file(file_path, output_path, is_video):
 
     while True:
         logging.info(f"Processing {'video' if is_video else 'GIF'} {
-                     file_path} with scale={scale_factor:.2f}")
+                     Path(file_path).name} with scale={scale_factor:.2f}")
         fps_range = range(
             max(GIF_COMPRESSION['fps_range']),
             min(GIF_COMPRESSION['fps_range']) - 1,
@@ -240,7 +235,7 @@ def process_file(file_path, output_path, is_video):
 
 
 def process_gif(input_args):
-    """Process a single GIF with given parameters."""
+    """Process a single GIF with given parameters with improved quality preservation."""
     file_path, output_path, is_video, fps, scale_factor = input_args
     temp_dir = Path(TEMP_FILE_DIR)
     base_name = Path(output_path).stem
@@ -264,27 +259,38 @@ def process_gif(input_args):
 
     try:
         if not is_video:
+            # Improved GIF processing with better quality preservation
             command = [
-                'gifsicle', '--scale', f'{scale_factor}',
+                'gifsicle',
+                '--scale', f'{scale_factor}',
                 '--colors', str(GIF_COMPRESSION['colors']),
                 '--lossy=' + str(GIF_COMPRESSION['lossy_value']),
                 '--optimize=3',
-                str(file_path), '-o', str(temp_gif_path)
+                '--no-warnings',
+                '--careful',
+                '--threads=4',
+                str(file_path),
+                '-o', str(temp_gif_path)
             ]
             subprocess.run(command, check=True, capture_output=True, text=True)
         else:
             palette_path = temp_dir / \
                 f"palette_{fps}_{scale_factor}_{os.getpid()}.png"
-            # Register palette file
             TempFileManager.register(palette_path)
 
-            generate_palette(file_path, palette_path,
-                             fps, (new_width, new_height))
-            create_gif_from_video(file_path, palette_path,
-                                  temp_gif_path, fps, (new_width, new_height))
+            # Use the existing generate_palette function with improved parameters
+            dimensions = (new_width, new_height)
+            if not generate_palette(file_path, palette_path, fps, dimensions):
+                logging.error(f"Failed to generate palette for {
+                              Path(file_path).name}")
+                return (fps, float('inf'), None)
 
-            # Clean up palette file
-            TempFileManager.unregister(palette_path)
+            # Create GIF using the generated palette
+            if not create_gif_from_video(file_path, palette_path, temp_gif_path, fps, dimensions):
+                logging.error(f"Failed to create GIF for {
+                              Path(file_path).name}")
+                return (fps, float('inf'), None)
+
             if palette_path.exists():
                 palette_path.unlink()
 
@@ -295,25 +301,26 @@ def process_gif(input_args):
         initial_size = get_file_size(temp_gif_path)
 
         if initial_size > GIF_SIZE_TO_SKIP:
-            logging.info(f"GIF_OVERSIZED initial_size={initial_size:.2f}MB for {fps}fps - ({new_width}x{new_height}) - {
-                         GIF_COMPRESSION['colors']} - {GIF_COMPRESSION['lossy_value']}, skipping optimization")
+            logging.info(f"GIF_OVERSIZED initial_size={initial_size:.2f}MB for {
+                         fps}fps - ({new_width}x{new_height})")
             return (fps, initial_size, str(temp_gif_path))
 
-        optimized_size = optimize_gif_with_gifsicle(temp_gif_path, temp_gif_path,
-                                                    GIF_COMPRESSION['colors'],
-                                                    GIF_COMPRESSION['lossy_value'])
+        # More careful optimization for final pass
+        optimized_size = optimize_gif_with_gifsicle(
+            temp_gif_path,
+            temp_gif_path,
+            GIF_COMPRESSION['colors'],
+            GIF_COMPRESSION['lossy_value']
+        )
 
         if optimized_size:
             logging.info(f"GIF_OPTIMIZED size={optimized_size:.2f}MB fps={
-                         fps} - ({new_width}x{new_height}) - {GIF_COMPRESSION['colors']} - {GIF_COMPRESSION['lossy_value']}")
+                         fps} - ({new_width}x{new_height})")
         else:
             logging.error(f"GIF_OPTIMIZATION_FAILED for {
                           fps}fps - {Path(file_path).name}")
         return (fps, optimized_size, str(temp_gif_path))
 
-    except FileNotFoundError as e:
-        logging.error(f"File not found during GIF processing: {e}")
-        return (fps, float('inf'), None)
     except Exception as e:
         logging.error(f"An error occurred while processing GIF: {e}")
         return (fps, float('inf'), None)

@@ -7,8 +7,10 @@ import subprocess
 import sys
 from functools import partial
 from pathlib import Path
+from datetime import datetime
 
-from default_config import FFPMEG_LOG_FILE, LOG_FILE
+
+from default_config import FFPMEG_LOG_FILE, LOG_FILE, LOG_DIR
 
 
 class TeeLogger:
@@ -44,19 +46,39 @@ class FFmpegFilter(logging.Filter):
 
 
 def setup_logger():
-    """Set up logging configuration and clear existing log files."""
+    """Set up logging configuration and create log files."""
+    # Create log directory if it doesn't exist
+    Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
+
     # Clear existing log files
-    log_files = [Path(LOG_FILE), Path(FFPMEG_LOG_FILE).parent / 'ffmpeg.log']
+    log_files = [Path(LOG_FILE), Path(FFPMEG_LOG_FILE)]
     for log_file in log_files:
         try:
+            # Ensure parent directory exists
+            log_file.parent.mkdir(parents=True, exist_ok=True)
             if log_file.exists():
                 log_file.unlink()  # Delete the file if it exists
+            # Create empty log file with proper permissions
+            log_file.touch(mode=0o666)  # Read/write for all users
+            logging.info(f"Created log file: {log_file}")
         except PermissionError:
             logging.warning(f"Could not clear {log_file}: Permission denied")
         except Exception as e:
-            logging.error(f"Error clearing {log_file}: {e}")
+            logging.error(f"Error handling {log_file}: {e}")
 
-    # Create a file handler for the log file
+    # Create a file handler specifically for FFmpeg logs
+    ffmpeg_handler = logging.FileHandler(FFPMEG_LOG_FILE)
+    ffmpeg_handler.setLevel(logging.DEBUG)
+    ffmpeg_formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s')
+    ffmpeg_handler.setFormatter(ffmpeg_formatter)
+
+    # Configure the FFmpeg logger
+    ffmpeg_logger = logging.getLogger('ffmpeg')
+    ffmpeg_logger.setLevel(logging.DEBUG)
+    ffmpeg_logger.addHandler(ffmpeg_handler)
+
+    # Create a file handler for the main log file
     file_handler = logging.FileHandler(LOG_FILE)
     file_handler.setLevel(logging.DEBUG)
     file_formatter = logging.Formatter(
@@ -119,7 +141,7 @@ def log_function_call(func):
         logging.debug(f"Calling function: {func.__name__}")
         try:
             result = func(*args, **kwargs)
-            logging.debug(f"Function {func.__name__} returned: {result}")
+            # logging.debug(f"Function {func.__name__} returned: {result}")
             return result
         except Exception as e:
             logging.error(f"Error in function {
@@ -129,30 +151,51 @@ def log_function_call(func):
 
 
 def run_ffmpeg_command(command):
-    """Run an FFmpeg command and redirect output to log file."""
-    log_path = Path(FFPMEG_LOG_FILE).parent / 'ffmpeg.log'
-    with open(log_path, 'a') as ffmpeg_log:
-        try:
-            process = subprocess.run(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=True
-            )
-            # Log stdout and stderr to the FFmpeg log file
-            if process.stdout:
-                ffmpeg_log.write(process.stdout)
-            if process.stderr:
-                ffmpeg_log.write(process.stderr)
-            return True
-        except subprocess.CalledProcessError as e:
-            logging.error(f"FFmpeg command failed: {e}")
-            if e.stdout:
-                ffmpeg_log.write(e.stdout)
-            if e.stderr:
-                ffmpeg_log.write(e.stderr)
-            return False
+    """Run an FFmpeg command and redirect FFmpeg's output to log file."""
+    ffmpeg_logger = logging.getLogger('ffmpeg')
+
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            universal_newlines=True
+        )
+
+        # Process both stdout and stderr streams simultaneously
+        while True:
+            # Read from both streams
+            stdout_line = process.stdout.readline()
+            stderr_line = process.stderr.readline()
+
+            # Break if both streams are empty and process has finished
+            if not stdout_line and not stderr_line and process.poll() is not None:
+                break
+
+            # Log FFmpeg's direct output
+            if stdout_line:
+                # Only log actual FFmpeg output, not empty lines
+                line = stdout_line.strip()
+                if line:
+                    ffmpeg_logger.debug(line)
+
+            if stderr_line:
+                # FFmpeg outputs most of its progress information to stderr
+                line = stderr_line.strip()
+                if line:
+                    ffmpeg_logger.debug(line)
+
+        # Get return code
+        return_code = process.poll()
+
+        # Only return success/failure
+        return return_code == 0
+
+    except Exception as e:
+        ffmpeg_logger.error(f"FFmpeg process failed: {str(e)}")
+        return False
 
 
 # Override the default exception hook
