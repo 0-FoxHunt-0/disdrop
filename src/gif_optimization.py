@@ -1,6 +1,7 @@
 # gif_optimization.py
 import logging
 import os
+import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from enum import Enum
@@ -82,7 +83,7 @@ class GIFProcessor:
             success = run_ffmpeg_command(cmd)
             if success:
                 logging.info(f"Generated palette: {
-                             fps}fps - ({dimensions[0]}x{dimensions[1]}) - {file_path.name}")
+                             fps}fps - ({dimensions[0]}x{dimensions[1]}) -> {file_path.name}")
                 return True
             return False
         except Exception as e:
@@ -102,7 +103,7 @@ class GIFProcessor:
             if run_ffmpeg_command(cmd):
                 gif_size = self.get_file_size(output_gif)
                 logging.info(f"Generated GIF: {
-                             fps}fps - {gif_size:.2f}MB - ({dimensions[0]}x{dimensions[1]}) - {file_path.name}")
+                             fps}fps - {gif_size:.2f}MB - ({dimensions[0]}x{dimensions[1]}) -> {file_path.name.stem}.gif")
                 return True
             return False
         except Exception as e:
@@ -112,6 +113,7 @@ class GIFProcessor:
     def optimize_gif(self, input_gif: Path, output_gif: Path,
                      colors: int, lossy: int) -> float:
         """Optimize GIF with enhanced quality preservation."""
+        logging.info(f"Optimizing GIF: {input_gif.name}")
         try:
             cmd = [
                 'gifsicle', '--optimize=3', '--colors', str(colors),
@@ -127,6 +129,7 @@ class GIFProcessor:
             logging.error(f"GIF optimization failed: {e}")
             return float('inf')
 
+    # TODO: Add a process that removed duplicate frames (meaning no duplicate parts of a video will be added to the GIF)
     def process_single_fps(self, args: Tuple) -> ProcessingResult:
         """Process GIF for a single FPS value with comprehensive error handling."""
         file_path, output_path, is_video, fps, scale_factor = args
@@ -165,6 +168,8 @@ class GIFProcessor:
                     palette_path.unlink()
 
             if initial_size > GIF_SIZE_TO_SKIP:
+                logging.warning(
+                    f"Skipping {temp_gif.name} due to size ({initial_size:.2f}MB)")
                 return ProcessingResult(fps, initial_size, str(temp_gif), ProcessingStatus.SUCCESS)
 
             optimized_size = self.optimize_gif(temp_gif, temp_gif,
@@ -204,6 +209,8 @@ class GIFProcessor:
                 best_result = min(results, key=lambda x: x.size)
                 if best_result.size <= GIF_COMPRESSION['min_size_mb']:
                     shutil.move(best_result.path, output_path)
+                    logging.info(f"Processed {file_path.name} to {
+                                 output_path.name}")
                     if file_path in self.failed_files:
                         self.failed_files.remove(file_path)
                     break
@@ -214,6 +221,8 @@ class GIFProcessor:
             if scale_factor < 0.1:
                 if file_path not in self.failed_files:
                     self.failed_files.append(file_path)
+                    logging.warning(
+                        f"f{file_path.name} has reached minimum dimensions, will be skipped until next pass with lower settings.")
                 break
 
     @staticmethod

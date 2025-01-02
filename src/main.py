@@ -2,6 +2,7 @@ import argparse
 import logging
 import os
 import shutil
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -9,11 +10,23 @@ from typing import Optional, List
 
 from default_config import (GIF_PASS_OVERS, INPUT_DIR, LOG_DIR, OUTPUT_DIR,
                             TEMP_FILE_DIR, GIF_COMPRESSION)
-from gif_optimization import GIFProcessor
+from gif_optimization import GIFProcessor, process_gifs
 from gpu_acceleration import setup_gpu_acceleration
 from logging_system import setup_logger
 from temp_file_manager import TempFileManager
 from video_optimization import process_videos
+
+
+def signal_handler(signum, frame):
+    logging.warning("\nGracefully shutting down...")
+    TempFileManager.cleanup()
+    TempFileManager.cleanup_dir(TEMP_FILE_DIR)
+    logging.info("Cleanup complete")
+    sys.exit(0)
+
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 
 def parse_arguments() -> argparse.Namespace:

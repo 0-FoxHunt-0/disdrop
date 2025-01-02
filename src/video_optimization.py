@@ -77,6 +77,10 @@ def get_frame_rate(video_path):
         logging.error(f"Failed to get frame rate for {video_path}")
         return None
 
+# TODO: the space after compression seems to go down at a pretty consistent pace every 2 CRF increase from about 4MB to 7MB.
+# Need to develop a mechanism to utilize this to predict how much CRF will be needed to reach target size or if skipping this
+# iteration is needed from the first iteration
+
 
 @log_function_call
 def compress_video(input_path, output_path, scale_factor, crf, use_gpu=True):
@@ -167,7 +171,7 @@ def compress_video(input_path, output_path, scale_factor, crf, use_gpu=True):
         if success:
             final_size = get_file_size(output_path)
             logging.info(f"Video compressed to {
-                         final_size:.2f} MB: {output_path}")
+                         final_size:.2f} MB: {output_path.name}")
             return True, final_size
         return False, float('inf')
     except Exception as e:
@@ -268,6 +272,9 @@ def process_videos(gpu_supported=False):
     input_dir = Path(INPUT_DIR)
     temp_dir = Path(TEMP_FILE_DIR)
     output_dir = Path(OUTPUT_DIR)
+    min_size_mb = VIDEO_COMPRESSION['min_size_mb']
+    min_width = VIDEO_COMPRESSION['min_width']
+    min_height = VIDEO_COMPRESSION['min_height']
 
     # First pass: Convert all non-MP4 videos to MP4 in input directory
     for format in SUPPORTED_VIDEO_FORMATS:
@@ -282,6 +289,7 @@ def process_videos(gpu_supported=False):
                         video_file, temp_file, gpu_supported)
                     if success:
                         shutil.move(str(temp_file), str(final_output))
+                        TempFileManager.register(final_output)
                     else:
                         failed_files.append(video_file)
 
@@ -291,6 +299,7 @@ def process_videos(gpu_supported=False):
     for video_file in input_dir.glob('*.[mM][pP]4'):
         temp_file_1 = temp_dir / f"temp_pass1_{video_file.name}"
         temp_file_2 = temp_dir / f"temp_pass2_{video_file.name}"
+        min_size_mb = VIDEO_COMPRESSION['min_size_mb']
         TempFileManager.register(temp_file_1)
         TempFileManager.register(temp_file_2)
 
