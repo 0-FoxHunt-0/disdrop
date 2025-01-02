@@ -1,6 +1,6 @@
-# Video and GIF Optimization Tool
+# DisDrop: Video and GIF Compression Tool
 
-This repository offers a powerful tool for reducing file sizes and maintaining quality in video and GIF content, making it ideal for creators, developers, and teams handling large media files. The tool supports GPU acceleration, multi-pass optimization, and detailed logging for a seamless processing experience.
+DisDrop is a powerful tool designed to compress and optimize videos and GIFs, enabling them to meet the 10MB file size constraints commonly imposed by social media platforms. This makes it ideal for creators, developers, and teams managing large media files. The tool supports GPU acceleration, multi-pass optimization, and detailed logging for a seamless processing experience.
 
 ## Features
 
