@@ -263,71 +263,44 @@ def compress_video_pass2(input_path, final_output_path, scale_factor, crf, use_g
 
 
 def process_videos(gpu_supported=False):
-    """Process all videos in the input directory for compression."""
+    """Process all videos from input directory with consolidated logic."""
     failed_files = []
     input_dir = Path(INPUT_DIR)
     temp_dir = Path(TEMP_FILE_DIR)
     output_dir = Path(OUTPUT_DIR)
-    min_size_mb = VIDEO_COMPRESSION['min_size_mb']
-    min_width = VIDEO_COMPRESSION['min_width']
-    min_height = VIDEO_COMPRESSION['min_height']
 
-    logging.info("Starting video scanning and conversion to MP4...")
+    # First pass: Convert all non-MP4 videos to MP4 in input directory
     for format in SUPPORTED_VIDEO_FORMATS:
-        if format != '.mp4':  # We'll handle .mp4 separately below
+        if format != '.mp4':
             for video_file in input_dir.glob(f'*{format}'):
-                # Temporary file for conversion to mp4
                 temp_file = temp_dir / f"temp_{video_file.stem}.mp4"
-                final_output = input_dir / (video_file.stem + '.mp4')
-
-                if not has_audio_stream(video_file):
-                    continue  # Skip if no audio stream for conversion to MP4
+                final_output = input_dir / f"{video_file.stem}.mp4"
+                TempFileManager.register(temp_file)
 
                 if not final_output.exists():
-                    # Convert video to MP4
                     success = convert_to_mp4(
                         video_file, temp_file, gpu_supported)
                     if success:
                         shutil.move(str(temp_file), str(final_output))
                     else:
                         failed_files.append(video_file)
-                else:
-                    logging.info(
-                        f"Video {video_file.name} already converted to MP4. Skipping.")
 
+                TempFileManager.unregister(temp_file)
+
+    # Second pass: Process all MP4 files from input directory
     for video_file in input_dir.glob('*.[mM][pP]4'):
-        # Temporary files for compression passes
         temp_file_1 = temp_dir / f"temp_pass1_{video_file.name}"
         temp_file_2 = temp_dir / f"temp_pass2_{video_file.name}"
-
-        # Register temporary files
         TempFileManager.register(temp_file_1)
         TempFileManager.register(temp_file_2)
 
-        # Check if the video has an audio stream
         has_audio = has_audio_stream(video_file)
-
-        # Output as MP4 for better compatibility
-        compressed_video_name = video_file.stem + ".mp4"
+        compressed_video_name = f"{video_file.stem}.mp4"
         final_output = output_dir / compressed_video_name
 
-        if has_audio and final_output.exists():
-            logging.info(f"Video {
-                         video_file.name} already has a compressed version in the output directory. Skipping.")
-            continue
-
-        original_size = get_file_size(video_file)
-        logging.info(f"Processing video: {video_file}")
-        logging.info(f"Original size: {original_size:.2f} MB")
-
-        if original_size < min_size_mb:
-            logging.info(f"Video is already smaller than {
-                         min_size_mb} MB. Converting to MP4 format.")
-            success = convert_to_mp4(video_file, temp_file_1, gpu_supported)
-            if success:
-                shutil.move(str(temp_file_1), str(final_output))
-            else:
-                failed_files.append(video_file)
+        if final_output.exists():
+            logging.info(
+                f"Video {video_file.name} already processed. Skipping.")
             continue
 
         # Compression strategy
