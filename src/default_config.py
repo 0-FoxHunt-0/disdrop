@@ -45,6 +45,18 @@ GIF_COMPRESSION = {
 GIF_PASS_OVERS = [
     {
         'fps_range': (10, 15),
+        'colors': 192,
+        'lossy_value': 55,
+        'scale_factor': 0.8,
+    },
+    {
+        'fps_range': (10, 15),
+        'colors': 192,
+        'lossy_value': 80,
+        'scale_factor': 0.8,
+    },
+    {
+        'fps_range': (10, 15),
         'colors': 128,
         'lossy_value': 80,
         'scale_factor': 0.8,

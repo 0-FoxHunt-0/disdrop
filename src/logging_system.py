@@ -9,7 +9,7 @@ from functools import partial, wraps
 from pathlib import Path
 from typing import Optional, TextIO, Union
 
-from default_config import TEMP_FILE_DIR, FFPMEG_LOG_FILE, LOG_FILE, LOG_DIR
+from default_config import FFPMEG_LOG_FILE, LOG_DIR, LOG_FILE, TEMP_FILE_DIR
 
 
 def log_function_call(func):
@@ -81,6 +81,8 @@ class TeeLogger:
         return self.terminal.fileno()
 
 # TODO: Add a success level to logging
+
+
 def setup_logger(debug_mode: bool = False) -> None:
     Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
 

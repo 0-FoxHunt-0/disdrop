@@ -6,10 +6,10 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
-from typing import Optional, List
+from typing import List, Optional
 
-from default_config import (GIF_PASS_OVERS, INPUT_DIR, LOG_DIR, OUTPUT_DIR,
-                            TEMP_FILE_DIR, GIF_COMPRESSION)
+from default_config import (GIF_COMPRESSION, GIF_PASS_OVERS, INPUT_DIR,
+                            LOG_DIR, OUTPUT_DIR, TEMP_FILE_DIR)
 from gif_optimization import GIFProcessor, process_gifs
 from gpu_acceleration import setup_gpu_acceleration
 from logging_system import setup_logger
@@ -27,6 +27,8 @@ def signal_handler(signum, frame):
 
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
+
+# TODO: Add a flag to process only videos and not output gifs
 
 
 def parse_arguments() -> argparse.Namespace:

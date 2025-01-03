@@ -142,6 +142,7 @@ class GIFProcessor:
         if not width or not height:
             return ProcessingResult(fps, float('inf'), None, ProcessingStatus.DIMENSION_ERROR)
 
+        # TODO: Add a condition to check if the compressed video is already below 10MB and if so use a scale of 1.0
         new_width, new_height = int(
             width * scale_factor), int(height * scale_factor)
         if new_height < GIF_COMPRESSION['min_height'] or new_width < GIF_COMPRESSION['min_width']:
