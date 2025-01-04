@@ -1,12 +1,16 @@
+# logging_system.py
+
 import atexit
 import functools
 import logging
 import os
+import queue
 import subprocess
 import sys
 from datetime import datetime
 from functools import partial, wraps
 from pathlib import Path
+import threading
 from typing import Optional, TextIO, Union
 
 from default_config import FFPMEG_LOG_FILE, LOG_DIR, LOG_FILE, TEMP_FILE_DIR
@@ -29,33 +33,112 @@ def log_function_call(func):
 
 class ColorFormatter(logging.Formatter):
     COLORS = {
-        'DEBUG': '\033[0;36m',  # Cyan
-        'INFO': '\033[0;37m',   # White
+        'DEBUG': '\033[0;36m',    # Cyan
+        'INFO': '\033[0;37m',     # White
+        'SUCCESS': '\033[0;32m',  # Green
         'WARNING': '\033[0;33m',  # Yellow
-        'ERROR': '\033[0;31m',   # Red
-        'CRITICAL': '\033[0;35m',  # Purple
-        'SUCCESS': '\033[0;32m'   # Green
+        'ERROR': '\033[0;31m',    # Red
+        'CRITICAL': '\033[0;35m'  # Purple
     }
     RESET = '\033[0m'
 
     def format(self, record):
-        color = self.COLORS.get(record.levelname, self.RESET)
+        # Mark successful operation messages in green
+        if record.levelname == 'INFO' and any(success_term in record.msg.lower()
+           for success_term in ['successful', 'succeeded', 'completed', 'finished']):
+            color = self.COLORS['SUCCESS']
+        else:
+            color = self.COLORS.get(record.levelname, self.RESET)
+
         record.msg = f"{color}{record.msg}{self.RESET}"
         return super().format(record)
 
 
-class RotatingFileHandler(logging.FileHandler):
-    def __init__(self, filename: Union[str, Path], max_bytes: int = 10485760):
-        super().__init__(filename)
+class AsyncRotatingFileHandler(logging.Handler):
+    def __init__(self, filename: Path, max_bytes: int = 10485760,
+                 backup_count: int = 5):
+        super().__init__()
+        self.filename = Path(filename)
         self.max_bytes = max_bytes
-        self._should_rotate()
+        self.backup_count = backup_count
+        self.queue = queue.Queue(maxsize=10000)
+        self.writer_thread = threading.Thread(target=self._writer_thread,
+                                              daemon=True)
+        self.writer_thread.start()
+        self.lock = threading.Lock()
+        atexit.register(self.close)
 
-    def _should_rotate(self) -> None:
-        if Path(self.baseFilename).exists():
-            if Path(self.baseFilename).stat().st_size > self.max_bytes:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                backup = Path(f"{self.baseFilename}.{timestamp}")
-                Path(self.baseFilename).rename(backup)
+    def _writer_thread(self):
+        while True:
+            try:
+                record = self.queue.get()
+                if record is None:
+                    break
+                self._do_write(record)
+            except Exception as e:
+                print(f"Error in writer thread: {e}")
+
+    def _do_write(self, record):
+        msg = self.format(record)
+        with self.lock:
+            if self.should_rotate():
+                self.do_rotation()
+            with open(self.filename, 'a', encoding='utf-8') as f:
+                f.write(msg + '\n')
+
+    def should_rotate(self) -> bool:
+        try:
+            return self.filename.stat().st_size > self.max_bytes
+        except FileNotFoundError:
+            return False
+
+    def do_rotation(self):
+        if not self.filename.exists():
+            return
+
+        for i in range(self.backup_count - 1, 0, -1):
+            sfn = f"{self.filename}.{i}"
+            dfn = f"{self.filename}.{i + 1}"
+            if Path(sfn).exists():
+                Path(sfn).rename(dfn)
+
+        dfn = f"{self.filename}.1"
+        Path(self.filename).rename(dfn)
+
+    def emit(self, record):
+        try:
+            self.queue.put_nowait(record)
+        except queue.Full:
+            print("Warning: Logging queue full, dropping message")
+
+    def close(self):
+        self.queue.put(None)
+        self.writer_thread.join(timeout=1.0)
+        super().close()
+
+
+class MetricsLogger:
+    def __init__(self):
+        self.metrics = {}
+        self.lock = threading.Lock()
+
+    def track(self, metric: str, value: float):
+        with self.lock:
+            if metric not in self.metrics:
+                self.metrics[metric] = []
+            self.metrics[metric].append(value)
+
+    def get_stats(self, metric: str) -> dict:
+        with self.lock:
+            values = self.metrics.get(metric, [])
+            if not values:
+                return {}
+            return {
+                'count': len(values),
+                'mean': sum(values) / len(values),
+                'min': min(values),
+                'max': max(values)
+            }
 
 
 class TeeLogger:
@@ -80,36 +163,57 @@ class TeeLogger:
     def fileno(self) -> int:
         return self.terminal.fileno()
 
-# TODO: Add a success level to logging
 
+def setup_logging(debug_mode: bool = False):
+    # Get root logger
+    root = logging.getLogger()
 
-def setup_logger(debug_mode: bool = False) -> None:
-    Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
+    # Remove existing handlers
+    if root.hasHandlers():
+        root.handlers.clear()
 
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG if debug_mode else logging.INFO)
+    # Set level
+    root.setLevel(logging.DEBUG if debug_mode else logging.INFO)
 
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(ColorFormatter('%(levelname)s: %(message)s'))
-    console_handler.setLevel(logging.DEBUG if debug_mode else logging.INFO)
+    # Console handler with color formatting
+    console = logging.StreamHandler()
+    console.setFormatter(ColorFormatter('%(levelname)s: %(message)s'))
+    root.addHandler(console)
 
-    file_handler = RotatingFileHandler(LOG_FILE)
-    file_handler.setFormatter(logging.Formatter(
+    # Async file handler for main log
+    main_handler = AsyncRotatingFileHandler(LOG_FILE)
+    main_handler.setFormatter(logging.Formatter(
         '%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'))
-    file_handler.setLevel(logging.DEBUG)
+    root.addHandler(main_handler)
 
-    ffmpeg_handler = RotatingFileHandler(FFPMEG_LOG_FILE)
+    # Async file handler for FFmpeg log
+    ffmpeg_handler = AsyncRotatingFileHandler(FFPMEG_LOG_FILE)
     ffmpeg_handler.setFormatter(logging.Formatter(
-        '%(asctime)s - %(levelname)s - %(message)s'))
-
-    root_logger.addHandler(console_handler)
-    root_logger.addHandler(file_handler)
-
+        '%(asctime)s [FFmpeg] %(message)s'))
     ffmpeg_logger = logging.getLogger('ffmpeg')
     ffmpeg_logger.addHandler(ffmpeg_handler)
 
-    sys.excepthook = log_exception
-    logging.info("Logging system initialized")
+    # Set up metrics logger
+    metrics = MetricsLogger()
+    return metrics
+
+
+def log_execution_time(logger: Optional[MetricsLogger] = None):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            start = datetime.now()
+            try:
+                result = func(*args, **kwargs)
+                if logger:
+                    duration = (datetime.now() - start).total_seconds()
+                    logger.track(f'{func.__name__}_duration', duration)
+                return result
+            except Exception as e:
+                logging.error(f"Error in {func.__name__}: {e}")
+                raise
+        return wrapper
+    return decorator
 
 
 def log_exception(exc_type, exc_value, exc_traceback):

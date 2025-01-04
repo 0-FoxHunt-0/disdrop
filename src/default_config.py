@@ -14,6 +14,15 @@ OUTPUT_DIR = BASE_DIR / 'output'
 LOG_DIR = BASE_DIR / 'logs'
 # Temporary directory for storing intermediate files
 TEMP_FILE_DIR = BASE_DIR / 'temp_files'
+LOG_FILE = LOG_DIR / 'disdrop.log'
+FFPMEG_LOG_FILE = LOG_DIR / 'ffmpeg.log'
+
+# Additional settings for file handling
+GIF_SIZE_TO_SKIP = 90  # Max size for gifs before skipping gif optimization with gifsicle
+
+# Supported video formats
+SUPPORTED_VIDEO_FORMATS = ['.mp4', '.mkv',
+                           '.m4v', '.avi', '.mov', '.wmv', '.flv']
 
 # Ensure that the directories exist
 for directory in [INPUT_DIR, OUTPUT_DIR, LOG_DIR, TEMP_FILE_DIR]:
@@ -29,7 +38,12 @@ VIDEO_COMPRESSION = {
     'gpu_acceleration': True,
     'min_size_mb': 10,
     'min_width': 0,
-    'min_height': 120
+    'min_height': 120,
+    'target_bitrate': 4000,  # Maximum target bitrate in kbps
+    'min_bitrate': 500,     # Minimum target bitrate in kbps
+    'max_crf': 51,          # Maximum CRF value
+    'min_crf': 18,          # Minimum CRF value
+
 }
 
 GIF_COMPRESSION = {
@@ -38,7 +52,10 @@ GIF_COMPRESSION = {
     'lossy_value': 55,      # Lossy value for gif compression
     'min_size_mb': 10,      # Target maximum size for gifs in MB
     'min_width': 0,
-    'min_height': 120
+    'min_height': 120,
+    'target_fps': 12,       # Target FPS for GIF conversion
+    'max_colors': 256,      # Maximum colors in palette
+    'optimize_level': 3,    # Optimization level for gifsicle
 }
 
 # Strategies for multiple pass overs after failed attempts
@@ -74,12 +91,3 @@ GIF_PASS_OVERS = [
         'scale_factor': 0.5,
     },
 ]
-
-# Additional settings for file handling
-GIF_SIZE_TO_SKIP = 90  # Max size for gifs before skipping gif optimization with gifsicle
-
-# File naming and logging settings
-LOG_FILE = LOG_DIR / 'disdrop.log'
-FFPMEG_LOG_FILE = LOG_DIR / 'ffmpeg.log'
-SUPPORTED_VIDEO_FORMATS = ['.mp4', '.mkv',
-                           '.m4v', '.avi', '.mov', '.wmv', '.flv']

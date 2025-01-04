@@ -1,20 +1,24 @@
+# main.py
+
 import argparse
-import logging
 import os
 import shutil
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Union
 
 from default_config import (GIF_COMPRESSION, GIF_PASS_OVERS, INPUT_DIR,
-                            LOG_DIR, OUTPUT_DIR, TEMP_FILE_DIR)
+                            LOG_DIR, OUTPUT_DIR, SUPPORTED_VIDEO_FORMATS,
+                            TEMP_FILE_DIR, VIDEO_COMPRESSION)
 from gif_optimization import GIFProcessor, process_gifs
 from gpu_acceleration import setup_gpu_acceleration
-from logging_system import setup_logger
+from logging_system import setup_logging, logging
 from temp_file_manager import TempFileManager
-from video_optimization import process_videos
+from utils import get_video_dimensions
+from video_optimization import VideoProcessor, process_videos
 
 
 def signal_handler(signum, frame):
@@ -42,6 +46,8 @@ def parse_arguments() -> argparse.Namespace:
                         help='Custom input directory')
     parser.add_argument('--output-dir', type=Path,
                         help='Custom output directory')
+    parser.add_argument('--videos-only', action='store_true',
+                        help='Process only videos, skip GIF generation')
     return parser.parse_args()
 
 
@@ -58,6 +64,46 @@ def verify_dependencies() -> bool:
                       ', '.join(missing_commands)}")
         return False
     return True
+
+
+def validate_config():
+    """Validate configuration settings."""
+    errors = []
+
+    if not isinstance(VIDEO_COMPRESSION['scale_factor'], (int, float)) or \
+       not 0 < VIDEO_COMPRESSION['scale_factor'] <= 1:
+        errors.append(
+            "VIDEO_COMPRESSION['scale_factor'] must be between 0 and 1")
+
+    if not isinstance(VIDEO_COMPRESSION['crf'], int) or \
+       not 0 <= VIDEO_COMPRESSION['crf'] <= 51:
+        errors.append("VIDEO_COMPRESSION['crf'] must be between 0 and 51")
+
+    if not isinstance(GIF_COMPRESSION['colors'], int) or \
+       not 2 <= GIF_COMPRESSION['colors'] <= 256:
+        errors.append("GIF_COMPRESSION['colors'] must be between 2 and 256")
+
+    if errors:
+        raise ValueError(
+            "Configuration validation failed:\n" + "\n".join(errors))
+
+
+def safe_process_file(processor: Union[VideoProcessor, GIFProcessor],
+                      file_path: Path,
+                      output_path: Path,
+                      max_retries: int = 3) -> bool:
+    """Process a file with error recovery."""
+    for attempt in range(max_retries):
+        try:
+            return processor.process_file(file_path, output_path,
+                                          is_video=file_path.suffix.lower() in SUPPORTED_VIDEO_FORMATS)
+        except Exception as e:
+            if attempt < max_retries - 1:
+                logging.warning(f"Attempt {attempt + 1} failed, retrying: {e}")
+                time.sleep(1)  # Add delay between retries
+            else:
+                logging.error(f"All attempts failed for {file_path}: {e}")
+                return False
 
 
 def process_failed_items(failed_files: List[Path], pass_over_index: int) -> List[Path]:
@@ -96,6 +142,28 @@ def process_failed_items(failed_files: List[Path], pass_over_index: int) -> List
     return remaining_failed
 
 
+def verify_directories():
+    """Verify all required directories exist and are accessible."""
+    required_dirs = {
+        'input': INPUT_DIR,
+        'output': OUTPUT_DIR,
+        'temp': TEMP_FILE_DIR,
+        'logs': LOG_DIR
+    }
+
+    for name, path in required_dirs.items():
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            # Test write permissions
+            test_file = path / '.write_test'
+            test_file.touch()
+            test_file.unlink()
+        except Exception as e:
+            logging.error(f"Directory {name} ({path}) error: {e}")
+            return False
+    return True
+
+
 def main() -> None:
     try:
         args = parse_arguments()
@@ -110,18 +178,36 @@ def main() -> None:
         for directory in [INPUT_DIR, OUTPUT_DIR, LOG_DIR]:
             directory.mkdir(parents=True, exist_ok=True)
 
-        setup_logger(args.debug)
+        setup_logging(args.debug)
+        validate_config()  # Add config validation
 
         if not verify_dependencies():
             sys.exit(1)
 
+        if not verify_directories():
+            logging.error("Directory verification failed")
+            sys.exit(1)
+
         gpu_supported = False if args.no_gpu else setup_gpu_acceleration()
 
-        logging.info("Processing videos...")
-        failed_videos = process_videos(gpu_supported)
+        failed_videos = []
+        failed_gifs = []
 
-        logging.info("Processing GIFs...")
-        failed_gifs = process_gifs()
+        # Update video processing
+        video_processor = VideoProcessor(gpu_supported)
+        for video in Path(INPUT_DIR).glob('*.mp4'):
+            output_path = OUTPUT_DIR / video.name
+            if not output_path.exists():
+                if not safe_process_file(video_processor, video, output_path):
+                    failed_videos.append(video)
+
+        # Update GIF processing
+        gif_processor = GIFProcessor()
+        for gif in Path(INPUT_DIR).glob('*.gif'):
+            output_path = OUTPUT_DIR / gif.name
+            if not output_path.exists():
+                if not safe_process_file(gif_processor, gif, output_path):
+                    failed_gifs.append(gif)
 
         failed_files = failed_videos + failed_gifs
 
@@ -143,7 +229,6 @@ def main() -> None:
     finally:
         TempFileManager.cleanup()
         TempFileManager.cleanup_dir(TEMP_FILE_DIR)
-        logging.info("Cleanup complete")
 
 
 if __name__ == "__main__":

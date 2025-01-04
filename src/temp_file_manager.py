@@ -1,6 +1,6 @@
 # temp_file_manager.py
-import logging
 from pathlib import Path
+from logging_system import logging
 
 
 class TempFileManager:

@@ -1,10 +1,9 @@
 # gpu_acceleration.py
 # Handles GPU setup and checks for hardware acceleration.
 
-import logging
 import subprocess
 
-from logging_system import log_function_call
+from logging_system import log_function_call, logging
 
 
 @log_function_call
