@@ -1,57 +1,66 @@
-# temp_file_manager.py
+import atexit
 import logging
+import signal
+import threading
 from pathlib import Path
+from typing import Set
 
 
 class TempFileManager:
-    """Manages temporary files and ensures cleanup."""
-    _temp_files = set()
+    """Thread-safe temporary file manager with enhanced cleanup."""
+    _temp_files: Set[Path] = set()
+    _lock = threading.Lock()
+    _initialized = False
 
     @classmethod
-    def register(cls, file_path):
-        """Register a temporary file for cleanup."""
-        cls._temp_files.add(Path(file_path))
+    def initialize(cls) -> None:
+        """Initialize cleanup handlers once."""
+        if not cls._initialized:
+            with cls._lock:
+                if not cls._initialized:
+                    atexit.register(cls.cleanup)
+                    signal.signal(signal.SIGINT, cls._signal_handler)
+                    signal.signal(signal.SIGTERM, cls._signal_handler)
+                    cls._initialized = True
 
     @classmethod
-    def unregister(cls, file_path):
-        """Unregister a temporary file (if it was moved or already cleaned)."""
-        try:
-            cls._temp_files.remove(Path(file_path))
-        except KeyError:
-            pass
+    def register(cls, file_path: Path) -> None:
+        """Thread-safely register a temporary file."""
+        with cls._lock:
+            cls._temp_files.add(Path(file_path))
+            logging.debug(f"Registered temp file: {file_path}")
 
     @classmethod
-    def cleanup(cls):
+    def unregister(cls, file_path: Path) -> None:
+        """Thread-safely unregister a temporary file."""
+        with cls._lock:
+            cls._temp_files.discard(Path(file_path))
+            logging.debug(f"Unregistered temp file: {file_path}")
+
+    @classmethod
+    def cleanup(cls) -> None:
         """Clean up all registered temporary files."""
-        for file_path in cls._temp_files.copy():
-            try:
-                if file_path.exists():
-                    file_path.unlink()
-                    logging.debug(f"Cleaned up temporary file: {file_path}")
-                cls._temp_files.remove(file_path)
-            except Exception as e:
-                logging.error(f"Failed to clean up temporary file {
-                              file_path}: {e}")
-
-    @classmethod
-    def cleanup_dir(cls, directory):
-        """Clean up all files in a directory."""
-        try:
-            for file_path in Path(directory).glob('*'):
+        with cls._lock:
+            for file_path in cls._temp_files.copy():
                 try:
-                    file_path.unlink()
-                    logging.debug(f"Cleaned up file in directory: {file_path}")
+                    if file_path.exists():
+                        file_path.unlink()
+                        logging.debug(f"Cleaned up temp file: {file_path}")
                 except Exception as e:
-                    logging.error(f"Failed to clean up file {file_path}: {e}")
-        except Exception as e:
-            logging.error(f"Failed to clean up directory {directory}: {e}")
+                    logging.error(f"Failed to clean up {file_path}: {e}")
+            cls._temp_files.clear()
 
     @classmethod
-    def get_temp_count(cls):
+    def _signal_handler(cls, signum: int, frame) -> None:
+        """Handle interruption signals."""
+        cls.cleanup()
+        signal.default_int_handler(signum, frame)
+
+    @classmethod
+    def get_temp_count(cls) -> int:
         """Get count of registered temporary files."""
-        return len(cls._temp_files)
+        with cls._lock:
+            return len(cls._temp_files)
 
-    @classmethod
-    def list_temp_files(cls):
-        """List all registered temporary files."""
-        return list(cls._temp_files)
+
+TempFileManager.initialize()

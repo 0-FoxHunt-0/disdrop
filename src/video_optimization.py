@@ -1,396 +1,366 @@
-# video_optimization.py
-
 import logging
 import os
 import shutil
 import subprocess
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union
 
 from default_config import (INPUT_DIR, OUTPUT_DIR, SUPPORTED_VIDEO_FORMATS,
                             TEMP_FILE_DIR, VIDEO_COMPRESSION)
 from logging_system import log_function_call, run_ffmpeg_command
-from temp_file_manager import TempFileManager  # Added import
+from temp_file_manager import TempFileManager
+
+logger = logging.getLogger(__name__)
 
 
-def get_video_dimensions(video_path):
-    """Retrieve the width and height of the video."""
-    command = [
-        'ffprobe', '-v', 'error', '-select_streams', 'v:0',
-        '-show_entries', 'stream=width,height', '-of', 'csv=s=x:p=0',
-        str(video_path)
-    ]
-    try:
-        # Replace direct subprocess call with run_ffmpeg_command
-        if run_ffmpeg_command(command):
-            output = subprocess.check_output(command, text=True).strip()
-            width, height = map(int, output.split('x'))
-            return width, height
-        return None, None
-    except subprocess.CalledProcessError:
-        logging.error(f"Failed to get dimensions for {video_path}")
-        return None, None
+class CompressionQuality(Enum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
 
 
-def get_file_size(file_path):
-    """Get the size of a file in MB."""
-    return os.path.getsize(file_path) / (1024 * 1024)
+@dataclass
+class VideoMetadata:
+    width: int
+    height: int
+    frame_rate: float
+    has_audio: bool
+    size_mb: float
+    duration: float
+    bitrate: int
 
 
-def has_audio_stream(video_path):
-    """Check if video has an audio stream."""
-    command = ['ffprobe', '-i', str(video_path), '-show_streams',
-               '-select_streams', 'a', '-loglevel', 'error']
-    try:
-        # Replace direct subprocess call with run_ffmpeg_command
-        if run_ffmpeg_command(command):
-            output = subprocess.check_output(command, stderr=subprocess.STDOUT)
-            return len(output) > 0
-        return False
-    except subprocess.CalledProcessError:
-        return False
+class VideoProcessor:
+    def __init__(self, use_gpu: bool = True):
+        self.use_gpu = use_gpu
+        self.quality_profiles = {
+            CompressionQuality.LOW: {"crf": 28, "scale": 0.7, "preset": "medium"},
+            CompressionQuality.MEDIUM: {"crf": 23, "scale": 0.85, "preset": "slow"},
+            CompressionQuality.HIGH: {"crf": 18,
+                                      "scale": 1.0, "preset": "veryslow"}
+        }
+        self.compression_cache: Dict[str, Dict] = {}
+        self._temp_manager = temp_manager
 
+    def _create_temp_file(self, prefix: str, suffix: str) -> Path:
+        temp_path = Path(TEMP_FILE_DIR) / f"{prefix}_{os.getpid()}{suffix}"
+        self._temp_manager.register(temp_path)
+        return temp_path
 
-def calculate_target_bitrate(width, height):
-    """Calculate appropriate bitrate based on video dimensions."""
-    pixels = width * height
-    base_bitrate = 4000  # 4Mbps base for 1080p
-    target_bitrate = min(base_bitrate,
-                         int(base_bitrate * pixels / (1920 * 1080)))
-    return max(500, target_bitrate)  # Ensure minimum 500kbps
+    def get_video_metadata(self, video_path: Path) -> Optional[VideoMetadata]:
+        try:
+            width, height = self._get_dimensions(video_path)
+            frame_rate = self._get_frame_rate(video_path)
+            has_audio = self._has_audio(video_path)
+            size_mb = self._get_file_size(video_path)
+            duration = self._get_duration(video_path)
+            bitrate = self._calculate_optimal_bitrate(width, height, duration)
 
+            return VideoMetadata(
+                width=width,
+                height=height,
+                frame_rate=frame_rate,
+                has_audio=has_audio,
+                size_mb=size_mb,
+                duration=duration,
+                bitrate=bitrate
+            )
+        except Exception as e:
+            logger.error(f"Failed to get metadata for {video_path}: {e}")
+            return None
 
-def get_frame_rate(video_path):
-    """Retrieve the frame rate of the video."""
-    command = [
-        'ffprobe', '-v', 'error', '-select_streams', 'v:0',
-        '-show_entries', 'stream=r_frame_rate', '-of', 'default=noprint_wrappers=1:nokey=1',
-        str(video_path)
-    ]
-    try:
-        # Replace direct subprocess call with run_ffmpeg_command
-        if run_ffmpeg_command(command):
-            output = subprocess.check_output(command, text=True).strip()
-            num, den = map(int, output.split('/'))
-            return num / den if den != 0 else num
-        return None
-    except subprocess.CalledProcessError:
-        logging.error(f"Failed to get frame rate for {video_path}")
-        return None
-
-# TODO: the space after compression seems to go down at a pretty consistent pace every 2 CRF increase from about 4MB to 7MB.
-# Need to develop a mechanism to utilize this to predict how much CRF will be needed to reach target size or if skipping this
-# iteration is needed from the first iteration
-
-
-@log_function_call
-def compress_video(input_path, output_path, scale_factor, crf, use_gpu=True):
-    """
-    Compress video with improved quality control and size management.
-    Returns (success, final_size_mb)
-    """
-    width, height = get_video_dimensions(input_path)
-    if not width or not height:
-        return False, float('inf')
-
-    # Get frame rate
-    frame_rate = get_frame_rate(input_path)
-    if frame_rate is None:
-        return False, float('inf')
-
-    # If frame rate is above 30, reduce to 30
-    if frame_rate > 30:
-        framerate_filter = ',fps=fps=30'
-    else:
-        framerate_filter = ''
-
-    # Handle small videos
-    if min(width, height) < 120:
-        new_width, new_height = width, height
-    else:
-        new_width = int(width * scale_factor)
-        new_height = int(height * scale_factor)
-
-        # Ensure minimum dimension of 120px
-        if min(new_width, new_height) < 120:
-            scale = 120 / min(new_width, new_height)
-            new_width = int(new_width * scale)
-            new_height = int(new_height * scale)
-
-    # Ensure dimensions are even
-    new_width += new_width % 2
-    new_height += new_height % 2
-
-    # Calculate appropriate bitrate
-    target_bitrate = calculate_target_bitrate(new_width, new_height)
-    bitrate = f"{target_bitrate}k"
-    buffer_size = f"{target_bitrate * 2}k"
-
-    # Check for audio stream
-    has_audio = has_audio_stream(input_path)
-
-    # Prepare scaling filter with padding
-    filter_string = (
-        f"scale={new_width}:{new_height}:force_original_aspect_ratio=decrease,"
-        f"pad={new_width}:{new_height}:(ow-iw)/2:(oh-ih)/2{framerate_filter}"
-    )
-
-    if use_gpu:
+    def _get_duration(self, video_path: Path) -> float:
         command = [
-            'ffmpeg', '-hwaccel', 'cuda', '-i', str(input_path),
-            '-vf', filter_string,
-            '-c:v', 'h264_nvenc',
-            '-preset', 'p7',  # Most efficient preset for NVENC
-            '-b:v', bitrate,
-            '-maxrate', bitrate,
-            '-bufsize', buffer_size,
-            '-profile:v', 'main',
-            '-rc', 'vbr',  # Variable bitrate mode
-            '-cq', str(crf),
-            '-c:a', 'copy' if has_audio else 'none',
-            '-movflags', '+faststart',
-            '-y', str(output_path)
+            'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1', str(video_path)
         ]
-    else:
-        command = [
-            'ffmpeg', '-i', str(input_path),
-            '-vf', filter_string,
-            '-c:v', 'libx264',
-            '-preset', 'veryslow',
-            '-b:v', bitrate,
-            '-maxrate', bitrate,
-            '-bufsize', buffer_size,
-            '-profile:v', 'main',
-            '-crf', str(crf),
-            '-c:a', 'copy' if has_audio else 'none',
-            '-movflags', '+faststart',
-            '-y', str(output_path)
-        ]
+        try:
+            if run_ffmpeg_command(command):
+                output = subprocess.check_output(command, text=True).strip()
+                return float(output)
+        except Exception as e:
+            logger.error(f"Failed to get duration: {e}")
+            return 0.0
 
-    try:
-        success = run_ffmpeg_command(command)
-        if success:
-            final_size = get_file_size(output_path)
-            logging.info(f"Video compressed to {
-                         final_size:.2f} MB: {output_path.name}")
-            return True, final_size
-        return False, float('inf')
-    except Exception as e:
-        logging.error(f"Error compressing video: {e}")
-        return False, float('inf')
+    def _calculate_optimal_bitrate(self, width: int, height: int, duration: float) -> int:
+        pixels = width * height
+        base_bitrate = 4000
 
+        # Dynamic bitrate based on resolution and duration
+        resolution_factor = pixels / (1920 * 1080)
+        # Adjust for longer videos
+        duration_factor = min(1.0, max(0.5, 1.0 - (duration / 3600)))
 
-def convert_to_mp4(input_path, output_path, use_gpu=True):
-    """Convert video to MP4 format while maintaining quality."""
-    try:
-        if use_gpu:
-            command = [
-                'ffmpeg', '-hwaccel', 'cuda',
-                '-i', str(input_path),
+        optimal_bitrate = int(
+            base_bitrate * resolution_factor * duration_factor)
+        # Cap between 500kbps and 8Mbps
+        return max(500, min(optimal_bitrate, 8000))
+
+    def process_video(self, input_path: Path, output_path: Path, target_size_mb: float) -> bool:
+        temp_output = self._create_temp_file(
+            input_path.stem, input_path.suffix)
+        TempFileManager.register(temp_output)
+
+        try:
+            metadata = self.get_video_metadata(input_path)
+            if not metadata:
+                return False
+
+            if self._compress_with_params(...):
+                shutil.move(str(temp_output), str(output_path))
+                return True
+            return False
+        finally:
+            TempFileManager.unregister(temp_output)
+            if temp_output.exists():
+                temp_output.unlink()
+
+    def _calculate_compression_params(self, metadata: VideoMetadata,
+                                      target_size_mb: float) -> Dict:
+        target_bitrate = int((target_size_mb * 8 * 1024) / metadata.duration)
+        current_bitrate = metadata.bitrate
+
+        # Calculate scale factor based on target size
+        scale_factor = min(1.0, (target_bitrate / current_bitrate) ** 0.5)
+
+        # Adjust CRF based on content complexity
+        base_crf = 23
+        if metadata.frame_rate > 30:
+            base_crf += 2
+        if metadata.width * metadata.height > 1920 * 1080:
+            base_crf += 1
+
+        return {
+            "crf": base_crf,
+            "scale_factor": scale_factor,
+            "target_bitrate": target_bitrate
+        }
+
+    def _adjust_params_for_quality(self, base_params: Dict,
+                                   quality: CompressionQuality) -> Dict:
+        profile = self.quality_profiles[quality]
+        return {
+            "crf": base_params["crf"] + (profile["crf"] - 23),
+            "scale_factor": base_params["scale_factor"] * profile["scale"],
+            "preset": profile["preset"],
+            "target_bitrate": base_params["target_bitrate"]
+        }
+
+    def _compress_with_params(self, input_path: Path, output_path: Path,
+                              params: Dict, metadata: VideoMetadata) -> bool:
+        command = self._build_compression_command(
+            input_path, output_path, params, metadata)
+
+        try:
+            success = run_ffmpeg_command(command)
+            if success:
+                result_size = self._get_file_size(output_path)
+                logger.success(
+                    f"Compressed {input_path.name} to {result_size:.2f}MB")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Compression failed: {e}")
+            return False
+
+    def _build_compression_command(self, input_path: Path, output_path: Path,
+                                   params: Dict, metadata: VideoMetadata) -> List[str]:
+        new_width = int(metadata.width * params["scale_factor"])
+        new_height = int(metadata.height * params["scale_factor"])
+
+        # Ensure dimensions are even
+        new_width += new_width % 2
+        new_height += new_height % 2
+
+        filter_string = (
+            f"scale={new_width}:{
+                new_height}:force_original_aspect_ratio=decrease,"
+            f"pad={new_width}:{new_height}:(ow-iw)/2:(oh-ih)/2"
+        )
+
+        if metadata.frame_rate > 30:
+            filter_string += ",fps=fps=30"
+
+        if self.use_gpu:
+            return [
+                'ffmpeg', '-hwaccel', 'cuda', '-i', str(input_path),
+                '-vf', filter_string,
                 '-c:v', 'h264_nvenc',
                 '-preset', 'p7',
-                '-c:a', 'aac',
-                '-b:a', '192k',
+                '-b:v', f"{params['target_bitrate']}k",
+                '-maxrate', f"{int(params['target_bitrate'] * 1.5)}k",
+                '-bufsize', f"{params['target_bitrate'] * 2}k",
+                '-profile:v', 'main',
+                '-rc', 'vbr',
+                '-cq', str(params['crf']),
+                '-c:a', 'copy' if metadata.has_audio else 'none',
                 '-movflags', '+faststart',
                 '-y', str(output_path)
             ]
         else:
-            command = [
+            return [
                 'ffmpeg', '-i', str(input_path),
+                '-vf', filter_string,
                 '-c:v', 'libx264',
-                '-preset', 'medium',
-                '-crf', '18',
-                '-c:a', 'aac',
-                '-b:a', '192k',
+                '-preset', params['preset'],
+                '-b:v', f"{params['target_bitrate']}k",
+                '-maxrate', f"{int(params['target_bitrate'] * 1.5)}k",
+                '-bufsize', f"{params['target_bitrate'] * 2}k",
+                '-profile:v', 'main',
+                '-crf', str(params['crf']),
+                '-c:a', 'copy' if metadata.has_audio else 'none',
                 '-movflags', '+faststart',
                 '-y', str(output_path)
             ]
 
-        logging.info(f"Converting {input_path.name} to MP4...")
-        success = run_ffmpeg_command(command)
-        if success:
-            logging.info(f"Successfully converted {input_path.name} to MP4")
-            return True
-        return False
-    except Exception as e:
-        logging.error(f"Error converting video to MP4: {e}")
-        return False
-
-
-def compress_video_pass1(input_path, temp_output_path, scale_factor, crf, use_gpu=True):
-    """First pass focuses on analyzing the video and creating a quality baseline."""
-    width, height = get_video_dimensions(input_path)
-    if not width or not height:
-        return False, float('inf')
-
-    # Calculate bitrate based on scaled dimensions
-    new_width = int(width * scale_factor)
-    new_height = int(height * scale_factor)
-    target_bitrate = calculate_target_bitrate(new_width, new_height)
-
-    # First pass uses 2-pass encoding to analyze the video
-    if use_gpu:
+    # Helper methods with better error handling
+    def _get_dimensions(self, video_path: Path) -> Tuple[int, int]:
         command = [
-            'ffmpeg', '-hwaccel', 'cuda', '-i', str(input_path),
-            '-vf', f'scale={new_width}:{new_height}',
-            '-c:v', 'h264_nvenc',
-            '-preset', 'p7',
-            '-b:v', f'{target_bitrate}k',
-            '-pass', '1',
-            '-f', 'null',
-            '/dev/null'  # Use NUL on Windows
+            'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+            '-show_entries', 'stream=width,height', '-of', 'csv=s=x:p=0',
+            str(video_path)
         ]
-    else:
+        try:
+            if run_ffmpeg_command(command):
+                output = subprocess.check_output(command, text=True).strip()
+                width, height = map(int, output.split('x'))
+                return width, height
+            raise ValueError("Failed to run ffprobe command")
+        except Exception as e:
+            logger.error(f"Failed to get dimensions: {e}")
+            raise
+
+    def _get_frame_rate(self, video_path: Path) -> float:
         command = [
-            'ffmpeg', '-i', str(input_path),
-            '-vf', f'scale={new_width}:{new_height}',
-            '-c:v', 'libx264',
-            '-preset', 'medium',
-            '-b:v', f'{target_bitrate}k',
-            '-pass', '1',
-            '-f', 'null',
-            '/dev/null'  # Use NUL on Windows
+            'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+            '-show_entries', 'stream=r_frame_rate', '-of',
+            'default=noprint_wrappers=1:nokey=1', str(video_path)
         ]
+        try:
+            if run_ffmpeg_command(command):
+                output = subprocess.check_output(command, text=True).strip()
+                num, den = map(int, output.split('/'))
+                return num / den if den != 0 else num
+            raise ValueError("Failed to run ffprobe command")
+        except Exception as e:
+            logger.error(f"Failed to get frame rate: {e}")
+            raise
 
-    success = run_ffmpeg_command(command)
-    if not success:
-        return False, float('inf')
+    def _has_audio(self, video_path: Path) -> bool:
+        command = ['ffprobe', '-i', str(video_path), '-show_streams',
+                   '-select_streams', 'a', '-loglevel', 'error']
+        try:
+            if run_ffmpeg_command(command):
+                output = subprocess.check_output(
+                    command, stderr=subprocess.STDOUT)
+                return len(output) > 0
+            return False
+        except Exception:
+            return False
 
-    # Now do the actual first pass encode
-    return compress_video(input_path, temp_output_path, scale_factor, crf, use_gpu)
+    def _get_file_size(self, file_path: Path) -> float:
+        try:
+            return os.path.getsize(file_path) / (1024 * 1024)
+        except OSError as e:
+            logger.error(f"Failed to get file size: {e}")
+            raise
 
 
-def compress_video_pass2(input_path, final_output_path, scale_factor, crf, use_gpu=True):
-    """Second pass focuses on achieving target size with quality constraints."""
-    # Increase CRF more significantly for second pass
-    adjusted_crf = min(crf + 4, 51)  # Ensure we don't exceed max CRF of 51
-    return compress_video(input_path, final_output_path, scale_factor, adjusted_crf, use_gpu)
+class BatchVideoProcessor:
+    def __init__(self, use_gpu: bool = True):
+        self.processor = VideoProcessor(use_gpu)
+        self.input_dir = Path(INPUT_DIR)
+        self.output_dir = Path(OUTPUT_DIR)
+        self.temp_dir = Path(TEMP_FILE_DIR)
 
+    def process_all_videos(self) -> List[Path]:
+        logger.info("Starting batch video processing")
+        failed_files = []
 
-def process_videos(gpu_supported=False):
-    """Process all videos from input directory with consolidated logic."""
-    failed_files = []
-    input_dir = Path(INPUT_DIR)
-    temp_dir = Path(TEMP_FILE_DIR)
-    output_dir = Path(OUTPUT_DIR)
-    min_size_mb = VIDEO_COMPRESSION['min_size_mb']
-    min_width = VIDEO_COMPRESSION['min_width']
-    min_height = VIDEO_COMPRESSION['min_height']
+        # Process non-MP4 videos first
+        self._convert_non_mp4_videos(failed_files)
 
-    # First pass: Convert all non-MP4 videos to MP4 in input directory
-    for format in SUPPORTED_VIDEO_FORMATS:
-        if format != '.mp4':
-            for video_file in input_dir.glob(f'*{format}'):
-                temp_file = temp_dir / f"temp_{video_file.stem}.mp4"
-                final_output = input_dir / f"{video_file.stem}.mp4"
-                TempFileManager.register(temp_file)
+        # Then process all MP4 files
+        self._process_mp4_videos(failed_files)
 
-                if not final_output.exists():
-                    success = convert_to_mp4(
-                        video_file, temp_file, gpu_supported)
-                    if success:
-                        shutil.move(str(temp_file), str(final_output))
-                        TempFileManager.register(final_output)
-                    else:
+        self._log_results(failed_files)
+        return failed_files
+
+    def _convert_non_mp4_videos(self, failed_files: List[Path]):
+        for format in SUPPORTED_VIDEO_FORMATS:
+            if format.lower() != '.mp4':
+                for video_file in self.input_dir.glob(f'*{format}'):
+                    if not self._convert_to_mp4(video_file):
                         failed_files.append(video_file)
 
-                TempFileManager.unregister(temp_file)
+    def _convert_to_mp4(self, video_file: Path) -> bool:
+        temp_file = self.temp_dir / f"temp_{video_file.stem}.mp4"
+        final_output = self.input_dir / f"{video_file.stem}.mp4"
 
-    # Second pass: Process all MP4 files from input directory
-    for video_file in input_dir.glob('*.[mM][pP]4'):
-        temp_file_1 = temp_dir / f"temp_pass1_{video_file.name}"
-        temp_file_2 = temp_dir / f"temp_pass2_{video_file.name}"
-        min_size_mb = VIDEO_COMPRESSION['min_size_mb']
-        TempFileManager.register(temp_file_1)
-        TempFileManager.register(temp_file_2)
-
-        has_audio = has_audio_stream(video_file)
-        compressed_video_name = f"{video_file.stem}.mp4"
-        final_output = output_dir / compressed_video_name
+        TempFileManager.register(temp_file)
 
         if final_output.exists():
-            logging.info(
-                f"Video {video_file.name} already processed. Skipping.")
-            continue
+            logger.skip(f"MP4 version exists: {video_file.name}")
+            return True
 
-        # Compression strategy
-        crf = VIDEO_COMPRESSION['crf']
-        scale_factor = VIDEO_COMPRESSION['scale_factor']
-        best_size = float('inf')
-        attempts = 0
+        TempFileManager.register(temp_file)
+        try:
+            metadata = self.processor.get_video_metadata(video_file)
+            if not metadata:
+                return False
 
-        # Get original dimensions
-        width, height = get_video_dimensions(video_file)
-        if not width or not height:
-            logging.error(f"Failed to get dimensions for {video_file}")
-            failed_files.append(video_file)
-            continue
+            params = {
+                "crf": 18,  # High quality for initial conversion
+                "preset": "medium",
+                "target_bitrate": metadata.bitrate
+            }
 
-        while best_size > min_size_mb:
-            success, size_pass1 = compress_video_pass1(
-                video_file, temp_file_1, scale_factor, crf, gpu_supported)
+            success = self.processor._compress_with_params(
+                video_file, temp_file, params, metadata)
 
-            if not success:
-                logging.warning(
-                    f"First pass compression failed for {video_file}")
+            if success:
+                shutil.move(str(temp_file), str(final_output))
+                logger.success(f"Converted to MP4: {video_file.name}")
+                return True
+
+            return False
+        finally:
+            TempFileManager.unregister(temp_file)
+            if temp_file.exists():
+                temp_file.unlink()
+
+    def _process_mp4_videos(self, failed_files: List[Path]):
+        for video_file in self.input_dir.glob('*.[mM][pP]4'):
+            output_path = self.output_dir / f"{video_file.stem}.mp4"
+
+            if output_path.exists():
+                logger.skip(f"Already processed: {video_file.name}")
+                continue
+
+            if not self._process_single_mp4(video_file, output_path):
                 failed_files.append(video_file)
-                break
 
-            success, size_pass2 = compress_video_pass2(
-                temp_file_1, temp_file_2, scale_factor, crf, gpu_supported)
+    def _process_single_mp4(self, video_file: Path, output_path: Path) -> bool:
+        try:
+            return self.processor.process_video(
+                video_file, output_path, VIDEO_COMPRESSION['min_size_mb'])
+        except Exception as e:
+            logger.error(f"Failed to process {video_file.name}: {e}")
+            return False
 
-            if not success:
-                logging.warning(
-                    f"Second pass compression failed for {video_file}")
-                failed_files.append(video_file)
-                break
+    def _log_results(self, failed_files: List[Path]):
+        if failed_files:
+            logger.warning(f"Failed to process {len(failed_files)} files:")
+            for file in failed_files:
+                logger.warning(f"- {file.name}")
+        else:
+            logger.success("All videos processed successfully")
 
-            if size_pass2 < best_size:
-                best_size = size_pass2
-                if best_size <= min_size_mb:
-                    # Check if dimensions meet the minimum requirements
-                    new_width = int(width * scale_factor)
-                    new_height = int(height * scale_factor)
-                    if new_width >= min_width and new_height >= min_height:
-                        shutil.move(str(temp_file_2), str(final_output))
-                        logging.info(f"Video successfully compressed to {
-                                     best_size:.2f} MB")
-                        break
-                    else:
-                        logging.warning(
-                            f"Video dimensions after scaling do not meet minimum size requirements. Continuing compression.")
+# Function to maintain backward compatibility
 
-            # Adjust compression parameters dynamically
-            attempts += 1
 
-            if best_size > min_size_mb * 1.5:  # If significantly over target
-                if crf < 35:  # Gradually increase CRF for quality reduction
-                    crf += 2
-                else:
-                    scale_factor *= 0.9  # Reduce scale if CRF is already high
-            elif best_size > min_size_mb:  # If slightly over target
-                if crf < 31:  # Moderate increase in CRF
-                    crf += 1
-                elif scale_factor > 0.5:  # Moderate scale reduction if CRF increase isn't enough
-                    scale_factor *= 0.95
-            else:
-                # If under target or just right, we might slightly improve quality or maintain
-                # If we've increased CRF, try to lower it back
-                if crf > VIDEO_COMPRESSION['crf']:
-                    # But not below initial value
-                    crf = max(crf - 1, VIDEO_COMPRESSION['crf'])
-                elif scale_factor < 1.0:  # If scale was reduced, try to increase slightly
-                    # But not above original scale
-                    scale_factor = min(scale_factor * 1.05, 1.0)
-
-            logging.info(f"Attempt {attempts}: CRF={
-                         crf}, scale={scale_factor:.2f}")
-
-        # Cleanup
-        TempFileManager.unregister(temp_file_1)
-        TempFileManager.unregister(temp_file_2)
-        if temp_file_1.exists():
-            temp_file_1.unlink()
-        if temp_file_2.exists():
-            temp_file_2.unlink()
-
-    return failed_files
+def process_videos(gpu_supported: bool = False) -> List[Path]:
+    processor = BatchVideoProcessor(use_gpu=gpu_supported)
+    return processor.process_all_videos()
