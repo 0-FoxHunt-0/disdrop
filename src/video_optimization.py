@@ -32,8 +32,96 @@ class VideoMetadata:
     bitrate: int
 
 
+class VideoEncoder:
+    def __init__(self, settings: dict = VIDEO_SETTINGS):
+        self.settings = settings
+        self.is_gpu_available = self._check_gpu_availability()
+        self._setup_encoder()
+
+    def _setup_encoder(self):
+        if self.is_gpu_available and self.settings['gpu']['enabled']:
+            self.mode = 'gpu'
+            self.encoder = self.settings['gpu']['encoders'][0]
+            self.presets = self.settings['gpu']['presets']
+        else:
+            self.mode = 'cpu'
+            self.encoder = self.settings['cpu']['encoders'][0]
+            self.presets = self.settings['cpu']['presets']
+
+    def encode_video(self, input_path: Path, output_path: Path,
+                     quality_preset: str = 'balanced') -> bool:
+        preset = self.presets[quality_preset]
+        command = self._build_encoding_command(input_path, output_path, preset)
+
+        for attempt in range(self.settings['general']['max_retries']):
+            try:
+                with ProcessManager(command, timeout=self.settings['general']['timeout']) as pm:
+                    if pm.run():
+                        return True
+                    if attempt == self.settings['general']['max_retries'] - 1:
+                        return False
+            except Exception as e:
+                logger.error(f"Encoding error: {e}")
+                if attempt == self.settings['general']['max_retries'] - 1:
+                    return False
+
+
+class ProcessManager:
+    def __init__(self, command: List[str], timeout: int):
+        self.command = command
+        self.timeout = timeout
+        self.process = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.cleanup()
+
+    def run(self) -> bool:
+        try:
+            self.process = subprocess.Popen(
+                self.command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                preexec_fn=os.setsid
+            )
+            stdout, stderr = self.process.communicate(timeout=self.timeout)
+            return self.process.returncode == 0
+        except subprocess.TimeoutExpired:
+            self.cleanup()
+            raise
+
+    def cleanup(self):
+        if self.process:
+            try:
+                os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
+                self.process.wait(timeout=5)
+            except:
+                os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
+
+
+class VideoWorker(Thread):
+    def __init__(self, queue: Queue, results: Queue, encoder: VideoEncoder):
+        super().__init__()
+        self.queue = queue
+        self.results = results
+        self.encoder = encoder
+
+    def run(self):
+        while True:
+            video = self.queue.get()
+            if video is None:
+                break
+
+            output_path = self._get_output_path(video)
+            success = self.encoder.encode_video(video, output_path)
+            self.results.put(ProcessResult(video, success))
+
+
 class VideoProcessor:
-    def __init__(self, use_gpu: bool = True):
+    def __init__(self, use_gpu: bool = True, temp_manager: Optional[TempFileManager] = None):
         self.use_gpu = use_gpu
         self.quality_profiles = {
             CompressionQuality.LOW: {"crf": 28, "scale": 0.7, "preset": "medium"},
@@ -41,13 +129,7 @@ class VideoProcessor:
             CompressionQuality.HIGH: {"crf": 18,
                                       "scale": 1.0, "preset": "veryslow"}
         }
-        self.compression_cache: Dict[str, Dict] = {}
-        self._temp_manager = temp_manager
-
-    def _create_temp_file(self, prefix: str, suffix: str) -> Path:
-        temp_path = Path(TEMP_FILE_DIR) / f"{prefix}_{os.getpid()}{suffix}"
-        self._temp_manager.register(temp_path)
-        return temp_path
+        self.temp_manager = temp_manager or TempFileManager()
 
     def get_video_metadata(self, video_path: Path) -> Optional[VideoMetadata]:
         try:
@@ -71,94 +153,37 @@ class VideoProcessor:
             logger.error(f"Failed to get metadata for {video_path}: {e}")
             return None
 
-    def _get_duration(self, video_path: Path) -> float:
-        command = [
-            'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-            '-of', 'default=noprint_wrappers=1:nokey=1', str(video_path)
-        ]
-        try:
-            if run_ffmpeg_command(command):
-                output = subprocess.check_output(command, text=True).strip()
-                return float(output)
-        except Exception as e:
-            logger.error(f"Failed to get duration: {e}")
-            return 0.0
-
-    def _calculate_optimal_bitrate(self, width: int, height: int, duration: float) -> int:
-        pixels = width * height
-        base_bitrate = 4000
-
-        # Dynamic bitrate based on resolution and duration
-        resolution_factor = pixels / (1920 * 1080)
-        # Adjust for longer videos
-        duration_factor = min(1.0, max(0.5, 1.0 - (duration / 3600)))
-
-        optimal_bitrate = int(
-            base_bitrate * resolution_factor * duration_factor)
-        # Cap between 500kbps and 8Mbps
-        return max(500, min(optimal_bitrate, 8000))
-
     def process_video(self, input_path: Path, output_path: Path, target_size_mb: float) -> bool:
         temp_output = self._create_temp_file(
             input_path.stem, input_path.suffix)
-        TempFileManager.register(temp_output)
+        self.temp_manager.register(temp_output)
 
         try:
             metadata = self.get_video_metadata(input_path)
             if not metadata:
                 return False
 
-            if self._compress_with_params(...):
+            params = self._calculate_compression_params(
+                metadata, target_size_mb)
+            if self._compress_with_params(input_path, temp_output, params, metadata):
                 shutil.move(str(temp_output), str(output_path))
                 return True
             return False
         finally:
-            TempFileManager.unregister(temp_output)
+            self.temp_manager.unregister(temp_output)
             if temp_output.exists():
                 temp_output.unlink()
-
-    def _calculate_compression_params(self, metadata: VideoMetadata,
-                                      target_size_mb: float) -> Dict:
-        target_bitrate = int((target_size_mb * 8 * 1024) / metadata.duration)
-        current_bitrate = metadata.bitrate
-
-        # Calculate scale factor based on target size
-        scale_factor = min(1.0, (target_bitrate / current_bitrate) ** 0.5)
-
-        # Adjust CRF based on content complexity
-        base_crf = 23
-        if metadata.frame_rate > 30:
-            base_crf += 2
-        if metadata.width * metadata.height > 1920 * 1080:
-            base_crf += 1
-
-        return {
-            "crf": base_crf,
-            "scale_factor": scale_factor,
-            "target_bitrate": target_bitrate
-        }
-
-    def _adjust_params_for_quality(self, base_params: Dict,
-                                   quality: CompressionQuality) -> Dict:
-        profile = self.quality_profiles[quality]
-        return {
-            "crf": base_params["crf"] + (profile["crf"] - 23),
-            "scale_factor": base_params["scale_factor"] * profile["scale"],
-            "preset": profile["preset"],
-            "target_bitrate": base_params["target_bitrate"]
-        }
 
     def _compress_with_params(self, input_path: Path, output_path: Path,
                               params: Dict, metadata: VideoMetadata) -> bool:
         command = self._build_compression_command(
             input_path, output_path, params, metadata)
-
         try:
             success = run_ffmpeg_command(command)
             if success:
                 result_size = self._get_file_size(output_path)
-                logger.success(
-                    f"Compressed {input_path.name} to {result_size:.2f}MB")
+                logger.success(f"Compressed {input_path.name} to {
+                               result_size:.2f}MB")
                 return True
             return False
         except Exception as e:
@@ -216,21 +241,19 @@ class VideoProcessor:
             ]
 
     # Helper methods with better error handling
-    def _get_dimensions(self, video_path: Path) -> Tuple[int, int]:
-        command = [
-            'ffprobe', '-v', 'error', '-select_streams', 'v:0',
-            '-show_entries', 'stream=width,height', '-of', 'csv=s=x:p=0',
-            str(video_path)
-        ]
+    def _get_dimensions(self, video_path: Path) -> Tuple[Optional[int], Optional[int]]:
         try:
-            if run_ffmpeg_command(command):
-                output = subprocess.check_output(command, text=True).strip()
-                width, height = map(int, output.split('x'))
-                return width, height
-            raise ValueError("Failed to run ffprobe command")
+            command = [
+                'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                '-show_entries', 'stream=width,height', '-of', 'csv=s=x:p=0',
+                str(video_path)
+            ]
+            output = subprocess.check_output(command, text=True).strip()
+            width, height = map(int, output.split('x'))
+            return width, height
         except Exception as e:
             logger.error(f"Failed to get dimensions: {e}")
-            raise
+            return None, None
 
     def _get_frame_rate(self, video_path: Path) -> float:
         command = [
@@ -269,50 +292,61 @@ class VideoProcessor:
 
 
 class BatchVideoProcessor:
-    def __init__(self, use_gpu: bool = True):
-        self.processor = VideoProcessor(use_gpu)
+    def __init__(self, use_gpu: bool = False, max_workers: Optional[int] = None):
+        self.max_workers = max_workers or min(32, (os.cpu_count() or 1) * 2)
+        self.processor = VideoProcessor(use_gpu=use_gpu)
         self.input_dir = Path(INPUT_DIR)
         self.output_dir = Path(OUTPUT_DIR)
         self.temp_dir = Path(TEMP_FILE_DIR)
 
     def process_all_videos(self) -> List[Path]:
-        logger.info("Starting batch video processing")
         failed_files = []
 
-        # Process non-MP4 videos first
-        self._convert_non_mp4_videos(failed_files)
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # Process non-MP4 videos first
+            for format in SUPPORTED_VIDEO_FORMATS:
+                if format.lower() != '.mp4':
+                    futures = []
+                    for video_file in self.input_dir.glob(f'*{format}'):
+                        futures.append(
+                            executor.submit(self._convert_to_mp4, video_file)
+                        )
+                    for future in futures:
+                        if not future.result():
+                            failed_files.append(future.path)
 
-        # Then process all MP4 files
-        self._process_mp4_videos(failed_files)
+            # Process MP4 videos
+            futures = []
+            for video_file in self.input_dir.glob('*.[mM][pP]4'):
+                output_path = self.output_dir / f"{video_file.stem}.mp4"
+                if not output_path.exists():
+                    futures.append(
+                        executor.submit(self._process_single_mp4,
+                                        video_file, output_path)
+                    )
+
+            for future in futures:
+                if not future.result():
+                    failed_files.append(future.path)
 
         self._log_results(failed_files)
         return failed_files
-
-    def _convert_non_mp4_videos(self, failed_files: List[Path]):
-        for format in SUPPORTED_VIDEO_FORMATS:
-            if format.lower() != '.mp4':
-                for video_file in self.input_dir.glob(f'*{format}'):
-                    if not self._convert_to_mp4(video_file):
-                        failed_files.append(video_file)
 
     def _convert_to_mp4(self, video_file: Path) -> bool:
         temp_file = self.temp_dir / f"temp_{video_file.stem}.mp4"
         final_output = self.input_dir / f"{video_file.stem}.mp4"
 
-        TempFileManager.register(temp_file)
-
         if final_output.exists():
             logger.skip(f"MP4 version exists: {video_file.name}")
             return True
 
-        TempFileManager.register(temp_file)
         try:
             metadata = self.processor.get_video_metadata(video_file)
             if not metadata:
                 return False
 
             params = {
-                "crf": 18,  # High quality for initial conversion
+                "crf": 18,
                 "preset": "medium",
                 "target_bitrate": metadata.bitrate
             }
@@ -327,20 +361,8 @@ class BatchVideoProcessor:
 
             return False
         finally:
-            TempFileManager.unregister(temp_file)
             if temp_file.exists():
                 temp_file.unlink()
-
-    def _process_mp4_videos(self, failed_files: List[Path]):
-        for video_file in self.input_dir.glob('*.[mM][pP]4'):
-            output_path = self.output_dir / f"{video_file.stem}.mp4"
-
-            if output_path.exists():
-                logger.skip(f"Already processed: {video_file.name}")
-                continue
-
-            if not self._process_single_mp4(video_file, output_path):
-                failed_files.append(video_file)
 
     def _process_single_mp4(self, video_file: Path, output_path: Path) -> bool:
         try:

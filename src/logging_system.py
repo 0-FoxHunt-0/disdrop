@@ -114,10 +114,20 @@ class RotatingFileHandler(logging.FileHandler):
 class TeeLogger:
     def __init__(self, filename: Union[str, Path], encoding: str = 'utf-8', buffer_size: int = 1):
         self.terminal: TextIO = sys.stdout
-        self.log_file: TextIO = open(
-            filename, 'w', encoding=encoding, buffering=buffer_size)
-        self.encoding = encoding
-        atexit.register(self.close)
+        try:
+            self.log_file: TextIO = open(
+                filename, 'w', encoding=encoding, buffering=buffer_size)
+            self.encoding = encoding
+            atexit.register(self.close)
+        except Exception as e:
+            logger.error(f"Failed to open log file: {e}")
+            self.lo
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
 
     def write(self, message: str) -> None:
         try:
@@ -199,7 +209,7 @@ def log_exception(exc_type, exc_value, exc_traceback):
                      exc_info=(exc_type, exc_value, exc_traceback))
 
 
-def run_ffmpeg_command(command: list, timeout: Optional[int] = None) -> bool:
+def run_ffmpeg_command(command: list, timeout: Optional[int] = 300) -> bool:
     ffmpeg_logger = logging.getLogger('ffmpeg')
     current_dir = os.getcwd()
 

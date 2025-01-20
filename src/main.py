@@ -1,20 +1,16 @@
 import argparse
 import logging
-import os
-import shutil
 import signal
-import subprocess
 import sys
 from pathlib import Path
-from typing import List, Optional
 
-from default_config import (GIF_COMPRESSION, GIF_PASS_OVERS, INPUT_DIR,
-                            LOG_DIR, OUTPUT_DIR, TEMP_FILE_DIR)
-from gif_optimization import GIFProcessor, process_gifs
+from default_config import (GIF_PASS_OVERS, INPUT_DIR, LOG_DIR, OUTPUT_DIR,
+                            TEMP_FILE_DIR, GIF_COMPRESSION)
+from gif_optimization import GIFProcessor
 from gpu_acceleration import setup_gpu_acceleration
 from logging_system import setup_logger
 from temp_file_manager import TempFileManager
-from video_optimization import process_videos
+from video_optimization import BatchVideoProcessor
 
 
 def signal_handler(signum, frame):
@@ -27,8 +23,6 @@ def signal_handler(signum, frame):
 
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
-
-# TODO: Add a flag to process only videos and not output gifs
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -46,12 +40,10 @@ def parse_arguments() -> argparse.Namespace:
 
 
 def verify_dependencies() -> bool:
+    import shutil
     required_commands = ['ffmpeg', 'ffprobe', 'gifsicle']
-    missing_commands = []
-
-    for cmd in required_commands:
-        if not shutil.which(cmd):
-            missing_commands.append(cmd)
+    missing_commands = [
+        cmd for cmd in required_commands if not shutil.which(cmd)]
 
     if missing_commands:
         logging.error(f"Missing required dependencies: {
@@ -60,20 +52,22 @@ def verify_dependencies() -> bool:
     return True
 
 
-def process_failed_items(failed_files: List[Path], pass_over_index: int) -> List[Path]:
+def process_failed_items(failed_files: list[Path], pass_over_index: int) -> list[Path]:
     logging.info(f"Starting optimization pass {pass_over_index + 1}")
+
+    # Update compression settings for this pass
     pass_over = GIF_PASS_OVERS[pass_over_index]
     GIF_COMPRESSION.update(pass_over)
 
-    remaining_failed = []
     processor = GIFProcessor()
+    remaining_failed = []
 
     for file_path in failed_files:
         try:
             source_file = Path(file_path)
             output_path = OUTPUT_DIR / f"{source_file.stem}.gif"
-
             is_video = source_file.suffix.lower() in ['.mp4', '.mkv', '.avi']
+
             processor.process_file(source_file, output_path, is_video)
 
             if not output_path.exists():
@@ -83,7 +77,7 @@ def process_failed_items(failed_files: List[Path], pass_over_index: int) -> List
             logging.error(f"Failed to process {file_path}: {e}")
             remaining_failed.append(file_path)
 
-    # Reset compression settings
+    # Reset compression settings to default
     GIF_COMPRESSION.update({
         'fps_range': (15, 10),
         'colors': 256,
@@ -118,13 +112,16 @@ def main() -> None:
         gpu_supported = False if args.no_gpu else setup_gpu_acceleration()
 
         logging.info("Processing videos...")
-        failed_videos = process_videos(gpu_supported)
+        video_processor = BatchVideoProcessor(use_gpu=gpu_supported)
+        failed_videos = video_processor.process_all_videos()
 
         logging.info("Processing GIFs...")
-        failed_gifs = process_gifs()
+        gif_processor = GIFProcessor()
+        failed_gifs = gif_processor.process_all()
 
         failed_files = failed_videos + failed_gifs
 
+        # Try multiple passes with different compression settings
         for i, _ in enumerate(GIF_PASS_OVERS):
             if not failed_files:
                 logging.info("All files processed successfully")

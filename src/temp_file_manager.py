@@ -11,6 +11,15 @@ class TempFileManager:
     _temp_files: Set[Path] = set()
     _lock = threading.Lock()
     _initialized = False
+    MAX_TEMP_FILES = 1000
+    MAX_AGE_HOURS = 24
+
+    def __enter__(self):
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._lock.release()
 
     @classmethod
     def initialize(cls) -> None:
@@ -34,8 +43,9 @@ class TempFileManager:
     def unregister(cls, file_path: Path) -> None:
         """Thread-safely unregister a temporary file."""
         with cls._lock:
-            cls._temp_files.discard(Path(file_path))
-            logging.debug(f"Unregistered temp file: {file_path}")
+            cls._temp_files.add(Path(file_path))
+            if len(cls._temp_files) > cls.MAX_TEMP_FILES:
+                cls._cleanup_oldest()
 
     @classmethod
     def cleanup(cls) -> None:
@@ -61,6 +71,16 @@ class TempFileManager:
         """Get count of registered temporary files."""
         with cls._lock:
             return len(cls._temp_files)
+
+    @classmethod
+    def _cleanup_oldest(cls):
+        with cls._lock:
+            now = time.time()
+            cls._temp_files = {
+                f for f in cls._temp_files
+                if f.exists() and
+                (now - f.stat().st_mtime) / 3600 < cls.MAX_AGE_HOURS
+            }
 
 
 TempFileManager.initialize()

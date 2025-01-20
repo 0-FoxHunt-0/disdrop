@@ -42,6 +42,9 @@ class GIFOptimizationError(Exception):
 class FileProcessor:
     """Base class for file processing operations."""
 
+    def __init__(self):
+        self.file_size_cache = TTLCache(maxsize=1000, ttl=3600)
+
     @staticmethod
     @lru_cache(maxsize=128)
     def get_file_size(file_path: Union[str, Path]) -> float:
@@ -322,14 +325,14 @@ class GIFProcessor(GIFOptimizer):
             return self.failed_files
 
 
-def process_gifs(compression_settings: Dict = None) -> List[Path]:
-    """Main entry point for GIF processing with optional custom settings."""
+def validate_compression_settings(settings: Dict[str, Any]) -> None:
+    required_keys = ['fps_range', 'colors', 'lossy_value']
+    if not all(key in settings for key in required_keys):
+        raise ValueError(f"Missing required keys: {required_keys}")
+
+
+def process_gifs(compression_settings: Optional[Dict[str, Any]] = None) -> List[Path]:
+    if compression_settings is not None:
+        validate_compression_settings(compression_settings)
     processor = GIFProcessor(compression_settings)
     return processor.process_all()
-
-# Backwards compatibility
-
-
-def legacy_process_gifs() -> List[Path]:
-    """Maintains backwards compatibility with old implementation."""
-    return process_gifs()

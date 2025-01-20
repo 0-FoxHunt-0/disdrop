@@ -23,13 +23,39 @@ for directory in [INPUT_DIR, OUTPUT_DIR, LOG_DIR, TEMP_FILE_DIR]:
 
 # Optimization settings for videos and gifs
 VIDEO_COMPRESSION = {
-    'scale_factor': 0.8,  # Scale down factor for videos
-    'crf': 23,            # Constant Rate Factor for video compression
-    # Use GPU for video optimization, set to False for CPU fallback
+    'scale_factor': 0.8,
+    'crf': 23,
     'gpu_acceleration': True,
-    'min_size_mb': 10,
-    'min_width': 0,
-    'min_height': 120
+    'fallback_settings': {
+        'scale_factor': 0.8,
+        'crf': 26,
+        'preset': 'medium'
+    }
+}
+
+VIDEO_SETTINGS = {
+    'gpu': {
+        'enabled': True,
+        'encoders': ['h264_nvenc', 'hevc_nvenc'],
+        'presets': {
+            'quality': {'preset': 'p7', 'crf': 18},
+            'balanced': {'preset': 'p4', 'crf': 23},
+            'speed': {'preset': 'p1', 'crf': 28}
+        }
+    },
+    'cpu': {
+        'encoders': ['libx264', 'libx265'],
+        'presets': {
+            'quality': {'preset': 'slower', 'crf': 18},
+            'balanced': {'preset': 'medium', 'crf': 23},
+            'speed': {'preset': 'veryfast', 'crf': 28}
+        }
+    },
+    'general': {
+        'scale_factor': 0.8,
+        'max_retries': 3,
+        'timeout': 3600
+    }
 }
 
 GIF_COMPRESSION = {
