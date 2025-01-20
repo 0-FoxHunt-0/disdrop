@@ -7,13 +7,15 @@ from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
-from typing import List, Optional, Tuple, Union, Dict
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+from cachetools import TTLCache
 
 from default_config import (GIF_COMPRESSION, GIF_PASS_OVERS, GIF_SIZE_TO_SKIP,
-                            INPUT_DIR, OUTPUT_DIR, SUPPORTED_VIDEO_FORMATS, TEMP_FILE_DIR)
+                            INPUT_DIR, OUTPUT_DIR, SUPPORTED_VIDEO_FORMATS,
+                            TEMP_FILE_DIR)
 from logging_system import log_function_call
 from temp_file_manager import TempFileManager
-from video_optimization import VideoProcessor
 
 
 class ProcessingStatus(Enum):
@@ -125,6 +127,9 @@ class GIFOptimizer(FileProcessor):
         from logging_system import run_ffmpeg_command
         logging.info(f"Optimizing GIF: {input_gif.name}")
         try:
+            # Get original size for comparison
+            original_size = self.get_file_size(input_gif)
+
             cmd = [
                 'gifsicle', '--optimize=3', '--colors', str(colors),
                 '--lossy=' + str(lossy), '--no-conserve-memory',
@@ -132,9 +137,10 @@ class GIFOptimizer(FileProcessor):
                 str(input_gif), '-o', str(output_gif)
             ]
             run_ffmpeg_command(cmd)
-            size = self.get_file_size(output_gif)
-            logging.info(f"Optimized GIF to: {size:.2f}MB")
-            return size
+            optimized_size = self.get_file_size(output_gif)
+            logging.info(f"Optimized GIF from {original_size:.2f}MB to: {
+                         optimized_size:.2f}MB")
+            return optimized_size
         except Exception as e:
             logging.error(f"GIF optimization failed: {e}")
             return float('inf')
@@ -180,9 +186,13 @@ class GIFProcessor(GIFOptimizer):
         temp_gif = temp_dir / \
             f"{Path(output_path).stem}_{fps}_{scale_factor:.2f}.gif"
         TempFileManager.register(temp_gif)
+        palette_path = None
 
         try:
-            width, height = VideoProcessor._get_dimensions(file_path)
+            from video_optimization import VideoProcessor
+
+            video_processor = VideoProcessor()
+            width, height = video_processor._get_dimensions(file_path)
             if not width or not height:
                 return ProcessingResult(fps, float('inf'), None,
                                         ProcessingStatus.DIMENSION_ERROR,
@@ -245,7 +255,7 @@ class GIFProcessor(GIFOptimizer):
 
         finally:
             TempFileManager.unregister(temp_gif)
-            if palette_path.exists():
+            if palette_path and palette_path.exists():
                 TempFileManager.unregister(palette_path)
                 palette_path.unlink()
 
@@ -263,35 +273,56 @@ class GIFProcessor(GIFOptimizer):
             fps_range = range(max(settings['fps_range']),
                               min(settings['fps_range']) - 1, -1)
 
-            with ThreadPoolExecutor() as executor:
-                futures = [
-                    executor.submit(self.process_single_fps,
-                                    (str(file_path), str(output_path),
-                                     is_video, fps, scale_factor))
-                    for fps in fps_range
-                ]
+            best_result = None
+            min_size_reached = False
 
-                results = []
+            with ThreadPoolExecutor() as executor:
+                futures = []
+                for fps in fps_range:
+                    if min_size_reached:
+                        break
+                    future = executor.submit(self.process_single_fps,
+                                             (str(file_path), str(output_path),
+                                              is_video, fps, scale_factor))
+                    futures.append(future)
+
                 for future in as_completed(futures):
                     try:
                         result = future.result()
                         if result.status == ProcessingStatus.SUCCESS:
-                            results.append(result)
+                            # Update best result if this is better or if we don't have one yet
+                            if best_result is None or result.size < best_result.size:
+                                best_result = result
+
+                            # If we've reached target size, set flag to stop processing higher FPS
+                            if result.size <= self.compression_settings['min_size_mb']:
+                                min_size_reached = True
+                                break
+
+                            # If current result is above min_size_mb, skip remaining higher FPS values
+                            if result.size > self.compression_settings['min_size_mb']:
+                                break
+
                     except Exception as e:
                         self.dev_logger.error(f"Future execution failed: {e}")
 
-            if results:
-                best_result = min(results, key=lambda x: x.size)
-                if best_result.size <= self.compression_settings['min_size_mb']:
-                    shutil.move(best_result.path, output_path)
-                    self.user_logger.info(
-                        f"Successfully processed {file_path.name}")
-                    if file_path in self.failed_files:
-                        self.failed_files.remove(file_path)
-                    return
+            if best_result and best_result.size <= self.compression_settings['min_size_mb']:
+                shutil.move(best_result.path, output_path)
+                self.user_logger.info(
+                    f"Successfully processed {file_path.name} with size {best_result.size:.2f}MB")
+                if file_path in self.failed_files:
+                    self.failed_files.remove(file_path)
+                return
 
             optimization_pass += 1
             if optimization_pass >= len(GIF_PASS_OVERS):
+                # If we have a best result but it's above min_size_mb, use it anyway
+                if best_result:
+                    shutil.move(best_result.path, output_path)
+                    self.user_logger.warning(
+                        f"Best achievable size for {file_path.name} was {best_result.size:.2f}MB")
+                    return
+
                 if file_path not in self.failed_files:
                     self.failed_files.append(file_path)
                     self.user_logger.warning(

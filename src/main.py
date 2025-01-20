@@ -17,7 +17,6 @@ def signal_handler(signum, frame):
     logging.warning("\nGracefully shutting down...")
     TempFileManager.cleanup()
     TempFileManager.cleanup_dir(TEMP_FILE_DIR)
-    logging.info("Cleanup complete")
     sys.exit(0)
 
 
@@ -91,56 +90,75 @@ def process_failed_items(failed_files: list[Path], pass_over_index: int) -> list
 
 
 def main() -> None:
+    args = parse_arguments()
+
+    # Initialize directories
+    input_dir = args.input_dir or INPUT_DIR
+    output_dir = args.output_dir or OUTPUT_DIR
+
+    for directory in [input_dir, output_dir, LOG_DIR, TEMP_FILE_DIR]:
+        directory.mkdir(parents=True, exist_ok=True)
+
+    # Setup logging and get the main logger
+    logger = setup_logger(args.debug)
+
     try:
-        args = parse_arguments()
-
-        if args.input_dir:
-            global INPUT_DIR
-            INPUT_DIR = args.input_dir
-        if args.output_dir:
-            global OUTPUT_DIR
-            OUTPUT_DIR = args.output_dir
-
-        for directory in [INPUT_DIR, OUTPUT_DIR, LOG_DIR]:
-            directory.mkdir(parents=True, exist_ok=True)
-
-        setup_logger(args.debug)
-
         if not verify_dependencies():
             sys.exit(1)
 
         gpu_supported = False if args.no_gpu else setup_gpu_acceleration()
 
-        logging.info("Processing videos...")
-        video_processor = BatchVideoProcessor(use_gpu=gpu_supported)
+        # Use logger instance instead of logging directly
+        logger.info("Processing videos...")
+        video_processor = BatchVideoProcessor(
+            use_gpu=gpu_supported,
+            input_dir=input_dir,
+            output_dir=output_dir
+        )
+
         failed_videos = video_processor.process_all_videos()
 
-        logging.info("Processing GIFs...")
+        if failed_videos:
+            logger.warning(f"Failed to process {len(failed_videos)} videos:")
+            for video in failed_videos:
+                logger.warning(f"  - {video}")
+        else:
+            logger.success("All videos processed successfully")
+
+        logger.info("Processing GIFs...")
         gif_processor = GIFProcessor()
         failed_gifs = gif_processor.process_all()
+
+        if failed_gifs:
+            logger.warning(f"Failed to process {len(failed_gifs)} gifs:")
+            for gif in failed_gifs:
+                logger.warning(f"  - {gif}")
+        else:
+            logger.success("All gifs processed successfully")
 
         failed_files = failed_videos + failed_gifs
 
         # Try multiple passes with different compression settings
         for i, _ in enumerate(GIF_PASS_OVERS):
             if not failed_files:
-                logging.info("All files processed successfully")
+                logger.success("All files processed successfully")
                 break
             failed_files = process_failed_items(failed_files, i)
 
         if failed_files:
-            logging.warning("Failed to process the following files:")
+            logger.warning("Failed to process the following files:")
             for file in failed_files:
-                logging.warning(f"  - {file}")
+                logger.warning(f"  - {file}")
 
     except KeyboardInterrupt:
-        logging.warning("Process interrupted by user")
+        logger.warning("Process interrupted by user")
     except Exception as e:
-        logging.critical(f"Fatal error: {e}", exc_info=True)
+        logger.critical(f"Fatal error: {e}", exc_info=True)
     finally:
         TempFileManager.cleanup()
-        TempFileManager.cleanup_dir(TEMP_FILE_DIR)
-        logging.info("Cleanup complete")
+        if TEMP_FILE_DIR.exists():
+            TempFileManager.cleanup_dir(TEMP_FILE_DIR)
+        logger.success("Cleanup complete")
 
 
 if __name__ == "__main__":

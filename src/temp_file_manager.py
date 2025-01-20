@@ -1,9 +1,11 @@
 import atexit
 import logging
+import os
 import signal
 import threading
+import time
 from pathlib import Path
-from typing import Set
+from typing import Set, Union
 
 
 class TempFileManager:
@@ -59,6 +61,24 @@ class TempFileManager:
                 except Exception as e:
                     logging.error(f"Failed to clean up {file_path}: {e}")
             cls._temp_files.clear()
+
+    @classmethod
+    def cleanup_dir(cls, directory: Union[str, Path]) -> None:
+        """Clean up all files in a directory."""
+        try:
+            directory = Path(directory)
+            if directory.exists():
+                for file in directory.iterdir():
+                    if file.is_file():
+                        try:
+                            file.unlink()
+                            logging.debug(f"Cleaned up file: {file}")
+                        except Exception as e:
+                            logging.error(f"Failed to clean up {file}: {e}")
+                directory.rmdir()
+                logging.debug(f"Removed directory: {directory}")
+        except Exception as e:
+            logging.error(f"Failed to clean up directory {directory}: {e}")
 
     @classmethod
     def _signal_handler(cls, signum: int, frame) -> None:

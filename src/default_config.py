@@ -30,7 +30,8 @@ VIDEO_COMPRESSION = {
         'scale_factor': 0.8,
         'crf': 26,
         'preset': 'medium'
-    }
+    },
+    'min_size_mb': 10,      # Target maximum size for gifs in MB
 }
 
 VIDEO_SETTINGS = {
