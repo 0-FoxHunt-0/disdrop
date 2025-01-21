@@ -183,28 +183,30 @@ def ensure_log_directories():
 
 def setup_logger(debug_mode: bool = False, log_rotation_size: int = 10485760,
                  backup_count: int = 5) -> logging.Logger:
-    for log_file in [LOG_FILE, FFPMEG_LOG_FILE]:
-        try:
-            if Path(log_file).exists():
-                Path(log_file).unlink()
-        except Exception as e:
-            print(f"Failed to clear log file {log_file}: {e}")
-
-    Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
-
-    # Create root logger
+    # Create root logger only if it doesn't exist
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG if debug_mode else logging.INFO)
 
-    # Clear existing handlers
+    # Clear existing handlers to prevent duplicates
     root_logger.handlers.clear()
 
-    # Console handler with colors
+    # Set the level only once
+    root_logger.setLevel(logging.DEBUG if debug_mode else logging.INFO)
+
+    # Use a set to track handler names and prevent duplicates
+    handler_names = set()
+
+    def add_handler(handler, name):
+        if name not in handler_names:
+            root_logger.addHandler(handler)
+            handler_names.add(name)
+
+    # Console handler
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(ColorFormatter('%(levelname)s: %(message)s'))
     console_handler.setLevel(logging.DEBUG if debug_mode else logging.INFO)
+    add_handler(console_handler, 'console')
 
-    # Main log file handler
+    # File handler
     file_handler = RotatingFileHandler(
         LOG_FILE,
         max_bytes=log_rotation_size,
@@ -213,8 +215,13 @@ def setup_logger(debug_mode: bool = False, log_rotation_size: int = 10485760,
     file_handler.setFormatter(logging.Formatter(
         '%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'))
     file_handler.setLevel(logging.DEBUG)
+    add_handler(file_handler, 'file')
 
-    # FFmpeg log file handler
+    # FFmpeg handler (keep separate from root logger)
+    ffmpeg_logger = logging.getLogger('ffmpeg')
+    ffmpeg_logger.handlers.clear()
+    ffmpeg_logger.propagate = False  # Prevent propagation to root logger
+
     ffmpeg_handler = RotatingFileHandler(
         FFPMEG_LOG_FILE,
         max_bytes=log_rotation_size,
@@ -222,20 +229,11 @@ def setup_logger(debug_mode: bool = False, log_rotation_size: int = 10485760,
     )
     ffmpeg_handler.setFormatter(logging.Formatter(
         '%(asctime)s - %(levelname)s - %(message)s'))
-
-    # Add handlers to root logger
-    root_logger.addHandler(console_handler)
-    root_logger.addHandler(file_handler)
-
-    # Create and configure ffmpeg logger
-    ffmpeg_logger = logging.getLogger('ffmpeg')
-    ffmpeg_logger.handlers.clear()
     ffmpeg_logger.addHandler(ffmpeg_handler)
 
     # Set up exception hook
     sys.excepthook = log_exception
 
-    # Create main logger
     logger = logging.getLogger(__name__)
     logger.success("Logging system initialized successfully")
 
