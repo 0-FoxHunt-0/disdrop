@@ -728,9 +728,11 @@ class GIFProcessor(GIFOptimizer):
             self._cleanup_file_resources(file_path)
 
     def _process_video(self, file_path: Path, output_path: Path) -> None:
-        """Process video files to GIF trying multiple FPS values and selecting the best result."""
+        """Process video files to GIF with parallel FPS processing using existing methods."""
         try:
             from video_optimization import VideoProcessor
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
             video_processor = VideoProcessor()
             width, height = video_processor._get_dimensions(file_path)
 
@@ -740,102 +742,127 @@ class GIFProcessor(GIFOptimizer):
                 self.failed_files.append(file_path)
                 return
 
-            # Create temporary files
-            temp_dir = Path(TEMP_FILE_DIR)
-            temp_dir.mkdir(parents=True, exist_ok=True)
-
             # Generate FPS values to try (inclusive range)
             min_fps, max_fps = self.compression_settings['fps_range']
             fps_values = range(min_fps, max_fps + 1)
 
-            best_result = {
-                'size': float('inf'),
-                'fps': None,
-                'path': None
-            }
+            with self.logging_lock:
+                self.dev_logger.info(f"Starting parallel processing for {
+                                     len(fps_values)} FPS values")
 
-            self.dev_logger.info(f"Trying FPS values from {
-                                 min_fps} to {max_fps}")
+            target_size = self.compression_settings.get('min_size_mb', 15.0)
+            successful_results = []
 
-            for fps in fps_values:
-                if self._shutdown_event.is_set():
-                    break
+            # Prepare processing arguments
+            processing_args = [
+                (file_path, output_path, True, fps, self.compression_settings)
+                for fps in fps_values
+            ]
 
-                # Create unique temporary files for this FPS attempt
-                palette_path = temp_dir / f"palette_{fps}_{os.getpid()}.png"
-                temp_gif = temp_dir / f"temp_{fps}_{os.getpid()}.gif"
-                optimized_gif = temp_dir / f"optimized_{fps}_{os.getpid()}.gif"
+            # Use ThreadPoolExecutor for parallel processing
+            with ThreadPoolExecutor(max_workers=min(4, len(fps_values))) as executor:
+                future_to_fps = {
+                    executor.submit(self._wrapped_process_single_fps, args): args[3]
+                    for args in processing_args
+                }
 
-                try:
-                    # Register temp files for cleanup
-                    TempFileManager.register(palette_path)
-                    TempFileManager.register(temp_gif)
-                    TempFileManager.register(optimized_gif)
+                for future in as_completed(future_to_fps):
+                    fps = future_to_fps[future]
+                    try:
+                        result = future.result()
 
-                    # Generate palette and create initial GIF
-                    if not self.ffmpeg.generate_palette(file_path, palette_path,
-                                                        fps, (width, height),
-                                                        self.compression_settings):
-                        self.dev_logger.warning(
-                            f"Palette generation failed for {fps} FPS")
-                        continue
-
-                    if not self.create_gif(file_path, palette_path, temp_gif,
-                                           fps, (width, height)):
-                        self.dev_logger.warning(
-                            f"GIF creation failed for {fps} FPS")
-                        continue
-
-                    # Optimize the created GIF
-                    target_size = self.compression_settings.get(
-                        'min_size_mb', 15.0)
-                    optimized_size, success = self.dynamic_optimizer.optimize_gif(
-                        temp_gif,
-                        optimized_gif,
-                        target_size
-                    )
-
-                    if success:
-                        self.dev_logger.info(f"FPS {fps}: Optimized size {
-                                             optimized_size:.2f}MB")
-
-                        # Update best result if this is better
-                        if optimized_size < best_result['size']:
-                            best_result = {
-                                'size': optimized_size,
+                        if result.status == ProcessingStatus.SUCCESS and result.path:
+                            successful_results.append({
+                                'size': result.size,
                                 'fps': fps,
-                                'path': optimized_gif
-                            }
-                            self.dev_logger.info(f"New best result at {fps} FPS: {
-                                                 optimized_size:.2f}MB")
+                                'path': result.path
+                            })
+                            with self.logging_lock:
+                                self.dev_logger.info(f"Result at {fps} FPS: {
+                                                     result.size:.2f}MB")
+
+                    except Exception as e:
+                        with self.logging_lock:
+                            self.dev_logger.error(f"Error processing {
+                                                  fps} FPS: {str(e)}")
+
+            # Handle the results
+            if successful_results:
+                try:
+                    # Filter results under size limit and sort by FPS (highest first)
+                    valid_results = [
+                        r for r in successful_results if r['size'] <= target_size]
+                    if valid_results:
+                        best_result = max(
+                            valid_results, key=lambda x: x['fps'])
+
+                        # Ensure output directory exists
+                        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+                        # Copy the best result to the output path
+                        if best_result['path'] and Path(best_result['path']).exists():
+                            with self.logging_lock:
+                                self.dev_logger.info(
+                                    f"Saving best result: {
+                                        best_result['fps']} FPS, "
+                                    f"{best_result['size']:.2f}MB → {
+                                        output_path}"
+                                )
+
+                            # Ensure any existing file is removed
+                            if output_path.exists():
+                                output_path.unlink()
+
+                            # Copy the best result to the final destination
+                            shutil.copy2(best_result['path'], output_path)
+
+                            # Verify the copy was successful
+                            if output_path.exists() and output_path.stat().st_size > 0:
+                                self.dev_logger.info(
+                                    f"Successfully saved optimized GIF to {output_path}")
+                            else:
+                                raise Exception("Failed to verify output file")
+                    else:
+                        self.dev_logger.error(
+                            f"No results under target size of {target_size}MB")
+                        self.failed_files.append(file_path)
+
+                    # Clean up all temporary results
+                    for result in successful_results:
+                        try:
+                            if result['path'] and Path(result['path']).exists():
+                                Path(result['path']).unlink()
+                                TempFileManager.unregister(
+                                    Path(result['path']))
+                        except Exception as e:
+                            self.dev_logger.warning(f"Failed to cleanup temporary file {
+                                                    result['path']}: {e}")
 
                 except Exception as e:
-                    self.dev_logger.error(f"Error processing {
-                                          fps} FPS: {str(e)}")
-                    continue
+                    with self.logging_lock:
+                        self.dev_logger.error(f"Error saving best result: {e}")
+                    self.failed_files.append(file_path)
 
-                finally:
-                    # Cleanup temporary files except for the best result
-                    for temp_file in [palette_path, temp_gif]:
-                        if temp_file.exists():
-                            temp_file.unlink()
-                        TempFileManager.unregister(temp_file)
-
-            # After trying all FPS values, use the best result
-            if best_result['path'] and best_result['path'].exists():
-                self.dev_logger.info(f"Selected best result: {best_result['fps']} FPS at {
-                                     best_result['size']:.2f}MB")
-                shutil.copy2(best_result['path'], output_path)
-                # Clean up the best result temporary file
-                best_result['path'].unlink()
-                TempFileManager.unregister(best_result['path'])
             else:
-                raise Exception("No successful optimization found at any FPS")
+                with self.logging_lock:
+                    self.dev_logger.error(
+                        f"No successful results found for {file_path.name}")
+                self.failed_files.append(file_path)
 
         except Exception as e:
-            self.dev_logger.error(f"Error processing video {
-                                  file_path.name}: {e}")
+            with self.logging_lock:
+                self.dev_logger.error(f"Error processing video {
+                                      file_path.name}: {e}")
             self.failed_files.append(file_path)
+
+            # Ensure cleanup in case of error
+            try:
+                for result in successful_results:
+                    if result['path'] and Path(result['path']).exists():
+                        Path(result['path']).unlink()
+                        TempFileManager.unregister(Path(result['path']))
+            except Exception as cleanup_error:
+                self.dev_logger.error(f"Error during cleanup: {cleanup_error}")
 
     def _cleanup_temp_files(self, temp_files: list[Path]) -> None:
         """Clean up temporary files with improved error handling."""
