@@ -5,12 +5,12 @@ import sys
 from pathlib import Path
 
 from default_config import (GIF_PASS_OVERS, INPUT_DIR, LOG_DIR, OUTPUT_DIR,
-                            TEMP_FILE_DIR, GIF_COMPRESSION)
+                            TEMP_FILE_DIR, GIF_COMPRESSION, VIDEO_COMPRESSION)
 from gif_optimization import GIFProcessor
 from gpu_acceleration import setup_gpu_acceleration
 from logging_system import setup_logger
 from temp_file_manager import TempFileManager
-from video_optimization import BatchVideoProcessor
+from video_optimization import VideoProcessor
 
 
 def signal_handler(signum, frame):
@@ -108,15 +108,14 @@ def main() -> None:
 
         gpu_supported = False if args.no_gpu else setup_gpu_acceleration()
 
-        # Use logger instance instead of logging directly
+        # Modified video processing section
         logger.info("Processing videos...")
-        video_processor = BatchVideoProcessor(
-            use_gpu=gpu_supported,
+        video_processor = VideoProcessor(use_gpu=gpu_supported)
+        failed_videos = video_processor.process_videos(
             input_dir=input_dir,
-            output_dir=output_dir
+            output_dir=output_dir,
+            target_size_mb=VIDEO_COMPRESSION['min_size_mb']
         )
-
-        failed_videos = video_processor.process_all_videos()
 
         if failed_videos:
             logger.warning(f"Failed to process {len(failed_videos)} videos:")

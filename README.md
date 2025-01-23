@@ -1,40 +1,49 @@
 # DisDrop: Video and GIF Compression Tool
 
-DisDrop is a powerful tool designed to compress and optimize videos and GIFs, enabling them to meet the 10MB file size constraints commonly imposed by social media platforms. This makes it ideal for creators, developers, and teams managing large media files. The tool supports GPU acceleration, multi-pass optimization, and detailed logging for a seamless processing experience.
+DisDrop is a powerful tool designed to compress and optimize videos and GIFs, enabling them to meet the 10MB file size constraints commonly imposed by social media platforms. It features adaptive compression, hardware acceleration, and intelligent file handling.
 
 ## Features
 
-- **Video Optimization**:
-  - Compress videos using ffmpeg with support for NVENC (GPU acceleration).
-  - Multi-pass processing for fine-tuned compression.
-  - Dynamic bitrate and CRF adjustments for optimal size and quality.
+### Video Optimization
+- **Smart Compression**:
+  - Multi-stage compression with dynamic quality adjustment
+  - Two-pass encoding for large files (>100MB)
+  - Adaptive bitrate and CRF based on file characteristics
+  - Progressive quality reduction until target size is reached
+  - Maintains maximum possible quality while achieving target size
 
-- **GIF Optimization**:
-  - Convert videos to GIFs with high-quality palettes and scaling.
-  - Optimize GIFs using gifsicle with configurable settings.
-  - Support for multi-pass attempts for failed files.
+- **Intelligent Scaling**:
+  - Dynamic resolution scaling based on content
+  - Preserves aspect ratio and quality
+  - Extreme compression mode for near-target files
+  - Smart dimension adjustment for optimal quality
 
-- **Hardware Acceleration**:
-  - Leverages NVIDIA GPU and NVENC for faster processing, significantly reducing encoding time and enabling smoother handling of high-resolution videos compared to CPU-only processing.
-  - Falls back to CPU processing if GPU is unavailable.
+- **Optimization Features**:
+  - Skip already compressed files meeting size requirements
+  - Process files in size order (largest first)
+  - Temporary file handling for safe processing
+  - Multiple compression attempts with increasing aggressiveness
 
-- **Robust Logging**:
-  - Logs system and processing events in color-coded and file-based formats.
-  - Dedicated logs for ffmpeg commands.
+### Hardware Acceleration
+- NVIDIA GPU (NVENC) support for faster processing
+- Automatic fallback to CPU if GPU unavailable
+- Optimized encoding presets for both GPU and CPU
 
-- **Error Handling**:
-  - Graceful shutdown and cleanup of temporary files.
-  - Detailed error reporting for failed files.
+### System Features
+- Detailed progress logging with color coding
+- Efficient temp file management
+- Error recovery and cleanup
+- Support for interrupted processing
 
 ## Requirements
 
-### Dependencies
-- [ffmpeg](https://ffmpeg.org/) (with NVENC support for GPU acceleration)
-- [ffprobe](https://ffmpeg.org/ffprobe.html)
-- [gifsicle](https://www.lcdf.org/gifsicle/)
+### System Requirements
 - Python 3.8+
+- FFmpeg with NVENC support (optional, for GPU acceleration)
+- 4GB RAM minimum (8GB+ recommended)
+- NVIDIA GPU (optional, for hardware acceleration)
 
-### Python Libraries
+### Python Dependencies
 - `concurrent.futures`
 - `dataclasses`
 - `functools`

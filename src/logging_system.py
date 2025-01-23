@@ -69,8 +69,16 @@ class ColorFormatter(logging.Formatter):
         self.default_color = self.RESET
 
     def format(self, record):
-        # Save original message
+        # Save original message and encode special characters
         original_msg = record.msg
+        if isinstance(record.msg, str):
+            # Replace Unicode characters with ASCII alternatives
+            record.msg = (record.msg.replace('→', '->')
+                                  .replace('⟶', '-->')
+                                  .replace('←', '<-')
+                                  .replace('⟵', '<--')
+                                  .replace('↔', '<->')
+                                  .replace('⟷', '<-->'))
 
         # Apply color
         color = self.COLORS.get(record.levelname, self.default_color)
@@ -181,6 +189,33 @@ def ensure_log_directories():
         raise
 
 
+class WindowsConsoleHandler(logging.StreamHandler):
+    """Custom handler that safely handles Unicode characters in Windows console."""
+    def __init__(self):
+        super().__init__()
+        # Use utf-8 encoding for output
+        if sys.platform == 'win32':
+            import locale
+            # Set console to UTF-8 mode
+            try:
+                import ctypes
+                kernel32 = ctypes.windll.kernel32
+                kernel32.SetConsoleOutputCP(65001)
+            except:
+                pass
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            # Replace problematic Unicode characters with ASCII alternatives
+            msg = msg.replace('→', '->').replace('⟶', '-->')
+            stream = self.stream
+            stream.write(msg + self.terminator)
+            self.flush()
+        except Exception:
+            self.handleError(record)
+
+
 def setup_logger(debug_mode: bool = False, log_rotation_size: int = 10485760,
                  backup_count: int = 5) -> logging.Logger:
     # Create root logger only if it doesn't exist
@@ -201,7 +236,7 @@ def setup_logger(debug_mode: bool = False, log_rotation_size: int = 10485760,
             handler_names.add(name)
 
     # Console handler
-    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler = WindowsConsoleHandler()
     console_handler.setFormatter(ColorFormatter('%(levelname)s: %(message)s'))
     console_handler.setLevel(logging.DEBUG if debug_mode else logging.INFO)
     add_handler(console_handler, 'console')
@@ -249,46 +284,29 @@ def log_exception(exc_type, exc_value, exc_traceback):
                      exc_info=(exc_type, exc_value, exc_traceback))
 
 
-def run_ffmpeg_command(command: list, timeout: Optional[int] = 300) -> bool:
+def run_ffmpeg_command(command: list, timeout: Optional[int] = None) -> bool:
     ffmpeg_logger = logging.getLogger('ffmpeg')
     current_dir = os.getcwd()
 
     try:
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            universal_newlines=True
-        )
+        # Run command without timeout for gifsicle commands
+        if 'gifsicle' in command[0]:
+            process = subprocess.run(command, capture_output=True, text=True)
+            return process.returncode == 0
 
-        while True:
-            try:
-                output = process.stdout.readline()
-                error = process.stderr.readline()
-
-                if output == error == '' and process.poll() is not None:
-                    break
-
-                if output:
-                    ffmpeg_logger.debug(output.strip())
-                if error:
-                    ffmpeg_logger.debug(error.strip())
-
-            except Exception as e:
-                ffmpeg_logger.error(f"Error processing FFmpeg output: {e}")
-                break
-
-        return_code = process.wait(timeout=timeout)
-        return return_code == 0
+        # Use timeout only for FFmpeg commands
+        process = subprocess.run(command, timeout=timeout, capture_output=True, text=True)
+        
+        if process.stderr:
+            ffmpeg_logger.debug(process.stderr)
+            
+        return process.returncode == 0
 
     except subprocess.TimeoutExpired:
-        process.kill()
-        ffmpeg_logger.error("FFmpeg command timed out")
+        ffmpeg_logger.error("Command timed out")
         return False
     except Exception as e:
-        ffmpeg_logger.error(f"FFmpeg command failed: {e}")
+        ffmpeg_logger.error(f"Command failed: {e}")
         return False
     finally:
         os.chdir(current_dir)
