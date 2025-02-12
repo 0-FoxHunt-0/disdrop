@@ -21,6 +21,7 @@ from .logging_system import log_function_call, run_ffmpeg_command
 from .temp_file_manager import TempFileManager
 from .utils.video_dimensions import get_video_dimensions
 from .utils.error_handler import validate_video_file, retry_video_processing, VideoProcessingError
+from .utils.resource_manager import ResourceMonitor, ResourceGuard
 
 logger = logging.getLogger(__name__)
 
@@ -116,30 +117,47 @@ class ProcessManager:
             raise
 
     def cleanup(self):
+        """Enhanced cleanup with better error handling."""
         if not self.process:
             return
 
         try:
             if self.is_windows:
                 if self.process.poll() is None:
-                    # Windows specific process termination
+                    # First try graceful termination
                     self.process.terminate()
                     try:
-                        self.process.wait(timeout=5)
+                        self.process.wait(timeout=3)
                     except subprocess.TimeoutExpired:
-                        self.process.kill()
+                        # Then force kill
+                        try:
+                            self.process.kill()
+                            self.process.wait(timeout=2)
+                        except:
+                            # Last resort: taskkill
+                            subprocess.run(['taskkill', '/F', '/T', '/PID', str(self.process.pid)],
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                           creationflags=subprocess.CREATE_NO_WINDOW)
             else:
-                # Unix specific process termination
-                os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
+                # Unix systems: try SIGTERM first, then SIGKILL
                 try:
-                    self.process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
+                    pgid = os.getpgid(self.process.pid)
+                    os.killpg(pgid, signal.SIGTERM)
+                    try:
+                        self.process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(pgid, signal.SIGKILL)
+                        self.process.wait(timeout=2)
+                except (ProcessLookupError, OSError):
+                    pass  # Process already terminated
         except Exception as e:
             logger.error(f"Failed to cleanup process: {e}")
-            # Force kill as last resort
+            # Ensure process is killed
             if self.process.poll() is None:
-                self.process.kill()
+                try:
+                    self.process.kill()
+                except:
+                    pass
 
 
 class VideoProcessor:
@@ -156,6 +174,8 @@ class VideoProcessor:
         self.target_size_mb = VIDEO_COMPRESSION['min_size_mb']  # Add this line
         self._setup_encoder()
         self.dimension_cache = {}
+        # Add resource monitor
+        self.resource_monitor = ResourceMonitor()
 
     def _setup_encoder(self):
         if self.gpu_available and self.settings['gpu']['enabled']:
@@ -202,6 +222,16 @@ class VideoProcessor:
                 logger.info(
                     f"Processing {idx}/{total_files}: {video_file.name} ({original_size:.2f}MB)")
 
+                # Check if file already meets requirements
+                if original_size <= target_size_mb:
+                    logger.info(
+                        f"File already meets size requirements ({original_size:.2f}MB <= {target_size_mb}MB)")
+                    if not output_path.exists():
+                        shutil.copy2(video_file, output_path)
+                        logger.info(
+                            f"Copied original file to output directory: {output_path}")
+                    continue
+
                 if not self._process_single_video(video_file, output_path, target_size_mb):
                     failed_files.append(video_file)
                 else:
@@ -220,90 +250,91 @@ class VideoProcessor:
     def _process_single_video(self, input_path: Path, output_path: Path, target_size_mb: float) -> bool:
         """Process a single video with dynamic quality adjustment."""
         try:
-            if not validate_video_file(str(input_path)):
-                raise VideoProcessingError(
-                    "Video validation failed", str(input_path))
+            with ResourceGuard(self.resource_monitor):
+                if not validate_video_file(str(input_path)):
+                    raise VideoProcessingError(
+                        "Video validation failed", str(input_path))
 
-            logger.info(f"Analyzing video metadata for {input_path.name}")
-            metadata = self.get_video_metadata(input_path)
-            if not metadata:
-                return False
+                logger.info(f"Analyzing video metadata for {input_path.name}")
+                metadata = self.get_video_metadata(input_path)
+                if not metadata:
+                    return False
 
-            # Adjust tolerance based on original file size
-            size_tolerance = self._get_size_tolerance(metadata.size_mb)
-            logger.debug(f"Video info: {metadata.width}x{metadata.height}, {
-                         metadata.frame_rate}fps, {metadata.duration: .1f}s")
-            logger.debug(f"Target size: {target_size_mb}MB(tolerance: {
-                         size_tolerance*100: .1f} % )")
+                # Adjust tolerance based on original file size
+                size_tolerance = self._get_size_tolerance(metadata.size_mb)
+                logger.debug(f"Video info: {metadata.width}x{metadata.height}, {
+                             metadata.frame_rate}fps, {metadata.duration: .1f}s")
+                logger.debug(f"Target size: {target_size_mb}MB(tolerance: {
+                             size_tolerance*100: .1f} % )")
 
-            # For very large files, try two-pass encoding first
-            if metadata.size_mb > 100 and metadata.size_mb / target_size_mb > 10:
-                logger.info(f"Large file detected({
-                            metadata.size_mb: .2f}MB), attempting two-pass compression")
-                if self._two_pass_compression(input_path, output_path, target_size_mb, metadata):
-                    return True
-                logger.info(
-                    "Two-pass compression unsuccessful, falling back to standard compression")
-
-            # Create working copy in temp directory
-            temp_input = self._get_temp_path(input_path)
-            shutil.copy2(input_path, temp_input)
-
-            attempt = 0
-            current_size = metadata.size_mb
-            best_result = None
-            best_size = float('inf')
-
-            # Initial scale based on resolution and target size
-            scale = self._calculate_initial_scale(metadata, target_size_mb)
-            crf = self._calculate_initial_crf(metadata, target_size_mb)
-
-            while attempt < self.max_compression_attempts and current_size > target_size_mb:
-                temp_output = self._get_temp_path(
-                    input_path, f"_attempt_{attempt}")
-
-                # Calculate compression parameters
-                target_bitrate = self._calculate_target_bitrate(
-                    target_size_mb, metadata.duration)
-
-                # Try compression with current parameters
-                success = self._compress_attempt(
-                    temp_input, temp_output, metadata, target_bitrate, scale, crf
-                )
-
-                if success and temp_output.exists():
-                    current_size = temp_output.stat().st_size / (1024 * 1024)
-
-                    # Update best result if this attempt is better
-                    if current_size < best_size:
-                        if best_result and best_result.exists():
-                            best_result.unlink()
-                        best_result = temp_output
-                        best_size = current_size
-
-                    # Adjust parameters for next attempt if needed
-                    if current_size > target_size_mb:
-                        scale, crf = self._adjust_parameters(
-                            scale, crf, current_size, target_size_mb
-                        )
-                        # Use the current best result as input for next attempt
-                        if best_result and best_result.exists():
-                            shutil.copy2(best_result, temp_input)
-                    else:
-                        # Target reached
-                        shutil.move(best_result, output_path)
+                # For very large files, try two-pass encoding first
+                if metadata.size_mb > 100 and metadata.size_mb / target_size_mb > 10:
+                    logger.info(f"Large file detected({
+                                metadata.size_mb: .2f}MB), attempting two-pass compression")
+                    if self._two_pass_compression(input_path, output_path, target_size_mb, metadata):
                         return True
+                    logger.info(
+                        "Two-pass compression unsuccessful, falling back to standard compression")
 
-                attempt += 1
+                # Create working copy in temp directory
+                temp_input = self._get_temp_path(input_path)
+                shutil.copy2(input_path, temp_input)
 
-            # If we have a best result but didn't hit target, use it anyway
-            if best_result and best_result.exists():
-                shutil.move(best_result, output_path)
-                logger.warning(
-                    f"Could not reach target size of {target_size_mb}MB. Best achieved: {best_size:.2f}MB")
-                return True
+                attempt = 0
+                current_size = metadata.size_mb
+                best_result = None
+                best_size = float('inf')
 
-            return False
+                # Initial scale based on resolution and target size
+                scale = self._calculate_initial_scale(metadata, target_size_mb)
+                crf = self._calculate_initial_crf(metadata, target_size_mb)
+
+                while attempt < self.max_compression_attempts and current_size > target_size_mb:
+                    temp_output = self._get_temp_path(
+                        input_path, f"_attempt_{attempt}")
+
+                    # Calculate compression parameters
+                    target_bitrate = self._calculate_target_bitrate(
+                        target_size_mb, metadata.duration)
+
+                    # Try compression with current parameters
+                    success = self._compress_attempt(
+                        temp_input, temp_output, metadata, target_bitrate, scale, crf
+                    )
+
+                    if success and temp_output.exists():
+                        current_size = temp_output.stat().st_size / (1024 * 1024)
+
+                        # Update best result if this attempt is better
+                        if current_size < best_size:
+                            if best_result and best_result.exists():
+                                best_result.unlink()
+                            best_result = temp_output
+                            best_size = current_size
+
+                        # Adjust parameters for next attempt if needed
+                        if current_size > target_size_mb:
+                            scale, crf = self._adjust_parameters(
+                                scale, crf, current_size, target_size_mb
+                            )
+                            # Use the current best result as input for next attempt
+                            if best_result and best_result.exists():
+                                shutil.copy2(best_result, temp_input)
+                        else:
+                            # Target reached
+                            shutil.move(best_result, output_path)
+                            return True
+
+                    attempt += 1
+
+                # If we have a best result but didn't hit target, use it anyway
+                if best_result and best_result.exists():
+                    shutil.move(best_result, output_path)
+                    logger.warning(
+                        f"Could not reach target size of {target_size_mb}MB. Best achieved: {best_size:.2f}MB")
+                    return True
+
+                return False
 
         except VideoProcessingError as e:
             logger.error(f"Video processing error: {e}")
@@ -882,3 +913,19 @@ class VideoProcessor:
             8000
 
         return max(min_bitrate, min(target_bitrate, max_bitrate))
+
+    def _get_encoder_threads(self) -> int:
+        """Get safe number of encoder threads."""
+        return self.resource_monitor.get_safe_thread_count()
+
+    def _build_ffmpeg_command(self, input_path: Path, output_path: Path, settings: Dict) -> List[str]:
+        """Build FFmpeg command with resource-aware thread count."""
+        thread_count = self._get_encoder_threads()
+
+        cmd = [
+            'ffmpeg',
+            '-i', str(input_path),
+            '-threads', str(thread_count),
+            # ...rest of existing command building code...
+        ]
+        return cmd

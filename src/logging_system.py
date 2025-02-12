@@ -217,18 +217,23 @@ class WindowsConsoleHandler(logging.StreamHandler):
             self.handleError(record)
 
 
-def setup_logger(debug_mode: bool = False, log_rotation_size: int = 10485760,
+def setup_logger(debug_mode: bool = False, verbose_mode: bool = False,
+                 log_rotation_size: int = 10485760,
                  backup_count: int = 5) -> logging.Logger:
-    # Create root logger only if it doesn't exist
-    root_logger = logging.getLogger()
+    """Setup enhanced logging system with verbose debug support."""
+    # Clear existing log files
+    for log_file in [LOG_FILE, FFPMEG_LOG_FILE, LOG_DIR / 'debug.log']:
+        if log_file.exists():
+            log_file.unlink()
 
-    # Clear existing handlers to prevent duplicates
+    root_logger = logging.getLogger()
     root_logger.handlers.clear()
 
-    # Set the level only once
-    root_logger.setLevel(logging.DEBUG if debug_mode else logging.INFO)
+    # Set base level based on debug flag
+    base_level = logging.DEBUG if debug_mode else logging.INFO
+    root_logger.setLevel(base_level)
 
-    # Use a set to track handler names and prevent duplicates
+    # Use a set to track handler names
     handler_names = set()
 
     def add_handler(handler, name):
@@ -236,27 +241,52 @@ def setup_logger(debug_mode: bool = False, log_rotation_size: int = 10485760,
             root_logger.addHandler(handler)
             handler_names.add(name)
 
-    # Console handler
+    # Console handler with color formatting
     console_handler = WindowsConsoleHandler()
-    console_handler.setFormatter(ColorFormatter('%(levelname)s: %(message)s'))
+    if verbose_mode:
+        # Detailed format for verbose mode
+        formatter = ColorFormatter(
+            '%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
+        )
+    else:
+        # Simple format for normal mode
+        formatter = ColorFormatter('%(levelname)s: %(message)s')
+
+    console_handler.setFormatter(formatter)
     console_handler.setLevel(logging.DEBUG if debug_mode else logging.INFO)
     add_handler(console_handler, 'console')
 
-    # File handler
+    # Debug file handler for verbose logging
+    if verbose_mode:
+        debug_handler = RotatingFileHandler(
+            LOG_DIR / 'debug.log',
+            max_bytes=log_rotation_size,
+            backup_count=backup_count
+        )
+        debug_handler.setFormatter(logging.Formatter(
+            '%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - '
+            '%(funcName)s - %(message)s'
+        ))
+        debug_handler.setLevel(logging.DEBUG)
+        add_handler(debug_handler, 'debug_file')
+
+    # Regular file handler
     file_handler = RotatingFileHandler(
         LOG_FILE,
         max_bytes=log_rotation_size,
         backup_count=backup_count
     )
     file_handler.setFormatter(logging.Formatter(
-        '%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'))
-    file_handler.setLevel(logging.DEBUG)
+        # Fixed levelname
+        '%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
+    ))
+    file_handler.setLevel(logging.DEBUG if debug_mode else logging.INFO)
     add_handler(file_handler, 'file')
 
-    # FFmpeg handler (keep separate from root logger)
+    # Set up FFmpeg logger with stream capture
     ffmpeg_logger = logging.getLogger('ffmpeg')
     ffmpeg_logger.handlers.clear()
-    ffmpeg_logger.propagate = False  # Prevent propagation to root logger
+    ffmpeg_logger.propagate = False
 
     ffmpeg_handler = RotatingFileHandler(
         FFPMEG_LOG_FILE,
@@ -264,14 +294,29 @@ def setup_logger(debug_mode: bool = False, log_rotation_size: int = 10485760,
         backup_count=backup_count
     )
     ffmpeg_handler.setFormatter(logging.Formatter(
-        '%(asctime)s - %(levelname)s - %(message)s'))
+        '%(asctime)s - %(levelname)s - %(message)s'
+    ))
     ffmpeg_logger.addHandler(ffmpeg_handler)
+    ffmpeg_logger.setLevel(logging.DEBUG if verbose_mode else logging.INFO)
 
-    # Set up exception hook
-    sys.excepthook = log_exception
+    # Redirect FFmpeg output
+    os.environ['FFMPEG_LOG_CAPTURE'] = '1'
+    os.environ['FFMPEG_LOG_LEVEL'] = 'debug' if verbose_mode else 'info'
+    os.environ['FFMPEG_LOG_FILE'] = str(FFPMEG_LOG_FILE)
 
     logger = logging.getLogger(__name__)
     logger.success("Logging system initialized successfully")
+
+    if verbose_mode:
+        logger.debug("Verbose debug logging enabled")
+        # Log system info in verbose mode
+        import platform
+        import psutil
+        logger.debug(f"System: {platform.system()} {platform.release()}")
+        logger.debug(f"Python: {platform.python_version()}")
+        logger.debug(f"CPU Cores: {psutil.cpu_count()}")
+        logger.debug(
+            f"Memory: {psutil.virtual_memory().total / (1024**3):.1f}GB")
 
     return logger
 
@@ -285,28 +330,19 @@ def log_exception(exc_type, exc_value, exc_traceback):
                      exc_info=(exc_type, exc_value, exc_traceback))
 
 
-def run_ffmpeg_command(command: list, timeout: Optional[int] = None) -> bool:
+def run_ffmpeg_command(command: list) -> bool:
+    """Run FFmpeg command without timeout."""
     ffmpeg_logger = logging.getLogger('ffmpeg')
     current_dir = os.getcwd()
 
     try:
-        # Run command without timeout for gifsicle commands
-        if 'gifsicle' in command[0]:
-            process = subprocess.run(command, capture_output=True, text=True)
-            return process.returncode == 0
-
-        # Use timeout only for FFmpeg commands
-        process = subprocess.run(
-            command, timeout=timeout, capture_output=True, text=True)
+        process = subprocess.run(command, capture_output=True, text=True)
 
         if process.stderr:
             ffmpeg_logger.debug(process.stderr)
 
         return process.returncode == 0
 
-    except subprocess.TimeoutExpired:
-        ffmpeg_logger.error("Command timed out")
-        return False
     except Exception as e:
         ffmpeg_logger.error(f"Command failed: {e}")
         return False

@@ -7,6 +7,7 @@ from pathlib import Path
 # Use relative imports since we're in the src package
 from .default_config import (GIF_PASS_OVERS, INPUT_DIR, LOG_DIR, OUTPUT_DIR,
                              TEMP_FILE_DIR, GIF_COMPRESSION, VIDEO_COMPRESSION)
+# Changed from "from gif_optimization import GIFProcessor"
 from .gif_optimization import GIFProcessor
 from .gpu_acceleration import setup_gpu_acceleration
 from .logging_system import setup_logger
@@ -37,6 +38,8 @@ def parse_arguments() -> argparse.Namespace:
                         help='Custom input directory')
     parser.add_argument('--output-dir', type=Path,
                         help='Custom output directory')
+    parser.add_argument('--verbose', action='store_true',
+                        help='Enable verbose debug logging')
     return parser.parse_args()
 
 
@@ -92,15 +95,9 @@ def process_failed_items(failed_files: list[Path], pass_over_index: int) -> list
 
 
 def setup_logging():
-    """Setup enhanced logging configuration."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s: %(message)s',
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler('video_processing.log', encoding='utf-8')
-        ]
-    )
+    """Remove standalone video_processing.log setup."""
+    # Remove this entire function as we're using the logging_system module
+    pass
 
 
 def process_videos(input_dir: Path, output_dir: Path) -> None:
@@ -136,10 +133,10 @@ def process_videos(input_dir: Path, output_dir: Path) -> None:
 
 
 def main() -> None:
-    setup_logging()
-    logging.info("Starting video processing")
-
     args = parse_arguments()
+
+    # Setup enhanced logging using the logging_system module
+    logger = setup_logger(debug_mode=args.debug, verbose_mode=args.verbose)
 
     # Initialize directories
     input_dir = args.input_dir or INPUT_DIR
@@ -148,16 +145,13 @@ def main() -> None:
     for directory in [input_dir, output_dir, LOG_DIR, TEMP_FILE_DIR]:
         directory.mkdir(parents=True, exist_ok=True)
 
-    # Setup logging and get the main logger
-    logger = setup_logger(args.debug)
-
     try:
         if not verify_dependencies():
             sys.exit(1)
 
         gpu_supported = False if args.no_gpu else setup_gpu_acceleration()
 
-        # Modified video processing section
+        # Process videos with shared logging
         logger.info("Processing videos...")
         process_videos(input_dir, output_dir)
 
