@@ -4,13 +4,15 @@ import signal
 import sys
 from pathlib import Path
 
-from default_config import (GIF_PASS_OVERS, INPUT_DIR, LOG_DIR, OUTPUT_DIR,
-                            TEMP_FILE_DIR, GIF_COMPRESSION, VIDEO_COMPRESSION)
-from gif_optimization import GIFProcessor
-from gpu_acceleration import setup_gpu_acceleration
-from logging_system import setup_logger
-from temp_file_manager import TempFileManager
-from video_optimization import VideoProcessor
+# Use relative imports since we're in the src package
+from .default_config import (GIF_PASS_OVERS, INPUT_DIR, LOG_DIR, OUTPUT_DIR,
+                             TEMP_FILE_DIR, GIF_COMPRESSION, VIDEO_COMPRESSION)
+from .gif_optimization import GIFProcessor
+from .gpu_acceleration import setup_gpu_acceleration
+from .logging_system import setup_logger
+from .temp_file_manager import TempFileManager
+from .video_optimization import VideoProcessor
+from .utils.error_handler import VideoProcessingError
 
 
 def signal_handler(signum, frame):
@@ -89,7 +91,54 @@ def process_failed_items(failed_files: list[Path], pass_over_index: int) -> list
     return remaining_failed
 
 
+def setup_logging():
+    """Setup enhanced logging configuration."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s: %(message)s',
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler('video_processing.log', encoding='utf-8')
+        ]
+    )
+
+
+def process_videos(input_dir: Path, output_dir: Path) -> None:
+    """Process videos with enhanced error handling."""
+    processor = VideoProcessor(use_gpu=True)
+
+    try:
+        # Ensure directories exist
+        input_dir.mkdir(exist_ok=True)
+        output_dir.mkdir(exist_ok=True)
+
+        # Check GPU availability
+        if processor.gpu_available:
+            logging.info("GPU acceleration enabled")
+        else:
+            logging.warning("GPU acceleration not available, using CPU")
+
+        # Process videos
+        failed_files = processor.process_videos(
+            input_dir, output_dir, target_size_mb=15.0)
+
+        if failed_files:
+            logging.warning(f"Failed to process {len(failed_files)} files:")
+            for file in failed_files:
+                logging.warning(f"  - {file}")
+
+    except VideoProcessingError as e:
+        logging.error(f"Video processing error: {e}")
+        sys.exit(1)
+    except Exception as e:
+        logging.error(f"Fatal error: {e}")
+        sys.exit(1)
+
+
 def main() -> None:
+    setup_logging()
+    logging.info("Starting video processing")
+
     args = parse_arguments()
 
     # Initialize directories
@@ -110,19 +159,7 @@ def main() -> None:
 
         # Modified video processing section
         logger.info("Processing videos...")
-        video_processor = VideoProcessor(use_gpu=gpu_supported)
-        failed_videos = video_processor.process_videos(
-            input_dir=input_dir,
-            output_dir=output_dir,
-            target_size_mb=VIDEO_COMPRESSION['min_size_mb']
-        )
-
-        if failed_videos:
-            logger.warning(f"Failed to process {len(failed_videos)} videos:")
-            for video in failed_videos:
-                logger.warning(f"  - {video}")
-        else:
-            logger.success("All videos processed successfully")
+        process_videos(input_dir, output_dir)
 
         logger.info("Processing GIFs...")
         gif_processor = GIFProcessor()
@@ -135,7 +172,7 @@ def main() -> None:
         else:
             logger.success("All gifs processed successfully")
 
-        failed_files = failed_videos + failed_gifs
+        failed_files = failed_gifs
 
         # Try multiple passes with different compression settings
         for i, _ in enumerate(GIF_PASS_OVERS):

@@ -58,8 +58,8 @@ DisDrop is a powerful tool designed to compress and optimize videos and GIFs, en
 
 1. Clone this repository:
    ```bash
-   git clone <repository-url>
-   cd <repository-name>
+   git clone <[repository-url](https://github.com/0-FoxHunt-0/disdrop.git)>
+   cd <disdrop>
    ```
 2. Install dependencies:
    ```bash

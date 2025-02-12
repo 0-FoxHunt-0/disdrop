@@ -9,7 +9,7 @@ from functools import partial, wraps
 from pathlib import Path
 from typing import Optional, TextIO, Union
 
-from default_config import FFPMEG_LOG_FILE, LOG_DIR, LOG_FILE, TEMP_FILE_DIR
+from .default_config import FFPMEG_LOG_FILE, LOG_DIR, LOG_FILE, TEMP_FILE_DIR
 
 # Add custom log levels
 SUCCESS_LEVEL = 25  # Between INFO and WARNING
@@ -74,11 +74,11 @@ class ColorFormatter(logging.Formatter):
         if isinstance(record.msg, str):
             # Replace Unicode characters with ASCII alternatives
             record.msg = (record.msg.replace('→', '->')
-                                  .replace('⟶', '-->')
-                                  .replace('←', '<-')
-                                  .replace('⟵', '<--')
-                                  .replace('↔', '<->')
-                                  .replace('⟷', '<-->'))
+                          .replace('⟶', '-->')
+                          .replace('←', '<-')
+                          .replace('⟵', '<--')
+                          .replace('↔', '<->')
+                          .replace('⟷', '<-->'))
 
         # Apply color
         color = self.COLORS.get(record.levelname, self.default_color)
@@ -191,6 +191,7 @@ def ensure_log_directories():
 
 class WindowsConsoleHandler(logging.StreamHandler):
     """Custom handler that safely handles Unicode characters in Windows console."""
+
     def __init__(self):
         super().__init__()
         # Use utf-8 encoding for output
@@ -295,11 +296,12 @@ def run_ffmpeg_command(command: list, timeout: Optional[int] = None) -> bool:
             return process.returncode == 0
 
         # Use timeout only for FFmpeg commands
-        process = subprocess.run(command, timeout=timeout, capture_output=True, text=True)
-        
+        process = subprocess.run(
+            command, timeout=timeout, capture_output=True, text=True)
+
         if process.stderr:
             ffmpeg_logger.debug(process.stderr)
-            
+
         return process.returncode == 0
 
     except subprocess.TimeoutExpired:

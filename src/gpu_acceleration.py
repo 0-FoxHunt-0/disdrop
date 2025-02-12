@@ -4,7 +4,7 @@
 import logging
 import subprocess
 
-from logging_system import log_function_call
+from .logging_system import log_function_call
 
 
 @log_function_call

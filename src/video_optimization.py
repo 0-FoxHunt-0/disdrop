@@ -4,7 +4,8 @@ import shutil
 import subprocess
 import threading
 import time
-import signal  # Add this import
+import signal
+import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
@@ -13,11 +14,13 @@ from queue import Empty, Queue
 from threading import Event, Thread
 from typing import Dict, List, Optional, Tuple, Union
 
-import temp_file_manager
-from default_config import (INPUT_DIR, OUTPUT_DIR, SUPPORTED_VIDEO_FORMATS,
-                            TEMP_FILE_DIR, VIDEO_COMPRESSION, VIDEO_SETTINGS)
-from logging_system import log_function_call, run_ffmpeg_command
-from temp_file_manager import TempFileManager
+# Updated imports with correct paths
+from .default_config import (INPUT_DIR, OUTPUT_DIR, SUPPORTED_VIDEO_FORMATS,
+                             TEMP_FILE_DIR, VIDEO_COMPRESSION, VIDEO_SETTINGS)
+from .logging_system import log_function_call, run_ffmpeg_command
+from .temp_file_manager import TempFileManager
+from .utils.video_dimensions import get_video_dimensions
+from .utils.error_handler import validate_video_file, retry_video_processing, VideoProcessingError
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +155,7 @@ class VideoProcessor:
         self.extreme_compression_threshold = 1.2
         self.target_size_mb = VIDEO_COMPRESSION['min_size_mb']  # Add this line
         self._setup_encoder()
+        self.dimension_cache = {}
 
     def _setup_encoder(self):
         if self.gpu_available and self.settings['gpu']['enabled']:
@@ -188,12 +192,12 @@ class VideoProcessor:
                 if output_path.exists():
                     existing_size = output_path.stat().st_size / (1024 * 1024)
                     if existing_size <= target_size_mb:
-                        logger.info(f"Skipping {video_file.name}: Already compressed version exists ({
-                                    existing_size:.2f}MB)")
+                        logger.info(f"Skipping {video_file.name}: Already compressed version exists({
+                                    existing_size: .2f}MB)")
                         continue
                     else:
-                        logger.info(f"Existing compressed version ({
-                                    existing_size:.2f}MB) exceeds target size ({target_size_mb}MB), recompressing")
+                        logger.info(f"Existing compressed version({
+                                    existing_size: .2f}MB) exceeds target size({target_size_mb}MB), recompressing")
 
                 logger.info(
                     f"Processing {idx}/{total_files}: {video_file.name} ({original_size:.2f}MB)")
@@ -204,17 +208,22 @@ class VideoProcessor:
                     final_size = output_path.stat().st_size / (1024 * 1024)
                     reduction = ((original_size - final_size) /
                                  original_size) * 100
-                    logger.success(f"Compressed {video_file.name}: {original_size:.2f}MB to {
-                                   final_size:.2f}MB ({reduction:.1f}% reduction)")
+                    logger.success(f"Compressed {video_file.name}: {original_size: .2f}MB to {
+                                   final_size: .2f}MB({reduction: .1f} % reduction)")
             except Exception as e:
                 logger.error(f"Failed to process {video_file}: {e}")
                 failed_files.append(video_file)
 
         return failed_files
 
+    @retry_video_processing
     def _process_single_video(self, input_path: Path, output_path: Path, target_size_mb: float) -> bool:
         """Process a single video with dynamic quality adjustment."""
         try:
+            if not validate_video_file(str(input_path)):
+                raise VideoProcessingError(
+                    "Video validation failed", str(input_path))
+
             logger.info(f"Analyzing video metadata for {input_path.name}")
             metadata = self.get_video_metadata(input_path)
             if not metadata:
@@ -223,14 +232,14 @@ class VideoProcessor:
             # Adjust tolerance based on original file size
             size_tolerance = self._get_size_tolerance(metadata.size_mb)
             logger.debug(f"Video info: {metadata.width}x{metadata.height}, {
-                         metadata.frame_rate}fps, {metadata.duration:.1f}s")
-            logger.debug(f"Target size: {target_size_mb}MB (tolerance: {
-                         size_tolerance*100:.1f}%)")
+                         metadata.frame_rate}fps, {metadata.duration: .1f}s")
+            logger.debug(f"Target size: {target_size_mb}MB(tolerance: {
+                         size_tolerance*100: .1f} % )")
 
             # For very large files, try two-pass encoding first
             if metadata.size_mb > 100 and metadata.size_mb / target_size_mb > 10:
-                logger.info(f"Large file detected ({
-                            metadata.size_mb:.2f}MB), attempting two-pass compression")
+                logger.info(f"Large file detected({
+                            metadata.size_mb: .2f}MB), attempting two-pass compression")
                 if self._two_pass_compression(input_path, output_path, target_size_mb, metadata):
                     return True
                 logger.info(
@@ -296,6 +305,9 @@ class VideoProcessor:
 
             return False
 
+        except VideoProcessingError as e:
+            logger.error(f"Video processing error: {e}")
+            return False
         except Exception as e:
             logger.exception(f"Processing failed for {input_path}: {e}")
             return False
@@ -346,22 +358,22 @@ class VideoProcessor:
             # Allow higher CRF for final compression
             new_crf = min(current_crf + 3, 38)
             logger.debug(f"Close to target, using extreme compression: scale={
-                         new_scale:.2f}, crf={new_crf}")
+                         new_scale: .2f}, crf={new_crf}")
         elif size_ratio > 2:
             new_scale = max(self.min_scale, current_scale * 0.8)
             new_crf = min(current_crf + 4, 35)
             logger.debug(f"Size ratio > 2, aggressive adjustment: scale={
-                         new_scale:.2f}, crf={new_crf}")
+                         new_scale: .2f}, crf={new_crf}")
         elif size_ratio > 1.5:
             new_scale = max(self.min_scale, current_scale * 0.9)
             new_crf = min(current_crf + 2, 32)
             logger.debug(f"Size ratio > 1.5, moderate adjustment: scale={
-                         new_scale:.2f}, crf={new_crf}")
+                         new_scale: .2f}, crf={new_crf}")
         else:
             new_scale = max(self.min_scale, current_scale * 0.95)
             new_crf = min(current_crf + 1, 30)
             logger.debug(f"Size ratio <= 1.5, fine adjustment: scale={
-                         new_scale:.2f}, crf={new_crf}")
+                         new_scale: .2f}, crf={new_crf}")
 
         return new_scale, new_crf
 
@@ -669,18 +681,20 @@ class VideoProcessor:
 
     # Helper methods with better error handling
     def _get_dimensions(self, video_path: Path) -> Tuple[Optional[int], Optional[int]]:
+        """Get video dimensions using new utility with caching."""
+        cache_key = str(video_path)
+        if cache_key in self.dimension_cache:
+            return self.dimension_cache[cache_key]
+
         try:
-            command = [
-                'ffprobe', '-v', 'error', '-select_streams', 'v:0',
-                '-show_entries', 'stream=width,height', '-of', 'csv=s=x:p=0',
-                str(video_path)
-            ]
-            output = subprocess.check_output(command, text=True).strip()
-            width, height = map(int, output.split('x'))
-            return width, height
+            dimensions = get_video_dimensions(str(video_path))
+            if dimensions:
+                self.dimension_cache[cache_key] = dimensions
+                return dimensions
         except Exception as e:
-            logger.error(f"Failed to get dimensions: {e}")
-            return None, None
+            logger.error(f"Failed to get dimensions for {video_path}: {e}")
+
+        return None, None
 
     def _get_frame_rate(self, video_path: Path) -> float:
         command = [
