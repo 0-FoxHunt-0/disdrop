@@ -3099,3 +3099,254 @@ def process_gifs(compression_settings: Optional[Dict[str, Any]] = None) -> List[
 
     loop = asyncio.get_event_loop()
     return loop.run_until_complete(process_all_async())
+
+
+# Add new quality control constants
+QUALITY_THRESHOLDS = {
+    'min_scale_factor': 0.2,  # Never scale below 20% of original size
+    'min_colors': 32,         # Minimum allowable colors
+    'max_lossy': 100,         # Maximum lossy compression value
+    'min_dimension': 64,      # Minimum dimension in pixels
+    'min_fps': 5,            # Minimum frames per second
+    'acceptable_overshoot': 1.1,  # Allow 10% over target size
+}
+
+# Add optimization strategy constants
+OPTIMIZATION_STRATEGIES = {
+    'quality_steps': [
+        # format: (scale_factor, colors, lossy, dither_mode)
+        (1.0, 256, 20, 'floyd_steinberg'),   # High quality
+        (0.9, 192, 30, 'floyd_steinberg'),   # Good quality
+        (0.8, 128, 40, 'sierra2'),           # Balanced
+        (0.7, 96, 60, 'bayer'),              # Reduced quality
+        (0.5, 64, 80, 'bayer'),              # Low quality
+        (0.3, 48, 90, 'bayer'),              # Very low quality
+        (0.2, 32, 100, 'bayer')              # Minimum quality
+    ],
+    'frame_reduction_steps': [1, 2, 3, 4],   # Frame skipping steps
+    'temporal_strategies': ['background', 'previous', 'none']
+}
+
+
+class OptimizationResult(NamedTuple):
+    """Enhanced result tracking with size and quality metrics"""
+    size: float
+    target_met: bool
+    settings: Dict
+    quality_score: float
+    warning: Optional[str] = None
+
+# Add new optimization controller
+
+
+class OptimizationController:
+    """Controls optimization process with quality limits"""
+
+    def __init__(self, target_size_mb: float):
+        self.target_size_mb = target_size_mb
+        self.best_result = None
+        self.quality_score = float('inf')
+        self.attempts = []
+
+    def evaluate_result(self, result_size: float, settings: Dict) -> OptimizationResult:
+        """Evaluate optimization result with quality metrics"""
+        quality_score = self._calculate_quality_score(settings)
+        target_met = result_size <= self.target_size_mb
+
+        warning = None
+        if not target_met and settings['scale_factor'] <= QUALITY_THRESHOLDS['min_scale_factor']:
+            warning = "Cannot reach target size without going below minimum quality"
+
+        result = OptimizationResult(
+            size=result_size,
+            target_met=target_met,
+            settings=settings,
+            quality_score=quality_score,
+            warning=warning
+        )
+
+        # Track best result even if target not met
+        if not self.best_result or result_size < self.best_result.size:
+            self.best_result = result
+
+        return result
+
+    def _calculate_quality_score(self, settings: Dict) -> float:
+        """Calculate quality score (0-1, higher is better)"""
+        scale_weight = 0.4
+        color_weight = 0.3
+        lossy_weight = 0.3
+
+        scale_score = settings['scale_factor']
+        color_score = settings['colors'] / 256
+        lossy_score = 1 - (settings['lossy_value'] / 100)
+
+        return (scale_score * scale_weight +
+                color_score * color_weight +
+                lossy_score * lossy_weight)
+
+    def should_continue(self, current_settings: Dict) -> bool:
+        """Determine if optimization should continue"""
+        # Stop if we've hit minimum thresholds
+        if (current_settings['scale_factor'] <= QUALITY_THRESHOLDS['min_scale_factor'] or
+                current_settings['colors'] <= QUALITY_THRESHOLDS['min_colors']):
+            return False
+
+        return True
+
+    def get_next_settings(self, current_result: OptimizationResult) -> Optional[Dict]:
+        """Get next optimization settings based on results"""
+        current_size = current_result.size
+        size_ratio = current_size / self.target_size_mb
+
+        # If very close to target, make small adjustments
+        if 1.0 < size_ratio < QUALITY_THRESHOLDS['acceptable_overshoot']:
+            return self._fine_tune_settings(current_result.settings)
+
+        # Find next quality step down
+        return self._get_next_quality_step(current_result.settings, size_ratio)
+
+    def _fine_tune_settings(self, settings: Dict) -> Dict:
+        """Make small adjustments to nearly-good-enough settings"""
+        new_settings = settings.copy()
+
+        # Try small color reduction first
+        if settings['colors'] > QUALITY_THRESHOLDS['min_colors'] + 16:
+            new_settings['colors'] = max(
+                QUALITY_THRESHOLDS['min_colors'],
+                settings['colors'] - 16
+            )
+            return new_settings
+
+        # Then try small lossy increase
+        if settings['lossy_value'] < QUALITY_THRESHOLDS['max_lossy'] - 5:
+            new_settings['lossy_value'] = min(
+                QUALITY_THRESHOLDS['max_lossy'],
+                settings['lossy_value'] + 5
+            )
+            return new_settings
+
+        # Finally, try small scale reduction
+        if settings['scale_factor'] > QUALITY_THRESHOLDS['min_scale_factor'] + 0.05:
+            new_settings['scale_factor'] = max(
+                QUALITY_THRESHOLDS['min_scale_factor'],
+                settings['scale_factor'] - 0.05
+            )
+            return new_settings
+
+        return None
+
+    def _get_next_quality_step(self, settings: Dict, size_ratio: float) -> Optional[Dict]:
+        """Get next quality step based on how far we are from target"""
+        current_quality = next(
+            (i for i, step in enumerate(OPTIMIZATION_STRATEGIES['quality_steps'])
+             if step[0] == settings['scale_factor']
+             and step[1] == settings['colors']),
+            0
+        )
+
+        # Skip more steps if we're very far from target
+        steps_to_skip = min(3, int(size_ratio - 1))
+        next_quality = current_quality + steps_to_skip
+
+        if next_quality < len(OPTIMIZATION_STRATEGIES['quality_steps']):
+            scale, colors, lossy, dither = OPTIMIZATION_STRATEGIES['quality_steps'][next_quality]
+            return {
+                'scale_factor': scale,
+                'colors': colors,
+                'lossy_value': lossy,
+                'dither_mode': dither
+            }
+
+        return None
+
+# Update GIF optimization class
+
+
+class GIFOptimizer(FileProcessor):
+    """Enhanced GIF optimization with better quality control"""
+
+    def __init__(self, compression_settings: Dict = None):
+        # ...existing initialization...
+
+        self.frame_analyzer = FrameAnalyzer()
+        self.warnings = []
+
+    def optimize_gif(self, input_path: Path, output_path: Path, target_size_mb: float) -> Tuple[float, bool]:
+        """Main optimization method with quality control"""
+        controller = OptimizationController(target_size_mb)
+
+        # Start with highest quality settings
+        current_settings = self._get_initial_settings(input_path)
+
+        while True:
+            # Apply current settings
+            result_size = self._apply_optimization(
+                input_path, output_path, current_settings)
+
+            # Evaluate result
+            result = controller.evaluate_result(result_size, current_settings)
+
+            # Log progress
+            self._log_optimization_progress(result)
+
+            if result.target_met:
+                return result_size, True
+
+            if result.warning:
+                self.warnings.append(result.warning)
+                # Use best result if we can't meet target
+                if controller.best_result:
+                    best = controller.best_result
+                    self._apply_optimization(
+                        input_path, output_path, best.settings)
+                    return best.size, False
+
+            # Get next settings
+            next_settings = controller.get_next_settings(result)
+            if not next_settings or not controller.should_continue(next_settings):
+                # Use best result if we can't continue
+                if controller.best_result:
+                    best = controller.best_result
+                    self._apply_optimization(
+                        input_path, output_path, best.settings)
+                    return best.size, False
+                return result_size, False
+
+            current_settings = next_settings
+
+    def _get_initial_settings(self, input_path: Path) -> Dict:
+        """Get initial settings based on input analysis"""
+        analysis = self.frame_analyzer.analyze_file(input_path)
+
+        # Start with highest quality settings
+        settings = {
+            'scale_factor': 1.0,
+            'colors': 256,
+            'lossy_value': 20,
+            'dither_mode': 'floyd_steinberg'
+        }
+
+        # Adjust based on analysis
+        if analysis.complexity < 0.3:
+            settings['colors'] = 192  # Less complex images need fewer colors
+
+        if analysis.motion_score < 0.2:
+            settings['fps'] = max(QUALITY_THRESHOLDS['min_fps'],
+                                  int(analysis.motion_score * 30))
+
+        return settings
+
+    def _log_optimization_progress(self, result: OptimizationResult) -> None:
+        """Log optimization progress with quality metrics"""
+        quality_percent = int(result.quality_score * 100)
+        self.dev_logger.info(
+            f"Size: {result.size:.2f}MB, "
+            f"Quality: {quality_percent}%, "
+            f"Settings: scale={result.settings['scale_factor']:.2f}, "
+            f"colors={result.settings['colors']}, "
+            f"lossy={result.settings['lossy_value']}"
+        )
+
+        if result.warning:
+            self.dev_logger.warning(result.warning)

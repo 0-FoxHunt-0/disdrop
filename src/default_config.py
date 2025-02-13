@@ -13,7 +13,7 @@ INPUT_DIR = BASE_DIR / 'input'
 OUTPUT_DIR = BASE_DIR / 'output'
 LOG_DIR = BASE_DIR / 'logs'
 # Temporary directory for storing intermediate files
-TEMP_FILE_DIR = BASE_DIR / 'temp_files'
+TEMP_FILE_DIR = BASE_DIR / 'temp'  # Changed from 'temp_files' to 'temp'
 
 # Ensure that the directories exist
 for directory in [INPUT_DIR, OUTPUT_DIR, LOG_DIR, TEMP_FILE_DIR]:
