@@ -1,42 +1,50 @@
+from itertools import chain
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import logging
 import os
 import queue
-import re  # Add this import at the top
+import re
 import shutil
 import signal
 import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed, ProcessPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
-from functools import wraps  # Add this import
+from functools import wraps
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union, Callable, Generator
 import psutil
 import traceback
 import json
 from cachetools import TTLCache
-import cv2  # Add this import at the top with other imports
+import cv2
 import ctypes
 import gc
 from typing import NamedTuple
 from functools import lru_cache
 import asyncio
-from contextlib import asynccontextmanager
-import numpy as np  # Add at top with other imports
+from contextlib import contextmanager, asynccontextmanager  # Fix the import error
+import numpy as np
+from PIL import Image, ImageSequence
+import io
 
 # Fix the imports to use absolute paths since this is imported from main.py
 from src.default_config import (GIF_COMPRESSION, GIF_PASS_OVERS, GIF_SIZE_TO_SKIP,
                                 INPUT_DIR, OUTPUT_DIR, SUPPORTED_VIDEO_FORMATS,
                                 TEMP_FILE_DIR)
-from src.logging_system import log_function_call, run_ffmpeg_command
+from src.logging_system import log_function_call
 from src.temp_file_manager import TempFileManager
 from src.video_optimization import VideoProcessor
 from src.utils.error_handler import VideoProcessingError
 from src.utils.video_dimensions import get_video_dimensions
 from .utils.resource_manager import ResourceMonitor, ResourceGuard
+from .utils.ffmpeg_handler import run_ffmpeg_command, ffmpeg_handler
+
+# Setup logger
+logger = logging.getLogger(__name__)
 
 
 class OptimizationConfig(NamedTuple):
@@ -550,8 +558,7 @@ class GIFOptimizer(FileProcessor):
             try:
                 directory.mkdir(parents=True, exist_ok=True)
             except Exception as e:
-                self.dev_logger.error(
-                    f"Failed to create directory {directory}: {e}")
+                logger.error(f"Failed to create directory {directory}: {e}")
                 raise
 
 
@@ -749,6 +756,7 @@ class GIFProcessor(GIFOptimizer):
                     self.user_logger.success(message)
                 self.processed_files.add(log_key)
 
+    @log_function_call
     def create_gif(self, file_path: Path, output_path: Path,
                    fps: int, dimensions: Tuple[int, int]) -> bool:
         """Create optimized GIF with better performance."""
@@ -1191,6 +1199,7 @@ class GIFProcessor(GIFOptimizer):
 
     # ...rest of the code...
 
+    @log_function_call
     def _compress_large_gif(self, gif_path: Path) -> None:
         """Additional compression for large GIFs."""
         temp_path = None
@@ -1221,24 +1230,24 @@ class GIFProcessor(GIFOptimizer):
                     try:
                         gif_path.unlink()
                         temp_path.replace(gif_path)
-                        self.dev_logger.success(
+                        logger.success(
                             f"Additional compression succeeded: {original_size:.2f}MB -> {compressed_size:.2f}MB"
                         )
                     except Exception as e:
-                        self.dev_logger.error(f"Failed to replace file: {e}")
+                        logger.error(f"Failed to replace file: {e}")
                 else:
-                    self.dev_logger.skip(
+                    logger.skip(
                         f"Additional compression skipped - no size reduction achieved"
                     )
 
         except Exception as e:
-            self.dev_logger.error(f"Additional compression failed: {str(e)}")
+            logger.error(f"Additional compression failed: {str(e)}")
         finally:
             if temp_path and temp_path.exists():
                 try:
                     temp_path.unlink()
                 except Exception as e:
-                    self.dev_logger.error(f"Failed to cleanup temp file: {e}")
+                    logger.error(f"Failed to cleanup temp file: {e}")
 
     def _ensure_worker_threads(self):
         """Ensure worker threads are running."""
@@ -1791,6 +1800,7 @@ class GIFProcessor(GIFOptimizer):
                 self._processing_cancelled.is_set() or
                 self._shutdown_initiated)
 
+    @log_function_call
     def create_gif(self, file_path: Path, output_path: Path,
                    fps: int, dimensions: Tuple[int, int]) -> bool:
         """Create optimized GIF with enhanced compression."""
@@ -1798,7 +1808,7 @@ class GIFProcessor(GIFOptimizer):
             # Initial size check
             original_size = self.get_file_size(file_path)
             if original_size > 1000:  # If source is larger than 1GB
-                self.dev_logger.error(
+                logger.error(
                     f"Source file too large: {original_size:.2f}MB")
                 return False
 
@@ -1859,7 +1869,7 @@ class GIFProcessor(GIFOptimizer):
                         self._compress_large_gif(output_path)
                         final_size = self.get_file_size(output_path)
 
-                    self.dev_logger.info(
+                    logger.success(
                         f"Generated GIF: Original={original_size:.2f}MB, Final={final_size:.2f}MB"
                     )
                     return True
@@ -1873,13 +1883,14 @@ class GIFProcessor(GIFOptimizer):
                         if temp_file.exists():
                             temp_file.unlink()
                     except Exception as e:
-                        self.dev_logger.error(
+                        logger.error(
                             f"Failed to cleanup {temp_file}: {e}")
 
         except Exception as e:
-            self.dev_logger.error(f"GIF creation failed: {str(e)}")
+            logger.error(f"GIF creation failed: {str(e)}")
             return False
 
+    @log_function_call
     def _compress_large_gif(self, gif_path: Path) -> None:
         """Additional compression for large GIFs."""
         try:
@@ -1904,7 +1915,7 @@ class GIFProcessor(GIFOptimizer):
                 temp_path.unlink()
 
         except Exception as e:
-            self.dev_logger.error(f"Additional compression failed: {str(e)}")
+            logger.error(f"Additional compression failed: {str(e)}")
             if temp_path.exists():
                 temp_path.unlink()
 
@@ -2646,3 +2657,445 @@ class QualityManager:
                     100, new_settings['lossy_value'] + 10)
 
             return new_settings
+
+
+# Add new imports
+
+# Add configuration constants
+MAX_PARALLEL_PROCESSES = max(1, (os.cpu_count() or 2) - 1)
+COMPRESSION_BATCH_SIZE = 3
+FRAME_ANALYSIS_THRESHOLD = 0.1
+MEMORY_LIMIT_MB = 1500
+CACHE_SIZE = 100
+
+
+class OptimizationStrategy(NamedTuple):
+    """Enhanced optimization strategy configuration"""
+    scale_factor: float
+    colors: int
+    lossy_value: int
+    dither_mode: str
+    bayer_scale: int
+    frame_skip: int = 0
+    compression_level: int = 3
+    use_temporal: bool = True
+
+
+class FrameAnalysis(NamedTuple):
+    """Frame analysis results"""
+    similarity_score: float
+    motion_score: float
+    color_count: int
+    brightness: float
+    complexity: float
+
+
+class CacheManager:
+    """Manages caching for optimization operations"""
+
+    def __init__(self):
+        self.frame_cache = TTLCache(maxsize=CACHE_SIZE, ttl=300)
+        self.palette_cache = TTLCache(maxsize=CACHE_SIZE, ttl=600)
+        self.dimension_cache = TTLCache(maxsize=CACHE_SIZE, ttl=900)
+        self._lock = threading.Lock()
+
+    @contextmanager
+    def cached_operation(self, cache_key: str, cache_type: str = 'frame'):
+        cache = getattr(self, f'{cache_type}_cache')
+        with self._lock:
+            if cache_key in cache:
+                yield cache[cache_key]
+                return
+        result = yield None
+        with self._lock:
+            cache[cache_key] = result
+
+
+class GIFOptimizer(FileProcessor):
+    """Enhanced GIF optimization with better performance and results"""
+
+    def __init__(self, compression_settings: Dict = None):
+        super().__init__()
+        self.compression_settings = compression_settings or GIF_COMPRESSION
+        self.cache_manager = CacheManager()
+        self.frame_analyzer = FrameAnalyzer()
+        self.pool = ThreadPoolExecutor(max_workers=MAX_PARALLEL_PROCESSES)
+        self._setup_optimizers()
+
+    def _setup_optimizers(self):
+        """Initialize optimization components"""
+        self.optimizers = {
+            'light': self._create_light_optimizer(),
+            'balanced': self._create_balanced_optimizer(),
+            'aggressive': self._create_aggressive_optimizer()
+        }
+
+    def _create_light_optimizer(self) -> OptimizationStrategy:
+        return OptimizationStrategy(
+            scale_factor=1.0,
+            colors=256,
+            lossy_value=20,
+            dither_mode='floyd_steinberg',
+            bayer_scale=2,
+            frame_skip=0,
+            use_temporal=True
+        )
+
+    def _create_balanced_optimizer(self) -> OptimizationStrategy:
+        return OptimizationStrategy(
+            scale_factor=0.85,
+            colors=192,
+            lossy_value=40,
+            dither_mode='bayer',
+            bayer_scale=3,
+            frame_skip=1,
+            use_temporal=True
+        )
+
+    def _create_aggressive_optimizer(self) -> OptimizationStrategy:
+        return OptimizationStrategy(
+            scale_factor=0.7,
+            colors=128,
+            lossy_value=60,
+            dither_mode='bayer',
+            bayer_scale=4,
+            frame_skip=2,
+            use_temporal=False
+        )
+
+    @log_function_call
+    async def optimize_gif(self, input_path: Path, output_path: Path, target_size_mb: float) -> Tuple[float, bool]:
+        """Optimized GIF compression with parallel processing and smart analysis"""
+        try:
+            # Analyze input file
+            analysis = await self.frame_analyzer.analyze_file(input_path)
+
+            # Choose optimization strategy based on analysis
+            strategy = self._select_strategy(analysis, target_size_mb)
+
+            # Process in parallel batches
+            async with ProcessPoolExecutor(max_workers=MAX_PARALLEL_PROCESSES) as pool:
+                tasks = self._create_optimization_tasks(input_path, strategy)
+                results = await asyncio.gather(*[
+                    pool.submit(self._process_batch, batch, strategy)
+                    for batch in self._chunk_tasks(tasks, COMPRESSION_BATCH_SIZE)
+                ])
+
+            # Combine results and optimize final output
+            final_size = await self._combine_and_optimize(
+                results, output_path, strategy)
+
+            success = final_size <= target_size_mb
+            if not success:
+                # Try progressive fallback if needed
+                return await self._progressive_fallback(
+                    input_path, output_path, target_size_mb)
+
+            return final_size, success
+
+        except Exception as e:
+            logger.error(f"Optimization failed: {str(e)}")
+            return float('inf'), False
+
+    def _select_strategy(self, analysis: FrameAnalysis, target_size_mb: float) -> OptimizationStrategy:
+        """Select optimal strategy based on frame analysis"""
+        if analysis.complexity < 0.3 and analysis.motion_score < 0.2:
+            return self.optimizers['light']
+        elif analysis.complexity < 0.6 and analysis.motion_score < 0.5:
+            return self.optimizers['balanced']
+        return self.optimizers['aggressive']
+
+    async def _process_batch(self, frames: List[np.ndarray], strategy: OptimizationStrategy) -> bytes:
+        """Process a batch of frames with the given strategy"""
+        # Implementation for batch processing
+        # ...existing implementation...
+
+
+class FrameAnalyzer:
+    """Analyzes GIF frames for optimal compression strategy"""
+
+    def __init__(self):
+        self.cache = TTLCache(maxsize=100, ttl=300)
+
+    async def analyze_file(self, file_path: Path) -> FrameAnalysis:
+        """Analyze file characteristics for optimization"""
+        cache_key = f"{file_path}:{file_path.stat().st_mtime}"
+        if cache_key in self.cache:
+            return self.cache[cache_key]
+
+        frames = await self._load_frames(file_path)
+
+        similarity = self._calculate_frame_similarity(frames)
+        motion = self._analyze_motion(frames)
+        colors = self._analyze_color_distribution(frames)
+        brightness = self._calculate_brightness(frames)
+        complexity = self._calculate_image_complexity(frames)
+
+        analysis = FrameAnalysis(
+            similarity_score=similarity,
+            motion_score=motion,
+            color_count=colors,
+            brightness=brightness,
+            complexity=complexity
+        )
+
+        self.cache[cache_key] = analysis
+        return analysis
+
+    def _calculate_frame_similarity(self, frames: List[np.ndarray]) -> float:
+        """Calculate similarity between consecutive frames"""
+        if len(frames) < 2:
+            return 1.0
+
+        similarities = []
+        for i in range(len(frames) - 1):
+            diff = np.abs(frames[i+1] - frames[i]).mean()
+            similarities.append(1 - (diff / 255))
+
+        return np.mean(similarities)
+
+    def _analyze_motion(self, frames: List[np.ndarray]) -> float:
+        """Analyze motion between frames"""
+        if len(frames) < 2:
+            return 0.0
+
+        motion_scores = []
+        for i in range(len(frames) - 1):
+            flow = cv2.calcOpticalFlowFarneback(
+                frames[i], frames[i+1], None,
+                0.5, 3, 15, 3, 5, 1.2, 0)
+            motion_scores.append(np.abs(flow).mean())
+
+        return np.mean(motion_scores)
+
+    async def _load_frames(self, file_path: Path) -> List[np.ndarray]:
+        """Load frames from GIF/video with efficient memory handling"""
+        frames = []
+        cap = cv2.VideoCapture(str(file_path))
+        try:
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            # Process in chunks to save memory
+            chunk_size = min(30, total_frames)
+
+            for i in range(0, total_frames, chunk_size):
+                chunk_frames = []
+                for _ in range(chunk_size):
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    # Convert to grayscale for analysis
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    chunk_frames.append(gray)
+
+                frames.extend(chunk_frames)
+                # Allow other tasks to run
+                await asyncio.sleep(0)
+
+        finally:
+            cap.release()
+
+        return frames
+
+    def _analyze_color_distribution(self, frames: List[np.ndarray]) -> int:
+        """Analyze color distribution and count unique colors"""
+        unique_colors = set()
+        # Sample every 10th frame
+        sample_frames = frames[::max(1, len(frames) // 10)]
+
+        for frame in sample_frames:
+            # Convert to RGB for better color analysis
+            rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+            # Downsample for efficiency
+            downsampled = cv2.resize(rgb, (160, 90))
+            colors = map(tuple, downsampled.reshape(-1, 3))
+            unique_colors.update(colors)
+
+        return len(unique_colors)
+
+    def _calculate_brightness(self, frames: List[np.ndarray]) -> float:
+        """Calculate average brightness of frames"""
+        brightnesses = []
+        for frame in frames:
+            mean_brightness = np.mean(frame)
+            brightnesses.append(mean_brightness / 255.0)
+        return np.mean(brightnesses)
+
+    def _calculate_image_complexity(self, frames: List[np.ndarray]) -> float:
+        """Calculate image complexity using edge detection"""
+        complexities = []
+        for frame in frames:
+            edges = cv2.Canny(frame, 100, 200)
+            complexity = np.count_nonzero(
+                edges) / (frame.shape[0] * frame.shape[1])
+            complexities.append(complexity)
+        return np.mean(complexities)
+
+
+class GIFOptimizer(FileProcessor):
+    # ...existing code...
+
+    def _create_optimization_tasks(self, input_path: Path, strategy: OptimizationStrategy) -> List[Dict]:
+        """Create optimization tasks for parallel processing"""
+        tasks = []
+        frame_count = self._get_frame_count(input_path)
+
+        # Calculate optimal chunk size based on frame count and CPU cores
+        chunk_size = max(1, frame_count // (MAX_PARALLEL_PROCESSES * 2))
+
+        for start in range(0, frame_count, chunk_size):
+            end = min(start + chunk_size, frame_count)
+            tasks.append({
+                'start_frame': start,
+                'end_frame': end,
+                'strategy': strategy,
+                'input_path': input_path
+            })
+
+        return tasks
+
+    def _chunk_tasks(self, tasks: List[Dict], batch_size: int) -> List[List[Dict]]:
+        """Split tasks into batches for processing"""
+        return [tasks[i:i + batch_size] for i in range(0, len(tasks), batch_size)]
+
+    async def _process_batch(self, frames: List[np.ndarray], strategy: OptimizationStrategy) -> bytes:
+        """Process a batch of frames with the given strategy"""
+        # Create temporary buffer for frames
+        buffer = io.BytesIO()
+
+        # Create PIL image sequence
+        images = []
+        for frame in frames:
+            # Apply strategy settings
+            processed = self._apply_optimization_strategy(frame, strategy)
+            images.append(Image.fromarray(processed))
+
+        # Save as GIF with optimization settings
+        images[0].save(
+            buffer,
+            format='GIF',
+            save_all=True,
+            append_images=images[1:],
+            optimize=True,
+            duration=1000 // 30,  # 30fps default
+            loop=0
+        )
+
+        return buffer.getvalue()
+
+    def _apply_optimization_strategy(self, frame: np.ndarray, strategy: OptimizationStrategy) -> np.ndarray:
+        """Apply optimization strategy to a single frame"""
+        # Resize
+        if strategy.scale_factor != 1.0:
+            new_size = tuple(int(dim * strategy.scale_factor)
+                             for dim in frame.shape[:2])
+            frame = cv2.resize(
+                frame, new_size[::-1], interpolation=cv2.INTER_LANCZOS4)
+
+        # Convert to PIL for better color quantization
+        pil_image = Image.fromarray(frame)
+
+        # Apply dithering and color reduction
+        if strategy.colors < 256:
+            if strategy.dither_mode == 'floyd_steinberg':
+                pil_image = pil_image.quantize(
+                    colors=strategy.colors,
+                    method=2,  # Floyd-Steinberg dithering
+                    palette=Image.ADAPTIVE
+                )
+            else:  # Bayer dithering
+                pil_image = pil_image.quantize(
+                    colors=strategy.colors,
+                    method=3,  # Ordered dithering
+                    palette=Image.ADAPTIVE
+                )
+
+        return np.array(pil_image)
+
+    async def _combine_and_optimize(self, results: List[bytes], output_path: Path, strategy: OptimizationStrategy) -> float:
+        """Combine processed batches and apply final optimization"""
+        # Combine all batches
+        combined = io.BytesIO()
+        images = []
+
+        for result in results:
+            gif = Image.open(io.BytesIO(result))
+            for frame in ImageSequence.Iterator(gif):
+                images.append(frame.copy())
+
+        # Apply final optimization
+        images[0].save(
+            output_path,
+            format='GIF',
+            save_all=True,
+            append_images=images[1:],
+            optimize=True,
+            duration=1000 // 30,
+            loop=0
+        )
+
+        # Apply gifsicle optimization
+        await self._apply_gifsicle_optimization(output_path, strategy)
+
+        return self.get_file_size(output_path)
+
+    async def _progressive_fallback(self, input_path: Path, output_path: Path, target_size_mb: float) -> Tuple[float, bool]:
+        """Progressive fallback for when initial optimization fails"""
+        strategies = [
+            self.optimizers['balanced'],
+            self.optimizers['aggressive'],
+            OptimizationStrategy(
+                scale_factor=0.5,
+                colors=64,
+                lossy_value=80,
+                dither_mode='bayer',
+                bayer_scale=5,
+                frame_skip=3,
+                compression_level=3,
+                use_temporal=False
+            )
+        ]
+
+        for strategy in strategies:
+            try:
+                size, success = await self.optimize_gif(input_path, output_path, target_size_mb)
+                if success:
+                    return size, True
+            except Exception as e:
+                logger.warning(f"Progressive fallback attempt failed: {e}")
+                continue
+
+        return float('inf'), False
+
+    async def _apply_gifsicle_optimization(self, gif_path: Path, strategy: OptimizationStrategy) -> None:
+        """Apply gifsicle optimization with strategy settings"""
+        cmd = [
+            'gifsicle',
+            '--optimize=3',
+            f'--colors={strategy.colors}',
+            f'--lossy={strategy.lossy_value}',
+            '--no-conserve-memory',
+            '--careful'
+        ]
+
+        if strategy.frame_skip > 0:
+            cmd.extend(
+                ['--unoptimize', f'--delete-every={strategy.frame_skip}'])
+
+        cmd.extend([str(gif_path), '--output', str(gif_path)])
+
+        # Run optimization
+        await asyncio.create_subprocess_exec(*cmd)
+
+
+def process_gifs(compression_settings: Optional[Dict[str, Any]] = None) -> List[Path]:
+    """Process GIFs with improved optimization system"""
+    if compression_settings is not None:
+        validate_compression_settings(compression_settings)
+
+    optimizer = GIFOptimizer(compression_settings)
+
+    async def process_all_async():
+        return await optimizer.process_all()
+
+    loop = asyncio.get_event_loop()
+    return loop.run_until_complete(process_all_async())

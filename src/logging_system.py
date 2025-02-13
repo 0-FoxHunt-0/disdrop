@@ -53,44 +53,47 @@ def log_function_call(func):
 
 
 class ColorFormatter(logging.Formatter):
+    """Enhanced color formatter with better visual separation."""
     COLORS = {
-        'DEBUG': '\033[0;36m',    # Cyan
-        'INFO': '\033[0;37m',     # White
-        'WARNING': '\033[0;33m',  # Yellow
-        'ERROR': '\033[0;31m',    # Red
-        'CRITICAL': '\033[0;35m',  # Purple
-        'SUCCESS': '\033[0;32m',  # Green
-        'SKIP': '\033[0;34m'      # Blue
+        'DEBUG': '\033[0;36m',     # Cyan
+        'INFO': '\033[0;37m',      # White
+        'WARNING': '\033[0;33m',   # Yellow
+        'ERROR': '\033[1;31m',     # Bright Red
+        'CRITICAL': '\033[1;35m',  # Bright Purple
+        'SUCCESS': '\033[1;32m',   # Bright Green
+        'SKIP': '\033[0;34m'       # Blue
     }
     RESET = '\033[0m'
 
-    def __init__(self, fmt=None, datefmt=None):
-        super().__init__(fmt, datefmt)
-        self.default_color = self.RESET
+    def __init__(self, fmt=None, datefmt=None, style='%', use_color=True):
+        super().__init__(fmt, datefmt, style)
+        self.use_color = use_color
 
     def format(self, record):
-        # Save original message and encode special characters
-        original_msg = record.msg
+        # Replace Unicode characters first
         if isinstance(record.msg, str):
-            # Replace Unicode characters with ASCII alternatives
-            record.msg = (record.msg.replace('→', '->')
-                          .replace('⟶', '-->')
-                          .replace('←', '<-')
-                          .replace('⟵', '<--')
-                          .replace('↔', '<->')
-                          .replace('⟷', '<-->'))
+            record.msg = record.msg.replace('✓', '>').replace('⚠', '!').replace(
+                '→', '->').replace('⟶', '->').replace('─', '-').replace('│', '|')
 
-        # Apply color
-        color = self.COLORS.get(record.levelname, self.default_color)
-        record.msg = f"{color}{record.msg}{self.RESET}"
+        if record.levelname in ['ERROR', 'CRITICAL', 'SUCCESS']:
+            record.msg = f"\n{'-' * 50}\n{record.msg}"
 
-        # Format the message
-        formatted_msg = super().format(record)
+        if self.use_color:
+            color = self.COLORS.get(record.levelname, self.RESET)
+            if record.levelname in ['ERROR', 'CRITICAL']:
+                record.msg = f"{color}! {record.msg}{self.RESET}"
+            elif record.levelname == 'SUCCESS':
+                record.msg = f"{color}> {record.msg}{self.RESET}"
+            else:
+                record.msg = f"{color}{record.msg}{self.RESET}"
 
-        # Restore original message
-        record.msg = original_msg
+        if isinstance(record.msg, str):
+            record.msg = record.msg.replace('\\', '/')
 
-        return formatted_msg
+        if record.levelname in ['ERROR', 'CRITICAL', 'SUCCESS']:
+            record.msg = f"{record.msg}\n{'-' * 50}"
+
+        return super().format(record)
 
 
 class RotatingFileHandler(logging.FileHandler):
@@ -190,29 +193,27 @@ def ensure_log_directories():
 
 
 class WindowsConsoleHandler(logging.StreamHandler):
-    """Custom handler that safely handles Unicode characters in Windows console."""
+    """Custom handler for Windows console with robust Unicode support."""
 
     def __init__(self):
         super().__init__()
-        # Use utf-8 encoding for output
         if sys.platform == 'win32':
-            import locale
-            # Set console to UTF-8 mode
-            try:
-                import ctypes
-                kernel32 = ctypes.windll.kernel32
-                kernel32.SetConsoleOutputCP(65001)
-            except:
-                pass
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            kernel32.SetConsoleOutputCP(65001)
+            kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
 
     def emit(self, record):
         try:
             msg = self.format(record)
-            # Replace problematic Unicode characters with ASCII alternatives
-            msg = msg.replace('→', '->').replace('⟶', '-->')
             stream = self.stream
-            stream.write(msg + self.terminator)
-            self.flush()
+            try:
+                stream.write(msg + self.terminator)
+                self.flush()
+            except UnicodeEncodeError:
+                stream.buffer.write(msg.encode('utf-8', errors='replace'))
+                stream.buffer.write(self.terminator.encode('utf-8'))
+                self.flush()
         except Exception:
             self.handleError(record)
 
@@ -220,7 +221,7 @@ class WindowsConsoleHandler(logging.StreamHandler):
 def setup_logger(debug_mode: bool = False, verbose_mode: bool = False,
                  log_rotation_size: int = 10485760,
                  backup_count: int = 5) -> logging.Logger:
-    """Setup enhanced logging system with verbose debug support."""
+    """Setup enhanced logging system with improved visual formatting."""
     # Clear existing log files
     for log_file in [LOG_FILE, FFPMEG_LOG_FILE, LOG_DIR / 'debug.log']:
         if log_file.exists():
@@ -243,14 +244,14 @@ def setup_logger(debug_mode: bool = False, verbose_mode: bool = False,
 
     # Console handler with color formatting
     console_handler = WindowsConsoleHandler()
+    # Use improved formatting
     if verbose_mode:
-        # Detailed format for verbose mode
         formatter = ColorFormatter(
-            '%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
+            '\n%(asctime)s\n'
+            '%(levelname)-8s | %(message)s\n'
         )
     else:
-        # Simple format for normal mode
-        formatter = ColorFormatter('%(levelname)s: %(message)s')
+        formatter = ColorFormatter('%(levelname)-8s │ %(message)s')
 
     console_handler.setFormatter(formatter)
     console_handler.setLevel(logging.DEBUG if debug_mode else logging.INFO)
