@@ -89,7 +89,7 @@ python run.py
 
 ### Advanced Options
 ```bash
-python run.py --debug            # Enable debug logging
+python run.py --debug           # Enable debug logging
 python run.py --no-gpu          # Disable GPU acceleration
 python run.py --input-dir DIR   # Custom input directory
 python run.py --output-dir DIR  # Custom output directory
@@ -99,11 +99,11 @@ python run.py --verbose         # Detailed logging
 ## 📁 Directory Structure
 ```
 disdrop/
-├── src/                  # Source code
+├── src/                # Source code
 │   ├── gif_optimization.py
 │   ├── video_optimization.py
 │   └── ...
-├── input/               # Input files
+├── input/              # Input files
 ├── output/             # Processed files
 ├── temp/               # Temporary files
 ├── logs/               # Log files
