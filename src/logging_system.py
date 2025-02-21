@@ -1,40 +1,19 @@
 import atexit
-import functools
+from functools import wraps
 import logging
 import os
 import subprocess
 import sys
 from datetime import datetime
-from functools import partial, wraps
+from enum import Enum
 from pathlib import Path
 from typing import Optional, TextIO, Union
 
-from .default_config import FFPMEG_LOG_FILE, LOG_DIR, LOG_FILE, TEMP_FILE_DIR
+from .default_config import FFPMEG_LOG_FILE, LOG_DIR, LOG_FILE
 
-# Add custom log levels
-SUCCESS_LEVEL = 25  # Between INFO and WARNING
-SKIP_LEVEL = 15    # Between DEBUG and INFO
-
-# Register new log levels
-logging.addLevelName(SUCCESS_LEVEL, 'SUCCESS')
-logging.addLevelName(SKIP_LEVEL, 'SKIP')
-
-# Define the success and skip methods
-
-
-def success(self, message, *args, **kwargs):
-    if self.isEnabledFor(SUCCESS_LEVEL):
-        self._log(SUCCESS_LEVEL, message, args, **kwargs)
-
-
-def skip(self, message, *args, **kwargs):
-    if self.isEnabledFor(SKIP_LEVEL):
-        self._log(SKIP_LEVEL, message, args, **kwargs)
-
-
-# Add methods to Logger class
-logging.Logger.success = success
-logging.Logger.skip = skip
+# Custom log levels
+SUCCESS_LEVEL = 25
+SKIP_LEVEL = 15
 
 
 def log_function_call(func):
@@ -52,48 +31,246 @@ def log_function_call(func):
     return wrapper
 
 
-class ColorFormatter(logging.Formatter):
-    """Enhanced color formatter with better visual separation."""
-    COLORS = {
-        'DEBUG': '\033[0;36m',     # Cyan
-        'INFO': '\033[0;37m',      # White
-        'WARNING': '\033[0;33m',   # Yellow
-        'ERROR': '\033[1;31m',     # Bright Red
-        'CRITICAL': '\033[1;35m',  # Bright Purple
-        'SUCCESS': '\033[1;32m',   # Bright Green
-        'SKIP': '\033[0;34m'       # Blue
-    }
+# class LogLevel(Enum):
+#     """Enhanced log levels with symbols and colors"""
+#     DEBUG = ('◐', '\033[38;5;245m')    # Gray
+#     INFO = ('ℹ', '\033[38;5;39m')      # Blue
+#     WARNING = ('⚠', '\033[38;5;208m')   # Orange
+#     ERROR = ('✖', '\033[38;5;196m')     # Red
+#     CRITICAL = ('☠', '\033[38;5;200m')  # Magenta
+#     SUCCESS = ('✔', '\033[38;5;40m')    # Green
+#     SKIP = ('→', '\033[38;5;244m')      # Light gray
+
+
+# class ColorFormatter(logging.Formatter):
+#     """Enhanced color formatter with better visual separation."""
+
+#     RESET = '\033[0m'
+#     BOLD = '\033[1m'
+#     DIM = '\033[2m'
+
+#     def __init__(self, fmt=None, datefmt=None, style='%', use_color=True):
+#         super().__init__(fmt, datefmt, style)
+#         self.use_color = use_color and sys.platform != 'win32'
+#         self._last_level = None
+#         self._section_count = 0
+
+#     def format(self, record):
+#         if not self.use_color:
+#             return super().format(record)
+
+#         # Add visual breaks between different log levels
+#         if self._last_level != record.levelname:
+#             if self._section_count > 0:
+#                 record.msg = f"\n{record.msg}"
+#             self._last_level = record.levelname
+#             self._section_count += 1
+
+#         level_info = LogLevel[record.levelname] if record.levelname in LogLevel.__members__ else LogLevel.INFO
+#         symbol, color = level_info.value
+
+#         # Format the level name with fixed width and symbol
+#         level_display = f"{color}{symbol} {record.levelname:<8}{self.RESET}"
+
+#         # Add timestamp for debug messages
+#         timestamp = ""
+#         if record.levelname == 'DEBUG':
+#             timestamp = f"{self.DIM}{self.format_time(record)}{self.RESET} "
+
+#         # Format messages based on level
+#         if record.levelname in ['ERROR', 'CRITICAL']:
+#             msg = self._format_box(record.msg, color)
+#         elif record.levelname == 'SUCCESS':
+#             msg = self._format_box(record.msg, LogLevel.SUCCESS.value[1])
+#         else:
+#             msg = record.msg
+
+#         return f"{timestamp}{level_display} │ {msg}"
+
+#     def _format_box(self, msg: str, color: str) -> str:
+#         """Format message in a colored box."""
+#         lines = msg.split('\n')
+#         width = max(len(line) for line in lines) + 2
+
+#         box_top = f"{color}╭{'─' * width}╮{self.RESET}"
+#         box_bottom = f"{color}╰{'─' * width}╯{self.RESET}"
+
+#         formatted_lines = [box_top]
+#         for line in lines:
+#             padding = ' ' * (width - len(line))
+#             formatted_lines.append(f"{color}│ {line}{padding} │{self.RESET}")
+#         formatted_lines.append(box_bottom)
+
+#         return '\n'.join(formatted_lines)
+
+
+# class ConsoleHandler(logging.StreamHandler):
+#     """Enhanced console handler with proper encoding and color support."""
+
+#     def __init__(self):
+#         super().__init__()
+#         if sys.platform == 'win32':
+#             # Enable ANSI colors on Windows
+#             from ctypes import windll
+#             k = windll.kernel32
+#             k.SetConsoleMode(k.GetStdHandle(-11), 7)
+
+class LogStyle:
+    """Modern logging styles with rich formatting"""
     RESET = '\033[0m'
+    BOLD = '\033[1m'
+    DIM = '\033[2m'
+    ITALIC = '\033[3m'
+
+    # Background colors
+    BG_BLACK = '\033[40m'
+    BG_RED = '\033[41m'
+    BG_GREEN = '\033[42m'
+    BG_YELLOW = '\033[43m'
+    BG_BLUE = '\033[44m'
+    BG_MAGENTA = '\033[45m'
+    BG_CYAN = '\033[46m'
+
+    # Modern color palette
+    SLATE = '\033[38;5;246m'
+    AZURE = '\033[38;5;39m'
+    EMERALD = '\033[38;5;48m'
+    AMBER = '\033[38;5;214m'
+    ROSE = '\033[38;5;204m'
+    VIOLET = '\033[38;5;141m'
+
+
+class LogLevel(Enum):
+    """Enhanced log levels with modern symbols and colors"""
+    DEBUG = ('⚙', LogStyle.SLATE)
+    INFO = ('○', LogStyle.AZURE)
+    WARNING = ('△', LogStyle.AMBER)
+    ERROR = ('✕', LogStyle.ROSE)
+    CRITICAL = ('⬢', LogStyle.VIOLET)
+    SUCCESS = ('●', LogStyle.EMERALD)
+    SKIP = ('→', LogStyle.SLATE)
+
+
+class ModernFormatter(logging.Formatter):
+    """Modern formatter with improved visual hierarchy and readability"""
 
     def __init__(self, fmt=None, datefmt=None, style='%', use_color=True):
         super().__init__(fmt, datefmt, style)
-        self.use_color = use_color
+        self.use_color = use_color and sys.platform != 'win32'
+        self._last_timestamp = None
 
     def format(self, record):
-        # Replace Unicode characters first
-        if isinstance(record.msg, str):
-            record.msg = record.msg.replace('✓', '>').replace('⚠', '!').replace(
-                '→', '->').replace('⟶', '->').replace('─', '-').replace('│', '|')
+        if not self.use_color:
+            return super().format(record)
 
-        if record.levelname in ['ERROR', 'CRITICAL', 'SUCCESS']:
-            record.msg = f"\n{'-' * 50}\n{record.msg}"
+        # Get level styling
+        level_info = LogLevel[record.levelname] if record.levelname in LogLevel.__members__ else LogLevel.INFO
+        symbol, color = level_info.value
 
-        if self.use_color:
-            color = self.COLORS.get(record.levelname, self.RESET)
-            if record.levelname in ['ERROR', 'CRITICAL']:
-                record.msg = f"{color}! {record.msg}{self.RESET}"
-            elif record.levelname == 'SUCCESS':
-                record.msg = f"{color}> {record.msg}{self.RESET}"
+        # Format timestamp with visual grouping
+        current_timestamp = datetime.fromtimestamp(record.created)
+        timestamp_changed = (not self._last_timestamp or
+                             current_timestamp.minute != self._last_timestamp.minute)
+
+        if timestamp_changed:
+            self._last_timestamp = current_timestamp
+            timestamp_header = f"\n{LogStyle.DIM}╮ {current_timestamp.strftime('%H:%M')}{LogStyle.RESET}\n"
+        else:
+            timestamp_header = ""
+
+        # Format the message
+        if record.levelname in ['ERROR', 'CRITICAL']:
+            msg = self._format_error(record.msg, color)
+        elif record.levelname == 'SUCCESS':
+            msg = self._format_success(record.msg)
+        else:
+            msg = f"{color}{record.msg}{LogStyle.RESET}"
+
+        # Build the log line with modern indentation
+        log_line = (
+            f"{timestamp_header}"
+            f"{LogStyle.DIM}│{LogStyle.RESET} "
+            f"{color}{symbol}{LogStyle.RESET} "
+            f"{msg}"
+        )
+
+        return log_line
+
+    def _format_error(self, msg: str, color: str) -> str:
+        """Format error messages with modern styling"""
+        lines = msg.split('\n')
+        formatted = [
+            f"{color}{LogStyle.BG_BLACK} {lines[0]} {LogStyle.RESET}"
+        ]
+        if len(lines) > 1:
+            formatted.extend(
+                f"{LogStyle.DIM}│{LogStyle.RESET} {LogStyle.DIM}{line}{LogStyle.RESET}"
+                for line in lines[1:]
+            )
+        return '\n'.join(formatted)
+
+    def _format_success(self, msg: str) -> str:
+        """Format success messages with subtle highlighting"""
+        return f"{LogStyle.EMERALD}{LogStyle.ITALIC}{msg}{LogStyle.RESET}"
+
+
+class ModernConsoleHandler(logging.StreamHandler):
+    """Console handler with modern output handling"""
+
+    def __init__(self):
+        if sys.platform == 'win32':
+            import codecs
+            sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer)
+            from ctypes import windll
+            k = windll.kernel32
+            k.SetConsoleMode(k.GetStdHandle(-11), 7)
+        super().__init__()
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            stream = self.stream
+            if sys.platform == 'win32':
+                try:
+                    stream.write(msg)
+                except UnicodeEncodeError:
+                    stream.buffer.write(msg.encode('utf-8'))
             else:
-                record.msg = f"{color}{record.msg}{self.RESET}"
+                stream.write(msg)
+            stream.write(self.terminator)
+            self.flush()
+        except Exception:
+            self.handleError(record)
 
-        if isinstance(record.msg, str):
-            record.msg = record.msg.replace('\\', '/')
 
-        if record.levelname in ['ERROR', 'CRITICAL', 'SUCCESS']:
-            record.msg = f"{record.msg}\n{'-' * 50}"
+def setup_modern_logger(debug_mode: bool = False) -> logging.Logger:
+    """Set up logger with modern styling"""
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+    root_logger.setLevel(logging.DEBUG if debug_mode else logging.INFO)
 
-        return super().format(record)
+    console_handler = ModernConsoleHandler()
+    formatter = ModernFormatter()
+    console_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
+
+    # Add custom log levels
+    logging.addLevelName(25, 'SUCCESS')
+    logging.addLevelName(15, 'SKIP')
+
+    def success(self, message, *args, **kwargs):
+        self._log(25, message, args, **kwargs)
+
+    def skip(self, message, *args, **kwargs):
+        self._log(15, message, args, **kwargs)
+
+    logging.Logger.success = success
+    logging.Logger.skip = skip
+
+    logger = logging.getLogger(__name__)
+    logger.success("System initialized")
+
+    return logger
 
 
 class RotatingFileHandler(logging.FileHandler):
@@ -190,136 +367,6 @@ def ensure_log_directories():
     except Exception as e:
         print(f"Failed to set up log directories: {e}")
         raise
-
-
-class WindowsConsoleHandler(logging.StreamHandler):
-    """Custom handler for Windows console with robust Unicode support."""
-
-    def __init__(self):
-        super().__init__()
-        if sys.platform == 'win32':
-            import ctypes
-            kernel32 = ctypes.windll.kernel32
-            kernel32.SetConsoleOutputCP(65001)
-            kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
-
-    def emit(self, record):
-        try:
-            msg = self.format(record)
-            stream = self.stream
-            try:
-                stream.write(msg + self.terminator)
-                self.flush()
-            except UnicodeEncodeError:
-                stream.buffer.write(msg.encode('utf-8', errors='replace'))
-                stream.buffer.write(self.terminator.encode('utf-8'))
-                self.flush()
-        except Exception:
-            self.handleError(record)
-
-
-def setup_logger(debug_mode: bool = False, verbose_mode: bool = False,
-                 log_rotation_size: int = 10485760,
-                 backup_count: int = 5) -> logging.Logger:
-    """Setup enhanced logging system with improved visual formatting."""
-    # Clear existing log files
-    for log_file in [LOG_FILE, FFPMEG_LOG_FILE, LOG_DIR / 'debug.log']:
-        if log_file.exists():
-            log_file.unlink()
-
-    root_logger = logging.getLogger()
-    root_logger.handlers.clear()
-
-    # Set base level based on debug flag
-    base_level = logging.DEBUG if debug_mode else logging.INFO
-    root_logger.setLevel(base_level)
-
-    # Use a set to track handler names
-    handler_names = set()
-
-    def add_handler(handler, name):
-        if name not in handler_names:
-            root_logger.addHandler(handler)
-            handler_names.add(name)
-
-    # Console handler with color formatting
-    console_handler = WindowsConsoleHandler()
-    # Use improved formatting
-    if verbose_mode:
-        formatter = ColorFormatter(
-            '\n%(asctime)s\n'
-            '%(levelname)-8s | %(message)s\n'
-        )
-    else:
-        formatter = ColorFormatter('%(levelname)-8s │ %(message)s')
-
-    console_handler.setFormatter(formatter)
-    console_handler.setLevel(logging.DEBUG if debug_mode else logging.INFO)
-    add_handler(console_handler, 'console')
-
-    # Debug file handler for verbose logging
-    if verbose_mode:
-        debug_handler = RotatingFileHandler(
-            LOG_DIR / 'debug.log',
-            max_bytes=log_rotation_size,
-            backup_count=backup_count
-        )
-        debug_handler.setFormatter(logging.Formatter(
-            '%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - '
-            '%(funcName)s - %(message)s'
-        ))
-        debug_handler.setLevel(logging.DEBUG)
-        add_handler(debug_handler, 'debug_file')
-
-    # Regular file handler
-    file_handler = RotatingFileHandler(
-        LOG_FILE,
-        max_bytes=log_rotation_size,
-        backup_count=backup_count
-    )
-    file_handler.setFormatter(logging.Formatter(
-        # Fixed levelname
-        '%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
-    ))
-    file_handler.setLevel(logging.DEBUG if debug_mode else logging.INFO)
-    add_handler(file_handler, 'file')
-
-    # Set up FFmpeg logger with stream capture
-    ffmpeg_logger = logging.getLogger('ffmpeg')
-    ffmpeg_logger.handlers.clear()
-    ffmpeg_logger.propagate = False
-
-    ffmpeg_handler = RotatingFileHandler(
-        FFPMEG_LOG_FILE,
-        max_bytes=log_rotation_size,
-        backup_count=backup_count
-    )
-    ffmpeg_handler.setFormatter(logging.Formatter(
-        '%(asctime)s - %(levelname)s - %(message)s'
-    ))
-    ffmpeg_logger.addHandler(ffmpeg_handler)
-    ffmpeg_logger.setLevel(logging.DEBUG if verbose_mode else logging.INFO)
-
-    # Redirect FFmpeg output
-    os.environ['FFMPEG_LOG_CAPTURE'] = '1'
-    os.environ['FFMPEG_LOG_LEVEL'] = 'debug' if verbose_mode else 'info'
-    os.environ['FFMPEG_LOG_FILE'] = str(FFPMEG_LOG_FILE)
-
-    logger = logging.getLogger(__name__)
-    logger.success("Logging system initialized successfully")
-
-    if verbose_mode:
-        logger.debug("Verbose debug logging enabled")
-        # Log system info in verbose mode
-        import platform
-        import psutil
-        logger.debug(f"System: {platform.system()} {platform.release()}")
-        logger.debug(f"Python: {platform.python_version()}")
-        logger.debug(f"CPU Cores: {psutil.cpu_count()}")
-        logger.debug(
-            f"Memory: {psutil.virtual_memory().total / (1024**3):.1f}GB")
-
-    return logger
 
 
 def log_exception(exc_type, exc_value, exc_traceback):

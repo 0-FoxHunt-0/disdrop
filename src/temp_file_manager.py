@@ -15,6 +15,7 @@ class TempFileManager:
     _initialized = False
     MAX_TEMP_FILES = 1000
     MAX_AGE_HOURS = 24
+    TEMP_FILE_DIR = "/tmp"
 
     def __enter__(self):
         self._lock.acquire()
@@ -38,7 +39,13 @@ class TempFileManager:
     def register(cls, file_path: Path) -> None:
         """Thread-safely register a temporary file."""
         with cls._lock:
-            cls._temp_files.add(Path(file_path))
+            # Ensure the file is directly in TEMP_FILE_DIR
+            if file_path.parent != Path(cls.TEMP_FILE_DIR):
+                new_path = Path(cls.TEMP_FILE_DIR) / file_path.name
+                if file_path.exists():
+                    file_path.replace(new_path)
+                file_path = new_path
+            cls._temp_files.add(file_path)
             logging.debug(f"Registered temp file: {file_path}")
 
     @classmethod

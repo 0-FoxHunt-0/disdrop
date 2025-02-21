@@ -163,6 +163,6 @@ cython_debug/
 input/*
 output/*
 logs/*
-temp_files/*
+temp/*
 test
 temp_move

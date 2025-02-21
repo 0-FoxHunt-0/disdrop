@@ -3,12 +3,13 @@ import logging
 import signal
 import sys
 from pathlib import Path
+import time
 
 # Use relative imports since we're in the src package
 from .default_config import (GIF_PASS_OVERS, INPUT_DIR, LOG_DIR, OUTPUT_DIR,
                              TEMP_FILE_DIR, GIF_COMPRESSION, VIDEO_COMPRESSION)
-# Changed from "from gif_optimization import GIFProcessor"
-from .gif_optimization import GIFProcessor
+# Use package-level import
+from src.gif_operations import GIFProcessor, DynamicGIFOptimizer
 from .gpu_acceleration import setup_gpu_acceleration
 from .logging_system import setup_logger
 from .temp_file_manager import TempFileManager
@@ -16,15 +17,15 @@ from .video_optimization import VideoProcessor
 from .utils.error_handler import VideoProcessingError
 
 
-def signal_handler(signum, frame):
-    logging.warning("\nGracefully shutting down...")
-    TempFileManager.cleanup()
-    TempFileManager.cleanup_dir(TEMP_FILE_DIR)
-    sys.exit(0)
+def setup_signal_handlers(processor):
+    """Setup signal handlers for graceful shutdown."""
+    def signal_handler(signum, frame):
+        print("\nReceived interrupt signal, initiating immediate shutdown...")
+        processor._immediate_shutdown_handler(signum, frame)
 
-
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
+    # Register for both SIGINT (Ctrl+C) and SIGTERM
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -64,6 +65,7 @@ def process_failed_items(failed_files: list[Path], pass_over_index: int) -> list
     GIF_COMPRESSION.update(pass_over)
 
     processor = GIFProcessor()
+    dynamic_optimizer = DynamicGIFOptimizer()
     remaining_failed = []
 
     for file_path in failed_files:
@@ -72,9 +74,12 @@ def process_failed_items(failed_files: list[Path], pass_over_index: int) -> list
             output_path = OUTPUT_DIR / f"{source_file.stem}.gif"
             is_video = source_file.suffix.lower() in ['.mp4', '.mkv', '.avi']
 
-            processor.process_file(source_file, output_path, is_video)
+            # Try dynamic optimizer first
+            if dynamic_optimizer.optimize_gif(source_file, output_path, GIF_COMPRESSION['min_size_mb'])[1]:
+                continue
 
-            if not output_path.exists():
+            # Fall back to standard processor
+            if not processor.process_file(source_file, output_path, is_video):
                 remaining_failed.append(file_path)
 
         except Exception as e:
@@ -101,7 +106,7 @@ def setup_logging():
 
 
 def process_videos(input_dir: Path, output_dir: Path) -> None:
-    """Process videos with enhanced error handling."""
+    """Process videos with enhanced error handling and progress tracking."""
     processor = VideoProcessor(use_gpu=True)
 
     try:
@@ -109,34 +114,53 @@ def process_videos(input_dir: Path, output_dir: Path) -> None:
         input_dir.mkdir(exist_ok=True)
         output_dir.mkdir(exist_ok=True)
 
-        # Check GPU availability
-        if processor.gpu_available:
-            logging.info("GPU acceleration enabled")
-        else:
-            logging.warning("GPU acceleration not available, using CPU")
+        # Process videos with progress tracking
+        total_processed = 0
+        last_progress_time = time.time()
 
-        # Process videos
+        def log_progress(current: int, total: int, file_name: str) -> None:
+            nonlocal last_progress_time
+            current_time = time.time()
+
+            # Only update progress every 5 seconds
+            if current_time - last_progress_time >= 5:
+                progress = (current / total) * 100
+                logging.info(f"Progress: {progress:.1f}% ({current}/{total})")
+                logging.info(f"Currently processing: {file_name}")
+                last_progress_time = current_time
+
+        # Add progress callback to processor
+        processor.set_progress_callback(log_progress)
+
+        # Process videos without timeout parameter
         failed_files = processor.process_videos(
-            input_dir, output_dir, target_size_mb=15.0)
+            input_dir,
+            output_dir,
+            target_size_mb=15.0
+        )
 
+        # Report results
         if failed_files:
             logging.warning(f"Failed to process {len(failed_files)} files:")
             for file in failed_files:
                 logging.warning(f"  - {file}")
+        else:
+            logging.info("All videos processed successfully")
 
-    except VideoProcessingError as e:
-        logging.error(f"Video processing error: {e}")
-        sys.exit(1)
     except Exception as e:
-        logging.error(f"Fatal error: {e}")
+        logging.error(f"Video processing error: {str(e)}")
         sys.exit(1)
 
 
 def main() -> None:
     args = parse_arguments()
-
-    # Setup enhanced logging using the logging_system module
     logger = setup_logger(debug_mode=args.debug, verbose_mode=args.verbose)
+
+    # Initialize processor first
+    gif_processor = GIFProcessor(verbose=args.verbose)
+
+    # Setup signal handlers
+    setup_signal_handlers(gif_processor)
 
     # Initialize directories
     input_dir = args.input_dir or INPUT_DIR
@@ -156,7 +180,7 @@ def main() -> None:
         process_videos(input_dir, output_dir)
 
         logger.info("Processing GIFs...")
-        gif_processor = GIFProcessor()
+        # Pass verbose flag to GIF processor
         failed_gifs = gif_processor.process_all()
 
         if failed_gifs:
@@ -181,14 +205,13 @@ def main() -> None:
                 logger.warning(f"  - {file}")
 
     except KeyboardInterrupt:
-        logger.warning("Process interrupted by user")
+        logger.warning("\nProcess interrupted by user")
+        gif_processor._immediate_shutdown_handler(signal.SIGINT, None)
     except Exception as e:
         logger.critical(f"Fatal error: {e}", exc_info=True)
+        gif_processor._immediate_shutdown_handler(signal.SIGTERM, None)
     finally:
-        TempFileManager.cleanup()
-        if TEMP_FILE_DIR.exists():
-            TempFileManager.cleanup_dir(TEMP_FILE_DIR)
-        logger.success("Cleanup complete")
+        sys.exit(0)
 
 
 if __name__ == "__main__":
