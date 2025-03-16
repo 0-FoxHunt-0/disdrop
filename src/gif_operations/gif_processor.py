@@ -13,56 +13,72 @@ from pathlib import Path
 import queue
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
 import time
 from tkinter import Image
 import traceback
-from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
+from typing import Callable, Dict, List, NamedTuple, Optional, Tuple, Any, Set
 
 from cachetools import TTLCache
 import cv2
 import psutil
+from tqdm import tqdm
+import atexit
+import uuid
 
-from src.default_config import GIF_SIZE_TO_SKIP, INPUT_DIR, OUTPUT_DIR, SUPPORTED_VIDEO_FORMATS, TEMP_FILE_DIR
+from src.default_config import GIF_SIZE_TO_SKIP, INPUT_DIR, OUTPUT_DIR, SUPPORTED_VIDEO_FORMATS, TEMP_FILE_DIR, GIF_COMPRESSION
 from src.gif_operations.ffmpeg_handler import FFmpegHandler
 from src.gif_operations.memory import MemoryManager
 from src.gif_operations.optimizer import GIFOptimizer, ProcessingStatus
 from src.gif_operations.processing_stats import ProcessingStats
 from src.gif_operations.quality_manager import QualityManager
 from src.gif_operations.resource_manager import ResourceMonitor
-from src.logging_system import log_function_call, run_ffmpeg_command
+from src.logging_system import get_logger, log_function_call, run_ffmpeg_command, performance_monitor, ModernLogStyle, UnifiedLogger
 from src.temp_file_manager import TempFileManager
 # Add DynamicGIFOptimizer to import
 from src.gif_operations.optimizer import GIFOptimizer, DynamicGIFOptimizer
-from src.gif_operations.base_processor import BaseProcessor
+from src.base.processor import BaseProcessor
+from ..utils.video_dimensions import _validate_dimensions as validate_dimensions
+
+
+@asynccontextmanager
+async def managed_process_pool():
+    """Async context manager for process pool with automatic cleanup."""
+    pool = None
+    try:
+        # Create a thread pool with a reasonable number of workers
+        pool = ThreadPoolExecutor(max_workers=max(2, os.cpu_count() or 4))
+        yield pool
+    finally:
+        # Ensure proper cleanup when the context is exited
+        if pool:
+            pool.shutdown(wait=False)
 
 
 def performance_monitor(func: Callable) -> Callable:
     """Decorator to monitor function performance."""
     @wraps(func)
-    def wrapper(*args, **kwargs):
+    async def async_wrapper(*args, **kwargs):
         start_time = time.time()
-        process = psutil.Process()
-        start_memory = process.memory_info().rss / 1024 / 1024
-
         try:
-            result = func(*args, **kwargs)
+            return await func(*args, **kwargs)
+        finally:
             end_time = time.time()
-            end_memory = process.memory_info().rss / 1024 / 1024
+            logger.debug(f"{func.__name__} took {end_time - start_time:.2f}s")
 
-            logging.debug(
-                f"Function: {func.__name__} | "
-                f"Time: {end_time - start_time:.2f}s | "
-                f"Memory: {end_memory - start_memory:.2f}MB"
-            )
-            return result
-        except Exception as e:
-            logging.error(
-                f"Error in {func.__name__}: {str(e)}\n{traceback.format_exc()}")
-            raise
-    return wrapper
+    @wraps(func)
+    def sync_wrapper(*args, **kwargs):
+        start_time = time.time()
+        try:
+            return func(*args, **kwargs)
+        finally:
+            end_time = time.time()
+            logger.debug(f"{func.__name__} took {end_time - start_time:.2f}s")
+
+    return async_wrapper if asyncio.iscoroutinefunction(func) else sync_wrapper
 
 
 class OptimizationConfig(NamedTuple):
@@ -102,12 +118,30 @@ class ProcessingResult:
     settings: Optional[OptimizationConfig] = None
 
 
+class GIFProcessingStatus(Enum):
+    """Enhanced GIF processing status with visual indicators"""
+    STARTING = ('⚡', ModernLogStyle.AZURE)
+    PROCESSING = ('↻', ModernLogStyle.CYAN)
+    OPTIMIZING = ('⚙', ModernLogStyle.SLATE)
+    SUCCESS = ('✓', ModernLogStyle.EMERALD)
+    WARNING = ('⚠', ModernLogStyle.AMBER)
+    ERROR = ('✖', ModernLogStyle.ROSE)
+    SKIPPED = ('→', ModernLogStyle.SLATE)
+
+
 class GIFProcessor(BaseProcessor):
     """Main GIF processing class combining optimization and conversion."""
 
-    def __init__(self, verbose: bool = False):
-        # Initialize base class first
-        super().__init__(verbose=verbose)
+    def __init__(self, logger=None, gpu_enabled=False, gpu_settings=None):
+        """Initialize GIF processor with GPU settings.
+
+        Args:
+            logger: Optional logger to use. If None, a module-specific logger is created.
+            gpu_enabled: Whether GPU acceleration is enabled.
+            gpu_settings: Dictionary of GPU settings to use.
+        """
+        # Initialize base class with logger
+        super().__init__(logger=logger or get_logger('gif_processor'))
 
         # Initialize thread-safe locks and events
         self._shutdown_event = threading.Event()
@@ -121,44 +155,91 @@ class GIFProcessor(BaseProcessor):
         self._stats_lock = threading.Lock()
         self._progress_lock = threading.Lock()
         self._processing_progress = {}
-        self._stats = {'retried': 0}
+        self._stats = {'retried': 0, 'processed': 0, 'failed': 0, 'skipped': 0}
         self._cleanup_handlers = []
         self.processed_files = set()
         self.logging_lock = threading.Lock()
         self.failed_files = []
+        # Add the missing file queue lock
+        self._file_queue_lock = threading.Lock()
 
-        # Initialize compression settings with consistent target size
-        self.compression_settings = {
-            'min_size_mb': 10.0,  # Changed from 15.0 to 10.0
-            'fps_range': (15, 30),
-            'colors': 256,
-            'quality': 85
-        }
+        # Store GPU status from parameters
+        self.has_gpu = gpu_enabled
+        self.gpu_settings = gpu_settings or {}
+
+        self.logger.debug(
+            f"Initializing GIF Processor. GPU enabled: {gpu_enabled}")
+        if gpu_settings:
+            self.logger.debug(f"GPU settings: {gpu_settings}")
+
+        # Import compression settings from default config
+        self.compression_settings = GIF_COMPRESSION
 
         # Initialize rest of components
-        self.dynamic_optimizer = DynamicGIFOptimizer(self.compression_settings)
         self._init_worker_management()
         self._init_caches()
         self._init_components()
         self._init_async_support()
 
+        # Setup signal handlers for graceful termination
+        self._setup_signal_handlers()
+
+        # Register cleanup handlers
+        atexit.register(self.cleanup_resources)
+
+        self.logger.debug("GIF Processor initialization complete")
+
     def _init_worker_management(self):
         """Initialize worker thread management."""
+        # Determine optimal number of threads based on CPU count
+        cpu_count = os.cpu_count() or 4
+        # At least 2, at most 6 threads
+        self.max_threads = max(2, min(cpu_count - 1, 6))
+
         self.worker_threads = []
-        self.max_threads = 2
         self.task_queue = queue.Queue()
         self.result_queue = queue.Queue()
         self._stop_workers = threading.Event()
 
+        # Add priority queue for important tasks
+        self.priority_queue = queue.PriorityQueue()
+
+        # Initialize thread pool
+        self._ensure_worker_threads()
+
+        self.logger.debug(
+            f"Worker management initialized with {self.max_threads} max threads")
+
     def _init_caches(self):
-        """Initialize caches."""
-        self._file_cache = TTLCache(maxsize=100, ttl=300)
-        self.dimension_cache = TTLCache(maxsize=100, ttl=300)
+        """Initialize caches with improved memory management."""
+        # Use LRU cache for file info with configurable size
+        # Increased cache size and TTL
+        self._file_cache = TTLCache(maxsize=150, ttl=600)
+        self.dimension_cache = TTLCache(maxsize=150, ttl=600)
+
+        # Add optimization result cache to avoid redundant processing
+        self.optimization_cache = TTLCache(maxsize=100, ttl=900)
+
+        # Add frame analysis cache
+        self.frame_analysis_cache = TTLCache(maxsize=50, ttl=300)
+
+        self.logger.debug("Caches initialized")
 
     def _init_components(self):
-        """Initialize processing components."""
+        """Initialize processing components with improved configuration."""
+        # Pass GPU settings to FFmpeg handler if available
         self.ffmpeg = FFmpegHandler()
-        self.memory_manager = MemoryManager(threshold_mb=1500)
+        if self.has_gpu and self.gpu_settings:
+            self.logger.debug("Updating FFmpeg handler with GPU settings")
+            self.ffmpeg.update_gpu_settings(self.gpu_settings)
+
+        # Increase memory threshold based on system memory
+        system_memory_gb = psutil.virtual_memory().total / (1024**3)
+        # 30% of system memory, min 1.5GB, max 4GB
+        memory_threshold = min(
+            max(1500, int(system_memory_gb * 0.3 * 1024)), 4096)
+
+        self.memory_manager = MemoryManager(threshold_mb=memory_threshold)
         self.stats = ProcessingStats()
         self.resource_monitor = ResourceMonitor()
         self.quality_manager = QualityManager()
@@ -166,10 +247,30 @@ class GIFProcessor(BaseProcessor):
         self.retry_count = 3
         self.retry_delay = 1
 
+        # Initialize the optimizer with GPU settings
+        self.logger.debug(f"Initializing DynamicGIFOptimizer")
+        self.dynamic_optimizer = DynamicGIFOptimizer(
+            self.compression_settings
+        )
+
+        self.logger.debug("Components initialization complete")
+
     def _init_async_support(self):
         """Initialize async support."""
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
+        self.logger.debug("Async support initialized")
+
+    def _setup_signal_handlers(self):
+        """Set up signal handlers for graceful termination."""
+        try:
+            # Set up signal handlers for graceful shutdown
+            signal.signal(signal.SIGINT, self._signal_handler)
+            signal.signal(signal.SIGTERM, self._signal_handler)
+            self.logger.debug("Signal handlers installed")
+        except Exception as e:
+            self.logger.warning(
+                f"Unable to set up signal handlers: {e}", exc_info=True)
 
     def get_file_lock(self, file_path: str) -> threading.Lock:
         """Get or create a lock for a specific file."""
@@ -215,7 +316,8 @@ class GIFProcessor(BaseProcessor):
                 try:
                     handler()
                 except Exception as e:
-                    self.dev_logger.error(f"Cleanup handler failed: {str(e)}")
+                    self.logger.error(
+                        f"Cleanup handler failed: {str(e)}")
 
             # Clean temp files with multiple attempts
             self._cleanup_temp_directory()
@@ -224,7 +326,7 @@ class GIFProcessor(BaseProcessor):
             self._clear_caches()
 
         except Exception as e:
-            self.dev_logger.error(f"Error during cleanup: {str(e)}")
+            self.logger.error(f"Error during cleanup: {str(e)}")
         finally:
             self._stop_workers.set()
             self._cleanup_threads()
@@ -254,7 +356,8 @@ class GIFProcessor(BaseProcessor):
                             except Exception:
                                 remaining_files.append(item)
                     except Exception as e:
-                        self.dev_logger.debug(f"Failed to remove {item}: {e}")
+                        self.logger.debug(
+                            f"Failed to remove {item}: {e}")
                         remaining_files.append(item)
 
                 if not remaining_files:
@@ -268,24 +371,25 @@ class GIFProcessor(BaseProcessor):
 
             # If files still remain, log them but continue
             if remaining_files:
-                self.dev_logger.warning(
+                self.logger.warning(
                     f"Could not remove {len(remaining_files)} files in temp directory")
                 for file in remaining_files:
-                    self.dev_logger.debug(f"Remaining file: {file}")
+                    self.logger.debug(f"Remaining file: {file}")
 
             # Don't try to remove the temp directory if files remain
             if not remaining_files:
                 try:
                     temp_dir.rmdir()
                 except Exception as e:
-                    self.dev_logger.debug(
+                    self.logger.debug(
                         f"Could not remove temp directory: {e}")
 
             # Always ensure temp directory exists
             temp_dir.mkdir(parents=True, exist_ok=True)
 
         except Exception as e:
-            self.dev_logger.error(f"Error cleaning temp directory: {str(e)}")
+            self.logger.error(
+                f"Error cleaning temp directory: {str(e)}")
             # Ensure temp directory exists even if cleanup failed
             temp_dir.mkdir(parents=True, exist_ok=True)
 
@@ -329,7 +433,7 @@ class GIFProcessor(BaseProcessor):
                 os.system("pkill -9 ffmpeg")
                 os.system("pkill -9 gifsicle")
         except Exception as e:
-            self.dev_logger.error(f"Failed to kill processes: {e}")
+            self.logger.error(f"Failed to kill processes: {e}")
 
     def _log_with_lock(self, level: str, message: str, file_id: str = "") -> None:
         """Thread-safe logging with deduplication."""
@@ -337,1089 +441,163 @@ class GIFProcessor(BaseProcessor):
             log_key = f"{file_id}:{message}"
             if log_key not in self.processed_files:
                 if level == "info":
-                    self.dev_logger.info(message)
+                    self.logger.info(message)
                 elif level == "error":
-                    self.dev_logger.error(message)
+                    self.logger.error(message)
                 elif level == "warning":
-                    self.dev_logger.warning(message)
+                    self.logger.warning(message)
                 elif level == "success":
-                    self.user_logger.success(message)
+                    self.logger.success(message)
                 self.processed_files.add(log_key)
 
     @log_function_call
     def create_gif(self, file_path: Path, output_path: Path, fps: int, dimensions: Tuple[int, int]) -> bool:
-        """Create optimized GIF with enhanced logging."""
-        try:
-            # Early exit for large files
-            MAX_INTERMEDIATE_SIZE_MB = 100  # Set a reasonable limit for intermediate files
+        """Create optimized GIF with enhanced quality and size control."""
+        # Initialize temp file variables outside the try block to ensure they exist in the finally block
+        temp_palette = None
+        temp_output = None
 
-            if self.verbose:
-                self.dev_logger.info(f"""
-=== Starting GIF Creation ===
-Source: {file_path.name}
-Target FPS: {fps}
-Input Dimensions: {dimensions[0]}x{dimensions[1]}
-Output Path: {output_path}
-===========================""")
+        try:
+            # Use the configured target size instead of hardcoded default
+            target_size_mb = self.compression_settings['min_size_mb']
+            MAX_INTERMEDIATE_SIZE_MB = max(100, target_size_mb * 2)
 
             original_size = self.get_file_size(file_path)
             if original_size > 1000:
-                self.dev_logger.error(
+                self.logger.error(
                     f"Source file too large: {original_size:.2f}MB")
                 return False
 
-            # Calculate dimensions with more aggressive scaling for large files
+            # Adjust FPS based on file size
+            adjusted_fps = fps
+            if original_size > 200:
+                adjusted_fps = min(fps, 12)
+            elif original_size > 100:
+                adjusted_fps = min(fps, 15)
+            elif original_size > 50:
+                adjusted_fps = min(fps, 20)
+
+            # Calculate dimensions with adaptive scaling
             max_dimension = max(dimensions[0], dimensions[1])
             scale_factor = 1.0
 
-            # More aggressive scaling based on file size
-            if original_size > 100:
-                scale_factor = min(scale_factor, 0.5)
+            # Scale based on file size and dimensions
+            if original_size > 200:
+                scale_factor = min(scale_factor, 0.4)
+            elif original_size > 100:
+                scale_factor = min(scale_factor, 0.6)
             elif original_size > 50:
-                scale_factor = min(scale_factor, 0.7)
+                scale_factor = min(scale_factor, 0.8)
 
-            if max_dimension > 1280:
-                scale_factor = min(scale_factor, 1280 / max_dimension)
-
-            if self.verbose:
-                self.dev_logger.info(
-                    f"Using scale factor {scale_factor:.2f} based on size and dimensions")
+            if max_dimension > 1920:
+                scale_factor = min(scale_factor, 0.4)
+            elif max_dimension > 1280:
+                scale_factor = min(scale_factor, 0.6)
+            elif max_dimension > 720:
+                scale_factor = min(scale_factor, 0.8)
 
             new_width = int(dimensions[0] * scale_factor // 2 * 2)
             new_height = int(dimensions[1] * scale_factor // 2 * 2)
+            new_width = max(new_width, 320)
+            new_height = max(new_height, 180)
 
-            if self.verbose:
-                self.dev_logger.info(
-                    f"Output dimensions: {new_width}x{new_height}")
+            # Determine optimal color count
+            color_count = 128
+            if original_size > 100:
+                color_count = 64
 
-            # Generate temp file paths
-            temp_palette = Path(TEMP_FILE_DIR) / \
-                f"palette_{file_path.stem}.png"
-            temp_output = Path(TEMP_FILE_DIR) / f"temp_{output_path.stem}.gif"
+            # Generate temp file paths with UUIDs to avoid FFmpeg image sequence pattern warnings
+            unique_id = str(uuid.uuid4())
+            temp_palette = Path(TEMP_FILE_DIR) / f"palette_{unique_id}.png"
+            temp_output = Path(TEMP_FILE_DIR) / f"temp_{unique_id}.gif"
 
-            try:
-                if self.verbose:
-                    self.dev_logger.info(
-                        "=== Step 1: Generating color palette ===")
+            # Create an optimized palette
+            palette_cmd = [
+                'ffmpeg', '-i', str(file_path),
+                '-vf', f'fps={adjusted_fps},scale={new_width}:{new_height}:flags=lanczos,palettegen=max_colors={color_count}:stats_mode=diff',
+                '-y', str(temp_palette)
+            ]
 
-                palette_cmd = [
-                    'ffmpeg', '-i', str(file_path),
-                    '-vf', f'fps={fps},scale={new_width}:{new_height}:flags=lanczos,palettegen=max_colors=128:stats_mode=diff',
-                    '-y', str(temp_palette)
-                ]
-
-                if self.verbose:
-                    self.dev_logger.info(
-                        f"Palette command: {' '.join(palette_cmd)}")
-
-                if not run_ffmpeg_command(palette_cmd):
-                    self.dev_logger.error("Palette generation failed")
-                    return False
-
-                palette_size = temp_palette.stat().st_size / 1024
-                if self.verbose:
-                    self.dev_logger.info(
-                        f"Palette generated successfully ({palette_size:.1f}KB)")
-                    self.dev_logger.info(
-                        "\n=== Step 2: Creating initial GIF ===")
-
-                gif_cmd = [
-                    'ffmpeg', '-i', str(file_path),
-                    '-i', str(temp_palette),
-                    '-lavfi',
-                    f'fps={fps},scale={new_width}:{new_height}:flags=lanczos[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle',
-                    '-y', str(temp_output)
-                ]
-
-                if self.verbose:
-                    self.dev_logger.info(
-                        f"GIF creation command: {' '.join(gif_cmd)}")
-
-                if not run_ffmpeg_command(gif_cmd):
-                    self.dev_logger.error("Initial GIF creation failed")
-                    return False
-
-                # Add size check after initial GIF creation
-                if temp_output.exists():
-                    initial_size = self.get_file_size(temp_output)
-                    if initial_size > MAX_INTERMEDIATE_SIZE_MB:
-                        self.dev_logger.warning(  # Changed from error to warning
-                            f"Initial GIF too large ({initial_size:.2f}MB > {MAX_INTERMEDIATE_SIZE_MB}MB), trying more aggressive compression")
-                        # Try more aggressive settings
-                        return self._create_gif_aggressive(file_path, output_path, fps, dimensions)
-
-                    # Continue with normal optimization if size is reasonable
-                    if self.verbose:
-                        self.dev_logger.info(
-                            f"Initial GIF created: {initial_size:.2f}MB")
-                        self.dev_logger.info(
-                            "\n=== Step 3: Optimizing with Gifsicle ===")
-
-                    gifsicle_cmd = [
-                        'gifsicle',
-                        '--optimize=3',
-                        '--colors', '128',
-                        '--lossy=80',
-                        '--no-conserve-memory',
-                        str(temp_output),
-                        '-o', str(output_path)
-                    ]
-
-                    if self.verbose:
-                        self.dev_logger.info(
-                            f"Optimization command: {' '.join(gifsicle_cmd)}")
-
-                    if not run_ffmpeg_command(gifsicle_cmd):
-                        self.dev_logger.error("Gifsicle optimization failed")
-                        return False
-
-                    final_size = self.get_file_size(output_path)
-                    reduction = ((original_size - final_size) /
-                                 original_size) * 100
-
-                    if self.verbose:
-                        self.dev_logger.info(f"""
-=== GIF Creation Summary ===
-Original Size: {original_size:.2f}MB
-Initial GIF: {initial_size:.2f}MB
-Final Size: {final_size:.2f}MB
-Reduction: {reduction:.1f}%
-FPS: {fps}
-Colors: 128
-Dimensions: {new_width}x{new_height}
-=========================""")
-
-                    # Changed this condition to use min_size_mb instead of hardcoded 100
-                    if final_size > self.compression_settings['min_size_mb']:
-                        if self.verbose:
-                            self.dev_logger.info(
-                                "\n=== Step 4: Additional Compression ===")
-                        self._compress_large_gif(output_path)
-
-                    # Final check against target size
-                    final_size = self.get_file_size(output_path)
-                    return final_size <= self.compression_settings['min_size_mb']
-
+            if not run_ffmpeg_command(palette_cmd):
+                self.logger.error("Palette generation failed")
                 return False
 
-            finally:
-                # Cleanup with logging
-                if self.verbose:
-                    self.dev_logger.info(
-                        "\n=== Cleaning up temporary files ===")
-                for temp_file in [temp_palette, temp_output]:
-                    try:
-                        if temp_file.exists():
-                            temp_file.unlink()
-                            if self.verbose:
-                                self.dev_logger.info(f"Removed: {temp_file}")
-                    except Exception as e:
-                        self.dev_logger.error(
-                            f"Failed to cleanup {temp_file}: {e}")
+            # Create the GIF with the generated palette
+            dither_method = "bayer" if original_size > 100 else "floyd_steinberg"
+            bayer_scale = 5 if original_size > 200 else 3
 
-        except Exception as e:
-            self.dev_logger.error(f"GIF creation failed: {str(e)}")
-            return False
+            gif_cmd = [
+                'ffmpeg', '-i', str(file_path),
+                '-i', str(temp_palette),
+                '-lavfi',
+                f'fps={adjusted_fps},scale={new_width}:{new_height}:flags=lanczos[x];[x][1:v]paletteuse=dither={dither_method}:bayer_scale={bayer_scale}:diff_mode=rectangle',
+                '-y', str(temp_output)
+            ]
 
-    def _create_gif_aggressive(self, file_path: Path, output_path: Path, fps: int, dimensions: Tuple[int, int]) -> bool:
-        """Create GIF with dynamically adjusted aggressive compression settings."""
-        original_size = self.get_file_size(file_path)
-        best_result_size = float('inf')
-        best_result_path = None
-        target_size = self.compression_settings['min_size_mb']
+            if not run_ffmpeg_command(gif_cmd):
+                self.logger.error("Initial GIF creation failed")
+                return False
 
-        # Calculate compression ratio needed
-        compression_ratio = original_size / target_size
+            # Check and optimize the initial GIF
+            if temp_output.exists():
+                initial_size = self.get_file_size(temp_output)
 
-        # Modified configs to preserve colors better
-        configs = []
-        if compression_ratio > 8:
-            # Extremely large files - preserve colors but be aggressive with other params
-            configs.extend([
-                {'scale': 0.3, 'colors': 256,
-                    'fps': min(fps, 12), 'lossy': 100},
-                {'scale': 0.4, 'colors': 192, 'fps': min(fps, 15), 'lossy': 90}
-            ])
-        elif compression_ratio > 4:
-            # Large files - still keep good color depth
-            configs.extend([
-                {'scale': 0.4, 'colors': 256,
-                    'fps': min(fps, 15), 'lossy': 90},
-                {'scale': 0.5, 'colors': 192, 'fps': min(fps, 20), 'lossy': 80}
-            ])
-        else:
-            # Moderate compression - maintain maximum color quality
-            configs.extend([
-                {'scale': 0.6, 'colors': 256,
-                    'fps': min(fps, 20), 'lossy': 80},
-                {'scale': 0.7, 'colors': 256, 'fps': min(fps, 25), 'lossy': 70}
-            ])
-
-        try:
-            # Create a unique temp directory for this process
-            temp_dir = Path(TEMP_FILE_DIR) / \
-                f"aggressive_{file_path.stem}_{int(time.time())}"
-            temp_dir.mkdir(parents=True, exist_ok=True)
-
-            for config in configs:
-                if self._should_exit():
-                    break
-
-                try:
-                    temp_palette = temp_dir / f"palette_{config['colors']}.png"
-                    temp_output = temp_dir / f"output_{config['colors']}.gif"
-
-                    new_width = int(dimensions[0] * config['scale'] // 2 * 2)
-                    new_height = int(dimensions[1] * config['scale'] // 2 * 2)
-
-                    # Ensure minimum dimensions
-                    new_width = max(16, new_width)
-                    new_height = max(16, new_height)
-
-                    # Modified palette generation command to preserve color fidelity
-                    palette_cmd = [
-                        'ffmpeg', '-i', str(file_path),
-                        '-vf', (f'fps={config["fps"]},scale={new_width}:{new_height}:flags=lanczos,'
-                                f'palettegen=max_colors={config["colors"]}:stats_mode=full:reserve_transparent=0'),
-                        '-y', str(temp_palette)
-                    ]
-
-                    if not run_ffmpeg_command(palette_cmd):
-                        continue
-
-                    # Modified paletteuse settings for better color preservation
-                    gif_cmd = [
-                        'ffmpeg', '-i', str(file_path),
-                        '-i', str(temp_palette),
-                        '-lavfi',
-                        (f'fps={config["fps"]},scale={new_width}:{new_height}:flags=lanczos[x];'
-                         f'[x][1:v]paletteuse=dither=floyd_steinberg:diff_mode=rectangle:new=1'),
-                        '-y', str(temp_output)
-                    ]
-
-                    if not run_ffmpeg_command(gif_cmd):
-                        continue
-
-                    # Check if file was created and optimize with gifsicle
-                    if temp_output.exists():
-                        # Modified gifsicle optimization to focus on frame optimization rather than color reduction
-                        gifsicle_cmd = [
-                            'gifsicle',
-                            '--optimize=3',
-                            '--colors', str(config['colors']),
-                            '--lossy=' + str(config['lossy']),
-                            '--no-conserve-memory',
-                            '--careful',  # Added careful flag
-                            '--dither=none',  # Prevent additional dithering
-                            str(temp_output),
-                            '-o', str(temp_output)
-                        ]
-
-                        if run_ffmpeg_command(gifsicle_cmd):
-                            current_size = self.get_file_size(temp_output)
-                            self.dev_logger.info(
-                                f"Aggressive attempt result: {current_size:.2f}MB"
-                            )
-
-                            # Update best result if this is better
-                            if current_size < best_result_size:
-                                if best_result_path and best_result_path != temp_output:
-                                    try:
-                                        best_result_path.unlink()
-                                    except Exception:
-                                        pass
-                                best_result_size = current_size
-                                best_result_path = temp_output
-                                # Create a copy in the temp directory
-                                best_copy = temp_dir / \
-                                    f"best_{config['colors']}.gif"
-                                shutil.copy2(temp_output, best_copy)
-                                best_result_path = best_copy
-
-                            # If we've reached target size, we can stop
-                            if current_size <= target_size:
-                                shutil.copy2(best_result_path, output_path)
-                                return True
-
-                except Exception as e:
-                    self.dev_logger.error(
-                        f"Error during aggressive compression attempt: {e}")
-                    continue
-
-            # If we have a best result but didn't reach target, use it anyway
-            if best_result_path and best_result_path.exists():
-                if best_result_size < original_size:
-                    shutil.copy2(best_result_path, output_path)
-                    self.dev_logger.warning(
-                        f"Using best achieved result: {best_result_size:.2f}MB"
-                    )
+                # If size is already good, copy directly to output
+                if initial_size <= target_size_mb:
+                    shutil.copy2(temp_output, output_path)
+                    self.logger.success(
+                        f"Initial GIF meets size target: {initial_size:.2f}MB")
                     return True
 
-            return False
+                # If initial GIF is too large, try aggressive optimization
+                if initial_size > MAX_INTERMEDIATE_SIZE_MB:
+                    self.logger.warning(
+                        f"Initial GIF too large, trying aggressive compression")
+                    return self._create_gif_aggressive(file_path, output_path, adjusted_fps, dimensions)
 
-        except Exception as e:
-            self.dev_logger.error(f"Aggressive GIF creation failed: {str(e)}")
-            return False
-        finally:
-            # Clean up temp directory and all its contents
-            try:
-                if temp_dir.exists():
-                    shutil.rmtree(temp_dir, ignore_errors=True)
-            except Exception as e:
-                self.dev_logger.error(f"Failed to cleanup temp directory: {e}")
-
-    def process_file(self, file_path: Path, output_path: Path, is_video: bool) -> bool:
-        """Process a single file with improved error handling."""
-        try:
-            if not file_path.exists():
-                self.dev_logger.error(
-                    f"Input file does not exist: {file_path}")
-                return False
-
-            # Check file size before processing
-            file_size = self.get_file_size(file_path)
-            if file_size > GIF_SIZE_TO_SKIP:
-                self.dev_logger.warning(
-                    f"Skipping {file_path.name} - {file_size:.1f}MB exceeds size limit")
-                return False
-
-            try:
-                if is_video:
-                    # For videos, create temporary GIF with timestamp
-                    timestamp = int(time.time() * 1000)
-                    temp_gif = Path(TEMP_FILE_DIR) / \
-                        f"temp_{timestamp}_{file_path.stem}.gif"
-
-                    # Get dimensions with retry
-                    dimensions = self._get_dimensions_with_retry(file_path)
-                    if not dimensions or not self._validate_dimensions(dimensions):
-                        self.dev_logger.error(
-                            f"Invalid dimensions for {file_path}")
-                        return False
-
-                    self.dev_logger.info(
-                        f"Creating GIF from video: {file_path.name}")
-                    if not self.create_gif(file_path, temp_gif, 30, dimensions):
-                        self.dev_logger.error(
-                            f"Failed to create GIF from video: {file_path}")
-                        return False
-
-                    # Add size check after initial creation
-                    if temp_gif.exists():
-                        initial_size = self.get_file_size(temp_gif)
-                        if initial_size > self.compression_settings['min_size_mb'] * 2:
-                            self.dev_logger.info(
-                                f"Initial GIF too large ({initial_size:.2f}MB), trying direct FFmpeg conversion")
-                            temp_gif.unlink(missing_ok=True)
-                            return self._compress_large_with_ffmpeg(file_path, output_path)
-
-                        # Now optimize the temporary GIF
-                        self.dev_logger.info(
-                            f"Optimizing temporary GIF: {temp_gif}")
-                        result = self.optimize_gif(
-                            temp_gif, output_path, self.compression_settings['min_size_mb'])
-                        temp_gif.unlink(missing_ok=True)
-                        return result[1]
-
-                else:
-                    # Direct GIF optimization
-                    self.dev_logger.info(
-                        f"Optimizing GIF directly: {file_path}")
-                    result = self.optimize_gif(
-                        file_path, output_path, self.compression_settings['min_size_mb'])
-                    return result[1]
-
-            except Exception as e:
-                self.dev_logger.error(f"Processing error: {e}")
-                return False
-
-        except Exception as e:
-            self.dev_logger.error(f"Error processing {file_path}: {str(e)}")
-            return False
-
-    def _process_video(self, file_path: Path, output_path: Path, dimensions: Tuple[int, int]) -> None:
-        """Process video with improved strategy for large files."""
-        temp_files = []
-        timestamp = int(time.time() * 1000)
-        success = False
-        best_size = float('inf')
-        best_temp_file = None
-        logged_attempts = set()  # Add this to track logged attempts
-
-        initial_size = self.get_file_size(file_path)
-        final_size = initial_size
-
-        try:
-            target_size = self.compression_settings.get('min_size_mb', 10.0)
-            initial_size = self.get_file_size(file_path)
-
-            # More aggressive initial scale for large files
-            size_ratio = target_size / initial_size
-            if initial_size > 90:  # Very large files
-                scale_factor = min(1.0, max(0.3, (size_ratio ** 0.5) * 0.7))
-                current_colors = 192  # Start with fewer colors
-            else:
-                scale_factor = min(1.0, max(0.4, (size_ratio ** 0.4)))
-                current_colors = 256
-
-            self.dev_logger.info(
-                f"\n{'='*50}\n"
-                f"Starting processing for: {file_path.name}\n"
-                f"Initial size: {initial_size:.2f}MB\n"
-                f"Target size: {target_size:.2f}MB\n"
-                f"Dimensions: {dimensions[0]}x{dimensions[1]}\n"
-                f"{'='*50}"
-            )
-
-            attempt = 0
-            max_attempts = 8
-            current_size = initial_size
-            fps = self.compression_settings["fps_range"][0]
-            prev_settings = set()  # Track used settings
-
-            while attempt < max_attempts and current_size > target_size:
-                attempt_num = attempt + 1
-
-                # Only log attempt header if we haven't seen this attempt number
-                if attempt_num not in logged_attempts:
-                    self.dev_logger.info(
-                        f"\n{'-'*50}\n"
-                        f"Optimization Attempt {attempt_num}/{max_attempts}\n"
-                        f"{'-'*50}"
-                    )
-                    logged_attempts.add(attempt_num)
-
-                # Create temp files in main temp directory
-                current_temp_file = Path(
-                    TEMP_FILE_DIR) / f"temp_{timestamp}_{file_path.stem}.gif"
-                temp_files.append(current_temp_file)
-
-                # Calculate dimensions
-                # Calculate dimensions
-                new_width = int(dimensions[0] * scale_factor // 2 * 2)
-                new_height = int(dimensions[1] * scale_factor // 2 * 2)
-
-                # Calculate lossy value based on current size ratio
-                current_ratio = current_size / target_size
-                lossy_value = min(100, int(40 * current_ratio))
-
-                # Skip if we've already tried these settings
-                settings_key = (scale_factor, current_colors, lossy_value)
-                if settings_key in prev_settings:
-                    # Force more aggressive changes
-                    scale_factor *= 0.7
-                    current_colors = max(128, current_colors - 32)
-                    continue
-
-                prev_settings.add(settings_key)
-
-                # Log settings only once per unique configuration
-                self.dev_logger.info(
-                    f"Settings:\n"
-                    f"- Scale: {scale_factor:.3f}\n"
-                    f"- Size: {new_width}x{new_height}\n"
-                    f"- Colors: {current_colors}\n"
-                    f"- Lossy: {lossy_value}"
-                )
-
-                # Optimized FFmpeg command with better compression
-                combined_cmd = [
-                    'ffmpeg', '-i', str(file_path),
-                    '-vf', (f'fps={fps},'
-                            f'scale={new_width}:{new_height}:flags=lanczos,'
-                            f'split[x][y];[x]palettegen=max_colors={current_colors}:reserve_transparent=0[p];'
-                            f'[y][p]paletteuse=dither=sierra2_4a:diff_mode=rectangle'),
-                    '-y', str(current_temp_file)
-                ]
-
-                if not run_ffmpeg_command(combined_cmd):
-                    self.dev_logger.error("Conversion failed")
-                    break
-
-                # Optimize in place with gifsicle
-                optimize_cmd = [
+                # Apply standard optimization
+                gifsicle_cmd = [
                     'gifsicle',
                     '--optimize=3',
-                    '--colors', str(current_colors),
-                    '--lossy=' + str(lossy_value),
+                    '--colors', str(color_count),
+                    '--lossy=30',
                     '--no-conserve-memory',
-                    '--careful',
-                    str(current_temp_file),
-                    '--output', str(current_temp_file)
+                    str(temp_output),
+                    '-o', str(output_path)
                 ]
 
-                run_ffmpeg_command(optimize_cmd)
-                current_size = self.get_file_size(current_temp_file)
+                if not run_ffmpeg_command(gifsicle_cmd):
+                    shutil.copy2(temp_output, output_path)
+                    self.logger.warning(
+                        "Gifsicle optimization failed, using unoptimized GIF")
 
-                # Track best result
-                if current_size < best_size:
-                    best_size = current_size
-                    if best_temp_file:
-                        try:
-                            best_temp_file.unlink()
-                        except Exception:
-                            pass
-                    best_temp_file = current_temp_file
-
-                reduction = ((initial_size - current_size) /
-                             initial_size) * 100
-                self.dev_logger.info(
-                    f"Result: {current_size:.2f}MB ({reduction:.1f}% reduction)"
-                )
-
-                if current_size <= target_size:
-                    self.dev_logger.info(
-                        f"\nTarget size achieved: {current_size:.2f}MB")
-                    shutil.copy2(current_temp_file, output_path)
-                    success = True
-                    break
-
-                # Smart parameter adjustment based on results
-                if attempt < max_attempts - 1:
-                    size_ratio = current_size / target_size
-
-                    if size_ratio > 3:
-                        # Very far from target, be aggressive
-                        scale_factor *= 0.6
-                        current_colors = max(128, current_colors - 64)
-                    elif size_ratio > 2:
-                        # Still too large
-                        scale_factor *= 0.7
-                        current_colors = max(128, current_colors - 32)
-                    elif size_ratio > 1.5:
-                        # Getting closer
-                        scale_factor *= 0.8
-                        if current_colors > 192:
-                            current_colors = 192
-                    else:
-                        # Fine-tuning
-                        scale_factor *= 0.9
-
-                    # Ensure we don't get stuck
-                    if scale_factor > 0.3 and attempt >= 2:
-                        scale_factor = min(scale_factor, 0.3)
-
-                    # Prevent going too low
-                    scale_factor = max(0.25, scale_factor)
-                    current_colors = max(64, current_colors)
-
-                attempt += 1
-
-            # If we didn't reach target but have a best result
-            if not success and best_temp_file and best_size < initial_size:
-                shutil.copy2(best_temp_file, output_path)
-                self.dev_logger.info(
-                    f"\nUsing best achieved result: {best_size:.2f}MB"
-                )
-
-            final_size = self.get_file_size(output_path)
-            self.dev_logger.info(
-                f"\nFinal Results:\n"
-                f"Initial: {initial_size:.2f}MB\n"
-                f"Final: {final_size:.2f}MB\n"
-                f"Reduction: {((initial_size - final_size) / initial_size) * 100:.1f}%"
-            )
-
-            success = final_size <= self.compression_settings.get(
-                'min_size_mb', 10.0)
-            self.stats.add_result(file_path, initial_size, final_size, success)
-
-        except Exception as e:
-            self.dev_logger.error(f"Error: {str(e)}")
-            self.stats.add_result(file_path, initial_size, initial_size, False)
-            self.failed_files.append(file_path)
-        finally:
-            for temp_file in temp_files:
-                try:
-                    if temp_file.exists() and temp_file != best_temp_file:
-                        temp_file.unlink()
-                except Exception as e:
-                    self.dev_logger.error(f"Cleanup error: {e}")
-            if best_temp_file and best_temp_file.exists():
-                try:
-                    best_temp_file.unlink()
-                except Exception:
-                    pass
-
-    # ...rest of the code...
-
-    @log_function_call
-    def _compress_large_gif(self, gif_path: Path) -> None:
-        """Additional compression for large GIFs."""
-        temp_path = None
-        try:
-            timestamp = int(time.time() * 1000)
-            temp_path = gif_path.with_name(
-                f"temp_{timestamp}_{gif_path.stem}.gif")
-
-            # More conservative optimization settings for better quality
-            cmd = [
-                'gifsicle',
-                '--optimize=3',
-                '--colors', '128',     # Keep more colors for quality
-                '--lossy=80',          # Less aggressive lossy compression
-                '--scale', '0.8',      # Less aggressive scaling
-                '--no-conserve-memory',
-                '--careful',           # More careful optimization
-                '--threads=4',
-                str(gif_path),
-                '-o', str(temp_path)
-            ]
-
-            if run_ffmpeg_command(cmd) and temp_path.exists():
-                original_size = self.get_file_size(gif_path)
-                compressed_size = self.get_file_size(temp_path)
-
-                if compressed_size < original_size:
-                    try:
-                        gif_path.unlink()
-                        temp_path.replace(gif_path)
-                        logger.success(
-                            f"Additional compression succeeded: {original_size:.2f}MB -> {compressed_size:.2f}MB"
-                        )
-                    except Exception as e:
-                        logger.error(f"Failed to replace file: {e}")
+                final_size = self.get_file_size(output_path)
+                if final_size > target_size_mb:
+                    self.logger.info(
+                        f"Further optimization needed: {final_size:.2f}MB > {target_size_mb}MB")
                 else:
-                    logger.skip(
-                        f"Additional compression skipped - no size reduction achieved"
-                    )
+                    self.logger.success(
+                        f"Initial optimization successful: {final_size:.2f}MB")
 
-        except Exception as e:
-            logger.error(f"Additional compression failed: {str(e)}")
-        finally:
-            if temp_path and temp_path.exists():
-                try:
-                    temp_path.unlink()
-                except Exception as e:
-                    logger.error(f"Failed to cleanup temp file: {e}")
-
-    def _ensure_worker_threads(self):
-        """Ensure worker threads are running."""
-        if not self.worker_threads:
-            for _ in range(self.max_threads):
-                thread = threading.Thread(
-                    target=self._worker_thread, daemon=True)
-                thread.start()
-                self.worker_threads.append(thread)
-
-    def _worker_thread(self):
-        """Worker thread to process tasks from queue."""
-        while not self._stop_workers.is_set():
-            try:
-                task = self.task_queue.get(timeout=1)
-                if task:
-                    file_path, temp_gif, fps, dimensions, config, target_size = task
-                    result = self._process_single_config(
-                        file_path, temp_gif, fps,
-                        dimensions[0], dimensions[1],
-                        config, target_size
-                    )
-                    self.result_queue.put(result)
-                self.task_queue.task_done()
-            except queue.Empty:
-                continue
-            except Exception as e:
-                self.dev_logger.error(f"Worker thread error: {e}")
-
-    def _process_single_config(self, file_path: Path, temp_gif: Path, fps: int,
-                               width: int, height: int, settings: OptimizationConfig, target_size: float) -> Optional[Dict]:
-        """Process a single optimization configuration."""
-        try:
-            # Create initial GIF
-            if self.ffmpeg.create_optimized_gif(
-                file_path,
-                temp_gif,
-                fps,
-                (int(width * settings.scale_factor),
-                 int(height * settings.scale_factor)),
-                {
-                    'colors': settings.colors,
-                    'lossy_value': settings.lossy_value,
-                    'dither_mode': settings.dither_mode,
-                    'bayer_scale': settings.bayer_scale
-                }
-            ):
-                size = self.get_file_size(temp_gif)
-
-                # Only proceed with gifsicle if initial size is promising
-                if size < min(90, target_size * 2):
-                    optimized_gif = Path(TEMP_FILE_DIR) / \
-                        f"{temp_gif.stem}_opt.gif"
-
-                    cmd = [
-                        'gifsicle',
-                        '--optimize=3',
-                        '--colors', str(settings.colors),
-                        '--lossy=' + str(settings.lossy_value),
-                        '--no-conserve-memory',
-                        '--threads=2',
-                        str(temp_gif),
-                        '-o', str(optimized_gif)
-                    ]
-
-                    if run_ffmpeg_command(cmd) and optimized_gif.exists():
-                        final_size = self.get_file_size(optimized_gif)
-                        return {
-                            'success': True,
-                            'fps': fps,
-                            'size': final_size,
-                            'path': str(optimized_gif),
-                            'settings': settings
-                        }
-
-        except Exception as e:
-            self.dev_logger.error(f"Configuration processing error: {str(e)}")
-
-        return None
-
-    def _cleanup_temp_files(self, temp_files: list[Path]) -> None:
-        """Clean up temporary files with improved error handling."""
-        for temp_file in temp_files:
-            try:
-                if temp_file and temp_file.exists():
-                    temp_file.unlink()
-                TempFileManager.unregister(temp_file)
-            except Exception as e:
-                self.dev_logger.error(
-                    f"Failed to cleanup {temp_file}: {str(e)}")
-
-    def _cleanup_file_resources(self, file_path: str) -> None:
-        """Clean up resources associated with a file."""
-        with self._file_locks_lock:
-            if file_path in self._file_locks:
-                del self._file_locks[file_path]
-
-        # Clear process queue
-        while not self.task_queue.empty():
-            try:
-                self.task_queue.get_nowait()
-            except queue.Empty:
-                break
-
-        # Force garbage collection
-        gc.collect()
-
-    def _wrapped_process_single_fps(self, args: Tuple) -> ProcessingResult:
-        """Wrapper for process_single_fps with thread registration."""
-        self._register_thread()
-        try:
-            return self.process_single_fps(args)
-        finally:
-            self._unregister_thread()
-
-    @performance_monitor
-    def process_all(self) -> List[Path]:
-        """Process all files with improved reporting."""
-        self.failed_files = []
-        self.stats.reset()
-
-        try:
-            # Get all input files and sort by size
-            input_files = []
-
-            # Collect video files
-            for video_format in SUPPORTED_VIDEO_FORMATS:
-                input_files.extend(Path(INPUT_DIR).glob(f'*{video_format}'))
-
-            # Collect GIF files
-            input_files.extend(Path(INPUT_DIR).glob('*.gif'))
-
-            if not input_files:
-                self.dev_logger.info("No files found to process")
-                return []
-
-            # Sort files by size (smallest first)
-            sorted_files = sorted(input_files, key=lambda f: f.stat().st_size)
-
-            # Process sorted files
-            total_files = len(sorted_files)
-            for index, file_path in enumerate(sorted_files, 1):
-                if self._should_exit():
-                    self.dev_logger.info("Gracefully stopping processing...")
-                    break
-
-                self.dev_logger.info(
-                    f"\nProcessing file {index}/{total_files}: {file_path.name}"
-                )
-
-                output_gif = Path(OUTPUT_DIR) / f"{file_path.stem}.gif"
-                # Add this line
-                target_size = self.compression_settings['min_size_mb']
-
-                # Check if output exists and meets size requirements
-                if output_gif.exists():
-                    output_size = self.get_file_size(output_gif)
-                    if output_size <= target_size:  # Use target_size consistently
-                        self.dev_logger.info(
-                            f"Skipping {file_path.name} - Output already exists and meets size requirement ({output_size:.2f}MB <= {target_size}MB)"
-                        )
-                        continue
-                    else:
-                        self.dev_logger.info(
-                            f"Reprocessing {file_path.name} - Existing output ({output_size:.2f}MB) exceeds size limit ({target_size}MB)"
-                        )
-                        try:
-                            output_gif.unlink()
-                        except Exception as e:
-                            self.dev_logger.error(
-                                f"Failed to remove oversized output: {e}")
-                            continue
-
-                try:
-                    is_video = file_path.suffix.lower() in SUPPORTED_VIDEO_FORMATS
-                    self.process_file(file_path, output_gif, is_video=is_video)
-
-                    # Verify the output was created
-                    if not output_gif.exists():
-                        self.dev_logger.error(
-                            f"Failed to create output for {file_path.name}")
-                        self.failed_files.append(file_path)
-
-                except Exception as e:
-                    self.dev_logger.error(
-                        f"Error processing {file_path.name}: {str(e)}")
-                    self.failed_files.append(file_path)
-
-                # Check memory usage and cleanup if needed
-                self.memory_manager.check_memory()
-
-        except KeyboardInterrupt:
-            self.dev_logger.warning("\nProcessing interrupted by user")
-            self._shutdown_event.set()
-        except Exception as e:
-            self.dev_logger.error(f"Error in process_all: {str(e)}")
-            self.dev_logger.debug(f"Stack trace: {traceback.format_exc()}")
-        finally:
-            # Log processing summary
-            self.dev_logger.info(self.stats.get_summary())
-
-            if self._should_exit():
-                self.dev_logger.info("Cleaning up after graceful exit...")
-            self.cleanup_resources()
-
-            # Report final status
-            if self.failed_files:
-                self.dev_logger.warning(
-                    f"Failed to process {len(self.failed_files)} files"
-                )
+                return True
             else:
-                self.dev_logger.success("All files processed successfully")
-
-        return self.failed_files
-
-    def _process_gif(self, file_path: Path, output_path: Path, dimensions: Tuple[int, int]) -> None:
-        """Process GIF with graceful exit support."""
-        try:
-            if self._should_exit():
-                return
-
-            file_size = self.get_file_size(file_path)
-            if file_size > GIF_SIZE_TO_SKIP:
-                self.dev_logger.warning(
-                    f"Skipping {file_path.name} - {file_size:.1f}MB exceeds size limit")
-                return None
-
-            max_attempts = 3  # Add max_attempts definition
-            for attempt in range(max_attempts):
-                if self._should_exit():
-                    self.dev_logger.info(
-                        "Gracefully stopping GIF optimization...")
-                    return
-
-                # Try progressive optimization first
-                if self.progressive_optimization:
-                    try:
-                        success, final_size = self.dynamic_optimizer.optimize_gif(
-                            file_path, output_path, self.compression_settings['min_size_mb'])
-                        if success:
-                            self.dev_logger.info(
-                                f"Progressive optimization succeeded: {final_size:.2f}MB")
-                            return file_path
-                    except Exception as e:
-                        self.dev_logger.warning(
-                            f"Progressive optimization failed: {e}")
-
-                # Fall back to standard optimization
-                try:
-                    current_settings = self._get_optimized_configs(
-                        file_size,
-                        self.compression_settings['min_size_mb'],
-                        30,  # Default FPS for GIFs
-                        dimensions
-                    )[0]  # Use best quality settings first
-
-                    result = self._process_single_config(
-                        file_path,
-                        output_path,
-                        self.compression_settings['fps_range'][0],
-                        dimensions[0],
-                        dimensions[1],
-                        current_settings,
-                        self.compression_settings['min_size_mb']
-                    )
-
-                    if result and result.get('success'):
-                        return file_path
-
-                except Exception as e:
-                    self.dev_logger.error(
-                        f"Standard optimization attempt {attempt + 1} failed: {e}")
-                    if attempt == max_attempts - 1:
-                        raise
-
-                time.sleep(1)  # Brief pause between attempts
-
-            return None
+                self.logger.error(
+                    "GIF creation failed - no output file generated")
+                return False
 
         except Exception as e:
-            self.dev_logger.error(f"Error processing {file_path}: {str(e)}")
-            return None
-
-    def _update_progress(self, file_id: str, status: str) -> None:
-        """Update processing progress for a file."""
-        with self._progress_lock:
-            self._processing_progress[file_id] = {
-                'status': status,
-                'timestamp': time.time()
-            }
-
-    def _check_timeout(self, file_id: str) -> bool:
-        """Check if processing has timed out."""
-        with self._progress_lock:
-            if file_id in self._processing_progress:
-                elapsed = time.time() - \
-                    self._processing_progress[file_id]['timestamp']
-                return elapsed > self._processing_timeout
-        return False
-
-    def _signal_handler(self, signum, frame):
-        """Enhanced signal handler with proper cleanup."""
-        if self._shutdown_initiated:
-            return
-
-        self.dev_logger.warning("\nReceived interrupt signal. Cleaning up...")
-        try:
-            self.cleanup_resources()
+            self.logger.error(f"GIF creation error: {str(e)}")
+            traceback.print_exc()
+            return False
         finally:
-            sys.exit(0)
-
-    def _immediate_shutdown_handler(self, signum, frame):
-        """Handle immediate shutdown when signal is received."""
-        if self._shutdown_initiated:
-            return
-
-        self.dev_logger.warning("\nForce stopping all processes...")
-        try:
-            # Set all termination flags immediately
-            self._immediate_termination.set()
-            self._shutdown_event.set()
-            self._processing_cancelled.set()
-            self._shutdown_initiated = True
-
-            # Kill all FFmpeg and Gifsicle processes immediately without waiting
-            self._kill_all_processes(force=True)
-
-            # Clear queues without waiting
-            self._clear_queues_no_wait()
-
-            # Stop all worker threads immediately
-            self._stop_workers.set()
-            self._terminate_threads()
-
-        except Exception as e:
-            self.dev_logger.error(f"Error during immediate shutdown: {e}")
-        finally:
-            sys.exit(1)  # Force exit without waiting
-
-    def _kill_all_processes(self, force: bool = False):
-        """Kill all running processes with optional force flag."""
-        try:
-            if sys.platform == 'win32':
-                # Use taskkill with /F for force
-                kill_flags = ['/F'] if force else []
-                for proc in ['ffmpeg.exe', 'gifsicle.exe']:
-                    subprocess.run(['taskkill'] + kill_flags + ['/IM', proc],
-                                   stdout=subprocess.DEVNULL,
-                                   stderr=subprocess.DEVNULL,
-                                   creationflags=subprocess.CREATE_NO_WINDOW)
-            else:
-                # Use SIGKILL for force, SIGTERM otherwise
-                sig = signal.SIGKILL if force else signal.SIGTERM
-                os.system(f"pkill -{sig} ffmpeg")
-                os.system(f"pkill -{sig} gifsicle")
-        except Exception as e:
-            self.dev_logger.error(f"Failed to kill processes: {e}")
-
-    def _clear_queues_no_wait(self):
-        """Clear queues without waiting."""
-        for queue_obj in [self.task_queue, self.result_queue]:
-            while True:
-                try:
-                    queue_obj.get_nowait()
-                except queue.Empty:
-                    break
-
-    def _terminate_threads(self):
-        """Terminate threads without waiting for completion."""
-        for thread in list(self.worker_threads):
-            if thread.is_alive():
-                # Just flag the thread, don't wait
-                self._stop_workers.set()
-        self.worker_threads.clear()
-
-    def _should_exit(self) -> bool:
-        """Enhanced exit check with immediate response."""
-        # Check immediate termination first
-        if self._immediate_termination.is_set():
-            return True
-        return (self._shutdown_event.is_set() or
-                self._processing_cancelled.is_set() or
-                self._shutdown_initiated)
-
-    def _process_single_config_with_retry(self, *args, **kwargs) -> Optional[dict]:
-        """Process single configuration with retry logic."""
-        for attempt in range(self.retry_count):
+            # Cleanup temp files
             try:
-                return self._process_single_config(*args, **kwargs)
-            except Exception as e:
-                if attempt < self.retry_count - 1:
-                    with self._stats_lock:
-                        self._stats['retried'] += 1
-                    time.sleep(self.retry_delay * (attempt + 1))
-                else:
-                    raise
-
-    def _calculate_optimal_batch_size(self) -> int:
-        """Calculate optimal batch size based on available memory."""
-        available_memory = psutil.virtual_memory().available / (1024 * 1024)  # MB
-        # Assume 500MB per process
-        return max(1, min(10, int(available_memory / 500)))
-
-    def _generate_optimization_configs(self, input_size: float, target_size: float) -> List[Dict]:
-        """Generate optimized configuration list."""
-        ratio = target_size / input_size
-        configs = []
-
-        # Dynamic scale factors based on size ratio
-        scale_factors = [
-            min(1.0, max(0.25, ratio ** 0.5)),
-            min(0.75, max(0.2, ratio ** 0.6)),
-            min(0.5, max(0.15, ratio ** 0.7)),
-            min(0.25, max(0.1, ratio ** 0.8))
-        ]
-
-        for scale in scale_factors:
-            for colors in [256, 192, 128, 64]:
-                configs.append({
-                    'scale_factor': scale,
-                    'colors': colors,
-                    'lossy_value': min(100, int(30 * (1/scale))),
-                    # Priority for processing order
-                    'priority': scale * (colors / 256)
-                })
-
-        # Sort by priority
-        return sorted(configs, key=lambda x: x['priority'], reverse=True)
+                if temp_palette and temp_palette.exists():
+                    temp_palette.unlink(missing_ok=True)
+                if temp_output and temp_output.exists():
+                    temp_output.unlink(missing_ok=True)
+            except Exception as cleanup_e:
+                self.logger.error(f"Cleanup error: {cleanup_e}")
 
     def _check_early_exit(self, results: List[Dict]) -> bool:
         """Check if we can exit early with good enough results."""
@@ -1427,325 +605,7 @@ Dimensions: {new_width}x{new_height}
             return False
 
         best_result = max(results, key=lambda x: (x['fps'], -x['size']))
-        target_size = self.compression_settings.get('min_size_mb', 15.0)
-
-        return (best_result['size'] <= target_size and
-                best_result['fps'] >= self.compression_settings['fps_range'][0] + 2)
-
-    def _get_dimensions_with_retry(self, file_path: Path, max_retries: int = 3) -> Tuple[Optional[int], Optional[int]]:
-        """Get video dimensions with improved error handling and validation."""
-        last_dimensions = None
-        last_error = None
-        file_path = Path(file_path)
-
-        if not file_path.exists():
-            self.dev_logger.error(f"File not found: {file_path}")
-            return None, None
-
-        # Remove the wait_for_file_completion check
-        self.dev_logger.debug(f"Starting dimension detection for {file_path}")
-
-        methods = [
-            (self._get_dimensions_ffprobe, "FFprobe"),
-            (self._get_dimensions_opencv, "OpenCV"),
-            (self._get_dimensions_ffmpeg, "FFmpeg")
-        ]
-
-        for method, method_name in methods:
-            for attempt in range(max_retries):
-                try:
-                    self.dev_logger.debug(
-                        f"Trying {method_name} (attempt {attempt + 1})")
-                    dimensions = method(file_path)
-
-                    # Store last valid dimensions as backup
-                    if dimensions and len(dimensions) == 2 and all(isinstance(d, int) for d in dimensions):
-                        last_dimensions = dimensions
-
-                    if self._validate_dimensions(dimensions):
-                        self.dev_logger.debug(
-                            f"Got valid dimensions using {method_name}: {dimensions}")
-                        return dimensions
-
-                except Exception as e:
-                    last_error = str(e)
-                    if attempt == max_retries - 1:
-                        self.dev_logger.debug(
-                            f"{method_name} failed after {max_retries} attempts: {str(e)}")
-
-                if attempt < max_retries - 1:
-                    time.sleep(0.5 * (2 ** attempt))
-
-        # If we have last_dimensions, try to use them as fallback
-        if last_dimensions:
-            if self._validate_dimensions(last_dimensions, strict=False):
-                self.dev_logger.warning(
-                    f"Using fallback dimensions: {last_dimensions}")
-                return last_dimensions
-
-        self.dev_logger.error(
-            f"All dimension detection methods failed for {file_path}. Last error: {last_error}")
-        return None, None
-
-    def _validate_dimensions(self, dimensions: Tuple[Optional[int], Optional[int]], strict: bool = True) -> bool:
-        """Validate dimensions with configurable strictness."""
-        try:
-            if not dimensions or len(dimensions) != 2:
-                return False
-
-            width, height = dimensions
-            if not isinstance(width, int) or not isinstance(height, int):
-                return False
-
-            if width <= 0 or height <= 0:
-                return False
-
-            # Strict validation includes aspect ratio and size limits
-            if strict:
-                # Max 8K resolution
-                if width > 7680 or height > 4320:
-                    return False
-
-                # Minimum dimensions (adjust as needed)
-                if width < 16 or height < 16:
-                    return False
-
-                # Reasonable aspect ratio (between 1:10 and 10:1)
-                aspect_ratio = width / height
-                if aspect_ratio < 0.1 or aspect_ratio > 10:
-                    return False
-
-            return True
-
-        except Exception as e:
-            self.dev_logger.debug(f"Dimension validation error: {str(e)}")
-            return False
-
-    def _get_dimensions_ffprobe(self, file_path: Path) -> Tuple[int, int]:
-        """Get dimensions using ffprobe with improved reliability."""
-        try:
-            cmd = [
-                'ffprobe',
-                '-v', 'error',
-                '-select_streams', 'v:0',
-                '-show_entries', 'stream=width,height,rotation,sample_aspect_ratio,display_aspect_ratio',
-                '-of', 'json',
-                str(file_path)
-            ]
-
-            output = subprocess.check_output(
-                cmd, stderr=subprocess.PIPE, text=True)
-            data = json.loads(output)
-
-            if not data.get('streams'):
-                raise ValueError("No video streams found")
-
-            stream = data['streams'][0]
-
-            # Get base dimensions
-            width = int(stream.get('width', 0))
-            height = int(stream.get('height', 0))
-
-            if width <= 0 or height <= 0:
-                raise ValueError("Invalid dimensions in stream")
-
-            # Handle rotation
-            rotation = int(stream.get('rotation', '0') or '0')
-            if rotation in [90, 270]:
-                width, height = height, width
-
-            # Handle pixel aspect ratio correction
-            sar = stream.get('sample_aspect_ratio', '1:1')
-            if sar and sar != '1:1':
-                try:
-                    num, den = map(int, sar.split(':'))
-                    if num > 0 and den > 0:
-                        width = int(width * (num / den))
-                except:
-                    pass
-
-            return width, height
-
-        except json.JSONDecodeError as e:
-            raise ValueError(f"FFprobe JSON error: {e}")
-        except subprocess.CalledProcessError as e:
-            raise ValueError(f"FFprobe process error: {e}")
-        except Exception as e:
-            raise ValueError(f"FFprobe error: {str(e)}")
-
-    def _get_dimensions_opencv(self, file_path: Path) -> Tuple[int, int]:
-        """Get dimensions using OpenCV with proper resource management."""
-        cap = None
-        try:
-            cap = cv2.VideoCapture(str(file_path))
-            if not cap.isOpened():
-                raise ValueError("Failed to open video file")
-
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-            if width <= 0 or height <= 0:
-                # Try reading first frame
-                ret, frame = cap.read()
-                if ret and frame is not None:
-                    height, width = frame.shape[:2]
-                else:
-                    raise ValueError("Failed to read frame dimensions")
-
-            # Verify dimensions are valid
-            if width <= 0 or height <= 0:
-                raise ValueError(f"Invalid dimensions: {width}x{height}")
-
-            return (width, height)
-
-        except Exception as e:
-            raise ValueError(f"OpenCV failed: {str(e)}")
-        finally:
-            if cap is not None:
-                cap.release()
-
-    def _get_dimensions_ffmpeg(self, file_path: Path) -> Tuple[int, int]:
-        """Get dimensions using FFmpeg as last resort."""
-        try:
-            cmd = ['ffmpeg', '-i', str(file_path)]
-            output = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True
-            ).stderr
-
-            # Try multiple regex patterns
-            patterns = [
-                r'Stream.*Video.* (\d+)x(\d+)',
-                r'Video: .* (\d+)x(\d+)',
-                r', (\d+)x(\d+)[,\s]'
-            ]
-
-            for pattern in patterns:
-                matches = re.findall(pattern, output)
-                if matches:
-                    width, height = map(int, matches[0])
-                    if width > 0 and height > 0:
-                        return (width, height)
-
-            raise ValueError("No valid dimensions found in FFmpeg output")
-        except Exception as e:
-            raise ValueError(f"FFmpeg dimension detection failed: {str(e)}")
-
-    def _should_exit(self) -> bool:
-        """Check if processing should stop."""
-        return (self._shutdown_event.is_set() or
-                self._processing_cancelled.is_set() or
-                self._shutdown_initiated)
-
-    def _get_video_frame_info(self, file_path: Path) -> Optional[Tuple[int, float]]:
-        """Get total frames and duration of video.
-
-        Args:
-            file_path: Path to the video file
-
-        Returns:
-            Tuple[int, float]: (total_frames, duration_in_seconds) or None if failed
-        """
-        try:
-            cmd = [
-                'ffprobe', '-v', 'error',
-                '-select_streams', 'v:0',
-                '-show_entries', 'stream=nb_frames,duration',
-                '-of', 'json',
-                str(file_path)
-            ]
-
-            output = subprocess.check_output(cmd, text=True)
-            data = json.loads(output)
-
-            if 'streams' in data and data['streams']:
-                stream = data['streams'][0]
-                frames = int(stream.get('nb_frames', 0))
-                duration = float(stream.get('duration', 0))
-
-                if frames == 0 or duration == 0:  # If ffprobe couldn't get frame count, estimate it
-                    cmd = [
-                        'ffmpeg', '-i', str(file_path), '-map', '0:v:0', '-c', 'copy', '-f', 'null', '-']
-                    output = subprocess.run(
-                        cmd, capture_output=True, text=True).stderr
-                    matches = re.search(r'frame=\s*(\d+)', output)
-                    if matches:
-                        frames = int(matches.group(1))
-                        # Verify frame count is reasonable
-                        if frames > 0 and frames < 1000000:  # Sanity check
-                            return frames, duration
-                        else:
-                            logging.warning(
-                                f"Suspicious frame count: {frames}, falling back to duration-based estimate")
-                            # Estimate frames from duration and common framerates
-                            for fps in [30, 25, 24, 60]:
-                                estimated = int(duration * fps)
-                                if abs(estimated - frames) < frames * 0.1:  # Within 10%
-                                    return estimated, duration
-
-                if frames > 0 and duration > 0:
-                    return frames, duration
-
-            self.dev_logger.warning(
-                f"Could not get accurate frame info for {file_path}")
-            return None
-
-        except Exception as e:
-            self.dev_logger.error(f"Error getting frame info: {str(e)}")
-            return None
-
-    def _get_optimized_configs(self, input_size: float, target_size: float,
-                               avg_fps: float, dimensions: Tuple[int, int]) -> List[Dict]:
-        """Generate optimized configurations based on input characteristics.
-
-        Args:
-            input_size: Original file size in MB
-            target_size: Target file size in MB
-            avg_fps: Average FPS of the source
-            dimensions: (width, height) of the source
-
-        Returns:
-            List[Dict]: List of optimization configurations sorted by priority
-        """
-        configs = []
-        size_ratio = target_size / input_size
-        max_dimension = max(dimensions)
-
-        # Base scale factor on both size ratio and resolution
-        if max_dimension > 1920:
-            scale_factors = [0.75, 0.5, 0.35]
-        elif max_dimension > 1280:
-            scale_factors = [0.85, 0.75, 0.5]
-        else:
-            scale_factors = [1.0, 0.85, 0.75]
-
-        # Keep high color count initially
-        color_configs = [256]
-        if size_ratio < 0.3:  # Only add lower color options for very large files
-            color_configs.extend([192, 128])
-
-        # Create configs prioritizing quality
-        for scale in scale_factors:
-            for colors in color_configs:
-                # Increased base lossy value
-                lossy_value = min(100, int(40 * (1/scale)))
-                configs.append({
-                    'scale_factor': scale,
-                    'colors': colors,
-                    'lossy_value': lossy_value,
-                    'priority': scale * (colors / 256)
-                })
-
-        return sorted(configs, key=lambda x: x['priority'], reverse=True)
-
-    def _check_early_exit(self, results: List[Dict]) -> bool:
-        """Check if we can exit early with good enough results."""
-        if not results:
-            return False
-
-        best_result = max(results, key=lambda x: (x['fps'], -x['size']))
-        target_size = self.compression_settings.get('min_size_mb', 15.0)
+        target_size = self.compression_settings['min_size_mb']
 
         return (best_result['size'] <= target_size and
                 best_result['fps'] >= self.compression_settings['fps_range'][0] + 2)
@@ -1757,15 +617,14 @@ Dimensions: {new_width}x{new_height}
                 # Get file lock with timeout
                 file_lock = self.get_file_lock(str(file_path))
                 if not await asyncio.get_event_loop().run_in_executor(None, file_lock.acquire, True, 5):
-                    self.dev_logger.error(
+                    self.logger.error(
                         f"Failed to acquire lock for {file_path.name}")
                     self.failed_files.append(file_path)
                     return
 
                 # Check file size and target
                 file_size = await asyncio.get_event_loop().run_in_executor(None, self.get_file_size, file_path)
-                target_size = self.compression_settings.get(
-                    'min_size_mb', 15.0)
+                target_size = self.compression_settings['min_size_mb']
 
                 if file_size <= target_size:
                     if not output_path.exists():
@@ -1785,16 +644,161 @@ Dimensions: {new_width}x{new_height}
                     await self._process_gif_async(file_path, output_path, dimensions)
 
             except Exception as e:
-                self.dev_logger.error(f"Async processing error: {str(e)}")
+                self.logger.error(f"Async processing error: {str(e)}")
                 self.failed_files.append(file_path)
             finally:
                 if file_lock:
                     file_lock.release()
 
-    def optimize_gif(self, input_path: Path, output_path: Path, target_size_mb: float = 15.0) -> Tuple[float, bool]:
+    def process_file(self, file_path: Path, output_path: Path, is_video: bool) -> bool:
+        """
+        Process a single file (GIF or video) synchronously.
+
+        Args:
+            file_path: Path to the input file
+            output_path: Path for the output file
+            is_video: Whether the input is a video file
+
+        Returns:
+            bool: True if processing was successful, False otherwise
+        """
+        try:
+            # Get file lock with timeout
+            file_lock = self.get_file_lock(str(file_path))
+            if not file_lock.acquire(timeout=5):
+                self.logger.error(
+                    f"Failed to acquire lock for {file_path.name}")
+                self.failed_files.append(file_path)
+                return False
+
+            try:
+                # Check file size and target
+                file_size = self.get_file_size(file_path)
+                target_size = self.compression_settings['min_size_mb']
+
+                if file_size <= target_size:
+                    if not output_path.exists():
+                        shutil.copy2(file_path, output_path)
+                    return True
+
+                # Get dimensions
+                dimensions = self._get_dimensions_with_retry(file_path)
+                if not self._validate_dimensions(dimensions):
+                    self.failed_files.append(file_path)
+                    return False
+
+                # Process based on type
+                if is_video:
+                    fps = self._get_source_fps(file_path)
+                    success = self.create_gif(
+                        file_path, output_path, int(fps), dimensions)
+
+                    # Verify final file size after creation
+                    if success and output_path.exists():
+                        final_size = self.get_file_size(output_path)
+                        if final_size > target_size:
+                            self.logger.warning(
+                                f"Video-to-GIF conversion resulted in a file larger than target size: {final_size:.2f}MB > {target_size:.2f}MB")
+                            # Try to optimize the created GIF further
+                            optimized_size, opt_success = self.optimize_gif(
+                                output_path, output_path, target_size)
+                            if not opt_success:
+                                self.logger.error(
+                                    f"Failed to optimize GIF to target size. Final size: {optimized_size:.2f}MB")
+                                # We'll still return True since we have a valid GIF, just oversized
+
+                    return success
+                else:
+                    # For existing GIFs, use the progressive optimization directly
+                    result = self._progressive_optimize(
+                        file_path, output_path, target_size)
+
+                    # If optimization succeeded but file is still over size limit, try more aggressive optimization
+                    if result.status == ProcessingStatus.SUCCESS and output_path.exists():
+                        final_size = self.get_file_size(output_path)
+                        if final_size > target_size:
+                            self.logger.warning(
+                                f"GIF optimization resulted in a file larger than target: {final_size:.2f}MB > {target_size:.2f}MB")
+                            # Apply more aggressive optimization
+                            optimized_size, opt_success = self.optimize_gif(
+                                output_path, output_path, target_size)
+                            if not opt_success:
+                                self.logger.error(
+                                    f"Failed to optimize GIF to target size. Final size: {optimized_size:.2f}MB")
+
+                    return result.status == ProcessingStatus.SUCCESS
+
+            finally:
+                if file_lock:
+                    file_lock.release()
+
+        except Exception as e:
+            self.logger.error(f"Processing error for {file_path}: {str(e)}")
+            self.failed_files.append(file_path)
+            return False
+
+    def _get_dimensions_with_retry(self, file_path: Path, max_retries: int = 3) -> Optional[Tuple[int, int]]:
+        """Get file dimensions with retry logic."""
+        for attempt in range(max_retries):
+            try:
+                if hasattr(self, 'ffmpeg') and hasattr(self.ffmpeg, 'get_dimensions'):
+                    return self.ffmpeg.get_dimensions(file_path)
+                else:
+                    # Fallback to importing the video dimensions utility
+                    from ..utils.video_dimensions import get_video_dimensions
+                    return get_video_dimensions(str(file_path))
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    self.logger.error(
+                        f"Failed to get dimensions for {file_path}: {e}")
+                    return None
+                time.sleep(0.5 * (attempt + 1))
+        return None
+
+    def _validate_dimensions(self, dimensions: Optional[Tuple[int, int]]) -> bool:
+        """Validate that dimensions are reasonable."""
+        if dimensions is None:
+            return False
+
+        try:
+            # Use the utility function if available
+            from ..utils.video_dimensions import _validate_dimensions
+            return _validate_dimensions(dimensions)
+        except ImportError:
+            # Fallback implementation
+            if not dimensions or len(dimensions) != 2:
+                return False
+
+            width, height = dimensions
+            if not isinstance(width, int) or not isinstance(height, int):
+                return False
+
+            # Check dimension limits
+            if width <= 0 or height <= 0:
+                return False
+            if width > 7680 or height > 4320:  # 8K resolution limit
+                return False
+            if width < 16 or height < 16:  # Minimum reasonable dimensions
+                return False
+
+            return True
+
+    def optimize_gif(self, input_path: Path, output_path: Path, target_size_mb: float = None) -> Tuple[float, bool]:
         """Optimize GIF until it reaches target size or max attempts are reached."""
+        # Initialize these variables outside the try block to ensure they exist in the finally block
+        temp_output = None
+        current_input = input_path
+        best_output = None
+        original_size = 0
+
         try:
             original_size = self.get_file_size(input_path)
+
+            # Use the configured value if no target size is specified
+            if target_size_mb is None:
+                target_size_mb = self.compression_settings['min_size_mb']
+
+            # Ensure we never exceed the configured limit
             target_size_mb = min(
                 target_size_mb, self.compression_settings['min_size_mb'])
 
@@ -1803,10 +807,9 @@ Dimensions: {new_width}x{new_height}
                 shutil.copy2(input_path, output_path)
                 return original_size, True
 
-            max_attempts = 5  # Maximum optimization attempts
+            max_attempts = 8  # Increase maximum optimization attempts for better size reduction
             current_size = original_size
-            current_input = input_path
-            temp_output = None
+            best_size = float('inf')
 
             for attempt in range(max_attempts):
                 if self._should_exit():
@@ -1815,78 +818,150 @@ Dimensions: {new_width}x{new_height}
                 temp_output = Path(TEMP_FILE_DIR) / \
                     f"temp_opt_{attempt}_{output_path.name}"
 
-                # Skip gifsicle for large files (>100MB) and use FFmpeg directly
-                if current_size > 100:
-                    success = self._compress_large_with_ffmpeg(
-                        current_input, temp_output)
+                # For larger files, use progressive reduction
+                if current_size > 50:
+                    # Reduce scale factor progressively based on attempt
+                    scale_factor = max(0.3, 1.0 - (attempt * 0.1))
+                    colors = max(32, 256 - (attempt * 32))
+                    lossy_value = min(95, 60 + (attempt * 5))
+
+                    # For really large files, use FFmpeg with more aggressive scaling
+                    if current_size > 100:
+                        success = self._compress_large_with_ffmpeg(
+                            current_input, temp_output, scale_factor=scale_factor)
+                    else:
+                        success = self._compress_with_gifsicle(
+                            current_input, temp_output, colors=colors, lossy=lossy_value)
                 else:
+                    # For smaller files, use gifsicle with gradually increasing compression
+                    lossy_value = min(95, 50 + (attempt * 10))
+                    colors = max(32, 256 - (attempt * 32))
                     success = self._compress_with_gifsicle(
-                        current_input, temp_output)
+                        current_input, temp_output, colors=colors, lossy=lossy_value)
 
                 if not success or not temp_output.exists():
-                    self.dev_logger.error(
+                    self.logger.error(
                         f"Optimization attempt {attempt + 1} failed")
                     continue
 
                 new_size = self.get_file_size(temp_output)
-                self.dev_logger.info(
+                self.logger.info(
                     f"Attempt {attempt + 1}: {new_size:.2f}MB (Target: {target_size_mb:.2f}MB)")
 
-                if new_size <= target_size_mb:
-                    # Target reached
-                    shutil.move(str(temp_output), str(output_path))
-                    return new_size, True
+                # Keep track of the best result so far
+                if new_size <= target_size_mb and (best_output is None or new_size > best_size):
+                    # Best result that meets target size criteria
+                    if best_output and best_output != current_input and best_output != input_path:
+                        best_output.unlink(missing_ok=True)
+                    best_size = new_size
+                    best_output = temp_output
+
+                    # If we're very close to target size, no need to optimize further
+                    if target_size_mb - new_size < 0.5:
+                        break
+
+                    # Continue with optimization to find even better result
+                    if current_input != input_path:
+                        current_input.unlink(missing_ok=True)
+                    current_input = temp_output
+                    continue
+                elif new_size <= target_size_mb:
+                    # Target reached but smaller than previous best
+                    if best_output and best_output != current_input and best_output != input_path:
+                        best_output.unlink(missing_ok=True)
+                    best_size = new_size
+                    best_output = temp_output
+                    break
                 elif new_size < current_size:
                     # Better but not enough - continue optimizing
+                    if best_output and best_output != current_input and best_output != input_path:
+                        best_output.unlink(missing_ok=True)
                     current_size = new_size
                     if current_input != input_path:
-                        current_input.unlink()
+                        current_input.unlink(missing_ok=True)
                     current_input = temp_output
                     continue
                 else:
                     # No improvement
-                    temp_output.unlink()
-                    break
+                    temp_output.unlink(missing_ok=True)
+                    temp_output = None
+            # Use best result if we found one that meets target size
+            if best_output and best_size <= target_size_mb:
+                shutil.move(str(best_output), str(output_path))
+                return best_size, True
 
-            # If we have a better result but didn't reach target, use it
-            if current_size < original_size and current_input != input_path:
-                shutil.move(str(current_input), str(output_path))
-                return current_size, False
+            # If we have a better result but didn't reach target, use most aggressive compression
+            if current_size < original_size:
+                # Last-ditch effort with maximum compression
+                temp_final = Path(TEMP_FILE_DIR) / \
+                    f"temp_final_{output_path.name}"
+                success = self._compress_with_gifsicle(
+                    current_input, temp_final, colors=32, lossy=95, scale=0.5)
 
+                if success and temp_final.exists():
+                    final_size = self.get_file_size(temp_final)
+                    if final_size <= target_size_mb:
+                        shutil.move(str(temp_final), str(output_path))
+                        return final_size, True
+                    elif final_size < current_size:
+                        shutil.move(str(temp_final), str(output_path))
+                        # Still failed to meet target
+                        return final_size, False
+                    else:
+                        temp_final.unlink(missing_ok=True)
+                        if current_input != input_path:
+                            shutil.move(str(current_input), str(output_path))
+                        return current_size, False
+                else:
+                    if current_input != input_path:
+                        shutil.move(str(current_input), str(output_path))
+                    return current_size, False
+
+            # If we reach here, optimization failed to meet target size
+            self.logger.error(
+                f"Failed to optimize GIF to target size {target_size_mb}MB")
             return original_size, False
 
         except Exception as e:
-            self.dev_logger.error(f"Optimization error: {e}")
+            self.logger.error(f"Optimization error: {e}")
             return original_size, False
         finally:
             # Cleanup any remaining temp files
             try:
                 if temp_output and temp_output.exists():
-                    temp_output.unlink()
+                    temp_output.unlink(missing_ok=True)
                 if current_input != input_path and current_input.exists():
-                    current_input.unlink()
+                    current_input.unlink(missing_ok=True)
+                if best_output and best_output.exists() and best_output != current_input:
+                    best_output.unlink(missing_ok=True)
             except Exception as e:
-                self.dev_logger.error(f"Cleanup error: {e}")
+                self.logger.error(f"Cleanup error: {e}")
 
-    def _compress_with_gifsicle(self, input_path: Path, output_path: Path) -> bool:
-        """Compress GIF using gifsicle with progressively aggressive settings."""
+    def _compress_with_gifsicle(self, input_path: Path, output_path: Path, colors: int = 128, lossy: int = 80, scale: float = 1.0) -> bool:
+        """Compress GIF using gifsicle with configurable settings."""
         try:
             cmd = [
                 'gifsicle',
                 '--optimize=3',
-                '--colors', '128',
-                '--lossy=80',
+                '--colors', str(colors),
+                '--lossy=' + str(lossy),
                 '--no-conserve-memory',
-                str(input_path),
-                '-o', str(output_path)
             ]
+
+            # Add scale if less than 1.0
+            if scale < 1.0:
+                cmd.extend(['--scale', str(scale)])
+
+            # Add input and output paths
+            cmd.extend([str(input_path), '-o', str(output_path)])
+
             return run_ffmpeg_command(cmd)
         except Exception as e:
-            self.dev_logger.error(f"Gifsicle compression failed: {e}")
+            self.logger.error(f"Gifsicle compression failed: {e}")
             return False
 
-    def _compress_large_with_ffmpeg(self, input_path: Path, output_path: Path) -> bool:
-        """Compress large GIF using FFmpeg with aggressive settings."""
+    def _compress_large_with_ffmpeg(self, input_path: Path, output_path: Path, scale_factor: float = 0.7) -> bool:
+        """Compress large GIF using FFmpeg with configurable settings."""
         try:
             # Get dimensions
             dimensions = self._get_dimensions_with_retry(input_path)
@@ -1894,18 +969,20 @@ Dimensions: {new_width}x{new_height}
                 return False
 
             width, height = dimensions
-            new_width = int(width * 0.7)  # Scale down to 70%
-            new_height = int(height * 0.7)
+            new_width = int(width * scale_factor)
+            new_height = int(height * scale_factor)
 
             cmd = [
                 'ffmpeg', '-i', str(input_path),
                 '-vf', f'scale={new_width}:{new_height}:flags=lanczos,fps=15',
-                '-gifflags', '-offsetting',
+                '-c:v', 'gif',
+                '-f', 'gif',
                 '-y', str(output_path)
             ]
+
             return run_ffmpeg_command(cmd)
         except Exception as e:
-            self.dev_logger.error(f"FFmpeg compression failed: {e}")
+            self.logger.error(f"FFmpeg compression failed: {e}")
             return False
 
     def _get_optimized_configs(self, input_size: float, target_size: float,
@@ -1979,11 +1056,14 @@ Dimensions: {new_width}x{new_height}
             return 30.0  # Default fallback
 
         except Exception as e:
-            self.dev_logger.warning(f"Failed to get source FPS: {e}")
+            self.logger.warning(f"Failed to get source FPS: {e}")
             return 30.0  # Safe default
 
     def _progressive_optimize(self, input_path: Path, output_path: Path, target_size_mb: float) -> ProcessingResult:
         """Progressive optimization with quality reduction."""
+        # Initialize temp_output outside the try block to ensure it exists in the finally block
+        temp_output = None
+
         try:
             # Instead of creating a temp directory, just use temp files directly in TEMP_FILE_DIR
             timestamp = int(time.time() * 1000)
@@ -2054,8 +1134,16 @@ Dimensions: {new_width}x{new_height}
             return ProcessingResult(0, original_size, None, ProcessingStatus.OPTIMIZATION_ERROR)
 
         except Exception as e:
-            self.dev_logger.error(f"Progressive optimization failed: {str(e)}")
+            self.logger.error(
+                f"Progressive optimization failed: {str(e)}")
             return ProcessingResult(0, original_size, None, ProcessingStatus.OPTIMIZATION_ERROR, str(e))
+        finally:
+            # Clean up temp_output if it exists
+            try:
+                if temp_output and temp_output.exists():
+                    temp_output.unlink(missing_ok=True)
+            except Exception as cleanup_e:
+                self.logger.error(f"Cleanup error: {cleanup_e}")
 
     def _analyze_source_colors(self, input_path: Path) -> int:
         """Analyze color distribution in the GIF with better preservation."""
@@ -2083,7 +1171,7 @@ Dimensions: {new_width}x{new_height}
                     return 128  # Minimum color count increased
 
         except Exception as e:
-            self.dev_logger.warning(
+            self.logger.warning(
                 f"Color analysis failed: {e}, using maximum colors")
             return 256  # Default to maximum colors on error
 
@@ -2120,51 +1208,670 @@ Dimensions: {new_width}x{new_height}
                 lossy_value=min(100, config.lossy_value + 10)
             )
 
+    def _create_gif_aggressive(self, file_path: Path, output_path: Path, fps: int, dimensions: Tuple[int, int]) -> bool:
+        """Create GIF with aggressive compression to ensure size constraints are met."""
+        original_size = self.get_file_size(file_path)
+        target_size = self.compression_settings['min_size_mb']
 
-@asynccontextmanager
-async def managed_process_pool(max_workers: int = None):
-    pool = ThreadPoolExecutor(max_workers=max_workers)
-    try:
-        yield pool
-    finally:
-        pool.shutdown(wait=True)
-
-    def process_file(self, input_path: Path, output_path: Path, is_video: bool = False) -> bool:
         try:
-            if not input_path.exists():
-                logging.error(f"Input file does not exist: {input_path}")
-                return False
+            # Create a temp directory for this process with UUID
+            unique_id = str(uuid.uuid4())
+            temp_dir = Path(TEMP_FILE_DIR) / f"aggressive_{unique_id}"
+            temp_dir.mkdir(parents=True, exist_ok=True)
 
+            # Define a series of increasingly aggressive configs
+            configs = [
+                {'scale': 0.7, 'fps': max(
+                    10, fps-10), 'colors': 128, 'lossy': 40},
+                {'scale': 0.6, 'fps': max(8, fps-15),
+                 'colors': 96, 'lossy': 60},
+                {'scale': 0.5, 'fps': max(6, fps-20),
+                 'colors': 64, 'lossy': 80},
+                {'scale': 0.4, 'fps': max(5, fps-22),
+                 'colors': 32, 'lossy': 90}
+            ]
+
+            # For very large files, add even more aggressive configs
+            if original_size > 100:
+                configs.extend([
+                    {'scale': 0.3, 'fps': 5, 'colors': 24, 'lossy': 95},
+                    {'scale': 0.25, 'fps': 4, 'colors': 16, 'lossy': 100}
+                ])
+
+            best_result = None
+
+            for i, config in enumerate(configs):
+                if self._should_exit():
+                    break
+
+                try:
+                    # Calculate dimensions
+                    new_width = int(dimensions[0] * config['scale'] // 2 * 2)
+                    new_height = int(dimensions[1] * config['scale'] // 2 * 2)
+
+                    # Ensure minimum dimensions
+                    new_width = max(new_width, 200)
+                    new_height = max(new_height, 150)
+
+                    # Use UUID-based filenames to avoid FFmpeg warnings
+                    config_id = f"{unique_id}_{i}"
+                    temp_palette = temp_dir / f"palette_{config_id}.png"
+                    temp_output = temp_dir / f"output_{config_id}.gif"
+
+                    # Create palette
+                    palette_cmd = [
+                        'ffmpeg', '-i', str(file_path),
+                        '-vf', f"fps={config['fps']},scale={new_width}:{new_height}:flags=lanczos,palettegen=max_colors={config['colors']}:stats_mode=diff",
+                        '-y', str(temp_palette)
+                    ]
+
+                    if not run_ffmpeg_command(palette_cmd):
+                        continue
+
+                    # Create GIF
+                    gif_cmd = [
+                        'ffmpeg', '-i', str(file_path),
+                        '-i', str(temp_palette),
+                        '-lavfi', f"fps={config['fps']},scale={new_width}:{new_height}:flags=lanczos[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=3:diff_mode=rectangle",
+                        '-y', str(temp_output)
+                    ]
+
+                    if not run_ffmpeg_command(gif_cmd):
+                        continue
+
+                    # Optimize with gifsicle
+                    if temp_output.exists():
+                        optimized_output = temp_dir / \
+                            f"optimized_{config['colors']}.gif"
+
+                        gifsicle_cmd = [
+                            'gifsicle',
+                            '--optimize=3',
+                            '--colors', str(config['colors']),
+                            f"--lossy={config['lossy']}",
+                            '--no-conserve-memory',
+                            str(temp_output),
+                            '-o', str(optimized_output)
+                        ]
+
+                        if run_ffmpeg_command(gifsicle_cmd) and optimized_output.exists():
+                            # Check size
+                            size = self.get_file_size(optimized_output)
+
+                            # Store result if it's the first valid one or better than previous
+                            if (size <= target_size and
+                                (best_result is None or
+                                 # prefer larger file within target size
+                                 size > best_result['size'])):
+
+                                best_result = {
+                                    'path': optimized_output,
+                                    'size': size,
+                                    'config': config
+                                }
+
+                                # If we're close enough to target size, stop
+                                if target_size - size < 0.5:
+                                    break
+
+                except Exception as e:
+                    self.logger.error(f"Error with config {config}: {e}")
+                    continue
+
+            # Use best result or most aggressive as fallback
+            if best_result is not None:
+                shutil.copy2(best_result['path'], output_path)
+                self.logger.success(
+                    f"Aggressive optimization succeeded: {best_result['size']:.2f}MB (Target: {target_size}MB)"
+                )
+                return True
+            else:
+                # Last attempt with maximum compression
+                try:
+                    final_id = str(uuid.uuid4())
+                    last_chance = temp_dir / f"last_attempt_{final_id}.gif"
+                    final_palette = temp_dir / f"final_palette_{final_id}.png"
+
+                    # Extremely reduced settings
+                    min_width = max(160, int(dimensions[0] * 0.2))
+                    min_height = max(120, int(dimensions[1] * 0.2))
+                    min_fps = max(3, fps // 5)
+
+                    # Create palette
+                    palette_cmd = [
+                        'ffmpeg', '-i', str(file_path),
+                        '-vf', f"fps={min_fps},scale={min_width}:{min_height}:flags=fast_bilinear,palettegen=max_colors=16",
+                        '-y', str(final_palette)
+                    ]
+
+                    if run_ffmpeg_command(palette_cmd):
+                        # Create GIF
+                        gif_cmd = [
+                            'ffmpeg', '-i', str(file_path),
+                            '-i', str(final_palette),
+                            '-lavfi', f"fps={min_fps},scale={min_width}:{min_height}:flags=fast_bilinear[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=1",
+                            '-y', str(last_chance)
+                        ]
+
+                        if run_ffmpeg_command(gif_cmd) and last_chance.exists():
+                            # Final gifsicle pass with maximum compression
+                            final_output = temp_dir / \
+                                f"final_output_{final_id}.gif"
+                            gifsicle_cmd = [
+                                'gifsicle',
+                                '--optimize=3',
+                                '--colors', '16',
+                                '--lossy=100',
+                                '--scale', '0.5',
+                                '--no-conserve-memory',
+                                str(last_chance),
+                                '-o', str(final_output)
+                            ]
+
+                            if run_ffmpeg_command(gifsicle_cmd) and final_output.exists():
+                                final_size = self.get_file_size(final_output)
+
+                                if final_size <= target_size:
+                                    shutil.copy2(final_output, output_path)
+                                    self.logger.success(
+                                        f"Final aggressive attempt succeeded: {final_size:.2f}MB"
+                                    )
+                                    return True
+
+                except Exception as e:
+                    self.logger.error(f"Final compression attempt failed: {e}")
+
+            self.logger.error(
+                f"Failed to compress GIF within target size: {target_size}MB")
+            return False
+
+        except Exception as e:
+            self.logger.error(f"Aggressive GIF creation error: {str(e)}")
+            return False
+        finally:
+            # Clean up temp directory and files
+            try:
+                if temp_dir.exists():
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+            except Exception as e:
+                self.logger.error(f"Failed to clean up temp directory: {e}")
+
+    def _ensure_worker_threads(self):
+        """Ensure enough worker threads are running."""
+        # Clean up exited threads
+        self.worker_threads = [
+            t for t in self.worker_threads if t.is_alive()]
+
+        # Only create new threads if we don't have enough running
+        current_thread_count = len(
+            [t for t in self.worker_threads if t.is_alive()])
+
+        # Calculate how many threads to add
+        threads_to_add = max(0, self.max_threads - current_thread_count)
+
+        if threads_to_add > 0:
+            self.logger.debug(f"Starting {threads_to_add} worker threads")
+            for _ in range(threads_to_add):
+                thread = threading.Thread(
+                    target=self._worker_thread, daemon=True)
+                thread.start()
+                self.worker_threads.append(thread)
+
+    def _worker_thread(self):
+        """Worker thread to process tasks from queue."""
+        self._register_thread()
+
+        try:
+            while not self._stop_workers.is_set():
+                try:
+                    # First check priority queue
+                    try:
+                        priority, task = self.priority_queue.get(block=False)
+                        self.logger.debug(
+                            f"Processing priority task: {priority}")
+                    except queue.Empty:
+                        # Then check regular queue
+                        task = self.task_queue.get(timeout=1)
+
+                        if task is None:  # None is a signal to stop
+                            break
+
+                        # Process the task
+                        input_path = task.get('input_path')
+                        output_path = task.get('output_path')
+                        is_video = task.get('is_video', False)
+
+                        self.logger.debug(
+                            f"Worker processing: {input_path}")
+
+                        try:
+                            result = self.process_file(
+                                input_path, output_path, is_video)
+                            self.result_queue.put({
+                                'file_path': input_path,
+                                'success': result,
+                                'error': None
+                            })
+                        except Exception as e:
+                            self.logger.error(
+                                f"Error processing {input_path}: {str(e)}")
+                            self.result_queue.put({
+                                'file_path': input_path,
+                                'success': False,
+                                'error': str(e)
+                            })
+
+                            # Mark task as done in appropriate queue
+                            try:
+                                self.priority_queue.task_done()
+                            except ValueError:
+                                self.task_queue.task_done()
+
+                except queue.Empty:
+                    # No tasks available, just continue
+                    continue
+                except Exception as e:
+                    self.logger.error(f"Worker thread error: {str(e)}")
+                    time.sleep(0.5)  # Prevent CPU spinning in case of errors
+        finally:
+            self._unregister_thread()
+
+    def _signal_handler(self, signum, frame):
+        """Handle termination signals gracefully."""
+        signal_name = signal.Signals(signum).name if hasattr(
+            signal, 'Signals') else str(signum)
+        self.logger.info(
+            f"Received signal {signal_name}. Initiating graceful shutdown...")
+
+        # Set shutdown flag
+        self._shutdown_event.set()
+        self._processing_cancelled.set()
+
+        # Don't exit immediately, allow tasks to finish gracefully
+        if not self._shutdown_initiated:
+            self._shutdown_initiated = True
+            self.logger.info(
+                "Waiting for current tasks to complete (Press Ctrl+C again for immediate exit)...")
+
+            # Schedule cleanup
+            threading.Thread(target=self.cleanup_resources,
+                             daemon=True).start()
+        else:
+            # Second signal - immediate termination
+            self.logger.warning(
+                "Second termination signal received. Forcing immediate exit...")
+            self._immediate_termination.set()
+            self._kill_ffmpeg_processes()
+
+    def _should_exit(self) -> bool:
+        """Check if processing should be stopped."""
+        return (self._shutdown_event.is_set() or
+                self._processing_cancelled.is_set() or
+                self._immediate_termination.is_set())
+
+    @performance_monitor
+    def process_all(self) -> List[Path]:
+        """Process all files in the queue with sequential processing - one at a time."""
+        start_time = time.time()
+        processed_files = []
+
+        # First, find all GIF files in the input directory if queue is empty
+        if self.task_queue.qsize() == 0:
+            self.logger.info("Scanning for files to process...")
+            self._find_gif_files()
+
+        total_files = self.task_queue.qsize()
+
+        if total_files == 0:
+            self.logger.warning("No files in queue to process")
+            return []
+
+        self.logger.info(
+            f"Starting sequential processing of {total_files} files")
+        self.logger.info(
+            "Processing one file at a time - convert, optimize, then move to next file")
+
+        # Create a list of tasks from the queue
+        tasks = []
+        with self._file_queue_lock:
+            while not self.task_queue.empty():
+                try:
+                    task = self.task_queue.get(block=False)
+                    tasks.append(task)
+                    self.task_queue.task_done()
+                except Exception as e:
+                    self.logger.error(f"Error retrieving tasks: {e}")
+                    break
+
+        # Sort tasks - process videos first
+        tasks.sort(key=lambda x: not x.get('is_video', False))
+
+        # Process files one by one with progress tracking
+        with tqdm(total=len(tasks), desc="Processing Files", unit="file") as progress_bar:
+            for task in tasks:
+                if self._should_exit():
+                    break
+
+                file_path = task.get('input_path')
+                output_path = task.get('output_path')
+                is_video = task.get('is_video', False)
+                final_path = task.get('final_path')
+
+                try:
+                    # Skip if already processed
+                    if str(file_path) in self.processed_files:
+                        self.logger.debug(
+                            f"Skipping already processed file: {file_path}")
+                        progress_bar.update(1)
+                        self._stats['skipped'] += 1
+                        continue
+
+                    self.logger.info(f"Processing: {file_path}")
+
+                    # STEP 1: For videos, convert to GIF
+                    success = False
+                    if is_video:
+                        # First convert MP4 to temporary GIF
+                        self.logger.info(
+                            f"Converting video to GIF: {file_path} → {output_path}")
+                        success = self.process_file(
+                            file_path, output_path, True)
+
+                        if not success:
+                            self.logger.error(
+                                f"Failed to convert video to GIF: {file_path}")
+                            self._stats['failed'] += 1
+                            self.failed_files.append(str(file_path))
+                            progress_bar.update(1)
+                            continue
+
+                        # Verify the temporary GIF exists and has content
+                        if not output_path.exists() or output_path.stat().st_size == 0:
+                            self.logger.error(
+                                f"Converted GIF is missing or empty: {output_path}")
+                            self._stats['failed'] += 1
+                            self.failed_files.append(str(file_path))
+                            progress_bar.update(1)
+                            continue
+
+                        # Now optimize the temporary GIF to final location
+                        self.logger.info(
+                            f"Optimizing converted GIF: {output_path} → {final_path}")
+                        target_size = self.compression_settings['min_size_mb']
+                        try:
+                            # Use our own optimize_gif method directly
+                            final_size, optimization_success = self.optimize_gif(
+                                output_path, final_path, target_size)
+
+                            if optimization_success:
+                                self.logger.success(
+                                    f"Successfully optimized to {final_size:.2f}MB")
+                                processed_files.append(final_path)
+                                self._stats['processed'] += 1
+                            else:
+                                self.logger.warning(
+                                    f"Optimization didn't meet target size, using direct conversion")
+                                # Still use the file but log it as a less-than-ideal result
+                                shutil.copy2(output_path, final_path)
+                                processed_files.append(final_path)
+                                self._stats['processed'] += 1
+                        except Exception as e:
+                            self.logger.error(
+                                f"Error during GIF optimization: {e}")
+                            # Try a direct copy as fallback
+                            try:
+                                shutil.copy2(output_path, final_path)
+                                self.logger.warning(
+                                    "Used direct copy due to optimization error")
+                                processed_files.append(final_path)
+                                self._stats['processed'] += 1
+                            except Exception as copy_error:
+                                self.logger.error(
+                                    f"Failed to copy GIF: {copy_error}")
+                                self._stats['failed'] += 1
+                                self.failed_files.append(str(file_path))
+                        finally:
+                            # Clean up the temporary file regardless of outcome
+                            try:
+                                if output_path.exists():
+                                    output_path.unlink(missing_ok=True)
+                            except Exception as cleanup_error:
+                                self.logger.warning(
+                                    f"Failed to remove temp file: {cleanup_error}")
+
+                    # STEP 2: For GIFs, just optimize them
+                    else:
+                        self.logger.info(
+                            f"Optimizing GIF: {file_path} → {output_path}")
+                        target_size = self.compression_settings['min_size_mb']
+                        try:
+                            final_size, success = self.optimize_gif(
+                                file_path, output_path, target_size)
+
+                            if success:
+                                self.logger.success(
+                                    f"Successfully optimized to {final_size:.2f}MB")
+                                processed_files.append(output_path)
+                                self._stats['processed'] += 1
+                            else:
+                                self.logger.error(
+                                    f"Failed to optimize GIF to target size: {file_path}")
+                                self._stats['failed'] += 1
+                                self.failed_files.append(str(file_path))
+                        except Exception as e:
+                            self.logger.error(
+                                f"Error optimizing GIF {file_path}: {e}")
+                            self._stats['failed'] += 1
+                            self.failed_files.append(str(file_path))
+
+                except Exception as e:
+                    self.logger.error(
+                        f"Processing error for {file_path}: {str(e)}")
+                    self._stats['failed'] += 1
+                    self.failed_files.append(str(file_path))
+
+                # Mark as processed and update progress
+                self.processed_files.add(str(file_path))
+                progress_bar.update(1)
+
+                # Check memory and cleanup
+                if hasattr(self, 'memory_manager'):
+                    self.memory_manager.check_memory()
+
+                # Small delay between files to ensure resources are freed
+                gc.collect()
+                time.sleep(0.2)
+
+        # Log summary
+        elapsed_time = time.time() - start_time
+        self.logger.info(
+            f"Sequential processing completed in {elapsed_time:.2f} seconds")
+        self.logger.info(
+            f"Processed: {self._stats['processed']}, Failed: {self._stats['failed']}, Skipped: {self._stats['skipped']}"
+        )
+
+        if self.failed_files:
+            self.logger.warning(
+                f"Failed to process {len(self.failed_files)} files:")
+            # Only show first 10 for brevity
+            for file in self.failed_files[:10]:
+                self.logger.warning(f"  - {file}")
+            if len(self.failed_files) > 10:
+                self.logger.warning(
+                    f"  ... and {len(self.failed_files) - 10} more")
+
+        return processed_files
+
+    def _process_with_timeout(self, file_path: Path, output_path: Path, is_video: bool):
+        """Process a file with timeout monitoring and result tracking."""
+        try:
+            # Get final output path if it exists in the task data
+            final_path = None
             if is_video:
-                # Convert video to GIF first
-                temp_gif = self.temp_manager.get_temp_path('.gif')
-                if not self.convert_video_to_gif(input_path, temp_gif):
-                    return False
-                input_path = temp_gif
+                for item in list(self.task_queue.queue):
+                    if isinstance(item, dict) and item.get('input_path') == file_path:
+                        final_path = item.get('final_path')
+                        break
 
-            # Validate GIF before processing
-            if not self.validate_gif(input_path):
-                logging.error(f"Invalid or corrupted GIF file: {input_path}")
-                return False
+            # First process to the output path (temp directory for videos)
+            success = self.process_file(file_path, output_path, is_video)
 
-            # Process the GIF with error handling
-            result = self.optimize_gif(input_path, output_path)
+            # For videos, after converting to temp GIF, optimize it to the final location
+            if success and is_video and final_path:
+                self.logger.info(
+                    f"Optimizing converted GIF from {output_path} to {final_path}")
+                # Use DynamicGIFOptimizer for the optimization step
+                optimizer = DynamicGIFOptimizer()
+                target_size = self.compression_settings['min_size_mb']
+                _, optimization_success = optimizer.optimize_gif(
+                    output_path, final_path, target_size)
 
-            if not result:
-                logging.error(f"Failed to optimize GIF: {input_path}")
-                return False
+                if not optimization_success:
+                    self.logger.warning(
+                        f"Failed to optimize converted GIF {output_path}, using direct conversion")
+                    # Fall back to a copy if optimization fails
+                    shutil.copy2(output_path, final_path)
 
-            return True
+                # Clean up the temporary file
+                try:
+                    if output_path.exists():
+                        output_path.unlink()
+                except Exception as e:
+                    self.logger.warning(
+                        f"Failed to remove temp file {output_path}: {e}")
 
+            # Put result in the queue
+            self.result_queue.put({
+                'file_path': file_path,
+                'success': success,
+                'error': None if success else "Failed to process file"
+            })
         except Exception as e:
-            logging.error(f"Error processing file {input_path}: {str(e)}")
-            return False
+            self.logger.error(f"Error processing file {file_path}: {str(e)}")
 
-    def validate_gif(self, gif_path: Path) -> bool:
-        try:
-            # Basic validation using PIL
-            with Image.open(gif_path) as img:
-                return img.format == 'GIF' and getattr(img, 'is_animated', False)
-        except Exception as e:
-            logging.error(f"GIF validation failed for {gif_path}: {str(e)}")
-            return False
+            # Put error result in the queue
+            self.result_queue.put({
+                'file_path': file_path,
+                'success': False,
+                'error': str(e)
+            })
+
+    def _immediate_shutdown_handler(self, signum, frame):
+        """Handle immediate shutdown signal."""
+        self.logger.warning(f"Immediate shutdown initiated (signal: {signum})")
+        self._immediate_termination.set()
+
+        # Force kill all processes
+        self._kill_ffmpeg_processes()
+
+        # Force exit
+        sys.exit(1)
+
+    def _find_gif_files(self, max_files_to_process=5):
+        """Find GIF and MP4 files to process based on configuration.
+
+        Args:
+            max_files_to_process: Maximum number of files to queue at once
+        """
+        # Get directories from imported constants
+        input_dir = Path(INPUT_DIR)
+        output_dir = Path(OUTPUT_DIR)
+        temp_dir = Path(TEMP_FILE_DIR)
+
+        # Ensure directories exist
+        input_dir.mkdir(exist_ok=True)
+        output_dir.mkdir(exist_ok=True)
+        temp_dir.mkdir(exist_ok=True)
+
+        # Clear the temp directory before starting
+        for temp_file in temp_dir.glob('*'):
+            try:
+                if temp_file.is_file():
+                    temp_file.unlink()
+            except Exception as e:
+                self.logger.warning(
+                    f"Failed to remove temp file {temp_file}: {e}")
+
+        # First find MP4 files in output directory to convert to GIFs
+        mp4_files_to_convert = list(output_dir.glob('*.mp4'))
+        self.logger.info(
+            f"Found {len(mp4_files_to_convert)} MP4 files to convert to GIFs")
+
+        # Then find GIF files in input directory to optimize
+        gif_files_to_optimize = list(input_dir.glob('*.gif'))
+        self.logger.info(
+            f"Found {len(gif_files_to_optimize)} GIFs to optimize")
+
+        # Only queue a limited number of files at once
+        mp4_files_to_process = mp4_files_to_convert[:max_files_to_process]
+        remaining_slots = max(0, max_files_to_process -
+                              len(mp4_files_to_process))
+        gif_files_to_process = gif_files_to_optimize[:remaining_slots]
+
+        self.logger.info(
+            f"Queueing {len(mp4_files_to_process)} MP4 files and {len(gif_files_to_process)} GIF files")
+
+        # Reset queues and processed files
+        with self._file_queue_lock:
+            # Clear the queue
+            while not self.task_queue.empty():
+                try:
+                    self.task_queue.get(block=False)
+                    self.task_queue.task_done()
+                except Exception:
+                    pass
+
+            # Clear the processed files set if it's a new processing run
+            if not hasattr(self, '_partial_processing') or not self._partial_processing:
+                self.processed_files.clear()
+                self.failed_files.clear()
+                self._stats = {'retried': 0, 'processed': 0,
+                               'failed': 0, 'skipped': 0}
+                self._partial_processing = True
+
+            # First add MP4 files to convert
+            for file_path in mp4_files_to_process:
+                # Skip if already processed
+                if str(file_path) in self.processed_files:
+                    continue
+
+                # Generate a temporary path for the converted GIF
+                temp_gif_path = temp_dir / f"{file_path.stem}.gif"
+                final_output_path = output_dir / f"{file_path.stem}.gif"
+
+                # Add to task queue
+                self.task_queue.put({
+                    'input_path': file_path,
+                    'output_path': temp_gif_path,  # First convert to temp
+                    'final_path': final_output_path,  # Then optimize to final
+                    'is_video': True
+                })
+
+            # Then add GIF files to optimize
+            for file_path in gif_files_to_process:
+                # Skip if already processed
+                if str(file_path) in self.processed_files:
+                    continue
+
+                output_path = output_dir / f"{file_path.stem}_optimized.gif"
+
+                # Add to task queue
+                self.task_queue.put({
+                    'input_path': file_path,
+                    'output_path': output_path,
+                    'is_video': False
+                })
+
+        # Return count of total files to process
+        count = self.task_queue.qsize()
+
+        # If no files were queued but there are still files to process,
+        # we've processed a batch and there are more remaining
+        if count == 0 and (len(mp4_files_to_convert) > len(mp4_files_to_process) or
+                           len(gif_files_to_optimize) > len(gif_files_to_process)):
+            self.logger.info(
+                "Batch complete, more files remain to be processed")
+            # Signal that there are more files to process
+            return -1
+
+        return count

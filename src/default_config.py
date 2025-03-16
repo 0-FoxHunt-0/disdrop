@@ -12,14 +12,7 @@ BASE_DIR = SRC_DIR.parent
 INPUT_DIR = BASE_DIR / 'input'
 OUTPUT_DIR = BASE_DIR / 'output'
 LOG_DIR = BASE_DIR / 'logs'
-# Temporary directory for storing intermediate files
 TEMP_FILE_DIR = BASE_DIR / 'temp'  # Changed from 'temp_files' to 'temp'
-
-# Ensure that the directories exist
-for directory in [INPUT_DIR, OUTPUT_DIR, LOG_DIR, TEMP_FILE_DIR]:
-    directory = Path(directory)
-    if not directory.exists():
-        os.makedirs(directory)
 
 # Optimization settings for videos and gifs
 VIDEO_COMPRESSION = {
@@ -31,7 +24,9 @@ VIDEO_COMPRESSION = {
         'crf': 26,
         'preset': 'medium'
     },
-    'min_size_mb': 10,      # Target maximum size for gifs in MB
+    'min_size_mb': 15.0,      # Target maximum size for gifs in MB
+    'fps_range': (15, 30),
+    'quality_presets': ['faster', 'medium', 'slower']
 }
 
 VIDEO_SETTINGS = {
@@ -60,32 +55,33 @@ VIDEO_SETTINGS = {
 }
 
 GIF_COMPRESSION = {
-    'fps_range': (10, 15),  # Frame rate range for gif optimization
+    'fps_range': (15, 30),  # Frame rate range for gif optimization
     'colors': 256,          # Number of colors for gif optimization
     'lossy_value': 55,      # Lossy value for gif compression
-    'min_size_mb': 10,      # Target maximum size for gifs in MB
+    'min_size_mb': 10.0,      # Target maximum size for gifs in MB
     'min_width': 0,
-    'min_height': 120
+    'min_height': 120,
+    'quality': 85
 }
 
 # Strategies for multiple pass overs after failed attempts
 GIF_PASS_OVERS = [
     {
-        'fps_range': (10, 15),
-        'colors': 192,
+        'fps_range': (15, 10),
+        'colors': 256,
         'lossy_value': 55,
         'scale_factor': 0.8,
     },
     {
-        'fps_range': (10, 15),
+        'fps_range': (12, 8),
         'colors': 192,
-        'lossy_value': 80,
+        'lossy_value': 65,
         'scale_factor': 0.8,
     },
     {
-        'fps_range': (10, 15),
+        'fps_range': (10, 6),
         'colors': 128,
-        'lossy_value': 80,
+        'lossy_value': 75,
         'scale_factor': 0.8,
     },
     {
@@ -103,10 +99,9 @@ GIF_PASS_OVERS = [
 ]
 
 # Additional settings for file handling
-GIF_SIZE_TO_SKIP = 90  # Max size for gifs before skipping gif optimization with gifsicle
+GIF_SIZE_TO_SKIP = 100  # Max size for gifs before skipping gif optimization with gifsicle
 
 # File naming and logging settings
-LOG_FILE = LOG_DIR / 'disdrop.log'
+LOG_FILE = LOG_DIR / 'processing.log'
 FFPMEG_LOG_FILE = LOG_DIR / 'ffmpeg.log'
-SUPPORTED_VIDEO_FORMATS = ['.mp4', '.mkv',
-                           '.m4v', '.avi', '.mov', '.wmv', '.flv']
+SUPPORTED_VIDEO_FORMATS = ['.mp4', '.avi', '.mkv', '.mov', '.wmv']

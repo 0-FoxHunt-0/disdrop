@@ -1,7 +1,7 @@
 # Core video processing
 ffmpeg-python>=0.2.0
 opencv-python>=4.5.0
-pillow>=8.0.0
+pillow>=9.0.0
 
 # System utilities
 psutil>=5.8.0
@@ -9,8 +9,8 @@ typing-extensions>=4.7.0
 python-magic>=0.4.27
 
 # Performance optimization
-numpy>=1.19.0
-cachetools>=4.2.0
+numpy>=1.21.0
+cachetools>=5.0.0
 
 # Logging and monitoring
 colorlog>=6.7.0

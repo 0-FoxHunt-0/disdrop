@@ -21,6 +21,14 @@ from src.video_optimization import VideoProcessor
 from .memory import MemoryManager
 from .ffmpeg_handler import ffmpeg_handler
 
+# Add new constants
+QUALITY_THRESHOLDS = {
+    'min_dimension': 200,
+    'min_fps': 12,
+    'min_colors': 32,
+    'quality_score': 0.7
+}
+
 
 class ProcessingStatus(Enum):
     SUCCESS = "success"
@@ -77,6 +85,9 @@ class GIFOptimizer:
         self._lock = threading.Lock()
         self._file_locks = {}
         self._file_locks_lock = threading.Lock()
+
+        # Add new attributes
+        self.quality_thresholds = QUALITY_THRESHOLDS
 
     def optimize_gif(self, input_path: Path, output_path: Path, target_size_mb: float) -> Tuple[float, bool]:
         """Main optimization method."""
@@ -234,19 +245,106 @@ class GIFOptimizer:
                             dimensions: Tuple[int, int]) -> float:
         """Apply optimization settings to create GIF."""
         try:
-            if self.ffmpeg.create_optimized_gif(
-                input_path, output_path, 30, dimensions, {
-                    'colors': settings.colors,
-                    'scale_factor': settings.scale_factor,
-                    'dither_mode': settings.dither_mode,
-                    'bayer_scale': settings.bayer_scale
-                }
-            ):
+            # Scale the GIF if needed
+            scaled_gif = input_path
+            if settings.scale_factor < 1.0:
+                scaled_gif = self._scale_gif(input_path, settings.scale_factor)
+                if not scaled_gif:
+                    return float('inf')
+
+            # Apply optimization using gifsicle
+            success = self._run_gifsicle(
+                scaled_gif,
+                output_path,
+                colors=settings.colors,
+                lossy=settings.lossy_value,
+                dither=settings.dither_mode
+            )
+
+            # Clean up temporary scaled file
+            if scaled_gif != input_path:
+                Path(scaled_gif).unlink(missing_ok=True)
+
+            if success and self._verify_quality(output_path):
                 return self.get_file_size(output_path)
             return float('inf')
+
         except Exception as e:
             self.dev_logger.error(f"Optimization error: {e}")
             return float('inf')
+
+    def _run_gifsicle(self, input_path: Path, output_path: Path,
+                      colors: int, lossy: int, dither: str) -> bool:
+        """Run gifsicle with specified parameters."""
+        try:
+            cmd = [
+                'gifsicle',
+                '--optimize=3',
+                f'--colors={colors}',
+                f'--lossy={lossy}',
+                f'--dither={dither}',
+                str(input_path),
+                '--output',
+                str(output_path)
+            ]
+
+            result = run_ffmpeg_command(cmd)
+            return result.returncode == 0
+        except Exception as e:
+            self.dev_logger.error(f"Gifsicle error: {str(e)}")
+            return False
+
+    def _verify_quality(self, gif_path: Path) -> bool:
+        """Verify the quality meets minimum standards."""
+        try:
+            img = Image.open(gif_path)
+
+            # Check dimensions
+            if (img.width < self.quality_thresholds['min_dimension'] or
+                    img.height < self.quality_thresholds['min_dimension']):
+                return False
+
+            # Check frame count and timing
+            frame_count = getattr(img, 'n_frames', 1)
+            duration = img.info.get('duration', 0)
+            if frame_count > 1 and duration > 0:
+                fps = 1000 / duration  # duration is in milliseconds
+                if fps < self.quality_thresholds['min_fps']:
+                    return False
+
+            return True
+        except Exception as e:
+            self.dev_logger.error(f"Quality verification failed: {str(e)}")
+            return False
+
+    def _scale_gif(self, input_path: Path, scale_factor: float) -> Optional[Path]:
+        """Scale GIF while preserving quality."""
+        try:
+            img = Image.open(input_path)
+            frames = []
+            new_size = (int(img.width * scale_factor),
+                        int(img.height * scale_factor))
+
+            try:
+                for frame in range(0, getattr(img, 'n_frames', 1)):
+                    img.seek(frame)
+                    new_frame = img.resize(new_size, Image.Resampling.LANCZOS)
+                    frames.append(new_frame)
+            except EOFError:
+                pass
+
+            temp_path = Path(TEMP_FILE_DIR) / f"scaled_{input_path.stem}.gif"
+            frames[0].save(
+                temp_path,
+                save_all=True,
+                append_images=frames[1:] if len(frames) > 1 else [],
+                duration=img.info.get('duration', 100),
+                loop=img.info.get('loop', 0)
+            )
+            return temp_path
+        except Exception as e:
+            self.dev_logger.error(f"Scaling failed: {str(e)}")
+            return None
 
     @staticmethod
     def get_file_size(file_path: Path) -> float:
@@ -287,10 +385,32 @@ class DynamicGIFOptimizer(GIFOptimizer):
             original_size = self.get_file_size(input_path)
             current_best_size = original_size
             best_output = None
+            temp_files = []
+            timestamp = int(time.time() * 1000)
 
+            # If already small enough, just copy directly
             if original_size <= target_size_mb:
-                shutil.copy2(input_path, output_path)
-                return original_size, True
+                try:
+                    # Use a temporary file first, then move to final location to avoid file locking issues
+                    temp_output = Path(TEMP_FILE_DIR) / \
+                        f"direct_copy_{timestamp}.gif"
+                    shutil.copy2(input_path, temp_output)
+
+                    # Make sure the source file is completely written before moving
+                    if temp_output.exists():
+                        # A small delay to ensure file is fully written
+                        time.sleep(0.1)
+                        shutil.move(str(temp_output), str(output_path))
+                    return original_size, True
+                except Exception as e:
+                    self.dev_logger.error(f"Error copying file: {e}")
+                    # Try direct copy as fallback
+                    shutil.copy2(input_path, output_path)
+                    return original_size, True
+
+            dimensions = self._get_dimensions_with_retry(input_path)
+            if not dimensions:
+                return original_size, False
 
             # Analyze input characteristics
             image_complexity = self._analyze_image_complexity(input_path)
@@ -307,7 +427,8 @@ class DynamicGIFOptimizer(GIFOptimizer):
                 motion_complexity, color_count, similar_cases
             )
 
-            best_result = {'size': float('inf'), 'settings': None}
+            best_result = {'size': float(
+                'inf'), 'settings': None, 'path': None}
             adaptation_count = 0
             max_adaptations = 5
 
@@ -322,32 +443,66 @@ class DynamicGIFOptimizer(GIFOptimizer):
                 result_size = self._apply_optimization(
                     input_path, temp_output, current_settings, dimensions)
 
+                # Check file access before proceeding
+                if not temp_output.exists():
+                    self.dev_logger.warning(
+                        f"Optimization attempt {attempt} failed to produce output file")
+                    continue
+
                 try:
                     # Add size validation
                     if result_size > original_size * 1.1:  # If result is 10% larger than original
                         self.dev_logger.warning(
                             f"Optimization attempt {attempt} produced larger file, reverting to previous settings")
-                        temp_output.unlink(missing_ok=True)
+                        try:
+                            temp_output.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+
                         # Revert to previous successful settings if available
                         if best_result['settings']:
                             current_settings = best_result['settings']
                         continue
 
                     if result_size < current_best_size:
-                        if best_output and best_output.exists():
-                            best_output.unlink()
+                        if best_output and best_output.exists() and best_output != input_path:
+                            try:
+                                best_output.unlink(missing_ok=True)
+                            except Exception:
+                                pass
+
                         best_output = temp_output
                         current_best_size = result_size
+
                         # Create a safe copy of the best result
-                        shutil.copy2(temp_output, Path(
-                            TEMP_FILE_DIR) / f"best_{input_path.stem}.gif")
+                        best_copy = Path(TEMP_FILE_DIR) / \
+                            f"best_{timestamp}_{input_path.stem}.gif"
+                        try:
+                            shutil.copy2(temp_output, best_copy)
+                            best_result = {
+                                'size': result_size,
+                                'settings': current_settings,
+                                'path': best_copy
+                            }
+                        except Exception as e:
+                            self.dev_logger.error(
+                                f"Failed to make best copy: {e}")
+                            best_result = {
+                                'size': result_size,
+                                'settings': current_settings,
+                                'path': temp_output
+                            }
+
+                    # If we've reached the target size, we can stop
+                    if result_size <= target_size_mb:
+                        break
 
                     # More conservative parameter adjustment
                     if result_size > target_size_mb:
                         # Only adjust one parameter at a time
                         if attempt % 3 == 0:
                             current_settings.scale_factor = max(
-                                0.25, current_settings.scale_factor * 0.9)
+                                0.3, current_settings.scale_factor * 0.9)
                         elif attempt % 3 == 1:
                             current_settings.colors = max(
                                 64, current_settings.colors - 32)
@@ -360,40 +515,53 @@ class DynamicGIFOptimizer(GIFOptimizer):
                         f"Error during optimization attempt {attempt}: {e}")
                     continue
 
-            while adaptation_count < max_adaptations:
-                result = self._try_optimization(
-                    input_path, output_path, current_settings)
+            # Copy the best result to the output path
+            if best_result['path'] and best_result['path'].exists():
+                try:
+                    # Use a copy-then-move strategy to avoid file locking
+                    final_temp = Path(TEMP_FILE_DIR) / \
+                        f"final_{timestamp}_{output_path.name}"
+                    shutil.copy2(best_result['path'], final_temp)
 
-                if result['success']:
-                    # Update optimization history
-                    self._update_history(original_size, target_size_mb,
-                                         image_complexity, motion_complexity,
-                                         current_settings, result)
+                    # Make sure the file is completely written
+                    time.sleep(0.1)
 
-                    if result['size'] <= target_size_mb:
-                        return result['size'], True
+                    # Now move it to the destination
+                    shutil.move(str(final_temp), str(output_path))
 
-                    if result['size'] < best_result['size']:
-                        best_result = result
-
-                # Adapt parameters based on result
-                current_settings = self._adapt_parameters(
-                    current_settings, result, target_size_mb,
-                    image_complexity, motion_complexity
-                )
-                adaptation_count += 1
-
-            # Use best result if target not met
-            if best_result['settings']:
-                final_result = self._try_optimization(
-                    input_path, output_path, best_result['settings'])
-                return final_result['size'], final_result['size'] <= target_size_mb
+                    success = best_result['size'] <= target_size_mb
+                    return best_result['size'], success
+                except Exception as e:
+                    self.dev_logger.error(f"Error copying final result: {e}")
+                    # Try direct copy as last resort
+                    try:
+                        shutil.copy2(best_result['path'], output_path)
+                        success = best_result['size'] <= target_size_mb
+                        return best_result['size'], success
+                    except Exception as e2:
+                        self.dev_logger.error(f"Final copy failed: {e2}")
+                        return original_size, False
 
             return original_size, False
 
         except Exception as e:
             self.dev_logger.error(f"Dynamic optimization failed: {str(e)}")
             return original_size, False
+        finally:
+            # Clean up temporary files
+            for temp_file in temp_files:
+                try:
+                    if temp_file and temp_file.exists():
+                        temp_file.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+            # Clean up best result copy if it exists
+            if 'best_result' in locals() and best_result.get('path') and best_result['path'].exists():
+                try:
+                    best_result['path'].unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     def _analyze_image_complexity(self, image_path: Path) -> float:
         """Analyze image complexity using entropy and edge detection."""

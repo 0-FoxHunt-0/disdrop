@@ -5,10 +5,9 @@ from pathlib import Path
 class BaseProcessor:
     """Base class for all processors with logging and verbose settings."""
 
-    def __init__(self, verbose: bool = False):
+    def __init__(self, logger=None, verbose: bool = False):
         self.verbose = verbose
-        self.dev_logger = logging.getLogger('dev')
-        self.user_logger = logging.getLogger('user')
+        self.logger = logger or logging.getLogger('app')
 
     def get_file_size(self, path: Path) -> float:
         """Get file size in MB."""

@@ -6,200 +6,154 @@ import signal
 import subprocess
 import sys
 import threading
+import time
+import uuid
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Any
 import json
 
-logger = logging.getLogger(__name__)
+from src.logging_system import get_logger, performance_monitor, setup_ffmpeg_logging
+
+# Use module-specific logger
+logger = get_logger('ffmpeg')
 
 
 class FFmpegHandler:
-    """Singleton handler for FFmpeg operations."""
-
-    _instance = None
-    _lock = threading.Lock()
-    _current_processes = set()
-
-    def __new__(cls):
-        if cls._instance is None:
-            with cls._lock:
-                if cls._instance is None:
-                    cls._instance = super().__new__(cls)
-                    cls._instance._initialized = False
-        return cls._instance
+    """Handles FFmpeg operations with proper resource management."""
 
     def __init__(self):
-        if not self._initialized:
-            self._process_lock = threading.Lock()
-            self._initialized = True
+        """Initialize FFmpeg handler with proper logging."""
+        self._process_lock = threading.Lock()
+        self._current_processes = set()
+        self.gpu_support = {
+            'nvidia': False,
+            'intel_qsv': False,
+            'amd_amf': False,
+            'vaapi': False,
+            'nvenc_available': False,
+            'qsv_available': False,
+            'amf_available': False,
+            'vaapi_available': False
+        }
+        logger.debug("FFmpegHandler initialized")
 
-    def create_optimized_gif(self, file_path: Path, output_path: Path,
-                             fps: int, dimensions: Tuple[int, int], settings: Dict) -> bool:
-        """Create optimized GIF in a single pass."""
-        try:
-            cmd = [
-                'ffmpeg',
-                '-i', str(file_path),
-                '-vf',
-                f'fps={fps},'
-                f'scale={dimensions[0]}:{dimensions[1]}:flags=lanczos,'
-                'split[s0][s1];'
-                '[s0]palettegen=max_colors={colors}:stats_mode=diff[p];'
-                '[s1][p]paletteuse=dither=bayer:bayer_scale=3:diff_mode=rectangle'.format(
-                    colors=settings.get('colors', 256)
-                ),
-                '-y',
-                str(output_path)
-            ]
-
-            return self.run_command(cmd)
-
-        except Exception as e:
-            logging.error(f"GIF creation failed: {str(e)}")
+    def run_command(self, command: List[str], timeout: int = 300) -> bool:
+        """Run FFmpeg command with proper error handling and timeout."""
+        if not command:
+            logger.error("Empty command passed to run_command")
             return False
 
-    def get_dimensions(self, file_path: Path) -> Tuple[Optional[int], Optional[int]]:
-        """Get video dimensions using multiple methods."""
-        methods = [
-            self._get_dimensions_ffprobe,
-            self._get_dimensions_ffmpeg
-        ]
+        # Get dedicated FFmpeg logger
+        ffmpeg_logger = setup_ffmpeg_logging()
 
-        last_error = None
-        for method in methods:
-            try:
-                dimensions = method(file_path)
-                if dimensions and all(isinstance(d, int) and d > 0 for d in dimensions):
-                    return dimensions
-            except Exception as e:
-                last_error = str(e)
-                continue
-
-        logger.error(
-            f"All dimension detection methods failed. Last error: {last_error}")
-        return None, None
-
-    def _get_dimensions_ffprobe(self, file_path: Path) -> Tuple[int, int]:
-        """Get dimensions using ffprobe."""
-        try:
-            cmd = [
-                'ffprobe',
-                '-v', 'error',
-                '-select_streams', 'v:0',
-                '-show_entries', 'stream=width,height,rotation,sample_aspect_ratio',
-                '-of', 'json',
-                str(file_path)
-            ]
-
-            output = subprocess.check_output(
-                cmd, stderr=subprocess.PIPE, text=True)
-            data = json.loads(output)
-
-            if not data.get('streams'):
-                raise ValueError("No video streams found")
-
-            stream = data['streams'][0]
-            width = int(stream.get('width', 0))
-            height = int(stream.get('height', 0))
-
-            if width <= 0 or height <= 0:
-                raise ValueError("Invalid dimensions in stream")
-
-            # Handle rotation
-            rotation = int(stream.get('rotation', '0') or '0')
-            if rotation in [90, 270]:
-                width, height = height, width
-
-            return width, height
-
-        except Exception as e:
-            raise ValueError(f"FFprobe dimension detection failed: {e}")
-
-    def _get_dimensions_ffmpeg(self, file_path: Path) -> Tuple[int, int]:
-        """Get dimensions using FFmpeg as fallback."""
-        try:
-            cmd = ['ffmpeg', '-i', str(file_path)]
-            output = subprocess.run(cmd, capture_output=True, text=True).stderr
-
-            patterns = [
-                r'Stream.*Video.* (\d+)x(\d+)',
-                r'Video: .* (\d+)x(\d+)',
-                r', (\d+)x(\d+)[,\s]'
-            ]
-
-            for pattern in patterns:
-                matches = re.findall(pattern, output)
-                if matches:
-                    width, height = map(int, matches[0])
-                    if width > 0 and height > 0:
-                        return (width, height)
-
-            raise ValueError("No valid dimensions found in FFmpeg output")
-        except Exception as e:
-            raise ValueError(f"FFmpeg dimension detection failed: {e}")
-
-    def run_command(self, command: List[str], timeout: Optional[int] = None) -> bool:
-        """Run FFmpeg command with proper handling and logging."""
-        current_dir = os.getcwd()
-        process = None
+        # Log the command to both the application log and FFmpeg log
+        command_str = ' '.join(command)
+        logger.debug(f"Running FFmpeg command")
+        ffmpeg_logger.info(f"Running FFmpeg command: {command_str}")
 
         try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+
             with self._process_lock:
-                process = subprocess.Popen(
-                    command,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True
-                )
                 self._current_processes.add(process)
 
-            stdout, stderr = process.communicate(timeout=timeout)
+            try:
+                stdout, stderr = process.communicate(timeout=timeout)
 
-            if stdout:
-                logger.debug(f"FFmpeg output: {stdout}")
-            if stderr:
-                logger.debug(f"FFmpeg error: {stderr}")
+                # Log all output to the FFmpeg log file
+                if stdout:
+                    ffmpeg_logger.debug("STDOUT: " + stdout)
 
-            success = process.returncode == 0
-            if not success:
-                logger.error(
-                    f"FFmpeg command failed with code {process.returncode}")
+                if stderr:
+                    ffmpeg_logger.debug("STDERR: " + stderr)
+                    # Keep a brief message in the application log
+                    logger.debug(
+                        "FFmpeg produced output (see ffmpeg.log for details)")
 
-            return success
+                # Return success based on return code
+                success = process.returncode == 0
+                if success:
+                    logger.debug("FFmpeg command completed successfully")
+                    ffmpeg_logger.info("Command completed successfully")
+                else:
+                    logger.error(
+                        f"FFmpeg command failed with exit code {process.returncode}")
+                    ffmpeg_logger.error(
+                        f"Command failed with exit code {process.returncode}")
 
-        except subprocess.TimeoutExpired:
-            logger.error("FFmpeg command timed out")
-            self._kill_process(process)
-            return False
-        except Exception as e:
-            logger.error(f"FFmpeg error: {str(e)}")
-            if process:
+                return success
+
+            except subprocess.TimeoutExpired:
+                error_msg = f"FFmpeg command timed out after {timeout}s"
+                logger.warning(error_msg)
+                ffmpeg_logger.error(error_msg)
                 self._kill_process(process)
-            return False
-        finally:
-            if process:
+                return False
+
+            finally:
                 with self._process_lock:
-                    self._current_processes.discard(process)
-            os.chdir(current_dir)
+                    if process in self._current_processes:
+                        self._current_processes.remove(process)
+
+        except Exception as e:
+            error_msg = f"Error running FFmpeg command: {e}"
+            logger.error(error_msg, exc_info=True)
+            ffmpeg_logger.error(error_msg, exc_info=True)
+            return False
 
     async def run_async(self, command: List[str]) -> bool:
         """Run FFmpeg command asynchronously."""
+        if not command:
+            logger.error("Empty command passed to run_async")
+            return False
+
+        # Get dedicated FFmpeg logger
+        ffmpeg_logger = setup_ffmpeg_logging()
+        
+        # Log the command to both the application log and FFmpeg log
+        command_str = ' '.join(command)
+        logger.debug(f"Running async FFmpeg command")
+        ffmpeg_logger.info(f"Running async FFmpeg command: {command_str}")
+
         try:
             process = await asyncio.create_subprocess_exec(
                 *command,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                stderr=asyncio.subprocess.PIPE,
+                text=True
             )
 
             stdout, stderr = await process.communicate()
 
+            # Log all output to the FFmpeg log file
+            if stdout:
+                ffmpeg_logger.debug("STDOUT: " + stdout)
+            
             if stderr:
-                logger.debug(f"FFmpeg output: {stderr.decode()}")
+                ffmpeg_logger.debug("STDERR: " + stderr)
+                # Keep a brief message in the application log
+                logger.debug("FFmpeg produced output (see ffmpeg.log for details)")
 
-            return process.returncode == 0
+            # Return success based on return code
+            success = process.returncode == 0
+            if success:
+                logger.debug("Async FFmpeg command completed successfully")
+                ffmpeg_logger.info("Async command completed successfully")
+            else:
+                logger.error(f"Async FFmpeg command failed with exit code {process.returncode}")
+                ffmpeg_logger.error(f"Async command failed with exit code {process.returncode}")
+            
+            return success
 
         except Exception as e:
-            logger.error(f"Async FFmpeg command failed: {e}")
+            error_msg = f"Error running async FFmpeg command: {e}"
+            logger.error(error_msg, exc_info=True)
+            ffmpeg_logger.error(error_msg, exc_info=True)
             return False
 
     def _kill_process(self, process: subprocess.Popen) -> None:
@@ -208,20 +162,83 @@ class FFmpegHandler:
             return
 
         try:
+            logger.debug(f"Killing FFmpeg process with PID {process.pid}")
+
             if sys.platform == 'win32':
                 subprocess.run(['taskkill', '/F', '/T', '/PID', str(process.pid)],
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             else:
                 os.killpg(os.getpgid(process.pid), signal.SIGTERM)
         except Exception as e:
-            logger.error(f"Error killing process {process.pid}: {e}")
+            logger.error(
+                f"Error killing process {process.pid}: {e}", exc_info=True)
 
     def kill_all_processes(self) -> None:
         """Kill all active FFmpeg processes."""
         with self._process_lock:
+            process_count = len(self._current_processes)
+            if process_count > 0:
+                logger.info(f"Killing {process_count} active FFmpeg processes")
+
             for process in self._current_processes.copy():
                 self._kill_process(process)
+
             self._current_processes.clear()
+
+    @performance_monitor
+    def update_gpu_settings(self, gpu_settings: Dict[str, Any]) -> None:
+        """Update GPU settings with externally detected capabilities.
+
+        This allows sharing GPU detection across the application instead
+        of each component detecting GPU capabilities separately.
+        """
+        if not gpu_settings:
+            logger.debug("No GPU settings provided to update")
+            return
+
+        # Log the update
+        logger.debug(f"Updating FFmpegHandler GPU settings: {gpu_settings}")
+
+        # Update GPU support flags if provided
+        if 'preferred_encoder' in gpu_settings:
+            encoder = gpu_settings['preferred_encoder']
+            if encoder == 'nvenc':
+                self.gpu_support['nvidia'] = True
+                self.gpu_support['intel_qsv'] = False
+                self.gpu_support['amd_amf'] = False
+                self.gpu_support['vaapi'] = False
+                logger.info("Set NVIDIA as preferred encoder")
+            elif encoder == 'qsv':
+                self.gpu_support['nvidia'] = False
+                self.gpu_support['intel_qsv'] = True
+                self.gpu_support['amd_amf'] = False
+                self.gpu_support['vaapi'] = False
+                logger.info("Set Intel QSV as preferred encoder")
+            elif encoder == 'amf':
+                self.gpu_support['nvidia'] = False
+                self.gpu_support['intel_qsv'] = False
+                self.gpu_support['amd_amf'] = True
+                self.gpu_support['vaapi'] = False
+                logger.info("Set AMD AMF as preferred encoder")
+            elif encoder == 'vaapi':
+                self.gpu_support['nvidia'] = False
+                self.gpu_support['intel_qsv'] = False
+                self.gpu_support['amd_amf'] = False
+                self.gpu_support['vaapi'] = True
+                logger.info("Set VAAPI as preferred encoder")
+
+        # Update specific encoder availability flags
+        if 'encoders' in gpu_settings:
+            encoders = gpu_settings['encoders']
+            if isinstance(encoders, list):
+                self.gpu_support['nvenc_available'] = 'NVENC' in encoders
+                self.gpu_support['qsv_available'] = 'QSV' in encoders
+                self.gpu_support['amf_available'] = 'AMF' in encoders
+                self.gpu_support['vaapi_available'] = 'VAAPI' in encoders
+                logger.debug(f"Updated encoder availability: {encoders}")
+
+        # Log the updated settings
+        logger.debug(f"Updated FFmpegHandler GPU settings: {self.gpu_support}")
 
 
 # Global instance

@@ -18,13 +18,14 @@ from typing import Any, Dict, List, Optional, Tuple, Union, Callable
 # Updated imports with correct paths
 from .default_config import (INPUT_DIR, OUTPUT_DIR, SUPPORTED_VIDEO_FORMATS,
                              TEMP_FILE_DIR, VIDEO_COMPRESSION, VIDEO_SETTINGS)
-from .logging_system import log_function_call, run_ffmpeg_command
+from .logging_system import log_function_call, run_ffmpeg_command, get_logger, performance_monitor
 from .temp_file_manager import TempFileManager
 from .utils.video_dimensions import get_video_dimensions
 from .utils.error_handler import validate_video_file, retry_video_processing, VideoProcessingError
 from src.gif_operations.resource_manager import ResourceMonitor, ResourceGuard
 
-logger = logging.getLogger(__name__)
+# Remove root logger, use module specific logger
+logger = get_logger('video')
 
 
 class CompressionQuality(Enum):
@@ -50,6 +51,15 @@ class VideoEncoder:
         self.settings = settings
         self.is_gpu_available = self._check_gpu_availability()
         self._setup_encoder()
+
+    def _check_gpu_availability(self) -> bool:
+        """Check if GPU acceleration is available for encoding."""
+        try:
+            from .gpu_acceleration import check_gpu_support
+            return check_gpu_support()
+        except Exception as e:
+            logger.warning(f"Error checking GPU availability: {e}")
+            return False
 
     def _setup_encoder(self):
         if self.is_gpu_available and self.settings['gpu']['enabled']:
@@ -161,85 +171,169 @@ class ProcessManager:
                     pass
 
 
+# class VideoLogger:
+#     """Enhanced logger for video processing"""
+
+#     def __init__(self):
+#         self._last_progress = 0
+#         self._progress_shown = False
+#         self._unified_logger = setup_application_logging()
+
+#     def error(self, message: str, **kwargs):
+#         self._unified_logger.logger.error(message, **kwargs)
+
+#     def warning(self, message: str, **kwargs):
+#         self._unified_logger.logger.warning(message, **kwargs)
+
+#     def info(self, message: str, **kwargs):
+#         self._unified_logger.logger.info(message, **kwargs)
+
+#     def debug(self, message: str, **kwargs):
+#         self._unified_logger.logger.debug(message, **kwargs)
+
+#     def success(self, message: str, **kwargs):
+#         self._unified_logger.logger.success(message, **kwargs)
+
+
 class VideoProcessor(BaseProcessor):
-    def __init__(self, use_gpu: bool = True, settings: dict = VIDEO_SETTINGS):
-        super().__init__()  # Initialize base logger first
+    def __init__(self, logger=None, use_gpu: bool = True, gpu_settings: dict = None, settings: dict = VIDEO_SETTINGS):
+        # Use provided logger or get a properly configured one
+        self.logger = logger or get_logger('video')
+        # Don't call super() with logger param since we've already set it
+        super().__init__()
 
-        # Add progress callback property
-        self._progress_callback: Optional[Callable[[
-            int, int, str], None]] = None
-
-        # Rest of existing initialization
-        self.use_gpu = use_gpu
         self.settings = settings
-        self.gpu_available = self._check_gpu_availability() if use_gpu else False
-        self.min_scale = 0.1
-        self.base_size_tolerance = 0.1
-        self.max_compression_attempts = 12
-        self.extreme_compression_threshold = 1.2
-        self.target_size_mb = VIDEO_COMPRESSION['min_size_mb']
-        self._setup_encoder()
-        self.dimension_cache = {}
-        self.resource_monitor = ResourceMonitor()
-        self._progress_callback = None
+        self.use_gpu = use_gpu
+        self.gpu_settings = gpu_settings or {}
 
+        # Log initialization
+        self.logger.debug(f"Initializing VideoProcessor with GPU: {use_gpu}")
+        if gpu_settings:
+            self.logger.debug(f"GPU settings: {gpu_settings}")
+
+        # Set up encoder based on settings
+        self._setup_encoder()
+
+        # Set up thread management
+        self.max_workers = min(os.cpu_count() or 4, 4)
+        self.executor = ThreadPoolExecutor(max_workers=self.max_workers)
+        self.progress_callback = None
+        self.resource_monitor = ResourceMonitor()
+
+        # Initialize stats tracking
+        self.processed_files = 0
+        self.failed_files = []
+
+        # Static configuration
+        self.max_compression_attempts = 5
+        self.min_scale = 0.4
+        self.target_size_mb = 15.0
+        self.base_size_tolerance = 0.10  # 10% tolerance
+        self.extreme_compression_threshold = 1.2  # 20% over target
+
+        # Dimension cache
+        self.dimension_cache = {}
+
+    @performance_monitor
     def _setup_encoder(self):
-        if self.gpu_available and self.settings['gpu']['enabled']:
-            self.mode = 'gpu'
-            self.encoder = self.settings['gpu']['encoders'][0]
-            self.presets = self.settings['gpu']['presets']
-        else:
-            self.mode = 'cpu'
-            self.encoder = self.settings['cpu']['encoders'][0]
-            self.presets = self.settings['cpu']['presets']
+        """Set up video encoder with appropriate GPU settings."""
+        try:
+            self.encoder = VideoEncoder(self.settings)
+            # Override GPU availability based on what was passed in
+            if not self.use_gpu:
+                self.logger.info("GPU acceleration disabled by configuration")
+                self.encoder.is_gpu_available = False
+                self.encoder._setup_encoder()  # Re-setup with GPU disabled
+            elif self.gpu_settings:
+                # Apply any specific GPU settings passed from outside
+                self.encoder.is_gpu_available = True
+                # Update encoder preferences if specific GPU type is known
+                if 'preferred_encoder' in self.gpu_settings:
+                    preferred = self.gpu_settings['preferred_encoder']
+                    self.logger.info(
+                        f"Set {preferred.upper()} as preferred encoder")
+                    # Update encoder settings if the preferred encoder is available
+                    for encoder_type in self.settings:
+                        if encoder_type in ['gpu', 'cpu']:
+                            encoders = self.settings[encoder_type].get(
+                                'encoders', [])
+                            for encoder in encoders:
+                                if preferred in encoder.lower():
+                                    self.settings[encoder_type]['encoders'] = [encoder] + [
+                                        e for e in encoders if e != encoder
+                                    ]
+                self.encoder._setup_encoder()  # Re-setup with updated settings
+
+            # Log encoder configuration
+            self.logger.debug(
+                f"Encoder configured: mode={self.encoder.mode}, encoder={self.encoder.encoder}")
+        except Exception as e:
+            self.logger.error(f"Error setting up encoder: {e}", exc_info=True)
+            # Create a basic encoder in CPU mode as fallback
+            self.encoder = VideoEncoder(self.settings)
+            self.encoder.is_gpu_available = False
+            self.encoder._setup_encoder()
 
     def _get_temp_path(self, original_path: Path, suffix: str = "") -> Path:
         """Generate a temporary file path in the temp directory."""
-        timestamp = int(time.time() * 1000)
-        return Path(TEMP_FILE_DIR) / f"temp_{timestamp}_{original_path.stem}{suffix}{original_path.suffix}"
+        try:
+            timestamp = int(time.time() * 1000)
+            return Path(TEMP_FILE_DIR) / f"temp_{timestamp}_{original_path.stem}{suffix}{original_path.suffix}"
+        except Exception as e:
+            self.logger.error(
+                f"Failed to create temp path: {e}", exc_info=True)
+            # Fallback
+            return Path(TEMP_FILE_DIR) / f"temp_{int(time.time())}_{suffix}.mp4"
 
     def set_progress_callback(self, callback: Callable[[int, int, str], None]) -> None:
         """Set a callback function to report processing progress."""
-        self._progress_callback = callback
+        self.progress_callback = callback
+        self.logger.debug("Progress callback set")
 
     def _report_progress(self, current: int, total: int, file_name: str) -> None:
         """Report processing progress through callback."""
-        if self._progress_callback:
+        if self.progress_callback:
             try:
-                self._progress_callback(current, total, file_name)
+                self.progress_callback(current, total, file_name)
             except Exception as e:
-                self.dev_logger.error(f"Progress callback error: {e}")
+                self.logger.error(
+                    f"Progress callback error: {e}", exc_info=True)
 
+    @performance_monitor
     def process_videos(self, input_dir: Path, output_dir: Path, target_size_mb: float) -> List[Path]:
         """Process videos with improved error handling and feedback."""
         input_dir = Path(input_dir)
         output_dir = Path(output_dir)
         failed_files = []
 
+        # Store target size for other methods to use
+        self.target_size_mb = target_size_mb
+
         video_files = []
         for fmt in SUPPORTED_VIDEO_FORMATS:
             video_files.extend(input_dir.glob(f'*{fmt}'))
 
         if not video_files:
-            self.dev_logger.info("No video files found to process")
+            self.logger.info("No video files found to process")
             return []
 
         # Sort files by size for better processing order
         video_files.sort(key=lambda x: x.stat().st_size, reverse=True)
         total_files = len(video_files)
+        self.logger.info(f"Found {total_files} video files to process")
 
         for idx, video_file in enumerate(video_files, 1):
             try:
                 original_size = video_file.stat().st_size / (1024 * 1024)
                 output_path = output_dir / f"{video_file.stem}.mp4"
 
-                self.dev_logger.info(
+                self.logger.info(
                     f"\nProcessing {idx}/{total_files}: {video_file.name} ({original_size:.2f}MB)"
                 )
 
                 # Validate input file
                 if not self._validate_input_file(video_file):
-                    self.dev_logger.error(
+                    self.logger.error(
                         f"Invalid or corrupted file: {video_file.name}")
                     failed_files.append(video_file)
                     continue
@@ -248,14 +342,14 @@ class VideoProcessor(BaseProcessor):
                 if output_path.exists():
                     existing_size = output_path.stat().st_size / (1024 * 1024)
                     if existing_size <= target_size_mb:
-                        self.dev_logger.info(
+                        self.logger.info(
                             f"Skipping {video_file.name} - Already compressed ({existing_size:.2f}MB)"
                         )
                         continue
 
                 # Process the video
                 if not self._process_single_video(video_file, output_path, target_size_mb):
-                    self.dev_logger.error(
+                    self.logger.error(
                         f"Failed to create output for {video_file.name}"
                     )
                     failed_files.append(video_file)
@@ -263,7 +357,7 @@ class VideoProcessor(BaseProcessor):
 
                 # Verify the output
                 if not self._verify_output(output_path, target_size_mb):
-                    self.dev_logger.error(
+                    self.logger.error(
                         f"Output verification failed for {video_file.name}"
                     )
                     failed_files.append(video_file)
@@ -272,11 +366,21 @@ class VideoProcessor(BaseProcessor):
 
                 self._report_progress(idx, total_files, video_file.name)
 
+                # Log successful processing
+                if output_path.exists():
+                    self.processed_files += 1
+                    self.logger.success(
+                        f"Processed {video_file.name} - Original: {original_size:.2f}MB, Final: {output_path.stat().st_size / (1024 * 1024):.2f}MB"
+                    )
+
             except Exception as e:
-                self.dev_logger.error(
-                    f"Error processing {video_file.name}: {str(e)}")
+                self.logger.error(
+                    f"Error processing {video_file.name}: {str(e)}", exc_info=True)
                 failed_files.append(video_file)
 
+        # Log summary
+        self.logger.info(
+            f"Video processing complete. Processed: {self.processed_files}, Failed: {len(failed_files)}")
         return failed_files
 
     def _validate_input_file(self, file_path: Path) -> bool:
@@ -284,6 +388,8 @@ class VideoProcessor(BaseProcessor):
         try:
             # Check if file exists and is not empty
             if not file_path.exists() or file_path.stat().st_size == 0:
+                self.logger.warning(
+                    f"File doesn't exist or is empty: {file_path}")
                 return False
 
             # Check if file is a valid video using ffprobe
@@ -298,25 +404,39 @@ class VideoProcessor(BaseProcessor):
 
             result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode != 0:
+                self.logger.warning(
+                    f"FFprobe returned error code {result.returncode} for {file_path}")
                 return False
 
             data = json.loads(result.stdout)
-            return bool(data.get('streams'))
+            is_valid = bool(data.get('streams'))
+            if not is_valid:
+                self.logger.warning(
+                    f"No valid video streams found in {file_path}")
+            return is_valid
 
+        except json.JSONDecodeError:
+            self.logger.error(
+                f"Invalid JSON response from ffprobe for {file_path}", exc_info=True)
+            return False
         except Exception as e:
-            self.dev_logger.error(
-                f"Validation error for {file_path.name}: {e}")
+            self.logger.error(
+                f"Validation error for {file_path.name}: {e}", exc_info=True)
             return False
 
     def _verify_output(self, output_path: Path, target_size_mb: float) -> bool:
         """Verify the output video is valid and meets requirements."""
         try:
             if not output_path.exists():
+                self.logger.warning(
+                    f"Output file does not exist: {output_path}")
                 return False
 
             # Check file size
             output_size = output_path.stat().st_size / (1024 * 1024)
             if output_size > target_size_mb * 1.1:  # Allow 10% tolerance
+                self.logger.warning(
+                    f"Output file too large: {output_size:.2f}MB > {target_size_mb * 1.1:.2f}MB")
                 return False
 
             # Verify video integrity
@@ -330,12 +450,14 @@ class VideoProcessor(BaseProcessor):
 
             result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode != 0:
+                self.logger.warning(
+                    f"FFprobe verification failed with code {result.returncode}")
                 return False
 
             return True
 
         except Exception as e:
-            self.dev_logger.error(f"Output verification error: {e}")
+            self.logger.error(f"Output verification error: {e}", exc_info=True)
             return False
 
     @retry_video_processing
@@ -346,12 +468,12 @@ class VideoProcessor(BaseProcessor):
                 # Add timeout for metadata fetching
                 metadata = self.get_video_metadata(input_path, timeout=30)
                 if not metadata:
-                    self.dev_logger.error(
+                    self.logger.error(
                         f"Failed to get metadata for {input_path}")
                     return False
 
                 # Log more detailed progress information
-                self.dev_logger.info(
+                self.logger.info(
                     f"Processing {input_path.name}\n"
                     f"Size: {metadata['size_mb']:.2f}MB\n"
                     f"Duration: {metadata.get('duration', 0):.1f}s\n"
@@ -373,7 +495,7 @@ class VideoProcessor(BaseProcessor):
 
                 # Validate essential metadata
                 if not all([width, height, duration]):
-                    logger.error(
+                    self.logger.error(
                         f"Invalid metadata for {input_path}: missing essential values")
                     return False
 
@@ -389,18 +511,18 @@ class VideoProcessor(BaseProcessor):
 
                 # Adjust tolerance based on original file size
                 size_tolerance = self._get_size_tolerance(metadata.size_mb)
-                logger.debug(f"Video info: {metadata.width}x{metadata.height}, {
-                             metadata.frame_rate}fps, {metadata.duration: .1f}s")
-                logger.debug(f"Target size: {target_size_mb}MB(tolerance: {
-                             size_tolerance*100: .1f} % )")
+                self.logger.debug(f"Video info: {metadata.width}x{metadata.height}, {
+                    metadata.frame_rate}fps, {metadata.duration: .1f}s")
+                self.logger.debug(f"Target size: {target_size_mb}MB(tolerance: {
+                    size_tolerance*100: .1f} % )")
 
                 # For very large files, try two-pass encoding first
                 if metadata.size_mb > 100 and metadata.size_mb / target_size_mb > 10:
-                    logger.info(f"Large file detected({
-                                metadata.size_mb: .2f}MB), attempting two-pass compression")
+                    self.logger.info(f"Large file detected({
+                        metadata.size_mb: .2f}MB), attempting two-pass compression")
                     if self._two_pass_compression(input_path, output_path, target_size_mb, metadata):
                         return True
-                    logger.info(
+                    self.logger.info(
                         "Two-pass compression unsuccessful, falling back to standard compression")
 
                 # Create working copy in temp directory
@@ -431,6 +553,8 @@ class VideoProcessor(BaseProcessor):
 
                     if success and temp_output.exists():
                         current_size = temp_output.stat().st_size / (1024 * 1024)
+                        self.logger.debug(
+                            f"Attempt {attempt+1}: size={current_size:.2f}MB, scale={scale:.2f}, crf={crf}")
 
                         # Update best result if this attempt is better
                         if current_size < best_size:
@@ -457,20 +581,20 @@ class VideoProcessor(BaseProcessor):
                 # If we have a best result but didn't hit target, use it anyway
                 if best_result and best_result.exists():
                     shutil.move(best_result, output_path)
-                    logger.warning(
+                    self.logger.warning(
                         f"Could not reach target size of {target_size_mb}MB. Best achieved: {best_size:.2f}MB")
                     return True
 
                 return False
 
         except TimeoutError:
-            self.dev_logger.error(f"Processing timed out for {input_path}")
+            self.logger.error(f"Processing timed out for {input_path}")
             return False
         except VideoProcessingError as e:
-            logger.error(f"Video processing error: {e}")
+            self.logger.error(f"Video processing error: {e}")
             return False
         except Exception as e:
-            logger.exception(f"Processing failed for {input_path}: {e}")
+            self.logger.exception(f"Processing failed for {input_path}: {e}")
             return False
         finally:
             # Cleanup temp files
@@ -478,7 +602,7 @@ class VideoProcessor(BaseProcessor):
                 try:
                     temp_file.unlink(missing_ok=True)
                 except Exception as e:
-                    logger.error(
+                    self.logger.error(
                         f"Failed to cleanup temp file {temp_file}: {e}")
 
     def _calculate_initial_scale(self, metadata: VideoMetadata, target_size_mb: float) -> float:
@@ -523,23 +647,23 @@ class VideoProcessor(BaseProcessor):
                             0.85)  # More aggressive scaling
             # Allow higher CRF for final compression
             new_crf = min(current_crf + 3, 38)
-            logger.debug(f"Close to target, using extreme compression: scale={
-                         new_scale: .2f}, crf={new_crf}")
+            self.logger.debug(f"Close to target, using extreme compression: scale={
+                new_scale: .2f}, crf={new_crf}")
         elif size_ratio > 2:
             new_scale = max(self.min_scale, current_scale * 0.8)
             new_crf = min(current_crf + 4, 35)
-            logger.debug(f"Size ratio > 2, aggressive adjustment: scale={
-                         new_scale: .2f}, crf={new_crf}")
+            self.logger.debug(f"Size ratio > 2, aggressive adjustment: scale={
+                new_scale: .2f}, crf={new_crf}")
         elif size_ratio > 1.5:
             new_scale = max(self.min_scale, current_scale * 0.9)
             new_crf = min(current_crf + 2, 32)
-            logger.debug(f"Size ratio > 1.5, moderate adjustment: scale={
-                         new_scale: .2f}, crf={new_crf}")
+            self.logger.debug(f"Size ratio > 1.5, moderate adjustment: scale={
+                new_scale: .2f}, crf={new_crf}")
         else:
             new_scale = max(self.min_scale, current_scale * 0.95)
             new_crf = min(current_crf + 1, 30)
-            logger.debug(f"Size ratio <= 1.5, fine adjustment: scale={
-                         new_scale: .2f}, crf={new_crf}")
+            self.logger.debug(f"Size ratio <= 1.5, fine adjustment: scale={
+                new_scale: .2f}, crf={new_crf}")
 
         return new_scale, new_crf
 
@@ -551,8 +675,8 @@ class VideoProcessor(BaseProcessor):
             new_width = int(metadata.width * scale // 2 * 2)
             new_height = int(metadata.height * scale // 2 * 2)
 
-            logger.debug(f"Compression attempt with: scale={scale:.2f} ({new_width}x{new_height}), "
-                         f"crf={crf}, bitrate={target_bitrate}k")
+            self.logger.debug(f"Compression attempt with: scale={scale:.2f} ({new_width}x{new_height}), "
+                              f"crf={crf}, bitrate={target_bitrate}k")
 
             # Ensure minimum dimensions
             new_width = max(16, new_width)
@@ -578,7 +702,7 @@ class VideoProcessor(BaseProcessor):
                 filters.append('unsharp=3:3:0.5:3:3:0.5')
 
             # GPU encoding command
-            if self.use_gpu and self.gpu_available:
+            if self.use_gpu and self.encoder.is_gpu_available:
                 command.extend([
                     '-c:v', 'h264_nvenc',
                     '-preset', 'p2',  # Fixed preset instead of using settings
@@ -615,7 +739,7 @@ class VideoProcessor(BaseProcessor):
                 return pm.run()
 
         except Exception as e:
-            logger.exception(f"Compression attempt failed: {e}")
+            self.logger.exception(f"Compression attempt failed: {e}")
             return False
 
     def _build_optimal_command(self, input_path: Path, output_path: Path,
@@ -647,7 +771,7 @@ class VideoProcessor(BaseProcessor):
             filters.append('fps=30')
 
         # GPU encoding command
-        if self.use_gpu and self.gpu_available:
+        if self.use_gpu and self.encoder.is_gpu_available:
             command = base_command + [
                 '-c:v', 'h264_nvenc',
                 '-preset', 'p2',  # Quality preset
@@ -693,7 +817,7 @@ class VideoProcessor(BaseProcessor):
             target_bitrate = int((target_size_mb * 7800) / metadata.duration)
 
             # More aggressive compression settings
-            if self.use_gpu and self.gpu_available:
+            if self.use_gpu and self.encoder.is_gpu_available:
                 command = [
                     'ffmpeg', '-hide_banner', '-y',
                     '-i', str(input_path),
@@ -740,31 +864,19 @@ class VideoProcessor(BaseProcessor):
                 temp_path.unlink(missing_ok=True)
 
     def _run_ffmpeg(self, command: List[str]) -> bool:
-        """Run FFmpeg command with proper error handling."""
-        try:
-            process = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-            stdout, stderr = process.communicate()
+        """Run FFmpeg command with proper error handling and dedicated logging."""
+        from .logging_system import setup_ffmpeg_logging, run_ffmpeg_command
 
-            if process.returncode != 0:
-                logger.error(f"FFmpeg error: {stderr}")
-                return False
-            return True
+        try:
+            # Make sure hide_banner is included
+            if '-hide_banner' not in command:
+                command.insert(1, '-hide_banner')
+
+            # Use the dedicated FFmpeg logging system
+            return run_ffmpeg_command(command)
+
         except Exception as e:
-            logger.exception(f"FFmpeg execution failed: {e}")
-            return False
-
-    def _check_gpu_availability(self) -> bool:
-        """Check if NVIDIA GPU encoding is available."""
-        try:
-            cmd = ['ffmpeg', '-hide_banner', '-encoders']
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            return 'h264_nvenc' in result.stdout
-        except Exception:
+            self.logger.exception(f"FFmpeg execution failed: {e}")
             return False
 
     def _create_temp_file(self, prefix: str, suffix: str) -> Path:
@@ -776,13 +888,21 @@ class VideoProcessor(BaseProcessor):
                 temp_path.unlink()
             return temp_path
         except Exception as e:
-            logger.error(f"Failed to create temp file: {e}")
+            self.logger.error(f"Failed to create temp file: {e}")
             raise
 
+    @performance_monitor
     def get_video_metadata(self, file_path: Path, timeout: int = 30) -> Optional[Dict[str, Any]]:
         """Get video metadata with timeout."""
         try:
+            # Check cache first
+            cache_key = str(file_path)
+            if hasattr(self, 'metadata_cache') and cache_key in self.metadata_cache:
+                self.logger.debug(f"Using cached metadata for {file_path}")
+                return self.metadata_cache[cache_key]
+
             # Use ffprobe to get video metadata
+            self.logger.debug(f"Retrieving metadata for {file_path}")
             cmd = [
                 'ffprobe',
                 '-v', 'quiet',
@@ -801,27 +921,33 @@ class VideoProcessor(BaseProcessor):
             )
 
             if result.returncode != 0:
-                self.dev_logger.error(
+                self.logger.error(
                     f"Failed to get metadata: {result.stderr}")
                 return None
 
-            metadata = json.loads(result.stdout)
+            try:
+                metadata = json.loads(result.stdout)
+            except json.JSONDecodeError as e:
+                self.logger.error(
+                    f"Invalid JSON from ffprobe: {e}", exc_info=True)
+                return None
 
             # Validate required metadata fields
             if not metadata or 'streams' not in metadata or not metadata['streams']:
-                logging.error(f"Invalid metadata format for {file_path}")
+                self.logger.error(f"Invalid metadata format for {file_path}")
                 return None
 
             video_stream = next(
                 (s for s in metadata['streams'] if s.get('codec_type') == 'video'), None)
             if not video_stream:
-                logging.error(f"No video stream found in {file_path}")
+                self.logger.error(f"No video stream found in {file_path}")
                 return None
 
             file_size = os.path.getsize(
                 file_path) / (1024 * 1024)  # Convert to MB
 
-            return {
+            # Create metadata dict
+            metadata_dict = {
                 'width': int(video_stream.get('width', 0)),
                 'height': int(video_stream.get('height', 0)),
                 'duration': float(video_stream.get('duration', 0)),
@@ -832,20 +958,27 @@ class VideoProcessor(BaseProcessor):
                 'size_mb': file_size
             }
 
+            # Cache the result
+            if not hasattr(self, 'metadata_cache'):
+                self.metadata_cache = {}
+            self.metadata_cache[cache_key] = metadata_dict
+
+            return metadata_dict
+
         except subprocess.TimeoutExpired:
-            self.dev_logger.error(
+            self.logger.error(
                 f"Metadata extraction timed out for {file_path}")
             return None
-        except (subprocess.SubprocessError, json.JSONDecodeError, KeyError, ValueError) as e:
-            logging.error(
-                f"Error extracting metadata from {file_path}: {str(e)}")
+        except (subprocess.SubprocessError, KeyError, ValueError) as e:
+            self.logger.error(
+                f"Error extracting metadata from {file_path}: {str(e)}", exc_info=True)
             return None
 
     def process_video(self, input_path: Path, output_path: Path) -> bool:
         try:
             metadata = self.get_video_metadata(input_path)
             if not metadata:
-                logging.error(
+                self.logger.error(
                     f"Could not process {input_path}: Failed to get metadata")
                 return False
 
@@ -853,7 +986,8 @@ class VideoProcessor(BaseProcessor):
             target_size_bytes = 15 * 1024 * 1024  # 15MB
             duration = metadata.get('duration', 0)
             if duration <= 0:
-                logging.error(f"Invalid duration in metadata for {input_path}")
+                self.logger.error(
+                    f"Invalid duration in metadata for {input_path}")
                 return False
 
             target_bitrate = int((target_size_bytes * 8) / duration)
@@ -871,14 +1005,14 @@ class VideoProcessor(BaseProcessor):
 
             result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode != 0:
-                logging.error(
+                self.logger.error(
                     f"FFmpeg error processing {input_path}: {result.stderr}")
                 return False
 
             return output_path.exists() and output_path.stat().st_size > 0
 
         except Exception as e:
-            logging.error(f"Error processing {input_path}: {str(e)}")
+            self.logger.error(f"Error processing {input_path}: {str(e)}")
             return False
 
     def _get_duration(self, video_path: Path) -> float:
@@ -893,7 +1027,7 @@ class VideoProcessor(BaseProcessor):
             output = subprocess.check_output(command, text=True).strip()
             return float(output)
         except (subprocess.CalledProcessError, ValueError) as e:
-            logger.error(f"Failed to get duration for {video_path}: {e}")
+            self.logger.error(f"Failed to get duration for {video_path}: {e}")
             raise
 
     def _calculate_optimal_bitrate(self, width: int, height: int, duration: float) -> int:
@@ -934,7 +1068,8 @@ class VideoProcessor(BaseProcessor):
                 self.dimension_cache[cache_key] = dimensions
                 return dimensions
         except Exception as e:
-            logger.error(f"Failed to get dimensions for {video_path}: {e}")
+            self.logger.error(
+                f"Failed to get dimensions for {video_path}: {e}")
 
         return None, None
 
@@ -951,7 +1086,7 @@ class VideoProcessor(BaseProcessor):
                 return num / den if den != 0 else num
             raise ValueError("Failed to run ffprobe command")
         except Exception as e:
-            logger.error(f"Failed to get frame rate: {e}")
+            self.logger.error(f"Failed to get frame rate: {e}")
             raise
 
     def _has_audio(self, video_path: Path) -> bool:
@@ -970,7 +1105,7 @@ class VideoProcessor(BaseProcessor):
         try:
             return os.path.getsize(file_path) / (1024 * 1024)
         except OSError as e:
-            logger.error(f"Failed to get file size: {e}")
+            self.logger.error(f"Failed to get file size: {e}")
             raise
 
     def _calculate_target_bitrate(self, target_size_mb: float, duration: float) -> int:
@@ -1001,7 +1136,7 @@ class VideoProcessor(BaseProcessor):
                               target_size_mb: float, metadata: VideoMetadata) -> bool:
         """Two-pass compression for better size control."""
         try:
-            logger.info("Starting two-pass compression...")
+            self.logger.info("Starting two-pass compression...")
             temp_output = self._get_temp_path(input_path, "_twopass")
             null_file = "NUL" if os.name == 'nt' else "/dev/null"
 
@@ -1024,7 +1159,7 @@ class VideoProcessor(BaseProcessor):
                 '-vf', ','.join(filters)
             ]
 
-            if self.use_gpu and self.gpu_available:
+            if self.use_gpu and self.encoder.is_gpu_available:
                 # GPU two-pass encoding
                 pass1_command = base_command + [
                     '-c:v', 'h264_nvenc',
@@ -1070,27 +1205,28 @@ class VideoProcessor(BaseProcessor):
                 ]
 
             # Run two-pass encoding
-            logger.info("Running first pass...")
+            self.logger.info("Running first pass...")
             with ProcessManager(pass1_command, timeout=self.settings['general']['timeout']) as pm1:
                 if not pm1.run():
-                    logger.error("First pass failed")
+                    self.logger.error("First pass failed")
                     return False
 
-            logger.info("Running second pass...")
+            self.logger.info("Running second pass...")
             with ProcessManager(pass2_command, timeout=self.settings['general']['timeout']) as pm2:
                 if not pm2.run():
-                    logger.error("Second pass failed")
+                    self.logger.error("Second pass failed")
                     return False
 
             if temp_output.exists():
-                logger.debug("Two-pass compression completed successfully")
+                self.logger.debug(
+                    "Two-pass compression completed successfully")
                 shutil.move(str(temp_output), str(output_path))
                 return True
 
             return False
 
         except Exception as e:
-            logger.exception(f"Two-pass compression failed: {e}")
+            self.logger.exception(f"Two-pass compression failed: {e}")
             return False
         finally:
             if temp_output.exists():
@@ -1148,66 +1284,127 @@ class VideoProcessor(BaseProcessor):
         best_result_path = None
         target_size = self.compression_settings['min_size_mb']
 
-        # Calculate compression ratio needed
-        compression_ratio = original_size / target_size
-
-        # Modified configs to preserve colors better
-        configs = []
-        # ...existing code...
-
         try:
-            # Remove temp directory creation, just use temp files directly
-            for config in configs:
+            # Create a unique temp directory for this process
+            temp_dir = Path(TEMP_FILE_DIR) / \
+                f"aggressive_{file_path.stem}_{int(time.time())}"
+            temp_dir.mkdir(parents=True, exist_ok=True)
+
+            for config in self._get_compression_configs(original_size):
                 if self._should_exit():
                     break
 
                 try:
-                    temp_palette = Path(
-                        TEMP_FILE_DIR) / f"palette_{file_path.stem}_{config['colors']}.png"
-                    temp_output = Path(
-                        TEMP_FILE_DIR) / f"output_{file_path.stem}_{config['colors']}.gif"
+                    temp_palette = temp_dir / f"palette_{config['colors']}.png"
+                    temp_output = temp_dir / f"output_{config['colors']}.gif"
 
-                    # Rest of the config processing code
-                    # ...existing code...
+                    # Generate palette
+                    palette_cmd = [
+                        'ffmpeg', '-i', str(file_path),
+                        '-vf', f'fps={config["fps"]},scale={dimensions[0]*config["scale"]}:{dimensions[1]*config["scale"]}:flags=lanczos,palettegen=max_colors={config["colors"]}',
+                        '-y', str(temp_palette)
+                    ]
 
-                    # Update best result handling to use main temp directory
-                    if current_size < best_result_size:
-                        if best_result_path and best_result_path != temp_output:
-                            try:
-                                best_result_path.unlink()
-                            except Exception:
-                                pass
-                        best_result_size = current_size
-                        best_result_path = temp_output
-                        # Create a copy in the temp directory (not in a subdirectory)
-                        best_copy = Path(
-                            TEMP_FILE_DIR) / f"best_{config['colors']}_{file_path.stem}.gif"
-                        shutil.copy2(temp_output, best_copy)
-                        best_result_path = best_copy
+                    if not self._run_ffmpeg(palette_cmd):
+                        continue
 
-                    # Rest of the processing logic
-                    # ...existing code...
+                    # Create GIF using palette
+                    gif_cmd = [
+                        'ffmpeg', '-i', str(file_path),
+                        '-i', str(temp_palette),
+                        '-filter_complex',
+                        f'fps={config["fps"]},scale={dimensions[0]*config["scale"]}:{dimensions[1]*config["scale"]}:flags=lanczos[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=5',
+                        '-y', str(temp_output)
+                    ]
+
+                    if not self._run_ffmpeg(gif_cmd):
+                        continue
+
+                    # Check if file was created and optimize with gifsicle
+                    if temp_output.exists():
+                        # Optimize with gifsicle
+                        optimize_cmd = [
+                            'gifsicle',
+                            '--optimize=3',
+                            '--lossy=' + str(config['lossy']),
+                            '--colors', str(config['colors']),
+                            str(temp_output),
+                            '-o', str(temp_output)
+                        ]
+
+                        if not self._run_ffmpeg(optimize_cmd):
+                            continue
+
+                        current_size = self.get_file_size(temp_output)
+                        self.logger.info(
+                            f"Aggressive attempt result: {current_size:.2f}MB")
+
+                        # Update best result if this is better
+                        if current_size < best_result_size:
+                            if best_result_path and best_result_path.exists():
+                                try:
+                                    best_result_path.unlink()
+                                except Exception:
+                                    pass
+                            best_result_size = current_size
+                            best_result_path = temp_output
+                            # Create a copy of the best result
+                            best_copy = temp_dir / \
+                                f"best_{config['colors']}.gif"
+                            shutil.copy2(temp_output, best_copy)
+                            best_result_path = best_copy
+
+                        # If we've reached target size, we can stop
+                        if current_size <= target_size:
+                            shutil.copy2(best_result_path, output_path)
+                            return True
 
                 except Exception as e:
-                    self.dev_logger.error(
+                    self.logger.error(
                         f"Error during aggressive compression attempt: {e}")
                     continue
 
             # If we have a best result but didn't reach target, use it anyway
-            # ...existing code...
+            if best_result_path and best_result_path.exists():
+                if best_result_size < original_size:
+                    shutil.copy2(best_result_path, output_path)
+                    self.logger.warning(
+                        f"Using best achieved result: {best_result_size:.2f}MB")
+                    return True
+
+            return False
 
         except Exception as e:
-            self.dev_logger.error(f"Aggressive GIF creation failed: {str(e)}")
+            self.logger.error(f"Aggressive GIF creation failed: {str(e)}")
             return False
         finally:
-            # Clean up temp files (not directories)
+            # Clean up temp directory and all its contents
             try:
-                for temp_file in Path(TEMP_FILE_DIR).glob(f"*_{file_path.stem}.*"):
-                    if temp_file != best_result_path:
-                        try:
-                            temp_file.unlink(missing_ok=True)
-                        except Exception as e:
-                            self.dev_logger.error(
-                                f"Failed to cleanup temp file {temp_file}: {e}")
+                if temp_dir.exists():
+                    shutil.rmtree(temp_dir, ignore_errors=True)
             except Exception as e:
-                self.dev_logger.error(f"Failed to cleanup temp files: {e}")
+                self.logger.error(f"Failed to cleanup temp directory: {e}")
+
+    def _get_compression_configs(self, original_size: float) -> List[Dict]:
+        """Get compression configurations based on file size."""
+        configs = []
+
+        if original_size > 50:  # Very large files
+            configs.extend([
+                {'scale': 0.3, 'colors': 256, 'fps': 12, 'lossy': 100},
+                {'scale': 0.4, 'colors': 192, 'fps': 15, 'lossy': 90}
+            ])
+        elif original_size > 25:  # Large files
+            configs.extend([
+                {'scale': 0.4, 'colors': 256, 'fps': 15, 'lossy': 90},
+                {'scale': 0.5, 'colors': 192, 'fps': 20, 'lossy': 80}
+            ])
+        else:  # Moderate size files
+            configs.extend([
+                {'scale': 0.6, 'colors': 256, 'fps': 20, 'lossy': 80},
+                {'scale': 0.7, 'colors': 256, 'fps': 25, 'lossy': 70}
+            ])
+
+        return configs
+
+    # ...rest of existing code...
