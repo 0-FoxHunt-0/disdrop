@@ -67,111 +67,128 @@ class ModernLogStyle:
 
 
 class UnifiedLogFormatter(logging.Formatter):
-    """Modern and unified log formatter with visual indicators and structured output."""
+    """Enhanced formatter combining verbose and normal modes"""
 
     def __init__(self):
         super().__init__()
-        self.phase_start_times = {}
-        self.last_phase = None
-
-        # Define prettier separators and indicators
-        self.main_separator = f"{ModernLogStyle.DIM}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{ModernLogStyle.RESET}"
-        self.sub_separator = f"{ModernLogStyle.DIM}───────────────────────────────{ModernLogStyle.RESET}"
-
-        # Define prettier indicators
-        self.indicators = {
-            'info': f"{ModernLogStyle.AZURE}→{ModernLogStyle.RESET}",
-            'success': f"{ModernLogStyle.EMERALD}✓{ModernLogStyle.RESET}",
-            'warning': f"{ModernLogStyle.AMBER}⚠{ModernLogStyle.RESET}",
-            'error': f"{ModernLogStyle.ROSE}✖{ModernLogStyle.RESET}",
-            'performance': f"{ModernLogStyle.LIME}⚡{ModernLogStyle.RESET}",
-            'processing': f"{ModernLogStyle.CYAN}↻{ModernLogStyle.RESET}",
-            'skipped': f"{ModernLogStyle.SLATE}→{ModernLogStyle.RESET}",
-        }
+        self._style = ModernLogStyle
+        self._last_phase = None
+        self._seen_messages = set()  # For deduplication
+        self._message_count = {}  # Track message occurrence counts
+        self._dedup_lock = threading.Lock()  # Thread-safe deduplication
+        self._max_similar_messages = 3  # Show at most this many similar messages
 
     def format(self, record):
         # Extract phase information if available
         current_phase = getattr(record, 'phase', None)
-        context = getattr(record, 'context', None)
-
-        # Format based on log level
-        if record.levelno >= logging.ERROR:
-            formatted_msg = self._format_error(record)
-        elif record.levelno >= logging.WARNING:
-            formatted_msg = self._format_warning(record)
-        elif record.levelno == SUCCESS_LEVEL:
-            formatted_msg = self._format_success(record)
-        elif record.levelno == PERFORMANCE_LEVEL:
-            formatted_msg = self._format_performance(record)
-        else:
-            formatted_msg = self._format_info(record)
 
         # Add visual separator between processing phases
-        if current_phase and current_phase != self.last_phase:
-            self.last_phase = current_phase
+        if current_phase and current_phase != self._last_phase:
+            self._last_phase = current_phase
             header = self._format_phase_header(current_phase)
-            formatted_msg = f"\n{header}\n{formatted_msg}"
+            record.msg = f"\n{header}\n{record.msg}"
 
-        # Add details if available
-        if hasattr(record, 'details') and record.details:
-            formatted_msg += '\n' + self._format_details(record)
+        # Deduplicate messages properly - thread-safe
+        message_key = f"{record.levelno}:{record.pathname}:{record.lineno}:{record.msg}"
+        with self._dedup_lock:
+            # Update count and check for excessive duplicates
+            self._message_count[message_key] = self._message_count.get(
+                message_key, 0) + 1
+            count = self._message_count[message_key]
 
-        return formatted_msg
+            # If we've seen too many similar messages, summarize or skip
+            if count > self._max_similar_messages:
+                if count == self._max_similar_messages + 1:
+                    return f"{self._style.DIM}(Similar message repeated, further occurrences will be suppressed){self._style.RESET}"
+                return ""  # Skip this record entirely by returning empty string
+
+            # Normal message processing for non-duplicates or allowed duplicates
+            if message_key in self._seen_messages and count <= self._max_similar_messages:
+                # Add occurrence count for duplicates
+                record.msg = f"{record.msg} {self._style.DIM}(repeat {count}){self._style.RESET}"
+
+            # Add to seen messages
+            self._seen_messages.add(message_key)
+
+        # Format based on level
+        if record.levelno >= logging.ERROR:
+            return self._format_error(record)
+        elif record.levelno >= logging.WARNING:
+            return self._format_warning(record)
+        elif record.levelno == SUCCESS_LEVEL:  # Custom success level
+            return self._format_success(record)
+        elif record.levelno == PERFORMANCE_LEVEL:  # Performance metrics
+            return self._format_performance(record)
+        else:
+            return self._format_info(record)
 
     def _format_phase_header(self, phase):
-        """Format a phase header with visual separators."""
-        s = ModernLogStyle
-        return f"{self.main_separator}\n{s.BOLD}{phase}{s.RESET}\n{self.sub_separator}"
+        s = self._style
+        return (
+            f"{s.SEPARATOR_MAIN}\n"
+            f"{s.BOLD}{s.AZURE}{phase}{s.RESET}\n"
+            f"{s.SEPARATOR_SUB}"
+        )
 
     def _format_error(self, record):
-        """Format an error message with visual indicator."""
-        return f"{self.indicators['error']} {ModernLogStyle.ROSE}{record.getMessage()}{ModernLogStyle.RESET}"
+        s = self._style
+        return (
+            f"{s.ROSE}{s.CROSS} Error: {record.msg}{s.RESET}"
+            f"{self._format_details(record)}"
+        )
 
     def _format_warning(self, record):
-        """Format a warning message with visual indicator."""
-        return f"{self.indicators['warning']} {ModernLogStyle.AMBER}{record.getMessage()}{ModernLogStyle.RESET}"
+        s = self._style
+        return (
+            f"{s.AMBER}{s.WARN} {record.msg}{s.RESET}"
+            f"{self._format_details(record)}"
+        )
 
     def _format_success(self, record):
-        """Format a success message with visual indicator."""
-        return f"{self.indicators['success']} {ModernLogStyle.EMERALD}{record.getMessage()}{ModernLogStyle.RESET}"
+        s = self._style
+        return (
+            f"{s.EMERALD}{s.CHECK} {record.msg}{s.RESET}"
+            f"{self._format_details(record)}"
+        )
 
     def _format_performance(self, record):
-        """Format a performance message with visual indicator."""
-        return f"{self.indicators['performance']} {ModernLogStyle.LIME}{record.getMessage()}{ModernLogStyle.RESET}"
+        s = self._style
+        return (
+            f"{s.LIME}{s.LIGHTNING} {record.msg}{s.RESET}"
+            f"{self._format_details(record)}"
+        )
 
     def _format_info(self, record):
-        """Format an info message with visual indicator."""
-        s = ModernLogStyle
+        s = self._style
 
-        # Check for special contexts
-        context = getattr(record, 'context', None)
-        if context == 'skipped':
-            return f"{self.indicators['skipped']} {s.SLATE}{record.getMessage()}{s.RESET}"
-        elif context == 'processing':
-            return f"{self.indicators['processing']} {s.CYAN}{record.getMessage()}{s.RESET}"
+        # Use different icon based on context
+        icon = s.BULLET
+        if hasattr(record, 'context'):
+            context = record.context
+            if context == 'progress':
+                icon = s.GEARS
+            elif context == 'timing':
+                icon = s.CLOCK
 
-        # Default info formatting
-        return f"{self.indicators['info']} {record.getMessage()}"
+        prefix = f"{s.AZURE}{icon}{s.RESET}" if hasattr(
+            record, 'highlight') else f"{s.DIM}{s.ARROW}{s.RESET}"
+
+        return (
+            f"{prefix} {record.msg}"
+            f"{self._format_details(record)}"
+        )
 
     def _format_details(self, record):
-        """Format additional details for a log record."""
-        if not hasattr(record, 'details') or not record.details:
-            return ""
-
-        s = ModernLogStyle
-        details = []
-
-        for key, value in record.details.items():
-            if isinstance(value, dict):
-                # Format nested dictionaries
-                nested = [f"  {s.DIM}{k}{s.RESET}: {v}" for k,
-                          v in value.items()]
-                details.append(f"{s.DIM}{key}{s.RESET}:\n" + "\n".join(nested))
-            else:
-                details.append(f"{s.DIM}{key}{s.RESET}: {value}")
-
-        if details:
-            return "\n  " + "\n  ".join(details)
+        if hasattr(record, 'details'):
+            s = self._style
+            details = record.details
+            if isinstance(details, dict):
+                detail_lines = [
+                    f"\n  {s.DIM}├ {s.SLATE}{k}: {v}{s.RESET}"
+                    for k, v in details.items()
+                ]
+                return ''.join(detail_lines)
+            return f"\n  {s.DIM}└ {s.SLATE}{details}{s.RESET}"
         return ""
 
 

@@ -24,7 +24,7 @@ VIDEO_COMPRESSION = {
         'crf': 26,
         'preset': 'medium'
     },
-    'min_size_mb': 10.0,      # Target maximum size for gifs in MB
+    'min_size_mb': 15.0,      # Target maximum size for gifs in MB
     'fps_range': (15, 30),
     'quality_presets': ['faster', 'medium', 'slower']
 }
