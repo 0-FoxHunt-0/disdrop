@@ -107,7 +107,6 @@ class GPUManager:
             self._detection_complete = False
             self._initialized = True
 
-    @log_function_call
     def detect_gpu(self, force_refresh: bool = False) -> GPUCapabilities:
         """Detect GPU capabilities with proper caching and locking."""
         # Use thread lock to avoid multiple detections
@@ -115,7 +114,9 @@ class GPUManager:
             if self._detection_complete and not force_refresh:
                 return self.capabilities
 
-            logger.info("Detecting GPU capabilities...")
+            # Only log if this is the first detection or forced refresh
+            if not self._detection_complete or force_refresh:
+                logger.info("Detecting GPU capabilities...")
 
             # Try to detect in order of market share and detection reliability
             try:
@@ -160,6 +161,31 @@ class GPUManager:
     def _detect_nvidia_gpu(self) -> bool:
         """Detect NVIDIA GPU and update capabilities."""
         try:
+            # Check if FFmpeg can detect NVENC first - most reliable on Windows
+            # Use run_ffmpeg_command to properly capture and log output
+            logger.debug("Checking for NVENC support via FFmpeg")
+            temp_encoder_file = os.path.join(
+                tempfile.gettempdir(), "ffmpeg_encoders_nvidia.txt")
+
+            # Run ffmpeg command to directly get encoder list
+            try:
+                encoder_output = subprocess.check_output(
+                    ['ffmpeg', '-encoders', '-hide_banner'],
+                    stderr=subprocess.STDOUT,
+                    universal_newlines=True
+                )
+
+                # Check if NVENC is in the encoder list
+                if 'h264_nvenc' in encoder_output:
+                    self.capabilities.nvenc_available = True
+                    self.capabilities.model = "NVIDIA GPU (NVENC available)"
+                    self.capabilities.cuda_available = True
+                    logger.debug("NVENC available via FFmpeg encoders list")
+                    return True
+            except:
+                logger.debug(
+                    "Could not directly check FFmpeg encoders, trying alternative methods")
+
             # Try importing pycuda for detailed info
             try:
                 import pycuda.driver as cuda
@@ -216,30 +242,18 @@ class GPUManager:
             except (subprocess.SubprocessError, FileNotFoundError):
                 logger.debug("NVCC not available")
 
-            # Check if FFmpeg can detect NVENC
-            # Use run_ffmpeg_command to properly capture and log output
-            ffmpeg_logger = setup_ffmpeg_logging()
-            ffmpeg_logger.info("Checking for NVENC support via FFmpeg")
-
-            # Run ffmpeg command to check for NVENC support
-            temp_encoder_file = os.path.join(
-                tempfile.gettempdir(), "ffmpeg_encoders_nvidia.txt")
-            run_ffmpeg_command(['ffmpeg', '-encoders', '-v', 'info',
-                               '-hide_banner', '-y', '-f', 'null', temp_encoder_file])
-
-            # Check ffmpeg.log for the h264_nvenc encoder
-            nvenc_available = False
-            with open(FFPMEG_LOG_FILE, 'r') as f:
-                log_content = f.read()
-                if 'h264_nvenc' in log_content:
-                    nvenc_available = True
-
-            if nvenc_available:
-                self.capabilities.nvenc_available = True
-                self.capabilities.model = "NVIDIA GPU (NVENC available)"
-                logger.debug("NVENC available via FFmpeg")
-                ffmpeg_logger.info("NVENC support detected")
-                return True
+            # Last resort - check ffmpeg.log file if available
+            try:
+                if os.path.exists(FFPMEG_LOG_FILE):
+                    with open(FFPMEG_LOG_FILE, 'r') as f:
+                        log_content = f.read()
+                        if 'h264_nvenc' in log_content:
+                            self.capabilities.nvenc_available = True
+                            self.capabilities.model = "NVIDIA GPU (NVENC available)"
+                            logger.debug("NVENC available via FFmpeg log file")
+                            return True
+            except:
+                pass
 
             return False
 
@@ -250,6 +264,26 @@ class GPUManager:
     def _detect_intel_gpu(self) -> bool:
         """Detect Intel GPU and capabilities."""
         try:
+            # Try FFmpeg first to check QSV availability directly
+            try:
+                encoder_output = subprocess.check_output(
+                    ['ffmpeg', '-encoders', '-hide_banner'],
+                    stderr=subprocess.STDOUT,
+                    universal_newlines=True
+                )
+
+                # Check if Intel QSV is in the encoder list
+                if 'h264_qsv' in encoder_output:
+                    self.capabilities.qsv_available = True
+                    self.capabilities.model = "Intel GPU (QSV available)"
+                    self.capabilities.supports_hwaccel = True
+                    logger.debug(
+                        "Intel QSV available via FFmpeg encoders list")
+                    return True
+            except:
+                logger.debug(
+                    "Could not directly check FFmpeg encoders for QSV, trying alternative methods")
+
             system = platform.system()
 
             if system == 'Windows':
@@ -284,14 +318,45 @@ class GPUManager:
                         self.capabilities.supports_hwaccel = True
                         return True
 
-        except:
-            pass
+            # Last resort, check if dxgkrnl.sys is loaded on Windows (Intel graphics driver)
+            if system == 'Windows':
+                try:
+                    output = subprocess.check_output(
+                        ['driverquery'], text=True)
+                    if 'igdkmd64.sys' in output or 'dxgkrnl.sys' in output:
+                        self.capabilities.model = "Intel Graphics (based on system drivers)"
+                        self.capabilities.supports_hwaccel = True
+                        return True
+                except:
+                    pass
+
+        except Exception as e:
+            logger.debug(f"Error detecting Intel GPU: {e}")
 
         return False
 
     def _detect_amd_gpu(self) -> bool:
         """Detect AMD GPU and capabilities."""
         try:
+            # Try FFmpeg first to check AMF availability directly
+            try:
+                encoder_output = subprocess.check_output(
+                    ['ffmpeg', '-encoders', '-hide_banner'],
+                    stderr=subprocess.STDOUT,
+                    universal_newlines=True
+                )
+
+                # Check if AMD AMF is in the encoder list
+                if 'h264_amf' in encoder_output:
+                    self.capabilities.amf_available = True
+                    self.capabilities.model = "AMD GPU (AMF available)"
+                    self.capabilities.supports_hwaccel = True
+                    logger.debug("AMD AMF available via FFmpeg encoders list")
+                    return True
+            except:
+                logger.debug(
+                    "Could not directly check FFmpeg encoders for AMF, trying alternative methods")
+
             system = platform.system()
 
             if system == 'Windows':
@@ -326,8 +391,20 @@ class GPUManager:
                         self.capabilities.supports_hwaccel = True
                         return True
 
-        except:
-            pass
+            # Check for AMD display drivers on Windows
+            if system == 'Windows':
+                try:
+                    output = subprocess.check_output(
+                        ['driverquery'], text=True)
+                    if 'amdkmdap.sys' in output or 'atikmdag.sys' in output:
+                        self.capabilities.model = "AMD Graphics (based on system drivers)"
+                        self.capabilities.supports_hwaccel = True
+                        return True
+                except:
+                    pass
+
+        except Exception as e:
+            logger.debug(f"Error detecting AMD GPU: {e}")
 
         return False
 
@@ -339,18 +416,46 @@ class GPUManager:
     def _detect_ffmpeg_support(self):
         """Detect FFmpeg hardware acceleration support."""
         try:
-            # Import the FFmpeg logging function
-            ffmpeg_logger = setup_ffmpeg_logging()
+            # Get encoders directly from FFmpeg rather than through log files
+            try:
+                encoder_output = subprocess.check_output(
+                    ['ffmpeg', '-encoders', '-hide_banner'],
+                    stderr=subprocess.STDOUT,
+                    universal_newlines=True
+                )
 
-            # Log the detection attempt
+                # Check for hardware encoders directly in the output
+                if 'h264_nvenc' in encoder_output:
+                    self.capabilities.nvenc_available = True
+                    logger.debug("NVENC support detected in FFmpeg encoders")
+
+                if 'h264_qsv' in encoder_output:
+                    self.capabilities.qsv_available = True
+                    logger.debug(
+                        "QuickSync support detected in FFmpeg encoders")
+
+                if 'h264_amf' in encoder_output:
+                    self.capabilities.amf_available = True
+                    logger.debug("AMD AMF support detected in FFmpeg encoders")
+
+                if 'h264_vaapi' in encoder_output:
+                    self.capabilities.vaapi_available = True
+                    logger.debug("VA-API support detected in FFmpeg encoders")
+
+                available_encoders = self.capabilities.get_available_encoders()
+                if available_encoders and available_encoders[0] != "None":
+                    logger.debug(
+                        f"Detected encoders: {', '.join(available_encoders)}")
+
+                return
+            except:
+                logger.debug(
+                    "Could not directly check FFmpeg encoders, falling back to log file method")
+
+            # Legacy method using log files as fallback
+            ffmpeg_logger = setup_ffmpeg_logging()
             ffmpeg_logger.info(
                 "Detecting FFmpeg hardware acceleration support")
-
-            # Get encoders and decoders output by running commands through our logging wrapper
-            encoders_output = ""
-            encoders_error = ""
-            decoders_output = ""
-            decoders_error = ""
 
             # Use temporary files to capture output
             temp_encoder_file = os.path.join(
@@ -365,48 +470,45 @@ class GPUManager:
                                '-hide_banner', '-y', '-f', 'null', temp_decoder_file])
 
             # Read outputs from the ffmpeg.log file since our run_ffmpeg_command redirects there
-            with open(FFPMEG_LOG_FILE, 'r') as f:
-                log_content = f.read()
-                # Extract the relevant sections
-                if "FFmpeg encoders output:" in log_content:
-                    encoders_output = log_content.split("FFmpeg encoders output:")[
-                        1].split("FFmpeg encoders error output:")[0]
-                if "FFmpeg encoders error output:" in log_content:
-                    encoders_error = log_content.split("FFmpeg encoders error output:")[1].split("FFmpeg decoders output:")[
-                        0] if "FFmpeg decoders output:" in log_content else log_content.split("FFmpeg encoders error output:")[1]
-                if "FFmpeg decoders output:" in log_content:
-                    decoders_output = log_content.split("FFmpeg decoders output:")[1].split("FFmpeg decoders error output:")[
-                        0] if "FFmpeg decoders error output:" in log_content else log_content.split("FFmpeg decoders output:")[1]
+            if os.path.exists(FFPMEG_LOG_FILE):
+                with open(FFPMEG_LOG_FILE, 'r') as f:
+                    log_content = f.read()
+                    # Extract the relevant sections
+                    if "FFmpeg encoders output:" in log_content:
+                        encoders_output = log_content.split("FFmpeg encoders output:")[
+                            1].split("FFmpeg encoders error output:")[0]
+                    else:
+                        encoders_output = log_content
 
-            # Check for hardware acceleration support
-            detected_encoders = []
+                    # Check for hardware acceleration support
+                    detected_encoders = []
 
-            # NVIDIA NVENC support
-            if self.capabilities.gpu_type == GPUType.NVIDIA:
-                if 'h264_nvenc' in encoders_output:
-                    self.capabilities.nvenc_available = True
-                    detected_encoders.append('NVENC')
-                    ffmpeg_logger.info("NVENC support detected")
+                    # NVIDIA NVENC support
+                    if self.capabilities.gpu_type == GPUType.NVIDIA or self.capabilities.gpu_type == GPUType.NONE:
+                        if 'h264_nvenc' in encoders_output:
+                            self.capabilities.nvenc_available = True
+                            detected_encoders.append('NVENC')
+                            ffmpeg_logger.info("NVENC support detected")
 
-            # Intel QuickSync support
-            if self.capabilities.gpu_type == GPUType.INTEL or 'h264_qsv' in encoders_output:
-                if 'h264_qsv' in encoders_output:
-                    self.capabilities.qsv_available = True
-                    ffmpeg_logger.info("QuickSync support detected")
+                    # Intel QuickSync support
+                    if self.capabilities.gpu_type == GPUType.INTEL or self.capabilities.gpu_type == GPUType.NONE:
+                        if 'h264_qsv' in encoders_output:
+                            self.capabilities.qsv_available = True
+                            ffmpeg_logger.info("QuickSync support detected")
 
-            # AMD AMF support
-            if self.capabilities.gpu_type == GPUType.AMD or 'h264_amf' in encoders_output:
-                if 'h264_amf' in encoders_output:
-                    self.capabilities.amf_available = True
-                    ffmpeg_logger.info("AMD AMF support detected")
+                    # AMD AMF support
+                    if self.capabilities.gpu_type == GPUType.AMD or self.capabilities.gpu_type == GPUType.NONE:
+                        if 'h264_amf' in encoders_output:
+                            self.capabilities.amf_available = True
+                            ffmpeg_logger.info("AMD AMF support detected")
 
-            # VA-API support (Linux)
-            if 'h264_vaapi' in encoders_output:
-                self.capabilities.vaapi_available = True
-                ffmpeg_logger.info("VA-API support detected")
+                    # VA-API support (Linux)
+                    if 'h264_vaapi' in encoders_output:
+                        self.capabilities.vaapi_available = True
+                        ffmpeg_logger.info("VA-API support detected")
 
-            ffmpeg_logger.info(
-                f"Detected encoders: {self.capabilities.get_available_encoders()}")
+                    ffmpeg_logger.info(
+                        f"Detected encoders: {self.capabilities.get_available_encoders()}")
 
         except Exception as e:
             logger.error(f"Error detecting FFmpeg support: {e}", exc_info=True)
@@ -488,17 +590,6 @@ class GPUManager:
         return options
 
 
-@log_function_call
-def check_gpu_support():
-    """Check if the system has GPU acceleration support."""
-    logger.debug("Checking GPU support")
-    gpu_manager = GPUManager()
-    capabilities = gpu_manager.detect_gpu()
-    result = capabilities.supports_hwaccel
-    logger.debug(f"GPU support check result: {result}")
-    return result
-
-
 @performance_monitor
 def setup_gpu_acceleration():
     """Prepare the environment for GPU-accelerated video processing."""
@@ -508,6 +599,41 @@ def setup_gpu_acceleration():
 
     # Set detection flag so we don't log again
     gpu_manager.detected = True
+
+    # If no hardware acceleration was detected, try one more direct check with FFmpeg
+    if not capabilities.supports_hwaccel:
+        logger.debug(
+            "No GPU acceleration detected by primary methods, trying direct FFmpeg check")
+        try:
+            # Direct check for hardware encoders
+            encoder_output = subprocess.check_output(
+                ['ffmpeg', '-encoders', '-hide_banner'],
+                stderr=subprocess.STDOUT,
+                universal_newlines=True
+            )
+
+            # Check for any hardware encoder
+            if any(encoder in encoder_output for encoder in ['h264_nvenc', 'h264_qsv', 'h264_amf', 'h264_vaapi']):
+                logger.debug("Found hardware encoders via direct FFmpeg check")
+
+                # Set specific encoder flags
+                if 'h264_nvenc' in encoder_output:
+                    capabilities.nvenc_available = True
+                    capabilities.gpu_type = GPUType.NVIDIA
+                    capabilities.model = "NVIDIA GPU (detected from FFmpeg)"
+                elif 'h264_qsv' in encoder_output:
+                    capabilities.qsv_available = True
+                    capabilities.gpu_type = GPUType.INTEL
+                    capabilities.model = "Intel GPU (detected from FFmpeg)"
+                elif 'h264_amf' in encoder_output:
+                    capabilities.amf_available = True
+                    capabilities.gpu_type = GPUType.AMD
+                    capabilities.model = "AMD GPU (detected from FFmpeg)"
+
+                # Set hardware acceleration flag
+                capabilities.supports_hwaccel = True
+        except:
+            logger.debug("Direct FFmpeg check failed")
 
     if not capabilities.supports_hwaccel:
         logger.warning(
