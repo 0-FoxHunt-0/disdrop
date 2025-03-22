@@ -55,46 +55,47 @@ VIDEO_SETTINGS = {
 }
 
 GIF_COMPRESSION = {
-    'fps_range': (15, 30),  # Frame rate range for gif optimization
-    'colors': 256,          # Number of colors for gif optimization
-    'lossy_value': 55,      # Lossy value for gif compression
-    'min_size_mb': 10.0,      # Target maximum size for gifs in MB
+    'fps_range': (10, 30),  # Frame rate range for gif optimization
+    'colors': 224,          # Lowered from 256 to avoid file size increase in lossless mode
+    'lossy_value': 0,       # Prioritize scaling over lossy compression
+    'min_size_mb': 10.0,    # Target maximum size for gifs in MB
     'min_width': 0,
     'min_height': 120,
-    'quality': 85
+    'quality': 95,          # Increased from 85 to preserve quality
+    'scale_priority': True  # New flag to prioritize scaling over other reductions
 }
 
-# Strategies for multiple pass overs after failed attempts
+# Strategies for multiple pass overs after failed attempts - updated to prioritize scaling
 GIF_PASS_OVERS = [
     {
-        'fps_range': (15, 10),
-        'colors': 256,
-        'lossy_value': 55,
-        'scale_factor': 0.8,
+        'fps_range': (15, 15),
+        'colors': 224,
+        'lossy_value': 0,
+        'scale_factor': 0.85,
     },
     {
-        'fps_range': (12, 8),
+        'fps_range': (15, 12),
         'colors': 192,
-        'lossy_value': 65,
-        'scale_factor': 0.8,
+        'lossy_value': 0,
+        'scale_factor': 0.7,
     },
     {
-        'fps_range': (10, 6),
-        'colors': 128,
-        'lossy_value': 75,
-        'scale_factor': 0.8,
+        'fps_range': (12, 12),
+        'colors': 192,
+        'lossy_value': 30,
+        'scale_factor': 0.6,
     },
     {
-        'fps_range': (10, 15),
-        'colors': 64,
-        'lossy_value': 80,
-        'scale_factor': 0.8,
-    },
-    {
-        'fps_range': (5, 10),
-        'colors': 64,
-        'lossy_value': 80,
+        'fps_range': (12, 10),
+        'colors': 160,
+        'lossy_value': 50,
         'scale_factor': 0.5,
+    },
+    {
+        'fps_range': (10, 10),
+        'colors': 128,
+        'lossy_value': 60,
+        'scale_factor': 0.4,
     },
 ]
 
