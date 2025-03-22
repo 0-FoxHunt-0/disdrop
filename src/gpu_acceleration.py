@@ -7,6 +7,7 @@ import platform
 import subprocess
 import threading
 import tempfile
+import time
 from enum import Enum
 from typing import Dict, Any, Optional, Tuple
 
@@ -119,6 +120,11 @@ class GPUManager:
 
             # Try to detect in order of market share and detection reliability
             try:
+                # First, check if the system has a GPU
+                if self._detect_any_gpu():
+                    logger.debug("Found a GPU in the system")
+
+                # Then try to identify the type
                 if self._detect_nvidia_gpu():
                     self.capabilities.gpu_type = GPUType.NVIDIA
                 elif self._detect_intel_gpu():
@@ -136,6 +142,14 @@ class GPUManager:
                     self.capabilities.amf_available,
                     self.capabilities.vaapi_available
                 ])
+
+                # If we detected a GPU but couldn't determine if it supports hw accel,
+                # enable basic acceleration anyway on Windows
+                if self.capabilities.gpu_type != GPUType.NONE and not self.capabilities.supports_hwaccel:
+                    if platform.system() == 'Windows':
+                        logger.debug(
+                            "Enabling basic hardware acceleration for detected GPU")
+                        self.capabilities.supports_hwaccel = True
 
                 # Set recommended concurrency based on GPU capabilities
                 self._set_recommended_concurrency()
@@ -156,6 +170,181 @@ class GPUManager:
             self._detection_complete = True
             self.detected = True
             return self.capabilities
+
+    def _detect_any_gpu(self) -> bool:
+        """Basic detection of any GPU in the system."""
+        try:
+            # For Windows, use DirectX diagnostics
+            if platform.system() == 'Windows':
+                try:
+                    # Use DxDiag for basic detection
+                    import tempfile
+                    temp_file = tempfile.NamedTemporaryFile(
+                        delete=False, suffix='.txt')
+                    temp_file.close()
+
+                    subprocess.run(['dxdiag', '/t', temp_file.name],
+                                   stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE)
+
+                    # Wait for dxdiag to complete
+                    time.sleep(2)
+
+                    with open(temp_file.name, 'r', encoding='utf-8', errors='ignore') as f:
+                        dxdiag_content = f.read()
+
+                    # Clean up temp file
+                    try:
+                        os.unlink(temp_file.name)
+                    except:
+                        pass
+
+                    # Look for Display section which indicates a GPU
+                    if "Display Devices" in dxdiag_content or "Display Device" in dxdiag_content:
+                        # Try to extract manufacturer
+                        import re
+                        vendor_match = re.search(
+                            r'Card name: ([^\r\n]+)', dxdiag_content)
+                        if vendor_match:
+                            vendor = vendor_match.group(1).strip()
+                            if "NVIDIA" in vendor:
+                                self.capabilities.gpu_type = GPUType.NVIDIA
+                                self.capabilities.model = vendor
+                            elif "AMD" in vendor or "Radeon" in vendor:
+                                self.capabilities.gpu_type = GPUType.AMD
+                                self.capabilities.model = vendor
+                            elif "Intel" in vendor:
+                                self.capabilities.gpu_type = GPUType.INTEL
+                                self.capabilities.model = vendor
+                            else:
+                                self.capabilities.gpu_type = GPUType.OTHER
+                                self.capabilities.model = vendor
+
+                            logger.debug(f"Detected GPU via dxdiag: {vendor}")
+                            return True
+                        # If we can't extract vendor but found Display section, assume there's a GPU
+                        else:
+                            self.capabilities.gpu_type = GPUType.OTHER
+                            self.capabilities.model = "Unknown GPU"
+                            logger.debug("Detected generic GPU via dxdiag")
+                            return True
+                except Exception as e:
+                    logger.debug(f"DxDiag GPU detection failed: {e}")
+
+                # Try using PowerShell to get video controller info
+                try:
+                    ps_cmd = "Get-WmiObject -Query \"SELECT * FROM Win32_VideoController\" | Select-Object Name, AdapterRAM | ConvertTo-Csv -NoTypeInformation"
+                    output = subprocess.check_output(
+                        ['powershell', '-Command', ps_cmd], text=True)
+
+                    lines = output.strip().split('\n')
+                    if len(lines) > 1:
+                        import csv
+                        from io import StringIO
+                        reader = csv.DictReader(StringIO('\n'.join(lines)))
+                        for row in reader:
+                            if 'Name' in row:
+                                gpu_name = row['Name']
+                                self.capabilities.model = gpu_name
+
+                                # Determine GPU type from name
+                                if "NVIDIA" in gpu_name:
+                                    self.capabilities.gpu_type = GPUType.NVIDIA
+                                elif "AMD" in gpu_name or "Radeon" in gpu_name:
+                                    self.capabilities.gpu_type = GPUType.AMD
+                                elif "Intel" in gpu_name:
+                                    self.capabilities.gpu_type = GPUType.INTEL
+                                else:
+                                    self.capabilities.gpu_type = GPUType.OTHER
+
+                                logger.debug(
+                                    f"Detected GPU via WMI: {gpu_name}")
+                                return True
+                except Exception as e:
+                    logger.debug(f"PowerShell GPU detection failed: {e}")
+
+            # For Linux, use lspci
+            elif platform.system() == 'Linux':
+                try:
+                    output = subprocess.check_output(
+                        ['lspci', '-v'], text=True)
+                    for line in output.splitlines():
+                        if 'VGA' in line or '3D' in line or 'Display' in line:
+                            self.capabilities.model = line.split(
+                                ':')[-1].strip()
+
+                            # Determine GPU type from lspci output
+                            if "NVIDIA" in line:
+                                self.capabilities.gpu_type = GPUType.NVIDIA
+                            elif "AMD" in line or "Radeon" in line or "ATI" in line:
+                                self.capabilities.gpu_type = GPUType.AMD
+                            elif "Intel" in line:
+                                self.capabilities.gpu_type = GPUType.INTEL
+                            else:
+                                self.capabilities.gpu_type = GPUType.OTHER
+
+                            logger.debug(
+                                f"Detected GPU via lspci: {self.capabilities.model}")
+                            return True
+                except Exception as e:
+                    logger.debug(f"lspci GPU detection failed: {e}")
+
+            # For macOS
+            elif platform.system() == 'Darwin':
+                try:
+                    output = subprocess.check_output(
+                        ['system_profiler', 'SPDisplaysDataType'], text=True)
+                    if "Chipset Model" in output:
+                        import re
+                        model_match = re.search(
+                            r'Chipset Model: ([^\n]+)', output)
+                        if model_match:
+                            model = model_match.group(1).strip()
+                            self.capabilities.model = model
+
+                            # Determine GPU type
+                            if "NVIDIA" in model:
+                                self.capabilities.gpu_type = GPUType.NVIDIA
+                            elif "AMD" in model or "Radeon" in model:
+                                self.capabilities.gpu_type = GPUType.AMD
+                            elif "Intel" in model:
+                                self.capabilities.gpu_type = GPUType.INTEL
+                            else:
+                                self.capabilities.gpu_type = GPUType.OTHER
+
+                            logger.debug(
+                                f"Detected GPU via system_profiler: {model}")
+                            return True
+                except Exception as e:
+                    logger.debug(f"system_profiler GPU detection failed: {e}")
+
+            # Last resort: Check if FFmpeg has any hardware encoders available
+            try:
+                temp_encoder_file = os.path.join(
+                    tempfile.gettempdir(), "ffmpeg_encoders_any.txt")
+                run_ffmpeg_command(['ffmpeg', '-encoders', '-v', 'info',
+                                   '-hide_banner', '-y', '-f', 'null', temp_encoder_file])
+
+                with open(FFPMEG_LOG_FILE, 'r') as f:
+                    log_content = f.read()
+                    hw_encoders = ['nvenc', 'qsv',
+                                   'amf', 'vaapi', 'videotoolbox']
+
+                    for encoder in hw_encoders:
+                        if encoder in log_content.lower():
+                            self.capabilities.model = f"Unknown GPU with {encoder} support"
+                            self.capabilities.gpu_type = GPUType.OTHER
+                            self.capabilities.supports_hwaccel = True
+                            logger.debug(
+                                f"Detected GPU via FFmpeg {encoder} support")
+                            return True
+            except Exception as e:
+                logger.debug(f"FFmpeg encoder detection failed: {e}")
+
+            return False
+        except Exception as e:
+            logger.error(f"Error in _detect_any_gpu: {e}")
+            return False
 
     def _detect_nvidia_gpu(self) -> bool:
         """Detect NVIDIA GPU and update capabilities."""
@@ -181,6 +370,47 @@ class GPUManager:
 
             # Try nvidia-smi as fallback
             try:
+                # On Windows, check if nvidia-smi exists before calling it
+                if platform.system() == 'Windows':
+                    import subprocess
+                    try:
+                        # First just check if nvidia-smi exists at all
+                        subprocess.run(['where', 'nvidia-smi'],
+                                       stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE,
+                                       check=True,
+                                       text=True)
+                    except (subprocess.SubprocessError, FileNotFoundError):
+                        logger.debug("nvidia-smi not found in PATH")
+                        # Try default install location
+                        nvidia_smi_paths = [
+                            r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe",
+                            r"C:\Windows\System32\nvidia-smi.exe"
+                        ]
+                        for path in nvidia_smi_paths:
+                            if os.path.exists(path):
+                                logger.debug(f"Found nvidia-smi at {path}")
+                                try:
+                                    output = subprocess.check_output(
+                                        [path, '--query-gpu=name,memory.total',
+                                            '--format=csv,noheader,nounits'],
+                                        universal_newlines=True
+                                    )
+                                    if output.strip():
+                                        gpu_info = output.strip().split(',')
+                                        self.capabilities.gpu_type = GPUType.NVIDIA
+                                        self.capabilities.model = gpu_info[0].strip(
+                                        )
+                                        self.capabilities.vram_mb = int(
+                                            gpu_info[1].strip())
+                                        self.capabilities.cuda_available = True
+                                        logger.debug(
+                                            f"Detected NVIDIA GPU via {path}: {self.capabilities.model}")
+                                        return True
+                                except Exception as e:
+                                    logger.debug(
+                                        f"Failed to use nvidia-smi at {path}: {e}")
+
                 import json
                 nvidia_smi_output = subprocess.check_output(
                     ['nvidia-smi', '--query-gpu=name,memory.total',
@@ -200,6 +430,37 @@ class GPUManager:
                 logger.debug("nvidia-smi not available")
             except Exception as e:
                 logger.debug(f"nvidia-smi detection failed: {e}")
+
+            # Alternative detection method for Windows - check registry
+            if platform.system() == 'Windows':
+                try:
+                    import winreg
+                    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Video") as key:
+                        i = 0
+                        while True:
+                            try:
+                                subkey_name = winreg.EnumKey(key, i)
+                                with winreg.OpenKey(key, f"{subkey_name}\\0000") as subkey:
+                                    try:
+                                        provider_name, _ = winreg.QueryValueEx(
+                                            subkey, "ProviderName")
+                                        device_desc, _ = winreg.QueryValueEx(
+                                            subkey, "Device Description")
+                                        if "NVIDIA" in provider_name:
+                                            self.capabilities.gpu_type = GPUType.NVIDIA
+                                            self.capabilities.model = device_desc
+                                            self.capabilities.supports_hwaccel = True
+                                            self.capabilities.nvenc_available = True
+                                            logger.debug(
+                                                f"Detected NVIDIA GPU via registry: {device_desc}")
+                                            return True
+                                    except FileNotFoundError:
+                                        pass
+                                i += 1
+                            except (WindowsError, FileNotFoundError):
+                                break
+                except Exception as e:
+                    logger.debug(f"Registry detection failed: {e}")
 
             # Try checking for CUDA libraries as fallback
             try:
@@ -514,8 +775,9 @@ def setup_gpu_acceleration():
             "Falling back to CPU processing as GPU acceleration is not supported or available.")
         return False
     else:
+        gpu_type_value = capabilities.gpu_type.value if capabilities.gpu_type else "unknown"
         logger.success(
-            f"GPU acceleration is enabled using {capabilities.gpu_type.value.upper()} acceleration")
+            f"GPU acceleration is enabled using {gpu_type_value.upper() if gpu_type_value else 'UNKNOWN'} acceleration")
         logger.info(f"GPU model: {capabilities.model}")
         logger.info(
             f"Available encoders: {', '.join(capabilities.get_available_encoders())}")

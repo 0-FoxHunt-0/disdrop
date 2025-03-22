@@ -1,5 +1,4 @@
 import atexit
-from functools import wraps
 import logging
 import os
 import subprocess
@@ -7,13 +6,16 @@ import sys
 import threading
 import time
 import traceback
+from collections import defaultdict
 from datetime import datetime
-from enum import Enum
+from enum import Enum, auto
+from functools import wraps
 from pathlib import Path
-from typing import Optional, TextIO, Union, Dict, Any, Callable
-from tqdm import tqdm
+from typing import Any, Callable, Dict, List, Optional, TextIO, Tuple, Union
+
 import colorlog
 import psutil
+from tqdm import tqdm
 
 from .default_config import FFPMEG_LOG_FILE, LOG_DIR, LOG_FILE
 
@@ -32,164 +34,257 @@ CONFIGURED_LOGGERS = set()
 FFMPEG_LOGGER_CONFIGURED = False
 
 
-class ModernLogStyle:
-    """Modern and unified logging styles"""
-    # Reset and basic styles
-    RESET = '\033[0m'
-    BOLD = '\033[1m'
-    DIM = '\033[2m'
-    ITALIC = '\033[3m'
+class ModernLogStyle(Enum):
+    """Modern log styling and color codes for better readability."""
+    DEFAULT = "white"
+    AZURE = "#2563eb"  # A nice blue
+    CYAN = "#06b6d4"
+    SLATE = "#64748b"  # Subtle gray-blue
+    AMBER = "#d97706"  # Warm amber
+    EMERALD = "#10b981"  # Rich green
+    ROSE = "#e11d48"  # Vibrant rose/red
+    PURPLE = "#a855f7"
+    PINK = "#ec4899"
+    LIME = "#84cc16"
+    INDIGO = "#6366f1"
+    ORANGE = "#f97316"
+    TEAL = "#14b8a6"
+    RED = "#ef4444"
+    YELLOW = "#eab308"
+    GREEN = "#22c55e"
+    BLUE = "#3b82f6"
+    GRAY = "#6b7280"
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
 
-    # Modern color palette
-    SLATE = '\033[38;5;246m'   # Subtle details
-    AZURE = '\033[38;5;39m'    # Processing info
-    EMERALD = '\033[38;5;48m'  # Success
-    AMBER = '\033[38;5;214m'   # Warnings
-    ROSE = '\033[38;5;204m'    # Errors
-    VIOLET = '\033[38;5;141m'  # Critical info
-    CYAN = '\033[38;5;51m'     # Statistics
-    LIME = '\033[38;5;118m'    # Performance metrics
+    def as_rgb(self) -> str:
+        """Convert to standard terminal RGB format if hex value."""
+        if self.value.startswith('#'):
+            # Convert hex to rgb
+            rgb = tuple(int(self.value.lstrip('#')[i:i+2], 16)
+                        for i in (0, 2, 4))
+            return f"\033[38;2;{rgb[0]};{rgb[1]};{rgb[2]}m"
+        # Otherwise return as is
+        return self.value
 
-    # Progress indicators
-    ARROW = '→'
-    BULLET = '•'
-    CHECK = '✓'
-    CROSS = '✗'
-    INFO = 'ℹ'
-    WARN = '⚠'
-    LIGHTNING = '⚡'
-    GEARS = '⚙'
-    CLOCK = '🕒'
+    def get_style(self) -> str:
+        """Get the style string."""
+        return self.value if not self.value.startswith('#') else self.as_rgb()
 
-    # Separator styles
-    SEPARATOR_MAIN = f"{DIM}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{RESET}"
-    SEPARATOR_SUB = f"{DIM}───────────────────────────────{RESET}"
+
+def get_color_for_severity(severity: str) -> str:
+    """Return a color based on message severity."""
+    return {
+        'DEBUG': ModernLogStyle.SLATE.value,
+        'INFO': ModernLogStyle.DEFAULT.value,
+        'SUCCESS': ModernLogStyle.EMERALD.value,
+        'WARNING': ModernLogStyle.AMBER.value,
+        'ERROR': ModernLogStyle.ROSE.value,
+        'CRITICAL': ModernLogStyle.RED.value,
+        'SKIP': ModernLogStyle.GRAY.value,
+        'PERFORMANCE': ModernLogStyle.INDIGO.value,
+    }.get(severity, ModernLogStyle.DEFAULT.value)
 
 
 class UnifiedLogFormatter(logging.Formatter):
-    """Enhanced formatter combining verbose and normal modes"""
+    """Advanced formatter with time estimation and color support."""
 
-    def __init__(self):
-        super().__init__()
-        self._style = ModernLogStyle
-        self._last_phase = None
-        self._seen_messages = set()  # For deduplication
-        self._message_count = {}  # Track message occurrence counts
-        self._dedup_lock = threading.Lock()  # Thread-safe deduplication
-        self._max_similar_messages = 3  # Show at most this many similar messages
+    def __init__(self, log_colors=None):
+        """Initialize formatter with color support."""
+        super().__init__(fmt='%(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+        self.log_colors = log_colors or {
+            'DEBUG': ModernLogStyle.SLATE.value,
+            'INFO': ModernLogStyle.DEFAULT.value,
+            'SUCCESS': ModernLogStyle.EMERALD.value,
+            'WARNING': ModernLogStyle.AMBER.value,
+            'ERROR': ModernLogStyle.ROSE.value,
+            'CRITICAL': ModernLogStyle.RED.value,
+            'SKIP': ModernLogStyle.GRAY.value,
+            'PERFORMANCE': ModernLogStyle.INDIGO.value,
+        }
+        self.supports_color = self._check_color_support()
+
+    def _check_color_support(self):
+        """Check if terminal supports colors."""
+        # Check if output is a TTY
+        is_tty = hasattr(sys.stdout, 'isatty') and sys.stdout.isatty()
+
+        # Check for Windows terminal that supports ANSI
+        if sys.platform == 'win32':
+            # Windows 10 build 14931+ supports ANSI colors in cmd.exe
+            # Check specific environments that support color
+            if os.environ.get('TERM_PROGRAM') == 'vscode':
+                return True  # VS Code integrated terminal supports colors
+
+            if 'ANSICON' in os.environ:
+                return True  # ANSICON is installed
+
+            if 'WT_SESSION' in os.environ:
+                return True  # Windows Terminal
+
+            if 'ConEmuANSI' in os.environ:
+                return True  # ConEmu
+
+            # Check Windows version for native ANSI support (Windows 10+)
+            try:
+                import ctypes
+                kernel32 = ctypes.windll.kernel32
+
+                # Check if SetConsoleMode function exists and supports ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                if hasattr(kernel32, 'SetConsoleMode'):
+                    # Try to enable ANSI escape sequence processing
+                    ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+                    mode = ctypes.c_ulong()
+                    if kernel32.GetConsoleMode(kernel32.GetStdHandle(-11), ctypes.byref(mode)):
+                        # Successfully got console mode, try to set ANSI support
+                        new_mode = mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                        if kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), new_mode):
+                            return True
+            except:
+                pass
+
+            # Fallback check for TERM=xterm
+            if os.environ.get('TERM') == 'xterm':
+                return True
+
+            # Default to no color for most Windows environments
+            # unless we've detected a compatible terminal
+            return False
+
+        # For other platforms, just check if it's a TTY
+        return is_tty
+
+    def get_timestamp(self):
+        """Get a nicely formatted timestamp."""
+        return time.strftime("%H:%M:%S", time.localtime())
+
+    def colorize(self, text, color=None):
+        """Add ANSI color codes to text if supported."""
+        if not color or not self.supports_color:
+            return text
+
+        # Convert hex color to ANSI RGB format
+        if color.startswith('#'):
+            try:
+                r = int(color[1:3], 16)
+                g = int(color[3:5], 16)
+                b = int(color[5:7], 16)
+                return f"\033[38;2;{r};{g};{b}m{text}\033[0m"
+            except Exception:
+                return text
+        # Return as is for named colors or ANSI codes
+        elif color.startswith('\033'):
+            return f"{color}{text}{ModernLogStyle.RESET.value}"
+        return text
 
     def format(self, record):
-        # Extract phase information if available
-        current_phase = getattr(record, 'phase', None)
+        """Format a record with enhanced styling and information."""
+        if not hasattr(record, 'original_format_message'):
+            record.original_format_message = record.getMessage
+            record.getMessage = lambda: record.original_format_message()
 
-        # Add visual separator between processing phases
-        if current_phase and current_phase != self._last_phase:
-            self._last_phase = current_phase
-            header = self._format_phase_header(current_phase)
-            record.msg = f"\n{header}\n{record.msg}"
+        # Get log level color
+        color = self.log_colors.get(record.levelname, None)
 
-        # Deduplicate messages properly - thread-safe
-        message_key = f"{record.levelno}:{record.pathname}:{record.lineno}:{record.msg}"
-        with self._dedup_lock:
-            # Update count and check for excessive duplicates
-            self._message_count[message_key] = self._message_count.get(
-                message_key, 0) + 1
-            count = self._message_count[message_key]
+        # Get timestamp
+        ts = self.get_timestamp()
 
-            # If we've seen too many similar messages, summarize or skip
-            if count > self._max_similar_messages:
-                if count == self._max_similar_messages + 1:
-                    return f"{self._style.DIM}(Similar message repeated, further occurrences will be suppressed){self._style.RESET}"
-                return ""  # Skip this record entirely by returning empty string
+        # Format basic message with level prefix for better visibility
+        level_str = record.levelname
 
-            # Normal message processing for non-duplicates or allowed duplicates
-            if message_key in self._seen_messages and count <= self._max_similar_messages:
-                # Add occurrence count for duplicates
-                record.msg = f"{record.msg} {self._style.DIM}(repeat {count}){self._style.RESET}"
-
-            # Add to seen messages
-            self._seen_messages.add(message_key)
-
-        # Format based on level
-        if record.levelno >= logging.ERROR:
-            return self._format_error(record)
-        elif record.levelno >= logging.WARNING:
-            return self._format_warning(record)
-        elif record.levelno == SUCCESS_LEVEL:  # Custom success level
-            return self._format_success(record)
-        elif record.levelno == PERFORMANCE_LEVEL:  # Performance metrics
-            return self._format_performance(record)
+        # Format message based on log level and content
+        if record.exc_info:
+            # Handle exceptions with detailed formatting
+            formatted_msg = super().format(record)
+            if self.supports_color:
+                # Add error trace formatting
+                lines = formatted_msg.split('\n')
+                if len(lines) > 1:
+                    # First line is the message
+                    formatted_message = self.colorize(lines[0], color)
+                    # Format traceback with error color
+                    error_color = self.log_colors.get(
+                        'ERROR', ModernLogStyle.ROSE.value)
+                    trace_lines = '\n'.join(
+                        [self.colorize(line, error_color) for line in lines[1:]])
+                    formatted_message = f"{formatted_message}\n{trace_lines}"
+                else:
+                    formatted_message = self.colorize(formatted_msg, color)
+            else:
+                formatted_message = formatted_msg
         else:
-            return self._format_info(record)
+            # Basic message formatting with colors
+            msg = record.getMessage()
 
-    def _format_phase_header(self, phase):
-        s = self._style
-        return (
-            f"{s.SEPARATOR_MAIN}\n"
-            f"{s.BOLD}{s.AZURE}{phase}{s.RESET}\n"
-            f"{s.SEPARATOR_SUB}"
-        )
+            if self.supports_color:
+                # Add colored level prefix for important messages
+                if record.levelno >= logging.WARNING or record.levelname in ['SUCCESS', 'PERFORMANCE']:
+                    level_display = f"[{level_str}] "
+                    formatted_message = f"{self.colorize(level_display, color)}{self.colorize(msg, color)}"
+                else:
+                    formatted_message = self.colorize(msg, color)
+            else:
+                # Plain formatting for non-color terminals
+                if record.levelno >= logging.WARNING or record.levelname in ['SUCCESS', 'PERFORMANCE']:
+                    formatted_message = f"[{level_str}] {msg}"
+                else:
+                    formatted_message = msg
 
-    def _format_error(self, record):
-        s = self._style
-        return (
-            f"{s.ROSE}{s.CROSS} Error: {record.msg}{s.RESET}"
-            f"{self._format_details(record)}"
-        )
+        # Add context details if available
+        if hasattr(record, 'details') and record.details:
+            details_str = ' | '.join(
+                [f"{k}: {v}" for k, v in record.details.items()])
+            if self.supports_color:
+                details_str = self.colorize(
+                    f"  {details_str}", ModernLogStyle.SLATE.value)
+            formatted_message = f"{formatted_message}\n{details_str}"
 
-    def _format_warning(self, record):
-        s = self._style
-        return (
-            f"{s.AMBER}{s.WARN} {record.msg}{s.RESET}"
-            f"{self._format_details(record)}"
-        )
+        return formatted_message
 
-    def _format_success(self, record):
-        s = self._style
-        return (
-            f"{s.EMERALD}{s.CHECK} {record.msg}{s.RESET}"
-            f"{self._format_details(record)}"
-        )
 
-    def _format_performance(self, record):
-        s = self._style
-        return (
-            f"{s.LIME}{s.LIGHTNING} {record.msg}{s.RESET}"
-            f"{self._format_details(record)}"
-        )
+class SafeUnicodeFormatter(logging.Formatter):
+    """Formatter that handles Unicode encoding errors gracefully."""
 
-    def _format_info(self, record):
-        s = self._style
+    def __init__(self, fmt=None, datefmt=None, style='%', validate=True):
+        super().__init__(fmt, datefmt, style, validate)
 
-        # Use different icon based on context
-        icon = s.BULLET
-        if hasattr(record, 'context'):
-            context = record.context
-            if context == 'progress':
-                icon = s.GEARS
-            elif context == 'timing':
-                icon = s.CLOCK
+    def format(self, record):
+        """Format the log record with Unicode safety."""
+        try:
+            # First, use the normal formatter
+            message = super().format(record)
 
-        prefix = f"{s.AZURE}{icon}{s.RESET}" if hasattr(
-            record, 'highlight') else f"{s.DIM}{s.ARROW}{s.RESET}"
+            # Check if we're on Windows and need special handling
+            if sys.platform == 'win32':
+                # Replace problematic Unicode characters
+                message = self._make_windows_safe(message)
 
-        return (
-            f"{prefix} {record.msg}"
-            f"{self._format_details(record)}"
-        )
+            return message
+        except Exception as e:
+            # Fallback to a safe version if formatting fails
+            return f"[Log formatting error: {e}] {record.getMessage()}"
 
-    def _format_details(self, record):
-        if hasattr(record, 'details'):
-            s = self._style
-            details = record.details
-            if isinstance(details, dict):
-                detail_lines = [
-                    f"\n  {s.DIM}├ {s.SLATE}{k}: {v}{s.RESET}"
-                    for k, v in details.items()
-                ]
-                return ''.join(detail_lines)
-            return f"\n  {s.DIM}└ {s.SLATE}{details}{s.RESET}"
-        return ""
+    def _make_windows_safe(self, message):
+        """Replace problematic Unicode characters with ASCII equivalents."""
+        # Map of Unicode characters to ASCII replacements
+        replacements = {
+            '\u2192': '->',  # Right arrow →
+            '\u2190': '<-',  # Left arrow ←
+            '\u2713': '+',   # Checkmark ✓
+            '\u2717': 'x',   # Cross ✗
+            '\u26a0': '!',   # Warning ⚠
+            '\u2714': '+',   # Heavy checkmark ✔
+            '\u2718': 'x',   # Heavy cross ✘
+            '\u21bb': '*',   # Clockwise open circle arrow ↻
+            '\u2699': '*',   # Gear ⚙
+            '\u26a1': '*',   # Lightning ⚡
+        }
+
+        # Replace each character
+        for char, replacement in replacements.items():
+            message = message.replace(char, replacement)
+
+        return message
 
 
 class UnifiedLogger:
@@ -197,11 +292,16 @@ class UnifiedLogger:
 
     def __init__(self, logger_name='app'):
         self.logger = logging.getLogger(logger_name)
+        self.logger_name = logger_name
 
         # Only configure if not already configured
         with LOGGER_LOCK:
-            if logger_name not in CONFIGURED_LOGGERS:
+            if not self._is_logger_configured(logger_name):
                 self.logger.setLevel(logging.INFO)
+
+                # Remove any existing handlers to prevent duplicates
+                for handler in self.logger.handlers[:]:
+                    self.logger.removeHandler(handler)
 
                 # Set up console handler with unified formatter
                 console_handler = logging.StreamHandler()
@@ -215,6 +315,20 @@ class UnifiedLogger:
         self._current_phase = None
         self._timers = {}
         self._timer_lock = threading.Lock()
+
+    def _is_logger_configured(self, logger_name):
+        """Check if logger is already configured properly."""
+        if logger_name in CONFIGURED_LOGGERS:
+            return True
+
+        # Check if the logger has any handlers
+        logger = logging.getLogger(logger_name)
+        if logger.handlers:
+            # If it has handlers, consider it configured and add to our tracking set
+            CONFIGURED_LOGGERS.add(logger_name)
+            return True
+
+        return False
 
     def __getattr__(self, name):
         """Delegate any undefined attributes to the internal logger"""
@@ -236,9 +350,10 @@ class UnifiedLogger:
         elapsed = time.time() - self._processing_start
 
         # Log with performance level
-        extra = {'context': 'timing'}
+        extra = {'context': 'timing', 'details': {
+            'Elapsed': f"{elapsed:.2f}s"}}
         self.logger.log(
-            PERFORMANCE_LEVEL, f"Completed {phase} in {elapsed:.2f} seconds", extra=extra)
+            PERFORMANCE_LEVEL, f"Completed {phase}", extra=extra)
 
         # Reset timers
         self._processing_start = None
@@ -297,23 +412,57 @@ class UnifiedLogger:
         self.logger.info(f"{message}\n  {progress_bar}", extra=extra)
 
     def _create_progress_bar(self, percentage: float, error_count: int = 0, width: int = 30) -> str:
+        """Create a vibrant progress bar with colored indicators.
+
+        Args:
+            percentage: Progress percentage (0-100)
+            error_count: Number of errors encountered
+            width: Width of the progress bar in characters
+
+        Returns:
+            Formatted progress bar string
+        """
         s = ModernLogStyle
         filled = int(width * percentage / 100)
 
-        # Change color based on errors
-        bar_color = s.AZURE
-        if error_count > 0:
-            bar_color = s.AMBER if error_count < 3 else s.ROSE
+        # Select color based on percentage and errors
+        if error_count > 3:
+            # Critical errors
+            bar_color = s.ROSE.as_rgb()
+            empty_color = s.SLATE.as_rgb()
+            fill_char = '█'  # Full block
+            empty_char = '░'  # Light shade
+        elif error_count > 0:
+            # Some errors
+            bar_color = s.AMBER.as_rgb()
+            empty_color = s.SLATE.as_rgb()
+            fill_char = '█'  # Full block
+            empty_char = '░'  # Light shade
+        elif percentage >= 100:
+            # Completed
+            bar_color = s.EMERALD.as_rgb()
+            empty_color = s.SLATE.as_rgb()
+            fill_char = '█'  # Full block
+            empty_char = '░'  # Light shade
+        else:
+            # Normal progress
+            bar_color = s.AZURE.as_rgb()
+            empty_color = s.SLATE.as_rgb()
+            fill_char = '█'  # Full block
+            empty_char = '░'  # Light shade
 
         # Create the bar with appropriate color
-        bar = (
-            f"{bar_color}{'━' * filled}{s.DIM}{'─' * (width - filled)}{s.RESET} "
-            f"{s.BOLD}{percentage:.1f}%{s.RESET}"
-        )
+        bar = f"{bar_color}{fill_char * filled}{empty_color}{empty_char * (width - filled)}{s.RESET.value}"
+
+        # Add percentage display
+        percentage_display = f" {s.BOLD.value}{percentage:.1f}%{s.RESET.value}"
 
         # Add error indicator if needed
         if error_count > 0:
-            bar += f" {s.AMBER}{error_count} errors{s.RESET}"
+            error_color = s.AMBER.as_rgb() if error_count < 3 else s.ROSE.as_rgb()
+            bar += f"{percentage_display} {error_color}({error_count} error{'s' if error_count > 1 else ''}){s.RESET.value}"
+        else:
+            bar += percentage_display
 
         return bar
 
@@ -405,6 +554,9 @@ def setup_application_logging(debug_mode=False, verbose_mode=False):
         # Mark loggers as configured
         CONFIGURED_LOGGERS.add('app')
 
+        # Ensure propagation is disabled to prevent duplicate logs
+        app_logger.propagate = False
+
         # Add shutdown cleanup
         atexit.register(shutdown_logging)
 
@@ -428,22 +580,36 @@ def get_logger(name='app'):
 
         # If this logger or the app logger has not been configured, set up basic config
         if name not in CONFIGURED_LOGGERS and 'app' not in CONFIGURED_LOGGERS:
-            # Add basic console handler if not already configured
-            if not logger.handlers:
-                handler = logging.StreamHandler()
-                formatter = UnifiedLogFormatter()
-                handler.setFormatter(formatter)
-                logger.addHandler(handler)
-                logger.setLevel(logging.INFO)
+            # Clear any existing handlers to prevent duplicates
+            for handler in logger.handlers[:]:
+                logger.removeHandler(handler)
 
-                # Mark as configured
-                CONFIGURED_LOGGERS.add(name)
+            # Add basic console handler
+            handler = logging.StreamHandler()
+            formatter = UnifiedLogFormatter()
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+            logger.setLevel(logging.INFO)
 
-                # Add custom log levels for this handler
-                if not hasattr(logging.Logger, 'success'):
-                    def success(self, message, *args, **kwargs):
-                        self.log(SUCCESS_LEVEL, message, *args, **kwargs)
-                    logging.Logger.success = success
+            # Disable propagation to prevent duplicate logs
+            logger.propagate = False
+
+            # Mark as configured
+            CONFIGURED_LOGGERS.add(name)
+
+            # Add custom log levels for this handler
+            if not hasattr(logging.Logger, 'success'):
+                def success(self, message, *args, **kwargs):
+                    self.log(SUCCESS_LEVEL, message, *args, **kwargs)
+                logging.Logger.success = success
+
+                def skip(self, message, *args, **kwargs):
+                    self.log(SKIP_LEVEL, message, *args, **kwargs)
+                logging.Logger.skip = skip
+
+                def performance(self, message, *args, **kwargs):
+                    self.log(PERFORMANCE_LEVEL, message, *args, **kwargs)
+                logging.Logger.performance = performance
 
         return logger
 
@@ -664,8 +830,17 @@ def clear_ffmpeg_log():
 
 
 # Run FFmpeg command with unified logging
-def run_ffmpeg_command(command: list) -> bool:
-    """Run FFmpeg command with unified logging."""
+def run_ffmpeg_command(command: list, timeout=None, capture_output=True) -> bool:
+    """Run FFmpeg command with unified logging.
+
+    Args:
+        command: Command list to run
+        timeout: Optional timeout in seconds
+        capture_output: Whether to capture and log output (True) or send to devnull (False)
+
+    Returns:
+        bool: Success status
+    """
     ffmpeg_logger = setup_ffmpeg_logging()
     app_logger = get_logger('app')
 
@@ -673,21 +848,33 @@ def run_ffmpeg_command(command: list) -> bool:
     ffmpeg_logger.info(f"Running FFmpeg command: {command_str}")
 
     try:
-        # Use stdout and stderr redirection to prevent terminal output
-        with open(os.devnull, 'w') as devnull:
+        if capture_output:
+            # Capture output for logging but don't display in terminal
             process = subprocess.run(
                 command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True
+                text=True,
+                timeout=timeout,
+                check=False  # Don't raise exception on non-zero exit
             )
 
-        # Log stdout and stderr to ffmpeg.log
-        if process.stdout and not process.stdout.isspace():
-            ffmpeg_logger.debug("STDOUT: " + process.stdout)
+            # Log stdout and stderr to ffmpeg.log if not empty
+            if process.stdout and not process.stdout.isspace():
+                ffmpeg_logger.debug("STDOUT: " + process.stdout)
 
-        if process.stderr and not process.stderr.isspace():
-            ffmpeg_logger.debug("STDERR: " + process.stderr)
+            if process.stderr and not process.stderr.isspace():
+                ffmpeg_logger.debug("STDERR: " + process.stderr)
+        else:
+            # Completely suppress output for terminal
+            with open(os.devnull, 'w') as devnull:
+                process = subprocess.run(
+                    command,
+                    stdout=devnull,
+                    stderr=devnull,
+                    timeout=timeout,
+                    check=False  # Don't raise exception on non-zero exit
+                )
 
         # Log command result to application log
         if process.returncode == 0:
@@ -697,6 +884,9 @@ def run_ffmpeg_command(command: list) -> bool:
                 f"FFmpeg command failed with code {process.returncode}")
 
         return process.returncode == 0
+    except subprocess.TimeoutExpired:
+        app_logger.error(f"FFmpeg command timed out after {timeout} seconds")
+        return False
     except Exception as e:
         error_msg = f"FFmpeg command failed: {e}"
         ffmpeg_logger.error(error_msg, exc_info=True)

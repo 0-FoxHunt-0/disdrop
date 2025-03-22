@@ -250,18 +250,22 @@ class VideoProcessor(BaseProcessor):
                 # Update encoder preferences if specific GPU type is known
                 if 'preferred_encoder' in self.gpu_settings:
                     preferred = self.gpu_settings['preferred_encoder']
-                    self.logger.info(
-                        f"Set {preferred.upper()} as preferred encoder")
-                    # Update encoder settings if the preferred encoder is available
-                    for encoder_type in self.settings:
-                        if encoder_type in ['gpu', 'cpu']:
-                            encoders = self.settings[encoder_type].get(
-                                'encoders', [])
-                            for encoder in encoders:
-                                if preferred in encoder.lower():
-                                    self.settings[encoder_type]['encoders'] = [encoder] + [
-                                        e for e in encoders if e != encoder
-                                    ]
+                    if preferred is not None:
+                        self.logger.info(
+                            f"Set {preferred.upper()} as preferred encoder")
+                        # Update encoder settings if the preferred encoder is available
+                        for encoder_type in self.settings:
+                            if encoder_type in ['gpu', 'cpu']:
+                                encoders = self.settings[encoder_type].get(
+                                    'encoders', [])
+                                for encoder in encoders:
+                                    if preferred in encoder.lower():
+                                        self.settings[encoder_type]['encoders'] = [encoder] + [
+                                            e for e in encoders if e != encoder
+                                        ]
+                    else:
+                        self.logger.warning(
+                            "Preferred encoder is None, using default")
                 self.encoder._setup_encoder()  # Re-setup with updated settings
 
             # Log encoder configuration

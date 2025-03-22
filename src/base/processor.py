@@ -99,10 +99,15 @@ class BaseProcessor:
         if self._shutdown_initiated:
             self.logger.warning("Forced shutdown initiated")
             self._immediate_termination.set()
+            # Make sure cleanup is called
+            self.cleanup_resources()
         else:
             self._shutdown_initiated = True
             self.logger.warning("Graceful shutdown initiated")
             self._shutdown_event.set()
+            # Start cleanup in a separate thread that won't be blocked
+            threading.Thread(target=self.cleanup_resources,
+                             daemon=True).start()
 
     def cleanup_resources(self):
         """Clean up resources during shutdown."""

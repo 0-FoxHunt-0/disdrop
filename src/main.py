@@ -6,12 +6,14 @@ from pathlib import Path
 import time
 import traceback
 import gc
+import shutil
+import subprocess
 
 # Use relative imports since we're in the src package
 from .default_config import (GIF_PASS_OVERS, INPUT_DIR, LOG_DIR, OUTPUT_DIR,
                              TEMP_FILE_DIR, GIF_COMPRESSION, VIDEO_COMPRESSION)
-# Use package-level import
-from .gif_operations import GIFProcessor, DynamicGIFOptimizer
+# Use package-level import - move GIFProcessor inside main to avoid circular imports
+from .gif_operations import DynamicGIFOptimizer
 from .gpu_acceleration import setup_gpu_acceleration, get_optimal_settings
 from .logging_system import setup_application_logging, clear_ffmpeg_log, setup_ffmpeg_logging
 from .temp_file_manager import TempFileManager
@@ -26,6 +28,8 @@ def setup_signal_handlers(processor):
         logger.warning(
             "\nReceived interrupt signal, initiating immediate shutdown...")
         processor._immediate_shutdown_handler(signum, frame)
+        # Add sys.exit to ensure the program terminates after cleanup
+        sys.exit(0)
 
     # Register for both SIGINT (Ctrl+C) and SIGTERM
     signal.signal(signal.SIGINT, signal_handler)
@@ -52,7 +56,6 @@ def parse_arguments() -> argparse.Namespace:
 
 def verify_dependencies() -> bool:
     logger = logging.getLogger('app')
-    import shutil
     required_commands = ['ffmpeg', 'ffprobe', 'gifsicle']
     missing_commands = [
         cmd for cmd in required_commands if not shutil.which(cmd)]
@@ -158,6 +161,17 @@ def process_videos(input_dir: Path, output_dir: Path, logger=None, gpu_enabled=F
 
 
 def main() -> None:
+    # Import GIFProcessor here to avoid circular import issues
+    from .gif_operations import GIFProcessor
+    from pathlib import Path
+    import shutil
+
+    # Variable to hold processor reference for cleanup
+    gif_processor = None
+
+    # Temp file tracking for final cleanup
+    temp_files_to_clean = []
+
     # Parse arguments first
     args = parse_arguments()
 
@@ -190,6 +204,13 @@ def main() -> None:
         # Get optimal GPU settings to share with processors
         gpu_settings = get_optimal_settings() if gpu_supported else {}
         if gpu_supported:
+            # Ensure no None values that might cause errors
+            for key in list(gpu_settings.keys()):
+                if gpu_settings[key] is None:
+                    app_logger.warning(
+                        f"Removing None value for GPU setting: {key}")
+                    gpu_settings[key] = ""  # Replace None with empty string
+
             app_logger.info(f"Using GPU settings: {gpu_settings}")
 
         # Initialize processor with GPU status from command line
@@ -251,6 +272,9 @@ def main() -> None:
                     temp_gif = temp_dir / f"{mp4_file.stem}.gif"
                     final_gif = output_dir / f"{mp4_file.stem}.gif"
 
+                    # Track temp files for cleanup
+                    temp_files_to_clean.append(temp_gif)
+
                     # Skip if final already exists and is good size
                     if final_gif.exists() and final_gif.stat().st_size > 0:
                         file_size_mb = final_gif.stat().st_size / (1024 * 1024)
@@ -264,7 +288,6 @@ def main() -> None:
 
                     # Basic conversion with direct ffmpeg command
                     try:
-                        import subprocess
                         # Get dimensions first
                         probe_cmd = [
                             'ffprobe', '-v', 'error',
@@ -297,6 +320,9 @@ def main() -> None:
                             palette_file = temp_dir / \
                                 f"palette_{mp4_file.stem}.png"
 
+                            # Track temp files for cleanup
+                            temp_files_to_clean.append(palette_file)
+
                             palette_cmd = [
                                 'ffmpeg', '-i', str(mp4_file),
                                 '-vf', f'fps=15,scale={new_width}:{new_height}:flags=lanczos,palettegen=max_colors=128',
@@ -313,33 +339,124 @@ def main() -> None:
                             ]
                             subprocess.run(gif_cmd, check=True)
 
-                            # Optimize with gifsicle
+                            # Check if initial file is already near target size, skip additional optimization
                             if temp_gif.exists():
-                                app_logger.info(
-                                    f"Optimizing GIF: {temp_gif.name}")
-                                opt_cmd = [
-                                    'gifsicle', '--optimize=3',
-                                    '--colors', '128',
-                                    '--lossy=30',
-                                    str(temp_gif),
-                                    '-o', str(final_gif)
-                                ]
-                                subprocess.run(opt_cmd, check=True)
+                                # Use config value
+                                target_size_mb = GIF_COMPRESSION['min_size_mb']
+                                initial_size_mb = temp_gif.stat().st_size / (1024 * 1024)
 
-                                # Verify final file
-                                if final_gif.exists():
-                                    final_size_mb = final_gif.stat().st_size / (1024 * 1024)
-                                    app_logger.success(
-                                        f"Successfully created {final_gif.name} ({final_size_mb:.2f}MB)")
+                                # Skip further processing if already small enough
+                                if initial_size_mb <= target_size_mb * 1.1:  # Within 10% of target
+                                    app_logger.info(
+                                        f"Initial GIF already close to target size: {initial_size_mb:.2f}MB. Skipping further optimization.")
+                                    # Just copy to final
+                                    shutil.copy2(temp_gif, final_gif)
                                 else:
-                                    app_logger.error(
-                                        f"Failed to create final GIF: {final_gif}")
+                                    # Process oversized GIFs
+                                    app_logger.info(
+                                        f"GIF size: {initial_size_mb:.2f}MB, target: {target_size_mb:.2f}MB")
+
+                                    # Try lossless optimization first to preserve quality
+                                    app_logger.info(
+                                        "Trying lossless optimization first")
+                                    lossless_temp = temp_dir / \
+                                        f"lossless_{mp4_file.stem}.gif"
+
+                                    # Track temp files for cleanup
+                                    temp_files_to_clean.append(lossless_temp)
+
+                                    lossless_cmd = [
+                                        'gifsicle', '--optimize=3',
+                                        '--no-conserve-memory',
+                                        str(temp_gif),
+                                        '-o', str(lossless_temp)
+                                    ]
+
+                                    try:
+                                        subprocess.run(
+                                            lossless_cmd,
+                                            check=True,
+                                            stdout=subprocess.PIPE,
+                                            stderr=subprocess.PIPE
+                                        )
+
+                                        # Check if lossless optimization was enough
+                                        if lossless_temp.exists():
+                                            lossless_size_mb = lossless_temp.stat().st_size / (1024 * 1024)
+
+                                            if lossless_size_mb <= target_size_mb:
+                                                # Lossless optimization is sufficient
+                                                app_logger.info(
+                                                    f"Lossless optimization successful: {lossless_size_mb:.2f}MB")
+                                                shutil.copy2(
+                                                    lossless_temp, final_gif)
+                                            else:
+                                                # Need lossy compression - use the GIF processor for better results
+                                                app_logger.info(
+                                                    f"Lossless not sufficient ({lossless_size_mb:.2f}MB), using lossy")
+
+                                                # Use the optimized processor with better color handling
+                                                success = gif_processor.optimize_gif(
+                                                    lossless_temp,
+                                                    final_gif,
+                                                    target_size_mb
+                                                )[1]
+
+                                                if not success:
+                                                    app_logger.warning(
+                                                        "GIF processor optimization failed, trying fallback method")
+                                                    # Fallback to simple gifsicle with lossy compression
+                                                    lossy_cmd = [
+                                                        'gifsicle', '--optimize=3',
+                                                        '--colors', '128',
+                                                        '--lossy=30',
+                                                        str(lossless_temp),
+                                                        '-o', str(final_gif)
+                                                    ]
+                                                    subprocess.run(
+                                                        lossy_cmd,
+                                                        check=True,
+                                                        stdout=subprocess.PIPE,
+                                                        stderr=subprocess.PIPE
+                                                    )
+                                    except Exception as e:
+                                        app_logger.error(
+                                            f"Error during optimization: {e}")
+                                        # Fallback to basic optimization
+                                        opt_cmd = [
+                                            'gifsicle', '--optimize=3',
+                                            '--colors', '128',
+                                            '--lossy=30',
+                                            str(temp_gif),
+                                            '-o', str(final_gif)
+                                        ]
+                                        try:
+                                            subprocess.run(
+                                                opt_cmd,
+                                                check=True,
+                                                stdout=subprocess.PIPE,
+                                                stderr=subprocess.PIPE
+                                            )
+                                        except Exception as e2:
+                                            app_logger.error(
+                                                f"Fallback optimization failed: {e2}")
+                                    finally:
+                                        # Cleanup temporary files
+                                        if lossless_temp.exists():
+                                            lossless_temp.unlink(
+                                                missing_ok=True)
+
+                                    # Check result
+                                    if final_gif.exists():
+                                        final_size_mb = final_gif.stat().st_size / (1024 * 1024)
+                                        app_logger.success(
+                                            f"Created {final_gif.name} ({final_size_mb:.2f}MB)")
+                                    else:
+                                        app_logger.error(
+                                            f"Failed to create final GIF: {final_gif}")
                             else:
                                 app_logger.error(
                                     f"Failed to create temporary GIF: {temp_gif}")
-                        else:
-                            app_logger.error(
-                                f"Failed to get dimensions for {mp4_file}")
                     except Exception as e:
                         app_logger.error(
                             f"Error processing {mp4_file.name}: {e}")
@@ -365,14 +482,62 @@ def main() -> None:
         # Report results
         app_logger.success("GIF processing complete")
 
+        # Final cleanup to ensure all temp files are removed
+        app_logger.info("Performing final cleanup...")
+        cleanup_temp_files(temp_files_to_clean, temp_dir, app_logger)
+
     except KeyboardInterrupt:
         app_logger.warning("\nProcess interrupted by user")
-        gif_processor._immediate_shutdown_handler(signal.SIGINT, None)
+        # Clean temp files before exiting
+        cleanup_temp_files(temp_files_to_clean, temp_dir, app_logger)
+        if gif_processor:  # Only call if gif_processor was successfully created
+            gif_processor._immediate_shutdown_handler(signal.SIGINT, None)
+        sys.exit(0)  # Ensure we exit here
     except Exception as e:
         app_logger.critical(f"Fatal error: {e}", exc_info=True)
-        gif_processor._immediate_shutdown_handler(signal.SIGTERM, None)
+        # Clean temp files before exiting
+        cleanup_temp_files(temp_files_to_clean, temp_dir, app_logger)
+        if gif_processor:  # Only call if gif_processor was successfully created
+            gif_processor._immediate_shutdown_handler(signal.SIGTERM, None)
+        sys.exit(1)  # Exit with error code
     finally:
-        sys.exit(0)
+        # One last attempt at cleanup
+        if gif_processor:
+            try:
+                gif_processor._enhanced_temp_directory_cleanup()
+            except Exception as e:
+                app_logger.error(f"Error in final cleanup: {e}")
+
+
+def cleanup_temp_files(tracked_files, temp_dir, logger):
+    """Clean up temporary files and perform general temp directory cleanup."""
+    try:
+        # First, clean tracked files
+        for temp_file in tracked_files:
+            try:
+                if temp_file.exists():
+                    temp_file.unlink(missing_ok=True)
+            except Exception as e:
+                logger.error(f"Error removing temp file {temp_file}: {e}")
+
+        # Then clean up by pattern
+        patterns = ["*.gif", "*.png", "palette_*",
+                    "lossless_*", "opt*_*.gif", "temp_*"]
+        for pattern in patterns:
+            try:
+                for file_path in temp_dir.glob(pattern):
+                    if file_path.is_file():
+                        try:
+                            file_path.unlink(missing_ok=True)
+                        except Exception as e:
+                            logger.error(f"Error cleaning up {file_path}: {e}")
+            except Exception as e:
+                logger.error(f"Error processing pattern {pattern}: {e}")
+
+        # Force garbage collection to release file handles
+        gc.collect()
+    except Exception as e:
+        logger.error(f"Error in cleanup_temp_files: {e}")
 
 
 if __name__ == "__main__":
