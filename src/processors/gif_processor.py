@@ -9,8 +9,9 @@ import shutil
 import concurrent.futures
 from typing import Dict, Optional, List, Set, Tuple
 
-# Import GPU detector
+# Import custom modules
 from src.gpu_detector import GPUDetector, AccelerationType
+from src.logging_system import LoggingSystem
 
 
 class GIFProcessor:
@@ -34,8 +35,11 @@ class GIFProcessor:
         Args:
             config: Configuration dictionary for the processor
         """
-        self.logger = logging.getLogger(__name__)
         self.config = config or {}
+
+        # Get the logging system
+        self.logging_system = LoggingSystem(self.config)
+        self.logger = self.logging_system.get_logger('gif_processor')
 
         # Set up directories
         self.input_dir = Path(self.config.get(
@@ -268,7 +272,7 @@ class GIFProcessor:
             new_size = output_file.stat().st_size / (1024*1024)
             savings_percent = (1 - (new_size / original_size)) * 100
 
-            self.logger.info(
+            self.logger.success(
                 f"GIF optimization completed. Size reduction: {original_size:.2f}MB -> {new_size:.2f}MB ({savings_percent:.1f}% saved)")
 
             return output_file
@@ -371,6 +375,16 @@ class GIFProcessor:
                 except OSError as e:
                     self.logger.warning(
                         f"Could not remove temporary file {temp_file}: {e}")
+
+        # Log summary
+        successful = sum(1 for output in results.values()
+                         if output is not None)
+        failed = sum(1 for output in results.values() if output is None)
+        if successful > 0:
+            self.logger.success(
+                f"Successfully processed {successful} GIF files")
+        if failed > 0:
+            self.logger.warning(f"Failed to process {failed} GIF files")
 
         return results
 

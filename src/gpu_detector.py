@@ -9,6 +9,8 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Set
 
+from src.logging_system import LoggingSystem
+
 
 class GPUType(Enum):
     """Enumeration of supported GPU types."""
@@ -46,9 +48,19 @@ class GPUDetector:
     If no GPU acceleration is available, it defaults to CPU processing.
     """
 
-    def __init__(self):
-        """Initialize the GPU detector with logging setup."""
-        self.logger = logging.getLogger(__name__)
+    def __init__(self, config=None):
+        """
+        Initialize the GPU detector with logging setup.
+
+        Args:
+            config: Optional configuration dictionary
+        """
+        self.config = config or {}
+
+        # Get the logging system
+        self.logging_system = LoggingSystem(self.config)
+        self.logger = self.logging_system.get_logger('gpu_detector')
+
         self.os_type = platform.system().lower()
         self.detected_gpus = set()
         self.available_accelerations = set()
@@ -116,8 +128,12 @@ class GPUDetector:
 
         for accel in preferences:
             if accel in self.available_accelerations:
+                self.logger.info(
+                    f"Selected {accel.name} as preferred acceleration method")
                 return accel
 
+        self.logger.info(
+            "Using CPU acceleration (no GPU acceleration available)")
         return AccelerationType.CPU
 
     def _detect_on_windows(self) -> None:

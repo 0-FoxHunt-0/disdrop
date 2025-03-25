@@ -12,32 +12,7 @@ from src.gpu_detector import GPUDetector, AccelerationType
 from src.processors.video_processor import VideoProcessor
 from src.processors.gif_processor import GIFProcessor
 from src.resource_manager import ResourceManager
-
-
-def setup_logging(config):
-    """
-    Set up logging based on the configuration.
-    """
-    log_level = getattr(logging, config.get(
-        'logging', {}).get('level', 'INFO'))
-    log_file = config.get('logging', {}).get('file', './logs/processing.log')
-
-    # Ensure log directory exists
-    log_dir = os.path.dirname(log_file)
-    if log_dir and not os.path.exists(log_dir):
-        os.makedirs(log_dir, exist_ok=True)
-
-    # Configure logging
-    logging.basicConfig(
-        level=log_level,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler(sys.stdout)
-        ]
-    )
-
-    return logging.getLogger('main')
+from src.logging_system import LoggingSystem
 
 
 def ensure_directories(config):
@@ -139,13 +114,25 @@ def main():
         print("No configuration loaded. Exiting.")
         return 1
 
-    # Set up logging
-    logger = setup_logging(config)
+    # Ensure logging config section exists
+    if 'logging' not in config:
+        config['logging'] = {}
 
+    # Setup logging with verbose mode if requested
     if args.verbose:
-        logger.setLevel(logging.DEBUG)
+        config['logging']['level'] = 'DEBUG'
+        config['logging']['console_level'] = 'DEBUG'
 
+    # Initialize the logging system
+    logging_system = LoggingSystem(config)
+    logger = logging_system.get_logger('main')
+
+    # Log application startup
     logger.info("Starting video and GIF compression tool")
+    logging_system.start_new_log_section("Initialization")
+
+    # Log system information
+    logging_system.log_system_info()
 
     # Initialize resource manager for handling interruption signals and cleanup
     resource_manager = ResourceManager(config)
@@ -165,6 +152,9 @@ def main():
     # Process video files if not limited to GIFs only
     if not args.gifs_only:
         try:
+            # Start a new log section for video processing
+            logging_system.start_new_log_section("Video Processing")
+
             # Initialize video processor
             video_processor = VideoProcessor(config)
 
@@ -201,11 +191,14 @@ def main():
                     if output_file:
                         terminal_gui.update_progress(
                             'videos', message=f"Processed: {input_file.name}")
+                        logger.success(
+                            f"Successfully processed: {input_file.name}")
                     else:
                         terminal_gui.update_progress(
                             'videos', message=f"Failed: {input_file.name}")
+                        logger.error(f"Failed to process: {input_file.name}")
 
-                logger.info("Video processing completed")
+                logger.success("Video processing completed")
             else:
                 logger.info("No video files found to process")
                 terminal_gui.display_info("No video files found to process")
@@ -220,6 +213,9 @@ def main():
     # Process GIF files if not limited to videos only
     if not args.videos_only:
         try:
+            # Start a new log section for GIF processing
+            logging_system.start_new_log_section("GIF Processing")
+
             # Initialize GIF processor
             gif_processor = GIFProcessor(config)
 
@@ -252,11 +248,14 @@ def main():
                     if output_file:
                         terminal_gui.update_progress(
                             'gifs', message=f"Processed: {input_file.name}")
+                        logger.success(
+                            f"Successfully processed: {input_file.name}")
                     else:
                         terminal_gui.update_progress(
                             'gifs', message=f"Failed: {input_file.name}")
+                        logger.error(f"Failed to process: {input_file.name}")
 
-                logger.info("GIF processing completed")
+                logger.success("GIF processing completed")
             else:
                 logger.info("No GIF files found to process")
                 terminal_gui.display_info("No GIF files found to process")
@@ -269,9 +268,12 @@ def main():
             if not args.videos_only:  # Only return error if we were exclusively processing GIFs
                 return 1
 
+    # Log completion
+    logging_system.start_new_log_section("Summary")
+    logger.success("Processing completed successfully")
+
     # Display summary
     terminal_gui.display_summary()
-    logger.info("Processing completed successfully")
     return 0
 
 

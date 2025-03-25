@@ -11,8 +11,9 @@ import time
 import concurrent.futures
 from typing import Dict, Optional, List, Set, Tuple
 
-# Import GPU detector
+# Import custom modules
 from src.gpu_detector import GPUDetector, AccelerationType
+from src.logging_system import LoggingSystem
 
 
 class VideoProcessor:
@@ -45,16 +46,19 @@ class VideoProcessor:
         Args:
             config: Configuration dictionary for the processor
         """
-        self.logger = logging.getLogger(__name__)
         self.config = config or {}
+
+        # Get the logging system
+        self.logging_system = LoggingSystem(self.config)
+        self.logger = self.logging_system.get_logger('video_processor')
 
         # Set up directories
         self.input_dir = Path(self.config.get(
-            'directories', {}).get('input', './input'))
+            'directories', {}).get('input', './input')).resolve()
         self.output_dir = Path(self.config.get(
-            'directories', {}).get('output', './output'))
+            'directories', {}).get('output', './output')).resolve()
         self.temp_dir = Path(self.config.get(
-            'directories', {}).get('temp', './temp'))
+            'directories', {}).get('temp', './temp')).resolve()
 
         # Get batch processing settings from config
         self.batch_size = self.config.get(
@@ -324,6 +328,12 @@ class VideoProcessor:
         temp_output = self.temp_dir / f"{input_file.stem}{self.OUTPUT_FORMAT}"
 
         try:
+            # Check if ffmpeg is available
+            if shutil.which("ffmpeg") is None:
+                self.logger.error(
+                    "FFmpeg not found. Please install FFmpeg to process videos.")
+                return None
+
             # Build FFmpeg command - IMPORTANT: hwaccel args must come BEFORE input file
             cmd = ["ffmpeg", "-y"]
 
@@ -423,9 +433,28 @@ class VideoProcessor:
             '2160p': '3840:2160',
             '4k': '3840:2160'
         }
-        scale = resolution_map.get(resolution.lower(), '1280:720')
+
+        # Handle custom resolution format (e.g., "1280x720" or "1280:720")
+        if resolution.lower() in resolution_map:
+            scale = resolution_map.get(resolution.lower())
+        elif 'x' in resolution or ':' in resolution:
+            # User provided custom resolution in format like "1280x720" or "1280:720"
+            scale = resolution.replace(
+                'x', ':') if 'x' in resolution else resolution
+            self.logger.info(f"Using custom resolution scale: {scale}")
+        else:
+            # Default to 720p if resolution not recognized
+            scale = resolution_map.get('720p')
+            self.logger.warning(
+                f"Unrecognized resolution format '{resolution}', defaulting to 720p")
 
         try:
+            # Check if ffmpeg is available
+            if shutil.which("ffmpeg") is None:
+                self.logger.error(
+                    "FFmpeg not found. Please install FFmpeg to process videos.")
+                return None
+
             # Build FFmpeg command - IMPORTANT: hwaccel args must come BEFORE input file
             cmd = ["ffmpeg", "-y"]
 
@@ -582,21 +611,29 @@ class VideoProcessor:
                 f"Processing {len(all_files)} files in {len(batches)} batches, using {self.num_threads} threads")
 
             # Process batches with thread pool
+            futures = []
             with concurrent.futures.ThreadPoolExecutor(max_workers=self.num_threads) as executor:
                 # Submit batch processing tasks
-                future_to_batch = {executor.submit(
-                    self._process_file_batch, batch): batch for batch in batches}
+                for batch in batches:
+                    futures.append(executor.submit(
+                        self._process_file_batch, batch))
 
                 # Collect results as they complete
-                for future in concurrent.futures.as_completed(future_to_batch):
+                for future in concurrent.futures.as_completed(futures):
                     if self.shutdown_requested:
-                        executor.shutdown(wait=False)
+                        # Cancel all remaining futures that haven't started
+                        for f in futures:
+                            f.cancel()
                         self.logger.info(
                             "Shutdown requested, cancelling remaining tasks")
                         break
 
-                    batch_results = future.result()
-                    results.update(batch_results)
+                    try:
+                        batch_results = future.result()
+                        results.update(batch_results)
+                    except Exception as e:
+                        self.logger.error(
+                            f"Error processing batch: {e}", exc_info=True)
         else:
             # Process files sequentially
             self.logger.info(f"Processing {len(all_files)} files sequentially")
@@ -620,6 +657,16 @@ class VideoProcessor:
                 except OSError as e:
                     self.logger.warning(
                         f"Could not remove temporary file {temp_file}: {e}")
+
+        # Log summary
+        successful = sum(1 for output in results.values()
+                         if output is not None)
+        failed = sum(1 for output in results.values() if output is None)
+        if successful > 0:
+            self.logger.info(
+                f"Successfully processed {successful} video files")
+        if failed > 0:
+            self.logger.warning(f"Failed to process {failed} video files")
 
         return results
 
