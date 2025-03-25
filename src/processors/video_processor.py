@@ -9,6 +9,7 @@ import shutil
 import threading
 import time
 import concurrent.futures
+import signal
 from typing import Dict, Optional, List, Set, Tuple
 
 # Import custom modules
@@ -99,6 +100,66 @@ class VideoProcessor:
 
         # Flag for shutdown detection - will be set by ResourceManager
         self.shutdown_requested = False
+
+        # Current active processes
+        self.active_processes = []
+        self.active_processes_lock = threading.Lock()
+
+        # Set up signal handlers for graceful shutdown
+        self._setup_signal_handlers()
+
+    def _setup_signal_handlers(self):
+        """Set up signal handlers for graceful shutdown."""
+        # Store original handlers to restore later
+        self.original_sigint_handler = signal.getsignal(signal.SIGINT)
+        self.original_sigterm_handler = signal.getsignal(signal.SIGTERM)
+
+        # Set custom handlers
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+
+    def _signal_handler(self, signum, frame):
+        """Handle interruption signals for graceful shutdown."""
+        self.logger.warning(
+            f"Received signal {signum}, initiating graceful shutdown...")
+
+        # Set shutdown flag
+        self.shutdown_requested = True
+
+        # Terminate any active processes
+        self._terminate_active_processes()
+
+        # Save processing cache to preserve work done so far
+        self._save_processed_cache()
+
+        # Log termination
+        self.logger.info(
+            "Graceful shutdown initiated. Waiting for tasks to complete...")
+
+    def _terminate_active_processes(self):
+        """Terminate any active FFmpeg processes."""
+        with self.active_processes_lock:
+            for process in self.active_processes:
+                if process and process.poll() is None:  # If process is still running
+                    try:
+                        self.logger.info(f"Terminating process {process.pid}")
+                        process.terminate()
+                    except Exception as e:
+                        self.logger.error(f"Error terminating process: {e}")
+
+            # Clear the list
+            self.active_processes.clear()
+
+    def _register_process(self, process):
+        """Register an active subprocess."""
+        with self.active_processes_lock:
+            self.active_processes.append(process)
+
+    def _unregister_process(self, process):
+        """Remove a subprocess from the active list."""
+        with self.active_processes_lock:
+            if process in self.active_processes:
+                self.active_processes.remove(process)
 
     def _ensure_directories(self) -> None:
         """Ensure all required directories exist."""
@@ -197,7 +258,7 @@ class VideoProcessor:
 
     def get_ffmpeg_acceleration_args(self) -> List[str]:
         """
-        Get the appropriate FFmpeg acceleration arguments based on detected hardware.
+        Get the appropriate FFmpeg acceleration arguments with improved RTX support.
 
         Returns:
             List[str]: FFmpeg command line arguments for hardware acceleration
@@ -205,6 +266,7 @@ class VideoProcessor:
         accel_type = self.preferred_acceleration
 
         if accel_type == AccelerationType.CUDA:
+            # For CUDA, use specific output format for better compatibility
             return ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
         elif accel_type == AccelerationType.METAL:
             return ["-hwaccel", "videotoolbox"]
@@ -221,7 +283,7 @@ class VideoProcessor:
 
     def get_codec_args(self) -> List[str]:
         """
-        Get the appropriate codec arguments based on hardware and settings.
+        Get the appropriate codec arguments with improved settings for RTX cards.
 
         Returns:
             List[str]: FFmpeg codec arguments
@@ -236,14 +298,31 @@ class VideoProcessor:
 
         if target_codec == 'h264':
             if accel_type == AccelerationType.CUDA:
-                # NVIDIA NVENC settings
-                return [
-                    "-c:v", "h264_nvenc",
-                    "-preset", "p4",  # Options: p1 (fastest) to p7 (slowest)
-                    "-profile:v", "high",
-                    "-rc:v", "vbr_hq",  # High-quality VBR mode
-                    "-cq:v", str(crf)  # Quality level
-                ]
+                # NVIDIA NVENC settings with improved RTX presets
+                # Check if it's an RTX card by looking at the model string
+                rtx_card = any('RTX' in gpu for gpu in self.gpu_types if hasattr(
+                    gpu, 'model') and gpu.model)
+
+                if rtx_card:
+                    # RTX cards support better quality presets
+                    return [
+                        "-c:v", "h264_nvenc",
+                        # Options: p1 (fastest) to p7 (best quality)
+                        "-preset", "p4",
+                        "-tune", "hq",    # High quality tuning
+                        "-profile:v", "high",
+                        "-rc:v", "vbr_hq",  # High-quality VBR mode
+                        "-cq:v", str(crf)  # Quality level
+                    ]
+                else:
+                    # Fallback for non-RTX NVIDIA cards
+                    return [
+                        "-c:v", "h264_nvenc",
+                        "-preset", "p2",  # More compatible preset
+                        "-profile:v", "high",
+                        "-rc:v", "vbr",
+                        "-cq:v", str(crf)
+                    ]
             elif accel_type == AccelerationType.METAL:
                 # Apple VideoToolbox settings
                 return [
@@ -278,13 +357,28 @@ class VideoProcessor:
 
         elif target_codec == 'h265' or target_codec == 'hevc':
             if accel_type == AccelerationType.CUDA:
-                return [
-                    "-c:v", "hevc_nvenc",
-                    "-preset", "p4",
-                    "-profile:v", "main",
-                    "-rc:v", "vbr_hq",
-                    "-cq:v", str(crf)
-                ]
+                # Check if it's an RTX card
+                rtx_card = any('RTX' in gpu for gpu in self.gpu_types if hasattr(
+                    gpu, 'model') and gpu.model)
+
+                if rtx_card:
+                    # RTX cards have better HEVC encoding
+                    return [
+                        "-c:v", "hevc_nvenc",
+                        "-preset", "p4",
+                        "-tune", "hq",
+                        "-profile:v", "main",
+                        "-rc:v", "vbr_hq",
+                        "-cq:v", str(crf)
+                    ]
+                else:
+                    return [
+                        "-c:v", "hevc_nvenc",
+                        "-preset", "p2",
+                        "-profile:v", "main",
+                        "-rc:v", "vbr",
+                        "-cq:v", str(crf)
+                    ]
             elif accel_type == AccelerationType.METAL:
                 return [
                     "-c:v", "hevc_videotoolbox",
@@ -320,7 +414,7 @@ class VideoProcessor:
 
     def convert_to_mp4(self, input_file: Path) -> Optional[Path]:
         """
-        Convert a non-MP4 file to MP4 format.
+        Convert a non-MP4 file to MP4 format with improved GPU fallback.
 
         Args:
             input_file: Path to the input video file
@@ -331,74 +425,298 @@ class VideoProcessor:
         # Create output path in temp directory
         temp_output = self.temp_dir / f"{input_file.stem}{self.OUTPUT_FORMAT}"
 
-        try:
-            # Check if ffmpeg is available
-            if shutil.which("ffmpeg") is None:
+        # Log file for FFmpeg output
+        log_file_path = self.temp_dir / f"{input_file.stem}_ffmpeg.log"
+
+        # Check if FFMPEG exists and is executable
+        ffmpeg_path = shutil.which("ffmpeg")
+        if ffmpeg_path is None:
+            self.logger.error(
+                "FFmpeg executable not found in PATH. Please install FFmpeg.")
+            return None
+
+        self.logger.debug(f"Using FFmpeg at: {ffmpeg_path}")
+
+        # Get video duration first to show progress
+        duration_seconds = self._get_video_duration(input_file)
+        if duration_seconds is None:
+            self.logger.warning(
+                f"Could not determine duration of {input_file}. Progress bar will be indeterminate.")
+
+        # Initialize acceleration strategy
+        # First try with full hardware acceleration (decode+encode)
+        # If that fails, try with just encoding acceleration
+        # If that fails too, fall back to CPU
+        acceleration_attempts = ["full", "encode_only", "cpu"]
+
+        for acceleration_type in acceleration_attempts:
+            try:
+                # Build FFmpeg command
+                cmd = [ffmpeg_path, "-y"]
+
+                # Add input options based on acceleration strategy
+                if acceleration_type == "full" and self.preferred_acceleration != AccelerationType.CPU:
+                    # Full hardware acceleration (decode + encode)
+                    cmd.extend(self.get_ffmpeg_acceleration_args())
+                elif acceleration_type == "encode_only" and self.preferred_acceleration != AccelerationType.CPU:
+                    # Skip hardware decoding, just use hw encoding
+                    self.logger.info(
+                        "Trying with hardware encoding only (no accelerated decoding)")
+                    # No hwaccel args for input
+
+                # Add input file
+                cmd.extend(["-i", str(input_file)])
+
+                # Setup encoding parameters based on acceleration strategy
+                if acceleration_type != "cpu" and self.preferred_acceleration != AccelerationType.CPU:
+                    # Use hardware encoder
+                    codec_args = self.get_codec_args()
+                    # For conversion, use a faster preset
+                    for i, arg in enumerate(codec_args):
+                        if arg == "-preset" and i + 1 < len(codec_args):
+                            if "nvenc" in codec_args[i-1]:  # For NVENC
+                                codec_args[i + 1] = "p2"  # Faster preset
+                            else:
+                                # Generic fast preset
+                                codec_args[i + 1] = "fast"
+                    cmd.extend(codec_args)
+                else:
+                    # CPU encoding fallback
+                    self.logger.info("Using CPU encoding fallback")
+                    cmd.extend(
+                        ["-c:v", "libx264", "-preset", "fast", "-crf", "23"])
+
+                # Audio settings
+                cmd.extend(["-c:a", "aac", "-b:a", "128k"])
+
+                # Add progress output
+                cmd.extend(["-progress", "pipe:1"])
+
+                # Add output file
+                cmd.append(str(temp_output))
+
+                # Log the command
+                accel_type_str = {
+                    "full": "full hardware acceleration",
+                    "encode_only": "hardware encoding only",
+                    "cpu": "CPU encoding"
+                }[acceleration_type]
+
+                self.logger.info(
+                    f"Converting video to MP4 using {accel_type_str}: {input_file} → {temp_output}")
+                self.logger.debug(f"FFmpeg command: {' '.join(cmd)}")
+
+                # Execute the command
+                with open(log_file_path, 'w') as log_file:
+                    process = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=log_file,
+                        universal_newlines=True,
+                        bufsize=1,
+                        text=True
+                    )
+
+                    # Register and monitor the process
+                    self._register_process(process)
+                    try:
+                        self._process_ffmpeg_output(
+                            process, input_file.name, duration_seconds)
+                    except KeyboardInterrupt:
+                        self.logger.warning("Conversion interrupted by user")
+                        process.terminate()
+                        if temp_output.exists():
+                            temp_output.unlink()
+                        raise
+                    finally:
+                        self._unregister_process(process)
+
+                    # Check exit code
+                    if process.wait() != 0:
+                        raise subprocess.CalledProcessError(
+                            process.returncode, cmd)
+
+                # Verify output file
+                if not temp_output.exists() or temp_output.stat().st_size == 0:
+                    raise RuntimeError(
+                        f"Output file missing or empty: {temp_output}")
+
+                # Success! Break out of the loop
+                self.logger.success(
+                    f"Video conversion successful using {accel_type_str}: {temp_output}")
+
+                # Clean up log file on success
+                if log_file_path.exists():
+                    try:
+                        log_file_path.unlink()
+                    except Exception as e:
+                        self.logger.warning(
+                            f"Could not remove log file {log_file_path}: {e}")
+
+                return temp_output
+
+            except (subprocess.CalledProcessError, RuntimeError) as e:
+                # Read error from log file
+                error_msg = ""
+                if log_file_path.exists():
+                    try:
+                        with open(log_file_path, 'r') as log_file:
+                            error_lines = log_file.readlines()
+                            error_msg = "".join(
+                                error_lines[-10:]) if error_lines else "No error details"
+                    except Exception:
+                        error_msg = str(e)
+                else:
+                    error_msg = str(e)
+
+                # If we're not on the last attempt, try next fallback
+                if acceleration_type != "cpu":
+                    self.logger.warning(
+                        f"Conversion with {acceleration_type} failed. Error: {error_msg}")
+                    self.logger.info(
+                        f"Falling back to next acceleration method...")
+
+                    # Clean up failed output
+                    if temp_output.exists():
+                        temp_output.unlink()
+                else:
+                    # All attempts failed
+                    self.logger.error(
+                        f"All conversion attempts failed: {error_msg}")
+                    if temp_output.exists():
+                        temp_output.unlink()
+                    return None
+
+            except Exception as e:
                 self.logger.error(
-                    "FFmpeg not found. Please install FFmpeg to process videos.")
+                    f"Error during video conversion: {e}", exc_info=True)
+                if temp_output.exists():
+                    temp_output.unlink()
                 return None
 
-            # Build FFmpeg command - IMPORTANT: hwaccel args must come BEFORE input file
-            cmd = ["ffmpeg", "-y"]
+        # We should never reach here, but just in case
+        return None
 
-            # Add hardware acceleration arguments before input file
-            cmd.extend(self.get_ffmpeg_acceleration_args())
+    def _get_video_duration(self, input_file: Path) -> Optional[float]:
+        """
+        Get the duration of a video file in seconds.
 
-            # Add input file
-            cmd.extend(["-i", str(input_file)])
+        Args:
+            input_file: Path to the video file
 
-            # For conversion, use fast preset but maintain quality
-            if self.preferred_acceleration == AccelerationType.CUDA:
-                cmd.extend(
-                    ["-c:v", "h264_nvenc", "-preset", "p2", "-cq:v", "23"])
-            elif self.preferred_acceleration == AccelerationType.CPU:
-                cmd.extend(
-                    ["-c:v", "libx264", "-preset", "fast", "-crf", "23"])
-            else:
-                # For other hardware acceleration, use appropriate codec
-                codec_args = self.get_codec_args()
-                # Override preset to fast if present in codec args
-                for i, arg in enumerate(codec_args):
-                    if arg == "-preset" and i + 1 < len(codec_args):
-                        codec_args[i + 1] = "fast"
-                cmd.extend(codec_args)
+        Returns:
+            float: Duration in seconds, or None if it couldn't be determined
+        """
+        ffprobe_path = shutil.which("ffprobe")
+        if ffprobe_path is None:
+            self.logger.warning(
+                "ffprobe executable not found, cannot determine video duration")
+            return None
 
-            # Copy audio stream without re-encoding
-            cmd.extend(["-c:a", "aac", "-b:a", "128k"])
-
-            # Add output file
-            cmd.append(str(temp_output))
-
-            # Execute the command
-            self.logger.info(
-                f"Converting video to MP4: {input_file} to {temp_output}")
-            self.logger.debug(f"FFmpeg command: {' '.join(cmd)}")
+        try:
+            cmd = [
+                ffprobe_path,
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(input_file)
+            ]
 
             result = subprocess.run(
                 cmd,
-                check=True,
                 capture_output=True,
-                text=True
+                text=True,
+                check=True
             )
 
-            self.logger.success(f"Video conversion completed: {temp_output}")
-            return temp_output
+            duration = float(result.stdout.strip())
+            return duration
+        except (subprocess.SubprocessError, ValueError) as e:
+            self.logger.warning(f"Could not determine video duration: {e}")
+            return None
 
-        except subprocess.CalledProcessError as e:
-            self.logger.error(f"FFmpeg error during conversion: {e.stderr}")
-            if temp_output.exists():
-                temp_output.unlink()
-            return None
-        except Exception as e:
-            self.logger.error(
-                f"Error during video conversion: {e}", exc_info=True)
-            if temp_output.exists():
-                temp_output.unlink()
-            return None
+    def _process_ffmpeg_output(self, process, filename: str, duration_seconds: Optional[float]):
+        """
+        Process FFmpeg progress output and update progress bar.
+
+        Args:
+            process: Subprocess object
+            filename: Name of the file being processed
+            duration_seconds: Duration of the video in seconds
+        """
+        import sys
+        from datetime import timedelta
+
+        progress_data = {}
+        bar_length = 50  # Length of progress bar
+
+        # Print initial progress bar
+        if duration_seconds:
+            sys.stdout.write(
+                f"\rProcessing {filename}: [{'.' * bar_length}] 0.0% (0/{int(duration_seconds)}s)")
+        else:
+            sys.stdout.write(
+                f"\rProcessing {filename}: [{'.' * bar_length}] ?%")
+        sys.stdout.flush()
+
+        while True:
+            line = process.stdout.readline()
+            if not line and process.poll() is not None:
+                break
+
+            if line:
+                # Parse progress information
+                line = line.strip()
+                if '=' in line:
+                    key, value = line.split('=', 1)
+                    progress_data[key] = value
+
+                    # Update progress bar if we have time information
+                    if 'out_time_ms' in progress_data and duration_seconds:
+                        try:
+                            current_time = float(
+                                progress_data['out_time_ms']) / 1_000_000
+                            progress = min(
+                                current_time / duration_seconds, 1.0)
+
+                            # Format time as H:MM:SS
+                            current_formatted = str(
+                                timedelta(seconds=int(current_time)))
+                            if current_formatted.startswith('0:'):
+                                # Remove leading 0:
+                                current_formatted = current_formatted[2:]
+
+                            duration_formatted = str(
+                                timedelta(seconds=int(duration_seconds)))
+                            if duration_formatted.startswith('0:'):
+                                # Remove leading 0:
+                                duration_formatted = duration_formatted[2:]
+
+                            # Create the progress bar
+                            filled_length = int(bar_length * progress)
+                            bar = '=' * filled_length + '.' * \
+                                (bar_length - filled_length)
+
+                            # Update the progress display
+                            sys.stdout.write(
+                                f"\rProcessing {filename}: [{bar}] {progress * 100:.1f}% ({current_formatted}/{duration_formatted})")
+                            sys.stdout.flush()
+                        except (ValueError, ZeroDivisionError):
+                            pass
+                    elif 'progress' in progress_data:
+                        # Fallback for when duration isn't known
+                        if progress_data['progress'] == 'end':
+                            sys.stdout.write(
+                                f"\rProcessing {filename}: [{'=' * bar_length}] 100.0% (Complete!)")
+                            sys.stdout.flush()
+
+        # Ensure we end with a newline
+        sys.stdout.write("\n")
+        sys.stdout.flush()
 
     def optimize_mp4(self, input_file: Path) -> Optional[Path]:
         """
-        Optimize an MP4 file using the appropriate hardware acceleration.
+        Optimize an MP4 file using appropriate hardware acceleration with improved fallback.
 
         Args:
             input_file: Path to the input MP4 file
@@ -414,6 +732,10 @@ class VideoProcessor:
             # Use "optimized_" prefix for files already in input dir
             output_file = self.output_dir / f"optimized_{input_file.name}"
 
+        # Log file for FFmpeg output
+        log_file_path = self.temp_dir / \
+            f"{input_file.stem}_optimize_ffmpeg.log"
+
         # Check if this file already has been processed with current settings
         settings_hash = self._get_settings_hash(input_file)
         if input_file.name in self.processed_cache and self.processed_cache[input_file.name] == settings_hash:
@@ -424,6 +746,21 @@ class VideoProcessor:
             # If cache says processed but file doesn't exist, reprocess
             self.logger.warning(
                 f"Cache indicates file was processed but output doesn't exist: {output_file}")
+
+        # Check if FFMPEG exists and is executable
+        ffmpeg_path = shutil.which("ffmpeg")
+        if ffmpeg_path is None:
+            self.logger.error(
+                "FFmpeg executable not found in PATH. Please install FFmpeg.")
+            return None
+
+        self.logger.debug(f"Using FFmpeg at: {ffmpeg_path}")
+
+        # Get video duration first to show progress
+        duration_seconds = self._get_video_duration(input_file)
+        if duration_seconds is None:
+            self.logger.warning(
+                f"Could not determine duration of {input_file}. Progress bar will be indeterminate.")
 
         # Get video parameters from config
         resolution = self.config.get('video', {}).get('resolution', '1080p')
@@ -438,87 +775,190 @@ class VideoProcessor:
             '4k': '3840:2160'
         }
 
-        # Handle custom resolution format (e.g., "1280x720" or "1280:720")
+        # Handle custom resolution format
         if resolution.lower() in resolution_map:
             scale = resolution_map.get(resolution.lower())
         elif 'x' in resolution or ':' in resolution:
-            # User provided custom resolution in format like "1280x720" or "1280:720"
             scale = resolution.replace(
                 'x', ':') if 'x' in resolution else resolution
             self.logger.info(f"Using custom resolution scale: {scale}")
         else:
-            # Default to 720p if resolution not recognized
             scale = resolution_map.get('720p')
             self.logger.warning(
                 f"Unrecognized resolution format '{resolution}', defaulting to 720p")
 
-        try:
-            # Check if ffmpeg is available
-            if shutil.which("ffmpeg") is None:
+        # Try different acceleration strategies in sequence
+        # 1. Full hardware acceleration (decode+encode)
+        # 2. Hardware encoding only (no accelerated decoding)
+        # 3. CPU fallback
+        acceleration_attempts = ["full", "encode_only", "cpu"]
+
+        for acceleration_type in acceleration_attempts:
+            try:
+                # Build FFmpeg command
+                cmd = [ffmpeg_path, "-y"]
+
+                # Add input options based on acceleration strategy
+                if acceleration_type == "full" and self.preferred_acceleration != AccelerationType.CPU:
+                    # Full hardware acceleration (decode + encode)
+                    cmd.extend(self.get_ffmpeg_acceleration_args())
+                elif acceleration_type == "encode_only" and self.preferred_acceleration != AccelerationType.CPU:
+                    # Skip hardware decoding, just use hw encoding
+                    self.logger.info(
+                        "Trying with hardware encoding only (no accelerated decoding)")
+                    # No hwaccel args for input
+
+                # Add input file
+                cmd.extend(["-i", str(input_file)])
+
+                # Add scaling filter based on acceleration type
+                if acceleration_type == "full" and self.preferred_acceleration == AccelerationType.CUDA:
+                    # For CUDA full acceleration, use hardware scaling
+                    cmd.extend(
+                        ["-vf", f"scale_cuda={scale.replace(':', 'x')}"])
+                else:
+                    # For other modes, use standard scaling
+                    cmd.extend(["-vf", f"scale={scale}"])
+
+                # Add bitrate if specified
+                if bitrate and not self.config.get('video', {}).get('use_crf_only', False):
+                    cmd.extend(["-b:v", bitrate])
+
+                # Add encoding parameters based on acceleration strategy
+                if acceleration_type != "cpu" and self.preferred_acceleration != AccelerationType.CPU:
+                    # Use hardware encoder
+                    cmd.extend(self.get_codec_args())
+                else:
+                    # CPU encoding fallback
+                    self.logger.info("Using CPU encoding fallback")
+                    cmd.extend([
+                        "-c:v", "libx264",
+                        "-preset", self.config.get('video',
+                                                   {}).get('preset', 'medium'),
+                        "-crf", str(self.config.get('video',
+                                    {}).get('crf', 23))
+                    ])
+
+                # Audio settings
+                audio_bitrate = self.config.get(
+                    'audio', {}).get('bitrate', '128k')
+                cmd.extend(["-c:a", "aac", "-b:a", audio_bitrate])
+
+                # Add faststart option for web streaming
+                cmd.extend(["-movflags", "+faststart"])
+
+                # Add progress output
+                cmd.extend(["-progress", "pipe:1"])
+
+                # Add output file
+                cmd.append(str(output_file))
+
+                # Log the command
+                accel_type_str = {
+                    "full": "full hardware acceleration",
+                    "encode_only": "hardware encoding only",
+                    "cpu": "CPU encoding"
+                }[acceleration_type]
+
+                self.logger.info(
+                    f"Optimizing video using {accel_type_str}: {input_file} → {output_file}")
+                self.logger.debug(f"FFmpeg command: {' '.join(cmd)}")
+
+                # Execute the command
+                with open(log_file_path, 'w') as log_file:
+                    process = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=log_file,
+                        universal_newlines=True,
+                        bufsize=1,
+                        text=True
+                    )
+
+                    # Register and monitor the process
+                    self._register_process(process)
+                    try:
+                        self._process_ffmpeg_output(
+                            process, input_file.name, duration_seconds)
+                    except KeyboardInterrupt:
+                        self.logger.warning("Optimization interrupted by user")
+                        process.terminate()
+                        if output_file.exists():
+                            output_file.unlink()
+                        raise
+                    finally:
+                        self._unregister_process(process)
+
+                    # Check exit code
+                    if process.wait() != 0:
+                        raise subprocess.CalledProcessError(
+                            process.returncode, cmd)
+
+                # Verify output file
+                if not output_file.exists() or output_file.stat().st_size == 0:
+                    raise RuntimeError(
+                        f"Output file missing or empty: {output_file}")
+
+                # Success! Break out of the loop
+                self.logger.success(
+                    f"Video optimization successful using {accel_type_str}: {output_file}")
+
+                # Clean up log file on success and update cache
+                if log_file_path.exists():
+                    try:
+                        log_file_path.unlink()
+                    except Exception as e:
+                        self.logger.warning(
+                            f"Could not remove log file {log_file_path}: {e}")
+
+                # Update the processed cache
+                with self.cache_lock:
+                    self.processed_cache[input_file.name] = settings_hash
+                    self._save_processed_cache()
+
+                return output_file
+
+            except (subprocess.CalledProcessError, RuntimeError) as e:
+                # Read error from log file
+                error_msg = ""
+                if log_file_path.exists():
+                    try:
+                        with open(log_file_path, 'r') as log_file:
+                            error_lines = log_file.readlines()
+                            error_msg = "".join(
+                                error_lines[-10:]) if error_lines else "No error details"
+                    except Exception:
+                        error_msg = str(e)
+                else:
+                    error_msg = str(e)
+
+                # If we're not on the last attempt, try next fallback
+                if acceleration_type != "cpu":
+                    self.logger.warning(
+                        f"Optimization with {acceleration_type} failed. Error: {error_msg}")
+                    self.logger.info(
+                        f"Falling back to next acceleration method...")
+
+                    # Clean up failed output
+                    if output_file.exists():
+                        output_file.unlink()
+                else:
+                    # All attempts failed
+                    self.logger.error(
+                        f"All optimization attempts failed: {error_msg}")
+                    if output_file.exists():
+                        output_file.unlink()
+                    return None
+
+            except Exception as e:
                 self.logger.error(
-                    "FFmpeg not found. Please install FFmpeg to process videos.")
+                    f"Error during video optimization: {e}", exc_info=True)
+                if output_file.exists():
+                    output_file.unlink()
                 return None
 
-            # Build FFmpeg command - IMPORTANT: hwaccel args must come BEFORE input file
-            cmd = ["ffmpeg", "-y"]
-
-            # Add hardware acceleration arguments before input
-            cmd.extend(self.get_ffmpeg_acceleration_args())
-
-            # Add input file
-            cmd.extend(["-i", str(input_file)])
-
-            # Add filters for scaling
-            cmd.extend(["-vf", f"scale={scale}"])
-
-            # Add bitrate if specified (otherwise use quality-based encoding)
-            if bitrate and not self.config.get('video', {}).get('use_crf_only', False):
-                cmd.extend(["-b:v", bitrate])
-
-            # Add codec arguments (with quality settings)
-            cmd.extend(self.get_codec_args())
-
-            # Add audio settings - transcode audio to ensure compatibility
-            audio_bitrate = self.config.get('audio', {}).get('bitrate', '128k')
-            cmd.extend(["-c:a", "aac", "-b:a", audio_bitrate])
-
-            # Add faststart option for web streaming
-            cmd.extend(["-movflags", "+faststart"])
-
-            # Add output file
-            cmd.append(str(output_file))
-
-            # Execute the command
-            self.logger.info(
-                f"Optimizing video: {input_file} to {output_file}")
-            self.logger.debug(f"FFmpeg command: {' '.join(cmd)}")
-
-            result = subprocess.run(
-                cmd,
-                check=True,
-                capture_output=True,
-                text=True
-            )
-
-            # Save to processed cache
-            with self.cache_lock:
-                self.processed_cache[input_file.name] = settings_hash
-                self._save_processed_cache()
-
-            self.logger.success(f"Video optimization completed: {output_file}")
-            return output_file
-
-        except subprocess.CalledProcessError as e:
-            self.logger.error(f"FFmpeg error during optimization: {e.stderr}")
-            if output_file.exists():
-                output_file.unlink()
-            return None
-        except Exception as e:
-            self.logger.error(
-                f"Error during video optimization: {e}", exc_info=True)
-            if output_file.exists():
-                output_file.unlink()
-            return None
+        # We should never reach here, but just in case
+        return None
 
     def _process_file_batch(self, batch_files: List[Path]) -> Dict[Path, Optional[Path]]:
         """
@@ -585,6 +1025,15 @@ class VideoProcessor:
                     results[orig_file] = optimized
                     break
 
+            # Clean up temp file after optimization
+            try:
+                if mp4_file.exists():
+                    mp4_file.unlink()
+                    self.logger.debug(f"Removed temporary file: {mp4_file}")
+            except OSError as e:
+                self.logger.warning(
+                    f"Could not remove temporary file {mp4_file}: {e}")
+
         return results
 
     def process_videos(self) -> Dict[Path, Optional[Path]]:
@@ -609,51 +1058,117 @@ class VideoProcessor:
         # Dictionary to store results
         results = {}
 
-        if self.batch_size > 1 and self.num_threads > 1:
-            # Split files into batches
-            batches = [all_files[i:i + self.batch_size]
-                       for i in range(0, len(all_files), self.batch_size)]
+        # Reset shutdown flag
+        self.shutdown_requested = False
 
-            self.logger.info(
-                f"Processing {len(all_files)} files in {len(batches)} batches, using {self.num_threads} threads")
+        try:
+            if self.batch_size > 1 and self.num_threads > 1:
+                # Split files into batches
+                batches = [all_files[i:i + self.batch_size]
+                           for i in range(0, len(all_files), self.batch_size)]
 
-            # Process batches with thread pool
-            futures = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=self.num_threads) as executor:
-                # Submit batch processing tasks
-                for batch in batches:
-                    futures.append(executor.submit(
-                        self._process_file_batch, batch))
+                self.logger.info(
+                    f"Processing {len(all_files)} files in {len(batches)} batches, using {self.num_threads} threads")
 
-                # Collect results as they complete
-                for future in concurrent.futures.as_completed(futures):
+                # Process batches with thread pool
+                futures = []
+                with concurrent.futures.ThreadPoolExecutor(max_workers=self.num_threads) as executor:
+                    # Submit batch processing tasks
+                    for batch in batches:
+                        futures.append(executor.submit(
+                            self._process_file_batch, batch))
+
+                    # Collect results as they complete
+                    for future in concurrent.futures.as_completed(futures):
+                        if self.shutdown_requested:
+                            # Cancel all remaining futures that haven't started
+                            for f in futures:
+                                if not f.done() and not f.running():
+                                    f.cancel()
+                            self.logger.info(
+                                "Shutdown requested, cancelling remaining tasks")
+                            break
+
+                        try:
+                            batch_results = future.result()
+                            results.update(batch_results)
+                        except Exception as e:
+                            self.logger.error(
+                                f"Error processing batch: {e}", exc_info=True)
+            else:
+                # Process files sequentially
+                self.logger.info(
+                    f"Processing {len(all_files)} files sequentially")
+
+                # Display overall progress
+                import sys
+                total_files = len(all_files)
+                processed_files = 0
+
+                # Process each file
+                for file in all_files:
                     if self.shutdown_requested:
-                        # Cancel all remaining futures that haven't started
-                        for f in futures:
-                            f.cancel()
                         self.logger.info(
-                            "Shutdown requested, cancelling remaining tasks")
+                            "Shutdown requested, stopping processing")
                         break
 
+                    # Update overall progress
+                    processed_files += 1
+                    progress_percent = (processed_files / total_files) * 100
+                    sys.stdout.write(
+                        f"\rOverall progress: {processed_files}/{total_files} files ({progress_percent:.1f}%)")
+                    sys.stdout.flush()
+
                     try:
-                        batch_results = future.result()
-                        results.update(batch_results)
+                        batch_result = self._process_file_batch([file])
+                        results.update(batch_result)
+                    except KeyboardInterrupt:
+                        self.logger.warning("Processing interrupted by user")
+                        self.shutdown_requested = True
+                        break
                     except Exception as e:
-                        self.logger.error(
-                            f"Error processing batch: {e}", exc_info=True)
-        else:
-            # Process files sequentially
-            self.logger.info(f"Processing {len(all_files)} files sequentially")
+                        self.logger.error(f"Error processing file {file}: {e}")
 
-            # Process each file
-            for file in all_files:
-                if self.shutdown_requested:
-                    self.logger.info("Shutdown requested, stopping processing")
-                    break
+                # End with newline
+                sys.stdout.write("\n")
+                sys.stdout.flush()
 
-                batch_result = self._process_file_batch([file])
-                results.update(batch_result)
+        except KeyboardInterrupt:
+            self.logger.warning("Processing interrupted by user")
+            self.shutdown_requested = True
 
+        finally:
+            # Always clean up temporary converted files
+            self._cleanup_temp_files()
+
+            # Always save the processing cache
+            self._save_processed_cache()
+
+        # Log summary
+        successful = sum(1 for output in results.values()
+                         if output is not None)
+        failed = sum(1 for output in results.values() if output is None)
+        skipped = len(all_files) - successful - failed
+
+        if successful > 0:
+            self.logger.success(
+                f"Successfully processed {successful} video files")
+        if failed > 0:
+            self.logger.warning(f"Failed to process {failed} video files")
+        if skipped > 0:
+            self.logger.info(
+                f"Skipped {skipped} video files due to interruption or errors")
+
+        # Make sure all results have been properly moved to the output directory
+        for input_file, output_file in results.items():
+            if output_file and not output_file.exists():
+                self.logger.error(
+                    f"Output file {output_file} is missing after processing")
+
+        return results
+
+    def _cleanup_temp_files(self):
+        """Clean up temporary files in the temp directory."""
         # Clean up temporary converted files
         for temp_file in self.temp_dir.glob(f'*{self.OUTPUT_FORMAT}'):
             if temp_file.is_file():
@@ -665,17 +1180,27 @@ class VideoProcessor:
                     self.logger.warning(
                         f"Could not remove temporary file {temp_file}: {e}")
 
-        # Log summary
-        successful = sum(1 for output in results.values()
-                         if output is not None)
-        failed = sum(1 for output in results.values() if output is None)
-        if successful > 0:
-            self.logger.success(
-                f"Successfully processed {successful} video files")
-        if failed > 0:
-            self.logger.warning(f"Failed to process {failed} video files")
+        # Clean up log files
+        for log_file in self.temp_dir.glob('*_ffmpeg.log'):
+            if log_file.is_file():
+                try:
+                    log_file.unlink()
+                    self.logger.debug(
+                        f"Cleaned up log file: {log_file}")
+                except OSError as e:
+                    self.logger.warning(
+                        f"Could not remove log file {log_file}: {e}")
 
-        return results
+    def __del__(self):
+        """Clean up when the processor is deleted."""
+        # Terminate any active processes
+        self._terminate_active_processes()
+
+        # Restore original signal handlers
+        if hasattr(self, 'original_sigint_handler'):
+            signal.signal(signal.SIGINT, self.original_sigint_handler)
+        if hasattr(self, 'original_sigterm_handler'):
+            signal.signal(signal.SIGTERM, self.original_sigterm_handler)
 
     def batch_process(self) -> Dict[Path, Optional[Path]]:
         """
@@ -684,10 +1209,41 @@ class VideoProcessor:
         Returns:
             Dict[Path, Optional[Path]]: Dictionary mapping input paths to output paths
         """
-        self.logging_system.start_new_log_section("Batch Processing")
-        self.logger.info(
-            f"Starting batch processing with {self.num_threads} threads and batch size of {self.batch_size}")
-        return self.process_videos()
+        try:
+            self.logging_system.start_new_log_section("Batch Processing")
+            self.logger.info(
+                f"Starting batch processing with {self.num_threads} threads and batch size of {self.batch_size}")
+
+            # Print information about signal handling
+            print(
+                "\n[INFO] Processing started. Press Ctrl+C to gracefully stop processing.")
+            print(
+                "[INFO] All completed files will be saved, and processing will be cleanly terminated.\n")
+
+            # Process videos
+            return self.process_videos()
+
+        except KeyboardInterrupt:
+            # Handle keyboard interrupt at the top level
+            self.logger.warning("Batch processing interrupted by user")
+            print("\n[INFO] Processing halted by user. Cleaning up...")
+
+            # Clean up
+            self._cleanup_temp_files()
+            self._save_processed_cache()
+
+            # Return any results we have so far
+            return {}
+        except Exception as e:
+            self.logger.error(
+                f"Error during batch processing: {e}", exc_info=True)
+            print(f"\n[ERROR] An error occurred during processing: {e}")
+
+            # Clean up
+            self._cleanup_temp_files()
+            self._save_processed_cache()
+
+            return {}
 
 
 # Example usage

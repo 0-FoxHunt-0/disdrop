@@ -37,11 +37,6 @@ class TerminalGUI:
         self.term = Terminal()
         self.default_config = "default.yaml"
 
-        # Automatically select default config on initialization
-        if self._is_default_config_available():
-            self.selected_config = self.default_config
-            self._load_config_data()
-
         # Register cleanup function to ensure terminal is reset on exit
         atexit.register(self.cleanup_terminal)
 
@@ -114,13 +109,6 @@ class TerminalGUI:
         configs = sorted([f.name for f in self.config_dir.glob(
             "*.yaml") or self.config_dir.glob("*.yml")])
 
-        # If configs exist and no config is selected yet, select the default
-        if configs and not self.selected_config:
-            if self.default_config in configs:
-                self.selected_config = self.default_config
-            else:
-                self.selected_config = configs[0]
-
         return configs
 
     def main_menu(self):
@@ -150,6 +138,9 @@ class TerminalGUI:
                     if self.selected_config:
                         self.print_at(
                             start_y - 2, 5, f"Current config: {self.selected_config}")
+                    else:
+                        self.print_at(
+                            start_y - 2, 5, "No configuration selected. Please choose one.")
 
                     # Display footer with controls
                     self.display_footer(
@@ -167,11 +158,15 @@ class TerminalGUI:
                             self.config_menu()
                         elif selected == 1:  # Start Processing
                             if self.selected_config:
-                                # Only reload if not already loaded
+                                # Load the config data if not already loaded
                                 if not self.config_data:
                                     self._load_config_data()
                                 return self.config_data
                             else:
+                                # If no config selected, go to config selection menu
+                                self.display_warning(
+                                    "No configuration selected. Please choose one first.")
+                                time.sleep(1.5)
                                 self.config_menu()
                         elif selected == 2:  # Exit
                             return None
@@ -197,7 +192,7 @@ class TerminalGUI:
                 self.term.inkey()
                 return None
 
-        # Find index of the selected config
+        # Initialize selected index - don't automatically select
         selected = 0
         if self.selected_config in config_files:
             selected = config_files.index(self.selected_config)
@@ -239,6 +234,9 @@ class TerminalGUI:
                         self.selected_config = config_files[selected]
                         # Load the selected config data
                         self._load_config_data()
+                        self.display_info(
+                            f"Selected configuration: {self.selected_config}")
+                        time.sleep(1)
                         return
                     elif key.lower() == 'q':
                         return
@@ -247,93 +245,109 @@ class TerminalGUI:
                         self.selected_config = config_files[selected]
                         # Load the selected config data
                         self._load_config_data()
+                        self.display_info(
+                            f"Selected configuration: {self.selected_config}")
+                        time.sleep(1)
                         return
-        finally:
-            # Ensure terminal is reset if an exception occurs
-            self.cleanup_terminal()
+        except Exception as e:
+            self.logger.error(f"Error in config menu: {e}", exc_info=True)
 
     def select_config_file(self):
-        """Display menus to select a config file."""
-        # If default config is already loaded, return it directly
-        if self.config_data:
-            return self.config_data
+        """
+        Public method to select a config file.
+        This is the main entry point for configuration selection.
+
+        Returns:
+            Dict: The loaded configuration data
+        """
+        # Force the user to make a choice in the main menu
         return self.main_menu()
 
     def initialize_progress_display(self, video_files=None, gif_files=None):
-        """Initialize progress display for processing files."""
+        """Initialize progress bars for batch processing."""
         self.progress_bars = {}
 
         if video_files:
-            self.progress_bars['videos'] = {
-                'total': len(video_files),
-                'completed': 0,
-                'bar': tqdm(total=len(video_files), desc="Videos", unit="file")
-            }
+            self.progress_bars['videos'] = tqdm(
+                total=len(video_files),
+                desc="Processing Videos",
+                unit="file"
+            )
 
         if gif_files:
-            self.progress_bars['gifs'] = {
-                'total': len(gif_files),
-                'completed': 0,
-                'bar': tqdm(total=len(gif_files), desc="GIFs", unit="file")
-            }
+            self.progress_bars['gifs'] = tqdm(
+                total=len(gif_files),
+                desc="Processing GIFs",
+                unit="file"
+            )
 
     def update_progress(self, file_type, increment=1, message=None):
-        """Update the progress bar for a specific file type."""
+        """Update progress bar for a specific file type."""
         if file_type in self.progress_bars:
-            self.progress_bars[file_type]['completed'] += increment
-            self.progress_bars[file_type]['bar'].update(increment)
-
+            self.progress_bars[file_type].update(increment)
             if message:
-                self.progress_bars[file_type]['bar'].set_description(message)
+                self.progress_bars[file_type].set_description(message)
 
     def display_summary(self):
-        """Display a summary of processed files."""
-        try:
-            with self.term.fullscreen():
-                self.clear_screen()
-                self.display_banner()
+        """Display a summary of the processing results."""
+        print("\n=== Processing Summary ===")
 
-                y = 10
-                self.print_at(y, 2, "PROCESSING SUMMARY")
-                self.print_at(y+1, 2, "="*20)
+        for file_type, progress_bar in self.progress_bars.items():
+            print(
+                f"{file_type.capitalize()}: Processed {progress_bar.n}/{progress_bar.total} files")
+            progress_bar.close()
 
-                y += 3
-                for file_type, data in self.progress_bars.items():
-                    self.print_at(
-                        y, 2, f"{file_type.capitalize()}: {data['completed']}/{data['total']} files processed")
-                    data['bar'].close()
-                    y += 1
+        print("==========================\n")
 
-                self.display_footer("Press any key to continue...")
-                self.term.inkey()
-        finally:
-            self.cleanup_terminal()
+    def display_warning(self, message):
+        """Display a warning message in the terminal."""
+        if hasattr(self, 'term') and self.term:
+            try:
+                current_pos = self.term.get_location()
+                warning_y = self.term.height - 4
+
+                # Create a bordered warning box
+                box_width = len(message) + 4
+
+                # Draw the box
+                self.print_at(warning_y - 1, 2, "╔" + "═" * box_width + "╗")
+                self.print_at(warning_y, 2, "║ " +
+                              self.term.bold_yellow(message) + " ║")
+                self.print_at(warning_y + 1, 2, "╚" + "═" * box_width + "╝")
+
+                # Reset cursor position
+                if current_pos:
+                    self.print_at(current_pos[0], current_pos[1], "")
+            except Exception as e:
+                # Fallback to simple print
+                print(f"\nWARNING: {message}\n")
+        else:
+            # Fallback to simple print
+            print(f"\nWARNING: {message}\n")
 
     def display_error(self, message):
-        """Display an error message."""
-        try:
-            with self.term.fullscreen():
-                self.clear_screen()
-                self.display_banner()
-
-                self.print_at(10, 2, f"ERROR: {message}")
-                self.display_footer("Press any key to continue...")
-                self.term.inkey()
-        finally:
-            self.cleanup_terminal()
+        """Display an error message to the user."""
+        if hasattr(self, 'term') and self.term:
+            try:
+                print(self.term.bold_red(f"\nERROR: {message}\n"))
+            except:
+                # Fallback to simple print
+                print(f"\nERROR: {message}\n")
+        else:
+            # Fallback to simple print
+            print(f"\nERROR: {message}\n")
 
     def display_info(self, message):
-        """Display an informational message."""
-        try:
-            with self.term.fullscreen():
-                self.clear_screen()
-                self.display_banner()
-
-                self.print_at(10, 2, f"INFO: {message}")
-                self.display_footer("Press any key to continue...")
-                self.term.inkey()
-        finally:
-            self.cleanup_terminal()
+        """Display an informational message to the user."""
+        if hasattr(self, 'term') and self.term:
+            try:
+                print(self.term.bold_cyan(f"\nINFO: {message}\n"))
+            except:
+                # Fallback to simple print
+                print(f"\nINFO: {message}\n")
+        else:
+            # Fallback to simple print
+            print(f"\nINFO: {message}\n")
 
 
 # Simple test if run directly

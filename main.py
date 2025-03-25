@@ -108,7 +108,7 @@ def main():
             config = yaml.safe_load(f)
     else:
         # Use terminal GUI to select a config file
-        config = terminal_gui.select_config_file()
+        config = terminal_gui.main_menu()  # Let user select config through the menu
 
     if not config:
         print("No configuration loaded. Exiting.")
@@ -155,7 +155,8 @@ def main():
             # Start a new log section for video processing
             logging_system.start_new_log_section("Video Processing")
 
-            # Initialize video processor
+            # Initialize video processor - this is now done only after user has selected to start processing
+            terminal_gui.display_info("Initializing video processor...")
             video_processor = VideoProcessor(config)
 
             # Register shutdown flag check with video processor
@@ -216,7 +217,8 @@ def main():
             # Start a new log section for GIF processing
             logging_system.start_new_log_section("GIF Processing")
 
-            # Initialize GIF processor
+            # Initialize GIF processor - only now after user selected to start processing
+            terminal_gui.display_info("Initializing GIF processor...")
             gif_processor = GIFProcessor(config)
 
             # Register shutdown flag check with GIF processor

@@ -179,16 +179,91 @@ class GPUDetector:
         self._detect_intel_linux()
 
     def _detect_nvidia_windows(self) -> None:
-        """Detect NVIDIA GPUs on Windows."""
-        # Look for NVIDIA CUDA on Windows
-        nvml_path = shutil.which("nvidia-smi")
-        if nvml_path:
-            output = self._run_command("nvidia-smi")
-            if output and not "failed" in output.lower():
+        """Detect NVIDIA GPUs on Windows with improved RTX support."""
+        # Look for NVIDIA CUDA on Windows using multiple detection methods
+        try:
+            # Try nvidia-smi first as it's faster and more reliable
+            nvml_path = shutil.which("nvidia-smi")
+            if nvml_path:
+                # On Windows, check common nvidia-smi paths
+                nvidia_smi_paths = [
+                    nvml_path,  # Use the found path
+                    r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe",
+                    r"C:\Windows\System32\nvidia-smi.exe"
+                ]
+
+                for path in nvidia_smi_paths:
+                    try:
+                        # Use a short timeout to avoid hanging
+                        output = self._run_command(f'"{path}" --query-gpu=name,memory.total --format=csv,noheader,nounits')
+                        if output and not "failed" in output.lower():
+                            self.detected_gpus.add(GPUType.NVIDIA)
+                            self.available_accelerations.add(AccelerationType.CUDA)
+                            
+                            # Check for RTX GPUs which definitely support NVENC
+                            if 'RTX' in output:
+                                self.logger.success("NVIDIA RTX GPU detected with NVENC support")
+                            else:
+                                self.logger.success("NVIDIA GPU detected with CUDA support")
+                            
+                            return True
+                    except Exception as e:
+                        self.logger.debug(f"Failed to use nvidia-smi at {path}: {e}")
+                        continue
+            
+            # If nvidia-smi fails, try dxdiag
+            dxdiag_output = self._run_command("dxdiag /t")
+            if dxdiag_output and "nvidia" in dxdiag_output.lower():
+                self.detected_gpus.add(GPUType.NVIDIA)
+                self.logger.info("NVIDIA GPU detected via dxdiag")
+                
+                # Check for RTX series which definitely supports NVENC
+                if 'RTX' in dxdiag_output:
+                    self.available_accelerations.add(AccelerationType.CUDA)
+                    self.logger.success("NVIDIA RTX GPU with NVENC support detected")
+                return True
+                
+            # Try PowerShell as a fallback
+            ps_cmd = "Get-WmiObject -Query \"SELECT * FROM Win32_VideoController WHERE Name LIKE '%NVIDIA%'\" | Select-Object Name | ConvertTo-Csv -NoTypeInformation"
+            output = self._run_command(f'powershell -Command "{ps_cmd}"')
+            
+            if output and "nvidia" in output.lower():
+                self.detected_gpus.add(GPUType.NVIDIA)
+                self.logger.info("NVIDIA GPU detected via WMI")
+                
+                # Check for RTX series which definitely supports NVENC
+                if 'RTX' in output:
+                    self.available_accelerations.add(AccelerationType.CUDA)
+                    self.logger.success("NVIDIA RTX GPU with NVENC support detected")
+                return True
+                
+            # Final check - use FFmpeg to see if NVENC is available
+            self._detect_ffmpeg_nvenc_support()
+            
+            if AccelerationType.CUDA in self.available_accelerations:
+                return True
+                
+        except Exception as e:
+            self.logger.error(f"Error detecting NVIDIA GPU: {e}")
+            
+        return False
+        
+    def _detect_ffmpeg_nvenc_support(self) -> bool:
+        """Check if FFmpeg can use NVENC."""
+        try:
+            # Check for NVENC support using FFmpeg directly
+            output = self._run_command("ffmpeg -encoders")
+            if output and ('h264_nvenc' in output.lower() or 'hevc_nvenc' in output.lower()):
                 self.detected_gpus.add(GPUType.NVIDIA)
                 self.available_accelerations.add(AccelerationType.CUDA)
-                self.logger.success("NVIDIA GPU with CUDA support detected")
-
+                self.logger.success("NVENC support detected via FFmpeg encoders")
+                return True
+                
+            return False
+        except Exception as e:
+            self.logger.debug(f"Error checking NVENC support: {e}")
+            return False
+            
     def _detect_amd_windows(self) -> None:
         """Detect AMD GPUs on Windows."""
         # Check for AMD GPUs
@@ -292,26 +367,35 @@ class GPUDetector:
 
     def _run_command(self, command: str) -> Optional[str]:
         """
-        Run a system command and return the output.
-
+        Run a shell command and return its output with improved timeout handling.
+        
         Args:
-            command: The command to run
-
+            command: Command to run
+            
         Returns:
-            Optional[str]: Command output or None if command failed
+            str: Command output if successful, None otherwise
         """
         try:
-            result = subprocess.run(
+            # Use a timeout to prevent hanging on problematic commands
+            process = subprocess.run(
                 command,
-                shell=True,
-                check=False,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=5  # Avoid hanging on problematic commands
+                timeout=4,  # 4 second timeout
+                shell=True
             )
-            return result.stdout
-        except (subprocess.SubprocessError, OSError) as e:
-            self.logger.debug(f"Command '{command}' failed: {e}")
+            
+            if process.returncode == 0:
+                return process.stdout
+            else:
+                self.logger.debug(f"Command '{command}' failed with code {process.returncode}")
+                return None
+        except subprocess.TimeoutExpired:
+            self.logger.debug(f"Command '{command}' timed out after 4 seconds")
+            return None
+        except Exception as e:
+            self.logger.debug(f"Error running command '{command}': {e}")
             return None
 
     def get_device_info(self) -> Dict:
