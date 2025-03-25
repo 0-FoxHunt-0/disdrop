@@ -10,6 +10,7 @@ import colorama
 from pathlib import Path
 from typing import Dict, Optional, Union, List, Set, Tuple, Any
 from enum import Enum
+import shutil
 
 
 # Initialize colorama for cross-platform colored terminal output
@@ -259,6 +260,10 @@ class LoggingSystem:
             root_logger = logging.getLogger()
             root_logger.info(
                 f"DirectX diagnostic information saved to {dxdiag_path}")
+
+            # Check for any dxdiag files that might have been generated elsewhere
+            self.find_and_move_dxdiag_file()
+
             return True
 
         except (subprocess.SubprocessError, OSError) as e:
@@ -266,6 +271,13 @@ class LoggingSystem:
             root_logger = logging.getLogger()
             root_logger.error(
                 f"Failed to capture DirectX diagnostic information: {e}")
+
+            # Even if the subprocess failed, try to find existing dxdiag files
+            if self.find_and_move_dxdiag_file():
+                root_logger.info(
+                    "Found and moved existing dxdiag file instead")
+                return True
+
             return False
 
     def clear_log_file(self, log_file: Union[str, Path]) -> None:
@@ -374,3 +386,57 @@ class LoggingSystem:
             except ImportError:
                 logger.info(
                     "psutil not available for detailed memory and disk info")
+
+    def find_and_move_dxdiag_file(self) -> Optional[Path]:
+        """
+        Find any dxdiag.txt files in the project directory (outside the logs directory)
+        and move them to the logs directory. If a dxdiag.txt already exists in the logs 
+        directory, it will be overwritten.
+
+        Returns:
+            Optional[Path]: Path to the moved dxdiag file, or None if no file was found or moved
+        """
+        try:
+            # Get the project root directory (parent of the logs directory)
+            project_root = Path().resolve()
+            logs_dir_absolute = self.logs_dir.resolve()
+
+            # Search for dxdiag.txt files in the project directory and subdirectories
+            dxdiag_files = []
+            for path in project_root.glob('**/dxdiag.txt'):
+                # Convert to absolute path for reliable comparison
+                abs_path = path.resolve()
+
+                # Skip files that are already in the logs directory
+                if logs_dir_absolute in abs_path.parents or abs_path.parent == logs_dir_absolute:
+                    continue
+                dxdiag_files.append(abs_path)
+
+            if not dxdiag_files:
+                return None
+
+            # Get the most recent dxdiag file
+            most_recent = max(dxdiag_files, key=lambda p: p.stat().st_mtime)
+
+            # Destination path in logs directory (absolute path)
+            dest_path = logs_dir_absolute / 'dxdiag.txt'
+
+            # Log information
+            logger = self.get_logger('logging_system')
+            logger.info(f"Found dxdiag file at {most_recent}")
+
+            # Move the file to the logs directory (overwrite if exists)
+            if dest_path.exists():
+                dest_path.unlink()
+
+            # Use shutil.copy2 to preserve metadata, then remove the original
+            shutil.copy2(most_recent, dest_path)
+            most_recent.unlink()
+
+            logger.info(f"Moved dxdiag file to {dest_path}")
+            return dest_path
+
+        except Exception as e:
+            logger = self.get_logger('logging_system')
+            logger.error(f"Error finding/moving dxdiag file: {e}")
+            return None

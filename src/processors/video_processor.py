@@ -86,6 +86,9 @@ class VideoProcessor:
         self.gpu_types, self.acceleration_types = self.gpu_detector.detect()
         self.preferred_acceleration = self.gpu_detector.get_preferred_acceleration()
 
+        # Check for any dxdiag files that might have been generated during GPU detection
+        self.logging_system.find_and_move_dxdiag_file()
+
         self.logger.info(
             f"Video processor initialized with {self.preferred_acceleration.name} acceleration")
         self.logger.info(
