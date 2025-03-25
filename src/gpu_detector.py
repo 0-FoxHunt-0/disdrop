@@ -61,6 +61,10 @@ class GPUDetector:
         self.logging_system = LoggingSystem(self.config)
         self.logger = self.logging_system.get_logger('gpu_detector')
 
+        # Start a section for GPU detection
+        self.logging_system.start_new_log_section(
+            "GPU Detection Initialization")
+
         self.os_type = platform.system().lower()
         self.detected_gpus = set()
         self.available_accelerations = set()
@@ -76,6 +80,11 @@ class GPUDetector:
         """
         if self._detection_performed:
             return self.detected_gpus, self.available_accelerations
+
+        # Start a new log section for GPU detection
+        self.logging_system.start_new_log_section("GPU Detection Process")
+        self.logger.info(
+            f"Detecting GPUs and acceleration frameworks on {self.os_type}")
 
         # Always ensure CPU is available as fallback
         self.available_accelerations.add(AccelerationType.CPU)
@@ -128,7 +137,7 @@ class GPUDetector:
 
         for accel in preferences:
             if accel in self.available_accelerations:
-                self.logger.info(
+                self.logger.success(
                     f"Selected {accel.name} as preferred acceleration method")
                 return accel
 
@@ -161,7 +170,7 @@ class GPUDetector:
 
                 # Metal is available on all modern Macs
                 self.available_accelerations.add(AccelerationType.METAL)
-                self.logger.info("Metal acceleration is available")
+                self.logger.success("Metal acceleration is available")
 
     def _detect_on_linux(self) -> None:
         """Detect GPUs on Linux systems."""
@@ -178,7 +187,7 @@ class GPUDetector:
             if output and not "failed" in output.lower():
                 self.detected_gpus.add(GPUType.NVIDIA)
                 self.available_accelerations.add(AccelerationType.CUDA)
-                self.logger.info("NVIDIA GPU with CUDA support detected")
+                self.logger.success("NVIDIA GPU with CUDA support detected")
 
     def _detect_amd_windows(self) -> None:
         """Detect AMD GPUs on Windows."""
@@ -191,7 +200,7 @@ class GPUDetector:
             # Check for ROCm
             if shutil.which("rocm-smi"):
                 self.available_accelerations.add(AccelerationType.ROCM)
-                self.logger.info("AMD ROCm acceleration is available")
+                self.logger.success("AMD ROCm acceleration is available")
 
     def _detect_intel_windows(self) -> None:
         """Detect Intel GPUs on Windows."""
@@ -203,15 +212,25 @@ class GPUDetector:
             # Check for OneAPI
             if os.environ.get("ONEAPI_ROOT") or shutil.which("sycl-ls"):
                 self.available_accelerations.add(AccelerationType.ONEAPI)
-                self.logger.info("Intel OneAPI acceleration is available")
+                self.logger.success("Intel OneAPI acceleration is available")
 
     def _detect_directml(self) -> None:
         """Detect DirectML support on Windows."""
         if self.os_type == 'windows':
             # If we have any GPU and we're on Windows 10/11, DirectML should be available
-            if self.detected_gpus and int(platform.version().split('.')[0]) >= 10:
-                self.available_accelerations.add(AccelerationType.DIRECTML)
-                self.logger.info("DirectML acceleration is available")
+            try:
+                windows_version = int(platform.version().split('.')[0])
+                if self.detected_gpus and windows_version >= 10:
+                    self.available_accelerations.add(AccelerationType.DIRECTML)
+                    self.logger.success("DirectML acceleration is available")
+            except (ValueError, IndexError) as e:
+                self.logger.warning(
+                    f"Failed to determine Windows version: {e}")
+                # Fall back to checking if we're on Windows 10 or higher without the version number
+                if self.detected_gpus and any(ver in platform.version() for ver in ['10.', '11.']):
+                    self.available_accelerations.add(AccelerationType.DIRECTML)
+                    self.logger.success(
+                        "DirectML acceleration is available (fallback detection)")
 
     def _detect_nvidia_linux(self) -> None:
         """Detect NVIDIA GPUs on Linux."""
@@ -224,7 +243,8 @@ class GPUDetector:
                 # Check for CUDA
                 if shutil.which("nvcc") or os.path.exists("/usr/local/cuda"):
                     self.available_accelerations.add(AccelerationType.CUDA)
-                    self.logger.info("NVIDIA GPU with CUDA support detected")
+                    self.logger.success(
+                        "NVIDIA GPU with CUDA support detected")
 
     def _detect_amd_linux(self) -> None:
         """Detect AMD GPUs on Linux."""
@@ -237,7 +257,7 @@ class GPUDetector:
                 # Check for ROCm
                 if shutil.which("rocm-smi") or os.path.exists("/opt/rocm"):
                     self.available_accelerations.add(AccelerationType.ROCM)
-                    self.logger.info("AMD GPU with ROCm support detected")
+                    self.logger.success("AMD GPU with ROCm support detected")
 
     def _detect_intel_linux(self) -> None:
         """Detect Intel GPUs on Linux."""
@@ -249,7 +269,7 @@ class GPUDetector:
             # Check for OneAPI
             if os.environ.get("ONEAPI_ROOT") or shutil.which("sycl-ls"):
                 self.available_accelerations.add(AccelerationType.ONEAPI)
-                self.logger.info("Intel GPU with OneAPI support detected")
+                self.logger.success("Intel GPU with OneAPI support detected")
 
     def _detect_opencl(self) -> None:
         """Detect OpenCL support (cross-platform)."""
@@ -268,7 +288,7 @@ class GPUDetector:
 
         if any(opencl_indicators):
             self.available_accelerations.add(AccelerationType.OPENCL)
-            self.logger.info("OpenCL acceleration is available")
+            self.logger.success("OpenCL acceleration is available")
 
     def _run_command(self, command: str) -> Optional[str]:
         """
@@ -330,26 +350,45 @@ class GPUDetector:
 
 # Example usage
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+    config = {
+        'logging': {
+            'level': 'INFO',
+            'console_level': 'INFO',
+            'file_level': 'DEBUG',
+            'directory': './logs',
+            'clear_logs': True
+        }
+    }
 
-    detector = GPUDetector()
+    # Initialize the logging system
+    logging_system = LoggingSystem(config)
+    logger = logging_system.get_logger('main')
+
+    # Start with a section header for GPU detection
+    logging_system.start_new_log_section("GPU Detection")
+
+    logger.info("Initializing GPU detector")
+    detector = GPUDetector(config)
+
+    # Detect GPU capabilities
     gpu_types, accel_types = detector.detect()
+    preferred = detector.get_preferred_acceleration()
 
-    print(f"Detected GPU types: {[gpu.name for gpu in gpu_types]}")
-    print(f"Available acceleration: {[accel.name for accel in accel_types]}")
-    print(
-        f"Preferred acceleration: {detector.get_preferred_acceleration().name}")
+    logger.info(f"Detected GPU types: {[gpu.name for gpu in gpu_types]}")
+    logger.info(
+        f"Available acceleration: {[accel.name for accel in accel_types]}")
+    logger.success(f"Preferred acceleration: {preferred.name}")
 
     # Get detailed device info
     device_info = detector.get_device_info()
-    print("\nDevice info:")
+    logger.info("\nDevice info:")
     for key, value in device_info.items():
         if key != "detailed_info":
-            print(f"  {key}: {value}")
+            logger.info(f"  {key}: {value}")
 
     if device_info["detailed_info"]:
-        print("\nDetailed GPU information:")
+        logger.info("\nDetailed GPU information:")
         for gpu, info in device_info["detailed_info"].items():
-            print(f"  {gpu.upper()}:")
+            logger.info(f"  {gpu.upper()}:")
             for line in info.strip().split('\n'):
-                print(f"    {line}")
+                logger.info(f"    {line}")

@@ -52,6 +52,10 @@ class VideoProcessor:
         self.logging_system = LoggingSystem(self.config)
         self.logger = self.logging_system.get_logger('video_processor')
 
+        # Start a section for initialization
+        self.logging_system.start_new_log_section(
+            "Video Processor Initialization")
+
         # Set up directories
         self.input_dir = Path(self.config.get(
             'directories', {}).get('input', './input')).resolve()
@@ -377,7 +381,7 @@ class VideoProcessor:
                 text=True
             )
 
-            self.logger.info(f"Video conversion completed: {temp_output}")
+            self.logger.success(f"Video conversion completed: {temp_output}")
             return temp_output
 
         except subprocess.CalledProcessError as e:
@@ -501,7 +505,7 @@ class VideoProcessor:
                 self.processed_cache[input_file.name] = settings_hash
                 self._save_processed_cache()
 
-            self.logger.info(f"Video optimization completed: {output_file}")
+            self.logger.success(f"Video optimization completed: {output_file}")
             return output_file
 
         except subprocess.CalledProcessError as e:
@@ -590,6 +594,9 @@ class VideoProcessor:
         Returns:
             Dict[Path, Optional[Path]]: Dictionary mapping input paths to output paths (or None if processing failed)
         """
+        # Start a new log section for this processing run
+        self.logging_system.start_new_log_section("Video Processing Started")
+
         # Find all video files
         mp4_files, other_video_files = self.find_video_files()
         all_files = mp4_files + other_video_files
@@ -663,7 +670,7 @@ class VideoProcessor:
                          if output is not None)
         failed = sum(1 for output in results.values() if output is None)
         if successful > 0:
-            self.logger.info(
+            self.logger.success(
                 f"Successfully processed {successful} video files")
         if failed > 0:
             self.logger.warning(f"Failed to process {failed} video files")
@@ -677,13 +684,14 @@ class VideoProcessor:
         Returns:
             Dict[Path, Optional[Path]]: Dictionary mapping input paths to output paths
         """
+        self.logging_system.start_new_log_section("Batch Processing")
+        self.logger.info(
+            f"Starting batch processing with {self.num_threads} threads and batch size of {self.batch_size}")
         return self.process_videos()
 
 
 # Example usage
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-
     # Simple config for testing
     config = {
         'directories': {
@@ -704,20 +712,38 @@ if __name__ == "__main__":
         'audio': {
             'bitrate': '128k'
         },
-        'codec': 'h264'
+        'codec': 'h264',
+        'logging': {
+            'level': 'INFO',
+            'console_level': 'INFO',
+            'file_level': 'DEBUG',
+            'directory': './logs',
+            'clear_logs': True
+        }
     }
 
+    # Initialize the logging system
+    logging_system = LoggingSystem(config)
+    logger = logging_system.get_logger('main')
+
+    # Start with a section header for processing
+    logging_system.start_new_log_section("Video Processing")
+
+    logger.info("Initializing video processor")
     processor = VideoProcessor(config)
 
     # Get info about acceleration
-    print(f"Using acceleration: {processor.preferred_acceleration.name}")
+    logger.info(f"Using acceleration: {processor.preferred_acceleration.name}")
 
     # Process all videos
+    logger.info("Starting batch processing of videos")
     results = processor.batch_process()
 
     # Print results
-    print("\nProcessing results:")
+    logger.info("\nProcessing results:")
     for input_file, output_file in results.items():
         status = "SUCCESS" if output_file else "FAILED"
-        print(
-            f"{input_file.name} → {output_file.name if output_file else 'N/A'} : {status}")
+        if output_file:
+            logger.success(f"{input_file.name} → {output_file.name}")
+        else:
+            logger.error(f"{input_file.name} → N/A (processing failed)")
