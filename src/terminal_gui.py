@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from tqdm import tqdm
 from blessed import Terminal
+import atexit
 
 
 class TerminalGUI:
@@ -15,6 +16,17 @@ class TerminalGUI:
     Provides functionality to select config files and display processing progress.
     Uses full-screen terminal and keyboard navigation.
     """
+
+    # ASCII art banner - fixed formatting for proper alignment
+    BANNER = """
+ ::::::::: ::::::::::: ::::::::  :::::::::  :::::::::   ::::::::  ::::::::: 
+:+:    :+:    :+:    :+:    :+: :+:    :+: :+:    :+: :+:    :+: :+:    :+: 
++:+    +:+    +:+    +:+        +:+    +:+ +:+    +:+ +:+    +:+ +:+    +:+  
++#+    +:+    +#+    +#++:++#++ +#+    +:+ +#++:++#:  +#+    +:+ +#++:++#+    
++#+    +#+    +#+           +#+ +#+    +#+ +#+    +#+ +#+    +#+ +#+           
+#+#    #+#    #+#    #+#    #+# #+#    #+# #+#    #+# #+#    #+# #+#            
+#########  ###########  ########  #########   ###    ###   ########   ###             
+"""
 
     def __init__(self):
         self.config_dir = Path("config")
@@ -25,27 +37,67 @@ class TerminalGUI:
         self.term = Terminal()
         self.default_config = "default.yaml"
 
+        # Automatically select default config on initialization
+        if self._is_default_config_available():
+            self.selected_config = self.default_config
+            self._load_config_data()
+
+        # Register cleanup function to ensure terminal is reset on exit
+        atexit.register(self.cleanup_terminal)
+
+    def _is_default_config_available(self):
+        """Check if the default config file exists."""
+        default_config_path = self.config_dir / self.default_config
+        return default_config_path.exists()
+
+    def _load_config_data(self):
+        """Load the data from the selected config file."""
+        if self.selected_config:
+            config_path = self.config_dir / self.selected_config
+            try:
+                with open(config_path, 'r') as f:
+                    self.config_data = yaml.safe_load(f)
+                self.logger.info(f"Loaded config file: {self.selected_config}")
+                return True
+            except Exception as e:
+                self.logger.error(f"Failed to load config file: {e}")
+        return False
+
+    def cleanup_terminal(self):
+        """Clean up terminal state on exit"""
+        print(self.term.normal_cursor, end='')
+        print(self.term.exit_fullscreen, end='')
+        print(self.term.clear, end='')
+        sys.stdout.flush()
+
     def clear_screen(self):
         """Clear the terminal screen."""
-        print(self.term.clear)
+        print(self.term.clear, end='')
+        sys.stdout.flush()
 
     def print_centered(self, y, text):
         """Print text centered horizontally at position y."""
         x = max(0, (self.term.width // 2) - (len(text) // 2))
-        print(self.term.move(y, x) + text)
+        print(self.term.move(y, x) + text, end='')
+        sys.stdout.flush()
 
     def print_at(self, y, x, text):
         """Print text at specific coordinates."""
-        print(self.term.move(y, x) + text)
+        print(self.term.move(y, x) + text, end='')
+        sys.stdout.flush()
 
     def display_banner(self):
-        """Display the application banner at the top of the screen."""
-        banner_text = "VIDEO AND GIF COMPRESSION TOOL"
-        banner_decoration = "=" * len(banner_text)
+        """Display the ASCII art banner at the top of the screen."""
+        # Split the banner into lines and remove empty lines
+        banner_lines = [
+            line for line in self.BANNER.split('\n') if line.strip()]
 
-        self.print_centered(1, banner_decoration)
-        self.print_centered(2, banner_text)
-        self.print_centered(3, banner_decoration)
+        # Calculate the starting y position
+        start_y = 1
+
+        # Print each line of the banner centered horizontally
+        for i, line in enumerate(banner_lines):
+            self.print_centered(start_y + i, line)
 
     def display_footer(self, message):
         """Display controls and information at the bottom of the screen."""
@@ -73,61 +125,63 @@ class TerminalGUI:
 
     def main_menu(self):
         """Display the main menu and handle user input."""
-        with self.term.fullscreen(), self.term.cbreak(), self.term.hidden_cursor():
-            selected = 0
-            options = ["Choose Configuration", "Start Processing", "Exit"]
+        try:
+            # Use the alternate screen buffer to prevent scrolling
+            with self.term.fullscreen(), self.term.hidden_cursor(), self.term.cbreak():
+                selected = 0
+                options = ["Choose Configuration", "Start Processing", "Exit"]
 
-            while True:
-                self.clear_screen()
-                self.display_banner()
+                while True:
+                    self.clear_screen()
+                    self.display_banner()
 
-                # Display menu options
-                for i, option in enumerate(options):
-                    y = 6 + i
-                    if i == selected:
-                        self.print_at(y, 5, f"> {option} <")
-                    else:
-                        self.print_at(y, 5, f"  {option}  ")
+                    # Calculate starting position below the banner
+                    start_y = 10  # Adjusted to accommodate the ASCII banner
 
-                # Display current config if available
-                if self.selected_config:
-                    self.print_at(self.term.height - 4, 2,
-                                  f"Current config: {self.selected_config}")
-
-                # Display footer with controls
-                self.display_footer(
-                    "Use ↑/↓ to navigate, ENTER to select, Q to quit")
-
-                # Get user input
-                key = self.term.inkey()
-
-                if key.code == self.term.KEY_UP:
-                    selected = max(0, selected - 1)
-                elif key.code == self.term.KEY_DOWN:
-                    selected = min(len(options) - 1, selected + 1)
-                elif key.code == self.term.KEY_ENTER:
-                    if selected == 0:  # Choose Configuration
-                        self.config_menu()
-                    elif selected == 1:  # Start Processing
-                        if self.selected_config:
-                            config_path = self.config_dir / self.selected_config
-                            try:
-                                with open(config_path, 'r') as f:
-                                    self.config_data = yaml.safe_load(f)
-                                self.logger.info(
-                                    f"Selected config file: {self.selected_config}")
-                                return self.config_data
-                            except Exception as e:
-                                self.logger.error(
-                                    f"Failed to load config file: {e}")
+                    # Display menu options
+                    for i, option in enumerate(options):
+                        y = start_y + i
+                        if i == selected:
+                            self.print_at(y, 5, f"> {option} <")
                         else:
+                            self.print_at(y, 5, f"  {option}  ")
+
+                    # Display current config if available
+                    if self.selected_config:
+                        self.print_at(
+                            start_y - 2, 5, f"Current config: {self.selected_config}")
+
+                    # Display footer with controls
+                    self.display_footer(
+                        "Use ↑/↓ to navigate, ENTER to select, Q to quit")
+
+                    # Get user input
+                    key = self.term.inkey()
+
+                    if key.code == self.term.KEY_UP:
+                        selected = max(0, selected - 1)
+                    elif key.code == self.term.KEY_DOWN:
+                        selected = min(len(options) - 1, selected + 1)
+                    elif key.code == self.term.KEY_ENTER:
+                        if selected == 0:  # Choose Configuration
                             self.config_menu()
-                    elif selected == 2:  # Exit
-                        sys.exit(0)
-                elif key.lower() == 'q':
-                    sys.exit(0)
-                elif key.isdigit() and 1 <= int(key) <= len(options):
-                    selected = int(key) - 1
+                        elif selected == 1:  # Start Processing
+                            if self.selected_config:
+                                # Only reload if not already loaded
+                                if not self.config_data:
+                                    self._load_config_data()
+                                return self.config_data
+                            else:
+                                self.config_menu()
+                        elif selected == 2:  # Exit
+                            return None
+                    elif key.lower() == 'q':
+                        return None
+                    elif key.isdigit() and 1 <= int(key) <= len(options):
+                        selected = int(key) - 1
+        finally:
+            # Ensure terminal is reset if an exception occurs
+            self.cleanup_terminal()
 
     def config_menu(self):
         """Display the config selection menu and handle user input."""
@@ -138,7 +192,7 @@ class TerminalGUI:
                 self.clear_screen()
                 self.display_banner()
                 self.print_at(
-                    6, 2, "No config files found in the config directory.")
+                    10, 2, "No config files found in the config directory.")
                 self.display_footer("Press any key to return to main menu")
                 self.term.inkey()
                 return None
@@ -148,47 +202,61 @@ class TerminalGUI:
         if self.selected_config in config_files:
             selected = config_files.index(self.selected_config)
 
-        with self.term.fullscreen(), self.term.cbreak(), self.term.hidden_cursor():
-            while True:
-                self.clear_screen()
-                self.display_banner()
+        try:
+            with self.term.fullscreen(), self.term.hidden_cursor(), self.term.cbreak():
+                while True:
+                    self.clear_screen()
+                    self.display_banner()
 
-                # Display current config
-                self.print_at(
-                    5, 2, f"Current config: {self.selected_config or 'None'}")
+                    # Adjust y positions to accommodate ASCII banner
+                    start_y = 10
 
-                # Display config files
-                self.print_at(7, 2, "Available configurations:")
-                for i, config in enumerate(config_files):
-                    y = 9 + i
-                    if i == selected:
-                        self.print_at(y, 4, f"→ {i+1}. {config}")
-                    else:
-                        self.print_at(y, 4, f"  {i+1}. {config}")
+                    # Display current config
+                    self.print_at(
+                        start_y, 2, f"Current config: {self.selected_config or 'None'}")
 
-                # Display footer with controls
-                self.display_footer(
-                    "Use ↑/↓ to navigate, ENTER to select, Q to return to main menu")
+                    # Display config files
+                    self.print_at(start_y + 2, 2, "Available configurations:")
+                    for i, config in enumerate(config_files):
+                        y = start_y + 4 + i
+                        if i == selected:
+                            self.print_at(y, 4, f"→ {i+1}. {config}")
+                        else:
+                            self.print_at(y, 4, f"  {i+1}. {config}")
 
-                # Get user input
-                key = self.term.inkey()
+                    # Display footer with controls
+                    self.display_footer(
+                        "Use ↑/↓ to navigate, ENTER to select, Q to return to main menu")
 
-                if key.code == self.term.KEY_UP:
-                    selected = max(0, selected - 1)
-                elif key.code == self.term.KEY_DOWN:
-                    selected = min(len(config_files) - 1, selected + 1)
-                elif key.code == self.term.KEY_ENTER:
-                    self.selected_config = config_files[selected]
-                    return
-                elif key.lower() == 'q':
-                    return
-                elif key.isdigit() and 1 <= int(key) <= len(config_files):
-                    selected = int(key) - 1
-                    self.selected_config = config_files[selected]
-                    return
+                    # Get user input
+                    key = self.term.inkey()
+
+                    if key.code == self.term.KEY_UP:
+                        selected = max(0, selected - 1)
+                    elif key.code == self.term.KEY_DOWN:
+                        selected = min(len(config_files) - 1, selected + 1)
+                    elif key.code == self.term.KEY_ENTER:
+                        self.selected_config = config_files[selected]
+                        # Load the selected config data
+                        self._load_config_data()
+                        return
+                    elif key.lower() == 'q':
+                        return
+                    elif key.isdigit() and 1 <= int(key) <= len(config_files):
+                        selected = int(key) - 1
+                        self.selected_config = config_files[selected]
+                        # Load the selected config data
+                        self._load_config_data()
+                        return
+        finally:
+            # Ensure terminal is reset if an exception occurs
+            self.cleanup_terminal()
 
     def select_config_file(self):
         """Display menus to select a config file."""
+        # If default config is already loaded, return it directly
+        if self.config_data:
+            return self.config_data
         return self.main_menu()
 
     def initialize_progress_display(self, video_files=None, gif_files=None):
@@ -220,43 +288,52 @@ class TerminalGUI:
 
     def display_summary(self):
         """Display a summary of processed files."""
-        with self.term.fullscreen():
-            self.clear_screen()
-            self.display_banner()
+        try:
+            with self.term.fullscreen():
+                self.clear_screen()
+                self.display_banner()
 
-            y = 6
-            self.print_at(y, 2, "PROCESSING SUMMARY")
-            self.print_at(y+1, 2, "="*20)
+                y = 10
+                self.print_at(y, 2, "PROCESSING SUMMARY")
+                self.print_at(y+1, 2, "="*20)
 
-            y += 3
-            for file_type, data in self.progress_bars.items():
-                self.print_at(
-                    y, 2, f"{file_type.capitalize()}: {data['completed']}/{data['total']} files processed")
-                data['bar'].close()
-                y += 1
+                y += 3
+                for file_type, data in self.progress_bars.items():
+                    self.print_at(
+                        y, 2, f"{file_type.capitalize()}: {data['completed']}/{data['total']} files processed")
+                    data['bar'].close()
+                    y += 1
 
-            self.display_footer("Press any key to continue...")
-            self.term.inkey()
+                self.display_footer("Press any key to continue...")
+                self.term.inkey()
+        finally:
+            self.cleanup_terminal()
 
     def display_error(self, message):
         """Display an error message."""
-        with self.term.fullscreen():
-            self.clear_screen()
-            self.display_banner()
+        try:
+            with self.term.fullscreen():
+                self.clear_screen()
+                self.display_banner()
 
-            self.print_at(6, 2, f"ERROR: {message}")
-            self.display_footer("Press any key to continue...")
-            self.term.inkey()
+                self.print_at(10, 2, f"ERROR: {message}")
+                self.display_footer("Press any key to continue...")
+                self.term.inkey()
+        finally:
+            self.cleanup_terminal()
 
     def display_info(self, message):
         """Display an informational message."""
-        with self.term.fullscreen():
-            self.clear_screen()
-            self.display_banner()
+        try:
+            with self.term.fullscreen():
+                self.clear_screen()
+                self.display_banner()
 
-            self.print_at(6, 2, f"INFO: {message}")
-            self.display_footer("Press any key to continue...")
-            self.term.inkey()
+                self.print_at(10, 2, f"INFO: {message}")
+                self.display_footer("Press any key to continue...")
+                self.term.inkey()
+        finally:
+            self.cleanup_terminal()
 
 
 # Simple test if run directly

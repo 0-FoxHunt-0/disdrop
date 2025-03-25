@@ -2,32 +2,38 @@
 
 # Input/Output settings
 directories:
-  input: "./input"
-  output: "./output"
-  temp: "./temp"
+    input: "./input"
+    output: "./output"
+    temp: "./temp"
 
 # Video compression settings
 video:
-  target_size_mb: 10  # Target size in MB
-  keep_audio: true
-  quality_preset: "medium"  # Options: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow
-  max_width: 1080  # Maximum width in pixels (aspect ratio will be maintained)
-  format: "mp4"
-  codec: "libx264"
-  
+    target_size_mb: 10 # Target size in MB
+    keep_audio: true
+    quality_preset: "medium" # Options: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow
+    max_width: 1080 # Maximum width in pixels (aspect ratio will be maintained)
+    format: "mp4"
+    codec: "libx264"
+    processing:
+        threads: 4 # Number of threads to use for video processing
+        batch_size: 5 # Number of video files to process in parallel
+
 # GIF optimization settings
 gif:
-  target_size_mb: 10  # Target size in MB
-  min_width: 160  # Maximum width in pixels (aspect ratio will be maintained)
-  colors: 256  # Number of colors in palette (lower = smaller file)
-  optimize_level: 3  # 1-3, where 3 is maximum optimization
+    target_size_mb: 10 # Target size in MB
+    min_width: 160 # Maximum width in pixels (aspect ratio will be maintained)
+    colors: 256 # Number of colors in palette (lower = smaller file)
+    optimize_level: 3 # 1-3, where 3 is maximum optimization
+    processing:
+        threads: 1 # Single-threaded for GIF processing
+        batch_size: 1 # No batching for GIF processing
 
-# Processing settings
+# Processing settings (global defaults, can be overridden by specific media types)
 processing:
-  threads: 4  # Number of threads to use for processing
-  batch_size: 5  # Number of files to process in parallel
-  
+    threads: 4 # Number of threads to use for processing
+    batch_size: 5 # Number of files to process in parallel
+
 # Logging settings
 logging:
-  level: "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
-  file: "./logs/processing.log" 
+    level: "INFO" # DEBUG, INFO, WARNING, ERROR, CRITICAL
+    file: "./logs/processing.log"
