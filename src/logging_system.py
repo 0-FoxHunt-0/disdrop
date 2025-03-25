@@ -38,11 +38,26 @@ FFMPEG_LOGGER_CONFIGURED = False
 ICONS = {
     'SUCCESS': '✓' if sys.platform != 'win32' else '+',
     'ERROR': '✗' if sys.platform != 'win32' else 'x',
+    'INFO': 'ℹ' if sys.platform != 'win32' else 'i',
     'WARNING': '⚠' if sys.platform != 'win32' else '!',
+    'STARTING': '►' if sys.platform != 'win32' else '>',
     'PROCESSING': '⚙' if sys.platform != 'win32' else '*',
     'OPTIMIZING': '↻' if sys.platform != 'win32' else '*',
     'SKIPPED': '→' if sys.platform != 'win32' else '->',
-    'STARTING': '▶' if sys.platform != 'win32' else '>',
+    'TIME': '⏱' if sys.platform != 'win32' else 'T',
+    'PURPLE': "#a855f7",
+    'PINK': "#ec4899",
+    'LIME': "#84cc16",
+    'INDIGO': "#6366f1",
+    'ORANGE': "#f97316",
+    'TEAL': "#14b8a6",
+    'RED': "#ef4444",
+    'YELLOW': "#eab308",
+    'GREEN': "#22c55e",
+    'BLUE': "#3b82f6",
+    'GRAY': "#6b7280",
+    'RESET': "\033[0m",
+    'BOLD': "\033[1m"
 }
 
 
@@ -298,50 +313,16 @@ class SafeUnicodeFormatter(logging.Formatter):
             '\u2699': '*',    # Gear ⚙
             '\u26a1': '*',    # Lightning ⚡
             '\u25cf': '*',    # Black circle ●
-            '\u25cb': 'o',    # White circle ○
-            '\u25b6': '>',    # Play button ▶
-            # Braille patterns for spinner animation
-            '\u2800': '.',    # ⠀
-            '\u2801': '.',    # ⠁
-            '\u2802': '.',    # ⠂
-            '\u2804': '.',    # ⠄
-            '\u2840': '.',    # ⡀
-            '\u2880': '.',    # ⢀
-            '\u28a0': '.',    # ⢠
-            '\u2820': '.',    # ⠠
-            '\u2830': '.',    # ⠰
-            '\u2838': '.',    # ⠸
-            '\u283c': '.',    # ⠼
-            '\u2836': '.',    # ⠶
-            '\u2837': '.',    # ⠷
-            '\u2827': '.',    # ⠧
-            '\u2807': '.',    # ⠇
-            '\u280f': '.',    # ⠏
-            '\u2887': '.',    # ⢇
-            '\u288f': '.',    # ⢏
-            '\u289f': '.',    # ⢟
-            '\u28bf': '.',    # ⢿
-            '\u287f': '.',    # ⡿
-            '\u283f': '.',    # ⠿
-            '\u281f': '.',    # ⠟
-            '\u280f': '.',    # ⠏
-            # Spinners
-            '\u2833': '.',    # ⠳
-            '\u2834': '.',    # ⠴
-            '\u2835': '.',    # ⠵
-            '\u2836': '.',    # ⠶
-            '\u2837': '.',    # ⠷
-            '\u283a': '.',    # ⠺
-            '\u283b': '.',    # ⠻
-            '\u283c': '.',    # ⠼
-            '\u283d': '.',    # ⠽
-            '\u283e': '.',    # ⠾
-            '\u283f': '.',    # ⠿
+            # Add any other problematic characters you encounter
         }
 
-        # Replace each character
+        # Replace characters
         for char, replacement in replacements.items():
             message = message.replace(char, replacement)
+
+        # Additional safety measure - Replace any remaining non-ASCII characters with a '?'
+        if sys.platform == 'win32':
+            message = ''.join(c if c.isascii() else '?' for c in message)
 
         return message
 
@@ -668,11 +649,15 @@ def setup_application_logging(debug_mode=False, verbose_mode=False):
         log_file.parent.mkdir(parents=True, exist_ok=True)
 
         file_handler = logging.FileHandler(log_file, mode='w')
-        file_handler.setFormatter(logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-        ))
+
+        # Use SafeUnicodeFormatter for file logging to prevent encoding issues
+        file_formatter = SafeUnicodeFormatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(file_formatter)
         file_handler.setLevel(logging.DEBUG if debug_mode else logging.INFO)
 
+        # Add file handler to loggers
+        root_logger.addHandler(file_handler)
         app_logger.addHandler(file_handler)
 
         # For debug mode, add an additional debug log file
@@ -852,13 +837,27 @@ class ThreadSafeProgressLogger:
         self.logger = get_logger()
         self.errors = []
         self.error_lock = threading.Lock()
+        self.start_time = time.time()
+        self.last_update_time = self.start_time
 
     def update(self, n: int = 1, status: str = None):
         """Update progress safely from multiple threads."""
         with self.lock:
+            current_time = time.time()
             self.progress_bar.update(n)
             if status:
                 self.progress_bar.set_description(status)
+
+            # Calculate and display ETA
+            elapsed = current_time - self.start_time
+            progress = self.progress_bar.n / \
+                self.progress_bar.total if self.progress_bar.total > 0 else 0
+            if progress > 0:
+                eta = elapsed / progress - elapsed
+                eta_str = f"{int(eta // 60)}m {int(eta % 60)}s"
+                self.progress_bar.set_postfix_str(f"ETA: {eta_str}")
+
+            self.last_update_time = current_time
 
     def add_error(self, error_msg: str):
         """Add error message thread-safely."""
@@ -881,6 +880,109 @@ class ThreadSafeProgressLogger:
         """Close progress bar."""
         with self.lock:
             self.progress_bar.close()
+
+
+def create_live_progress_bar(current: int, total: int, prefix: str = "", suffix: str = "",
+                             length: int = 50, fill: str = '█', empty: str = '░',
+                             start_time: float = None, use_color: bool = True):
+    """Create a live progress bar with elapsed time and ETA.
+
+    Args:
+        current: Current progress value
+        total: Total progress value
+        prefix: Prefix string
+        suffix: Suffix string
+        length: Length of the progress bar
+        fill: Character to use for filled part
+        empty: Character to use for empty part
+        start_time: Start time for ETA calculation (time.time() value)
+        use_color: Whether to use color in the progress bar
+
+    Returns:
+        Formatted progress bar string with elapsed time and ETA
+    """
+    # Calculate percentage
+    percent = (current / total) * 100 if total > 0 else 100
+
+    # Calculate filled length
+    filled_length = int(length * current // total) if total > 0 else length
+
+    # Create the bar
+    if use_color:
+        s = ModernLogStyle
+        # Choose color based on progress
+        if percent < 30:
+            color = s.AMBER.as_rgb()
+        elif percent < 70:
+            color = s.AZURE.as_rgb()
+        else:
+            color = s.EMERALD.as_rgb()
+
+        bar = f"{color}{fill * filled_length}{s.SLATE.as_rgb()}{empty * (length - filled_length)}{s.RESET.value}"
+    else:
+        bar = f"{fill * filled_length}{empty * (length - filled_length)}"
+
+    # Calculate elapsed time and ETA if start_time is provided
+    time_info = ""
+    if start_time is not None:
+        elapsed = time.time() - start_time
+        elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s"
+
+        # Calculate ETA
+        if current > 0 and current < total:
+            eta = elapsed / current * (total - current)
+            eta_str = f"{int(eta // 60)}m {int(eta % 60)}s"
+            time_info = f" | Elapsed: {elapsed_str} | ETA: {eta_str}"
+        else:
+            time_info = f" | Elapsed: {elapsed_str}"
+
+    # Format the complete progress bar
+    if use_color:
+        return f"{prefix} |{bar}| {s.BOLD.value}{percent:.1f}%{s.RESET.value} ({current}/{total}){time_info} {suffix}"
+    else:
+        return f"{prefix} |{bar}| {percent:.1f}% ({current}/{total}){time_info} {suffix}"
+
+
+def display_progress_update(current: int, total: int, description: str = "Progress",
+                            file_name: str = None, status: str = None, start_time: float = None,
+                            is_new_line: bool = False):
+    """Display a progress update with colored progress bar that updates in place.
+
+    Args:
+        current: Current progress value
+        total: Total progress value
+        description: Description of the operation
+        file_name: Current file being processed
+        status: Status message (processing, optimizing, etc.)
+        start_time: Start time for ETA calculation
+        is_new_line: Whether to print on a new line instead of updating in place
+    """
+    # Add icon based on status
+    icon = ICONS.get(status.upper() if status and status.upper()
+                     in ICONS else "PROCESSING", "")
+
+    # Create prefix with description and current file
+    file_info = f" | File: {file_name}" if file_name else ""
+    status_info = f" | {status}" if status else ""
+    prefix = f"{icon} {description}{file_info}{status_info}"
+
+    # Create the progress bar
+    progress_bar = create_live_progress_bar(
+        current, total, prefix=prefix, start_time=start_time,
+        use_color=True
+    )
+
+    # Check if we can use ANSI escape codes for in-place updates
+    supports_ansi = sys.stdout.isatty() and sys.platform != 'win32' or (
+        'TERM' in os.environ and os.environ['TERM'] != 'dumb')
+
+    if not is_new_line and supports_ansi and not current == 0:
+        # Move cursor up one line and clear line
+        sys.stdout.write("\033[1F\033[K")
+
+    # Print the progress bar
+    print(progress_bar)
+    sys.stdout.flush()
 
 
 # Function to setup the FFmpeg logger
@@ -1023,139 +1125,124 @@ def run_ffmpeg_command(command: list, timeout=None, capture_output=True) -> bool
         app_logger.info(f"{ICONS['PROCESSING']} Running FFmpeg operation...")
 
     try:
-        if capture_output:
-            # Create process with pipes
-            process = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-                universal_newlines=True
-            )
+        # Always capture output and redirect to log file instead of terminal
+        # Create process with pipes
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            universal_newlines=True
+        )
 
-            # Create threading event for coordinating threads
-            stop_event = threading.Event()
+        # Create threading event for coordinating threads
+        stop_event = threading.Event()
 
-            # Define helper function to read from a pipe and log it
-            def read_pipe(pipe, log_func, stop_event):
-                frame_count = 0
-                percentage = 0
-                spinner_idx = 0
-                # Use ASCII compatible spinner for Windows
-                spinner_chars = ["-", "\\", "|", "/"] if sys.platform == 'win32' else [
-                    "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-                last_update = time.time()
+        # Define helper function to read from a pipe and log it
+        def read_pipe(pipe, log_func, stop_event):
+            frame_count = 0
+            percentage = 0
+            spinner_idx = 0
+            # Use ASCII compatible spinner for Windows
+            spinner_chars = ["-", "\\", "|", "/"] if sys.platform == 'win32' else [
+                "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+            last_update = time.time()
 
-                try:
-                    for line in iter(pipe.readline, ''):
-                        if stop_event.is_set():
-                            break
-
-                        # Always log the full output to ffmpeg log
-                        log_func(line.strip())
-
-                        # Extract progress information
-                        if "frame=" in line and "fps=" in line:
-                            try:
-                                # Extract frame info
-                                frame_match = re.search(
-                                    r"frame=\s*(\d+)", line)
-                                if frame_match:
-                                    new_frame = int(frame_match.group(1))
-                                    if new_frame > frame_count:
-                                        frame_count = new_frame
-
-                                # Only update UI occasionally to avoid flooding
-                                now = time.time()
-                                if now - last_update > 0.5:
-                                    spinner_idx = (
-                                        spinner_idx + 1) % len(spinner_chars)
-                                    spinner = spinner_chars[spinner_idx]
-
-                                    # Extract fps if available
-                                    fps_match = re.search(
-                                        r"fps=\s*([\d.]+)", line)
-                                    fps_info = f", {fps_match.group(1)} fps" if fps_match else ""
-
-                                    # Show user-friendly progress
-                                    app_logger.debug(
-                                        f"{spinner} Processing frame {frame_count}{fps_info}")
-                                    last_update = now
-                            except Exception:
-                                pass  # Ignore parsing errors
-                except Exception as e:
-                    ffmpeg_logger.error(f"Error reading pipe: {e}")
-
-            # Create and start threads for stdout and stderr
-            stdout_thread = threading.Thread(
-                target=read_pipe,
-                args=(process.stdout, ffmpeg_logger.debug, stop_event)
-            )
-            stderr_thread = threading.Thread(
-                target=read_pipe,
-                args=(process.stderr, ffmpeg_logger.debug, stop_event)
-            )
-
-            stdout_thread.daemon = True
-            stderr_thread.daemon = True
-            stdout_thread.start()
-            stderr_thread.start()
-
-            # Wait for process to complete with timeout
             try:
-                if timeout:
-                    process.wait(timeout=timeout)
-                else:
-                    process.wait()
+                for line in iter(pipe.readline, ''):
+                    if stop_event.is_set():
+                        break
 
-                # Signal threads to stop
-                stop_event.set()
+                    # Always log the full output to ffmpeg log (not to terminal)
+                    log_func(line.strip())
 
-                # Wait for threads to finish with a short timeout
-                stdout_thread.join(timeout=2.0)
-                stderr_thread.join(timeout=2.0)
+                    # Extract progress information
+                    if "frame=" in line and "fps=" in line:
+                        try:
+                            # Extract frame info
+                            frame_match = re.search(
+                                r"frame=\s*(\d+)", line)
+                            if frame_match:
+                                new_frame = int(frame_match.group(1))
+                                if new_frame > frame_count:
+                                    frame_count = new_frame
 
-            except subprocess.TimeoutExpired:
-                # Try to terminate the process
-                process.terminate()
-                time.sleep(0.5)  # Allow a moment for graceful termination
+                            # Only update UI occasionally to avoid flooding
+                            now = time.time()
+                            if now - last_update > 0.5:
+                                spinner_idx = (
+                                    spinner_idx + 1) % len(spinner_chars)
+                                spinner = spinner_chars[spinner_idx]
 
-                # Force kill if needed
-                if process.poll() is None:
-                    process.kill()
+                                # Extract fps if available
+                                fps_match = re.search(
+                                    r"fps=\s*([\d.]+)", line)
+                                fps_info = f", {fps_match.group(1)} fps" if fps_match else ""
 
-                stop_event.set()  # Signal threads to stop
-                raise  # Re-raise the timeout exception
-        else:
-            # Completely suppress output for terminal
-            with open(os.devnull, 'w') as devnull:
-                process = subprocess.run(
-                    command,
-                    stdout=devnull,
-                    stderr=devnull,
-                    timeout=timeout,
-                    check=False  # Don't raise exception on non-zero exit
-                )
+                                # Show user-friendly progress without outputting raw ffmpeg logs
+                                app_logger.debug(
+                                    f"{spinner} Processing frame {frame_count}{fps_info}")
+                                last_update = now
+                        except Exception:
+                            pass  # Ignore parsing errors
+            except Exception as e:
+                ffmpeg_logger.error(f"Error reading pipe: {e}")
 
-        # Log command result to application log
-        if process.returncode == 0:
-            app_logger.success(
-                f"{ICONS['SUCCESS']} FFmpeg operation completed successfully")
-            return True
-        else:
-            app_logger.error(
-                f"{ICONS['ERROR']} FFmpeg operation failed with code {process.returncode}")
-            return False
+        # Create and start threads for stdout and stderr
+        stdout_thread = threading.Thread(
+            target=read_pipe,
+            args=(process.stdout, ffmpeg_logger.debug, stop_event)
+        )
+        stderr_thread = threading.Thread(
+            target=read_pipe,
+            args=(process.stderr, ffmpeg_logger.debug, stop_event)
+        )
+
+        stdout_thread.daemon = True
+        stderr_thread.daemon = True
+        stdout_thread.start()
+        stderr_thread.start()
+
+        # Wait for process to complete with timeout
+        try:
+            if timeout:
+                process.wait(timeout=timeout)
+            else:
+                process.wait()
+
+            # Signal threads to stop
+            stop_event.set()
+
+            # Wait for threads to finish with a short timeout
+            stdout_thread.join(timeout=2.0)
+            stderr_thread.join(timeout=2.0)
+
+        except subprocess.TimeoutExpired:
+            # Try to terminate the process
+            process.terminate()
+            time.sleep(0.5)  # Allow a moment for graceful termination
+
+            # Force kill if needed
+            if process.poll() is None:
+                process.kill()
+
+            stop_event.set()  # Signal threads to stop
+            raise  # Re-raise the timeout exception
+
+        # Check for process success
+        return process.returncode == 0
 
     except subprocess.TimeoutExpired:
         app_logger.error(
-            f"{ICONS['ERROR']} FFmpeg operation timed out after {timeout} seconds")
+            f"{ICONS['ERROR']} FFmpeg operation timed out after {timeout}s")
+        ffmpeg_logger.error(
+            f"Command timed out after {timeout}s: {command_str}")
         return False
     except Exception as e:
-        error_msg = f"{ICONS['ERROR']} FFmpeg operation failed: {e}"
+        error_msg = f"FFmpeg command failed: {e}"
+        app_logger.error(f"{ICONS['ERROR']} {error_msg}")
         ffmpeg_logger.error(error_msg, exc_info=True)
-        app_logger.error(error_msg)
         return False
 
 
@@ -1175,12 +1262,13 @@ def setup_process_logging():
     return UnifiedLogger('process')
 
 
-def log_gif_progress(message: str, progress_type: str = "processing"):
-    """Log GIF processing progress with appropriate styling.
+def log_gif_progress(message: str, progress_type: str = "processing", details: dict = None):
+    """Log GIF processing progress with appropriate icons and optional details.
 
     Args:
-        message: The progress message
-        progress_type: Type of progress (processing, optimizing, success, error)
+        message: The message to log
+        progress_type: Type of progress (processing, optimizing, success, error, warning, skipped)
+        details: Optional dictionary of additional details about the operation
     """
     logger = get_logger('app')
 
@@ -1188,12 +1276,27 @@ def log_gif_progress(message: str, progress_type: str = "processing"):
     icon_key = progress_type.upper() if progress_type.upper() in ICONS else "PROCESSING"
     icon = ICONS.get(icon_key)
 
-    # Log with appropriate level
+    # Make message Windows-safe if needed
+    if sys.platform == 'win32':
+        safe_formatter = SafeUnicodeFormatter()
+        message = safe_formatter._make_windows_safe(message)
+
+    # Format details if provided
+    details_str = ""
+    if details:
+        # Format the details as key=value pairs
+        details_str = " " + ", ".join([f"{k}={v}" for k, v in details.items()])
+
+        # Make details Windows-safe if needed
+        if sys.platform == 'win32':
+            details_str = safe_formatter._make_windows_safe(details_str)
+
+    # Log with appropriate level and details
     if progress_type.lower() == "success":
-        logger.success(f"{icon} {message}")
+        logger.success(f"{icon} {message}{details_str}")
     elif progress_type.lower() == "error":
-        logger.error(f"{icon} {message}")
+        logger.error(f"{icon} {message}{details_str}")
     elif progress_type.lower() == "warning":
-        logger.warning(f"{icon} {message}")
+        logger.warning(f"{icon} {message}{details_str}")
     else:
-        logger.info(f"{icon} {message}")
+        logger.info(f"{icon} {message}{details_str}")

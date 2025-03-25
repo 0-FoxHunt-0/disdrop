@@ -468,7 +468,8 @@ class VideoProcessor(BaseProcessor):
     def _process_single_video(self, input_path: Path, output_path: Path, target_size_mb: float) -> bool:
         """Process a single video with dynamic quality adjustment and timeout."""
         try:
-            with ResourceGuard(self.resource_monitor):
+            resource_guard = ResourceGuard(self.resource_monitor)
+            with resource_guard.guarded_operation():
                 # Add timeout for metadata fetching
                 metadata = self.get_video_metadata(input_path, timeout=30)
                 if not metadata:

@@ -86,8 +86,8 @@ class ResourceMonitor:
 class ResourceGuard:
     """Guard against resource exhaustion."""
 
-    def __init__(self):
-        self.monitor = ResourceMonitor()
+    def __init__(self, resource_monitor=None):
+        self.monitor = resource_monitor if resource_monitor is not None else ResourceMonitor()
 
     @contextmanager
     def guarded_operation(self) -> Generator[None, None, None]:

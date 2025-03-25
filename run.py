@@ -1,12 +1,8 @@
-print("Starting script...")
-
 import sys
 from pathlib import Path
 
 from src.default_config import INPUT_DIR, LOG_DIR, OUTPUT_DIR, TEMP_FILE_DIR
 from src.main import main
-
-print("Imports completed")
 
 
 # Add project root to path
@@ -16,10 +12,6 @@ sys.path.append(str(project_root))
 # Create directories first
 for directory in [INPUT_DIR, OUTPUT_DIR, TEMP_FILE_DIR, LOG_DIR]:
     directory.mkdir(parents=True, exist_ok=True)
-
-print("Directories created successfully.")
-
-print("Running main")
 
 try:
     main()

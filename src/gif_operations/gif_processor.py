@@ -44,9 +44,11 @@ from src.gif_operations.processing_stats import ProcessingStats
 from src.gif_operations.quality_manager import QualityManager
 from src.gif_operations.resource_manager import ResourceMonitor
 from src.logging_system import (UnifiedLogger, get_logger, performance_monitor, log_function_call,
-                                ModernLogStyle, ThreadSafeProgressLogger, run_ffmpeg_command, SUCCESS_LEVEL)
+                                ModernLogStyle, ThreadSafeProgressLogger, run_ffmpeg_command, SUCCESS_LEVEL,
+                                log_gif_progress, display_progress_update, ICONS)
 from src.temp_file_manager import TempFileManager
 from src.utils.video_dimensions import _validate_dimensions as validate_dimensions
+from src.gif_operations.enhanced_gif_optimizer import EnhancedGIFOptimizer
 
 # Define GIF processing status enum with icons and colors
 
@@ -171,23 +173,26 @@ class GIFProcessor(BaseProcessor):
     """Main GIF processing class combining optimization and conversion."""
 
     def __init__(self, logger=None, gpu_enabled=False, gpu_settings=None):
-        """Initialize GIF processor with GPU settings.
+        """Initialize the GIF processor with advanced performance options.
 
         Args:
-            logger: Optional logger to use. If None, a modern unified logger is created.
-            gpu_enabled: Whether GPU acceleration is enabled.
-            gpu_settings: Dictionary of GPU settings to use.
+            logger: Optional custom logger
+            gpu_enabled: Whether GPU acceleration is enabled
+            gpu_settings: Optional GPU settings dictionary
         """
-        # Initialize with modern unified logger if not provided
-        if logger is None:
-            logger = UnifiedLogger('gif_processor')
-        else:
-            # Ensure logger is a UnifiedLogger to have access to methods like start_timer
-            if not isinstance(logger, UnifiedLogger):
-                logger = UnifiedLogger('gif_processor')
+        super().__init__()
+        # Store initialization parameters
+        self.logger = logger or logging.getLogger('app')
+        self.gpu_enabled = gpu_enabled
+        self.gpu_settings = gpu_settings or {}
 
-        # Initialize base class with logger
-        super().__init__(logger=logger)
+        # Progress tracking variables
+        self.active_progress_bars = {}
+        self.progress_lock = threading.RLock()
+
+        # Start progress display timer
+        self.last_progress_update = time.time()
+        self.progress_update_interval = 2.0  # seconds
 
         # Initialize thread-safe locks and events
         self._shutdown_event = threading.Event()
@@ -209,10 +214,6 @@ class GIFProcessor(BaseProcessor):
         self.failed_files = []
         # Add the missing file queue lock
         self._file_queue_lock = threading.Lock()
-
-        # Store GPU status from parameters
-        self.has_gpu = gpu_enabled
-        self.gpu_settings = gpu_settings or {}
 
         # Use modern logging style for initialization
         self.logger.debug(
@@ -873,609 +874,123 @@ class GIFProcessor(BaseProcessor):
 
     @log_function_call
     def create_gif(self, file_path: Path, output_path: Path, fps: int, dimensions: Tuple[int, int]) -> bool:
-        """Create an optimized GIF from video with enhanced quality focus.
+        """Create a GIF from a video file with improved quality settings.
 
         Args:
-            file_path: Path to input video file
-            output_path: Path for output GIF file
-            fps: Frames per second (will be adaptively adjusted)
-            dimensions: Tuple of (width, height)
+            file_path: Path to the source video file
+            output_path: Path where the GIF should be saved
+            fps: Frames per second for the GIF
+            dimensions: Tuple containing (width, height)
 
         Returns:
-            bool: Success status
+            True if successful, False otherwise
         """
-        # Initialize temp file variables outside the try block to ensure they exist in the finally block
-        temp_palette = None
-        temp_output = None
+        # Add progress tracking
+        operation_id = f"create_gif_{file_path.stem}"
+        self.update_progress(
+            operation_id=operation_id,
+            current=0,
+            total=100,
+            description="Creating GIF from video",
+            file_name=file_path.name,
+            status="PROCESSING",
+            start_time=time.time(),
+            force_update=True
+        )
 
         try:
-            # Start a performance timer for GIF creation
-            self._start_timer("gif_creation")
+            # Get video dimensions
+            width, height = dimensions or (640, 480)
 
-            # Log the start of processing with modern styling
-            self._log_message(
-                "STARTING", f"Starting GIF creation for {file_path.name}", str(file_path))
+            # Prepare paths
+            palette_path = self.temp_manager.create_temp_file(
+                custom_suffix=".png")
+            self.logger.info(f"Creating palette for {file_path.name}")
 
-            # Use the configured target size instead of hardcoded default
-            target_size_mb = self.compression_settings['min_size_mb']
-            MAX_INTERMEDIATE_SIZE_MB = max(100, target_size_mb * 2)
+            # Update progress - creating palette (25%)
+            self.update_progress(
+                operation_id=operation_id,
+                current=25,
+                total=100,
+                description="Creating color palette",
+                file_name=file_path.name,
+                status="PROCESSING"
+            )
 
-            original_size = self.get_file_size(file_path)
-            if original_size > 1000:
-                self._log_message(
-                    "ERROR", f"Source file too large: {original_size:.2f}MB", str(file_path))
-                return False
-
-            # Check if file is extremely large compared to target (>700% of target)
-            size_ratio = original_size / target_size_mb
-            if size_ratio > 7.0:
-                self._log_message(
-                    "WARNING",
-                    f"Source file is {size_ratio:.1f}x larger than target. Using aggressive optimization approach.",
-                    str(file_path)
-                )
-                return self._create_gif_aggressive(file_path, output_path, fps, dimensions)
-
-            # Adjust FPS based on file size
-            adjusted_fps = fps
-            if original_size > 200:
-                adjusted_fps = min(fps, 12)
-            elif original_size > 100:
-                adjusted_fps = min(fps, 15)
-            elif original_size > 50:
-                adjusted_fps = min(fps, 20)
-
-            # Calculate dimensions with adaptive scaling
-            max_dimension = max(dimensions[0], dimensions[1])
-            scale_factor = 1.0
-
-            # Scale based on file size and dimensions
-            if original_size > 200:
-                scale_factor = min(scale_factor, 0.4)
-            elif original_size > 100:
-                scale_factor = min(scale_factor, 0.6)
-            elif original_size > 50:
-                scale_factor = min(scale_factor, 0.8)
-
-            if max_dimension > 1920:
-                scale_factor = min(scale_factor, 0.4)
-            elif max_dimension > 1280:
-                scale_factor = min(scale_factor, 0.6)
-            elif max_dimension > 720:
-                scale_factor = min(scale_factor, 0.8)
-
-            new_width = int(dimensions[0] * scale_factor // 2 * 2)
-            new_height = int(dimensions[1] * scale_factor // 2 * 2)
-            new_width = max(new_width, 320)
-            new_height = max(new_height, 180)
-
-            # Determine optimal color count
-            color_count = 128
-            if original_size > 100:
-                color_count = 64
-
-            # Generate temp file paths with UUIDs to avoid FFmpeg image sequence pattern warnings
-            unique_id = str(uuid.uuid4())
-            temp_palette = Path(TEMP_FILE_DIR) / f"palette_{unique_id}.png"
-            temp_output = Path(TEMP_FILE_DIR) / f"temp_{unique_id}.gif"
-
-            # Create an optimized palette
+            # Create palette command
             palette_cmd = [
                 'ffmpeg', '-i', str(file_path),
-                '-vf', f'fps={adjusted_fps},scale={new_width}:{new_height}:flags=lanczos,palettegen=max_colors={color_count}:stats_mode=diff:reserve_transparent=0',
-                '-y', str(temp_palette)
+                '-vf', f'fps={fps},scale={width}:{height}:flags=lanczos,palettegen=max_colors=256:stats_mode=diff',
+                '-y', str(palette_path)
             ]
 
-            if not run_ffmpeg_command(palette_cmd):
-                self.logger.error("Palette generation failed")
+            # Run the command with timeout
+            if not self._run_command(palette_cmd, "Create palette"):
+                self.logger.error(f"Failed to create palette for {file_path}")
+                self.complete_progress(
+                    operation_id, success=False, message="Failed to create palette")
                 return False
 
-            # Create the GIF with the generated palette - always favor quality
-            # Always use high quality dithering for better gradients and visual quality
-            dither_method = "floyd_steinberg"
-            bayer_scale = 3
+            # Update progress - creating GIF (50%)
+            self.update_progress(
+                operation_id=operation_id,
+                current=50,
+                total=100,
+                description="Converting video to GIF",
+                file_name=file_path.name,
+                status="PROCESSING"
+            )
 
+            # Create GIF command
             gif_cmd = [
                 'ffmpeg', '-i', str(file_path),
-                '-i', str(temp_palette),
-                '-lavfi',
-                f'fps={adjusted_fps},scale={new_width}:{new_height}:flags=lanczos[x];[x][1:v]paletteuse=dither={dither_method}:diff_mode=rectangle',
-                '-y', str(temp_output)
+                '-i', str(palette_path),
+                '-lavfi', f'fps={fps},scale={width}:{height}:flags=lanczos [x]; [x][1:v] paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle',
+                '-y', str(output_path)
             ]
 
-            if not run_ffmpeg_command(gif_cmd):
-                self.logger.error("Initial GIF creation failed")
-                return False
-
-            # Check and optimize the initial GIF
-            if temp_output.exists():
-                initial_size = self.get_file_size(temp_output)
-
-                # Check if initial GIF is still very large compared to target (>700% of target)
-                size_ratio = initial_size / target_size_mb
-                if size_ratio > 7.0:
-                    self.logger.warning(
-                        f"Initial GIF is {size_ratio:.1f}x larger than target. Applying more aggressive optimization.")
-
-                    # Try progressive optimization to reduce size before gifsicle
-                    attempt_settings = [
-                        # Prefer scaling down over quality loss
-                        {'scale': 0.8, 'fps': adjusted_fps, 'colors': color_count},
-                        {'scale': 0.7, 'fps': adjusted_fps, 'colors': color_count},
-                        {'scale': 0.6, 'fps': adjusted_fps, 'colors': color_count},
-                        {'scale': 0.5, 'fps': adjusted_fps, 'colors': color_count},
-                        # Only as last resort reduce colors and FPS
-                        {'scale': 0.5, 'fps': max(
-                            12, adjusted_fps-2), 'colors': min(192, color_count)},
-                        {'scale': 0.45, 'fps': max(
-                            10, adjusted_fps-4), 'colors': min(160, color_count)}
-                    ]
-
-                    for idx, settings in enumerate(attempt_settings):
-                        if initial_size <= target_size_mb * 2:
-                            break
-
-                        try:
-                            attempt_id = f"attempt_{idx}_{unique_id}"
-                            attempt_palette = Path(
-                                TEMP_FILE_DIR) / f"palette_{attempt_id}.png"
-                            attempt_output = Path(
-                                TEMP_FILE_DIR) / f"temp_{attempt_id}.gif"
-
-                            # Create new palette with reduced settings
-                            attempt_width = int(
-                                dimensions[0] * settings['scale'] // 2 * 2)
-                            attempt_height = int(
-                                dimensions[1] * settings['scale'] // 2 * 2)
-
-                            attempt_palette_cmd = [
-                                'ffmpeg', '-i', str(file_path),
-                                '-vf', f"fps={settings['fps']},scale={attempt_width}:{attempt_height}:flags=lanczos,palettegen=max_colors={settings['colors']}:stats_mode=diff:reserve_transparent=0",
-                                '-y', str(attempt_palette)
-                            ]
-
-                            if run_ffmpeg_command(attempt_palette_cmd):
-                                attempt_gif_cmd = [
-                                    'ffmpeg', '-i', str(file_path),
-                                    '-i', str(attempt_palette),
-                                    '-lavfi', f"fps={settings['fps']},scale={attempt_width}:{attempt_height}:flags=lanczos[x];[x][1:v]paletteuse=dither=floyd_steinberg:diff_mode=rectangle",
-                                    '-y', str(attempt_output)
-                                ]
-
-                                if run_ffmpeg_command(attempt_gif_cmd) and attempt_output.exists():
-                                    attempt_size = self.get_file_size(
-                                        attempt_output)
-
-                                    if attempt_size < initial_size:
-                                        # Use this better result
-                                        self.logger.info(
-                                            f"Using improved size: {attempt_size:.2f}MB (was {initial_size:.2f}MB)")
-                                        temp_output.unlink(missing_ok=True)
-                                        shutil.move(
-                                            str(attempt_output), str(temp_output))
-                                        initial_size = attempt_size
-                                    else:
-                                        attempt_output.unlink(missing_ok=True)
-
-                            # Clean up
-                            attempt_palette.unlink(missing_ok=True)
-                        except Exception as e:
-                            self.logger.error(
-                                f"Error in progressive optimization attempt {idx}: {e}")
-
-                # If size is already good, copy directly to output
-                if initial_size <= target_size_mb:
-                    shutil.copy2(temp_output, output_path)
-                    self.logger.success(
-                        f"Initial GIF meets size target: {initial_size:.2f}MB")
-                    return True
-
-                # If initial GIF is too large, try aggressive optimization
-                if initial_size > MAX_INTERMEDIATE_SIZE_MB:
-                    self.logger.warning(
-                        f"Initial GIF too large, trying aggressive compression")
-                    return self._create_gif_aggressive(file_path, output_path, adjusted_fps, dimensions)
-
-                # Apply standard optimization
-                gifsicle_cmd = [
-                    'gifsicle',
-                    '--optimize=3',
-                    '--colors', str(color_count),
-                    '--lossy=30',
-                    '--no-conserve-memory',
-                    str(temp_output),
-                    '-o', str(output_path)
-                ]
-
-                if not run_ffmpeg_command(gifsicle_cmd):
-                    shutil.copy2(temp_output, output_path)
-                    self.logger.warning(
-                        "Gifsicle optimization failed, using unoptimized GIF")
-
-                # Check final size and apply more optimization if needed
-                final_size = self.get_file_size(output_path)
-                if final_size > target_size_mb:
-                    self.logger.info(
-                        f"Further optimization needed: {final_size:.2f}MB > {target_size_mb}MB")
-
-                    # Try increasingly aggressive optimization until target is reached
-                    optimization_attempts = [
-                        {'colors': color_count//2, 'lossy': 50},
-                        {'colors': min(64, color_count//2), 'lossy': 70},
-                        {'colors': min(32, color_count//4), 'lossy': 90}
-                    ]
-
-                    for idx, settings in enumerate(optimization_attempts):
-                        if final_size <= target_size_mb:
-                            break
-
-                        try:
-                            opt_id = f"opt_{idx}_{unique_id}"
-                            opt_output = Path(TEMP_FILE_DIR) / \
-                                f"opt_{opt_id}.gif"
-
-                            opt_cmd = [
-                                'gifsicle',
-                                '--optimize=3',
-                                '--colors', str(settings['colors']),
-                                f"--lossy={settings['lossy']}",
-                                '--no-conserve-memory',
-                                str(output_path),
-                                '-o', str(opt_output)
-                            ]
-
-                            if run_ffmpeg_command(opt_cmd) and opt_output.exists():
-                                opt_size = self.get_file_size(opt_output)
-                                self.logger.info(
-                                    f"Optimization attempt {idx+1}: {opt_size:.2f}MB")
-
-                                if opt_size < final_size:
-                                    # Replace with optimized version
-                                    shutil.move(str(opt_output),
-                                                str(output_path))
-                                    final_size = opt_size
-                                else:
-                                    opt_output.unlink(missing_ok=True)
-                        except Exception as e:
-                            self.logger.error(
-                                f"Error in optimization attempt {idx}: {e}")
-                else:
-                    self.logger.success(
-                        f"Initial optimization successful: {final_size:.2f}MB")
-
-                return True
-            else:
+            # Run the command with timeout
+            if not self._run_command(gif_cmd, "Create GIF"):
                 self.logger.error(
-                    "GIF creation failed - no output file generated")
+                    f"Failed to create GIF from {file_path.name}")
+                self.complete_progress(
+                    operation_id, success=False, message="Failed to convert video to GIF")
                 return False
 
-        except Exception as e:
-            self.logger.error(f"GIF creation error: {str(e)}")
-            traceback.print_exc()
-            return False
-        finally:
-            # End the performance timer
-            try:
-                self._end_timer("gif_creation", include_system_stats=True)
-            except Exception:
-                pass  # Ignore timer errors
+            # Update progress - optimizing (75%)
+            self.update_progress(
+                operation_id=operation_id,
+                current=75,
+                total=100,
+                description="Optimizing GIF",
+                file_name=output_path.name,
+                status="OPTIMIZING"
+            )
 
-            # Cleanup temp files
-            try:
-                if temp_palette and temp_palette.exists():
-                    temp_palette.unlink(missing_ok=True)
-                if temp_output and temp_output.exists():
-                    temp_output.unlink(missing_ok=True)
-            except Exception as cleanup_e:
-                self.logger.error(f"Cleanup error: {cleanup_e}")
+            # Apply additional optimization with gifsicle
+            optimize_cmd = [
+                'gifsicle', '--optimize=3', '--colors=256',
+                '-o', str(output_path), str(output_path)
+            ]
 
-        # Try gifsicle optimization to reduce size
-        original_size = self.get_file_size(temp_output)
-        if original_size > target_size_mb:
-            self.logger.info(
-                f"Initial GIF exceeds target size. Trying gifsicle optimization.")
-            optimized = self.optimize_gif(
-                temp_output, output_path, target_size_mb)
-            if optimized[0] <= target_size_mb:
-                self.logger.success(
-                    f"Successfully optimized GIF: {optimized[0]:.2f}MB")
-                return True
-            else:
-                # If we couldn't reach the target size, still use the best result we have
-                self.logger.warning(
-                    f"Optimized GIF still exceeds target size ({optimized[0]:.2f}MB > {target_size_mb:.2f}MB)")
-                # Proceed with the best result we have
-                return True
-        else:
-            # Copy directly to output
-            shutil.copy2(temp_output, output_path)
-            self.logger.success(
-                f"Created GIF successfully: {original_size:.2f}MB")
+            # Run the command with timeout
+            self._run_command(optimize_cmd, "Optimize GIF")
+
+            # Clean up the palette file
+            if palette_path.exists():
+                palette_path.unlink()
+
+            # Mark progress as complete
+            self.complete_progress(
+                operation_id, success=True, message="GIF creation complete")
+
             return True
 
-    def _create_gif_aggressive(self, file_path: Path, output_path: Path, fps: int, dimensions: Tuple[int, int]) -> bool:
-        """Create GIF with aggressive compression to ensure size constraints are met."""
-        original_size = self.get_file_size(file_path)
-        target_size = self.compression_settings['min_size_mb']
-
-        try:
-            # Create a temp directory for this process with UUID
-            unique_id = str(uuid.uuid4())
-            temp_dir = Path(TEMP_FILE_DIR) / f"aggressive_{unique_id}"
-            temp_dir.mkdir(parents=True, exist_ok=True)
-
-            # Define a series of increasingly aggressive configs
-            configs = [
-                {'scale': 0.7, 'fps': max(
-                    10, fps-10), 'colors': 128, 'lossy': 40},
-                {'scale': 0.6, 'fps': max(8, fps-15),
-                 'colors': 96, 'lossy': 60},
-                {'scale': 0.5, 'fps': max(6, fps-20),
-                 'colors': 64, 'lossy': 80},
-                {'scale': 0.4, 'fps': max(5, fps-22),
-                 'colors': 32, 'lossy': 90}
-            ]
-
-            # For very large files (>700% of target), add even more aggressive configs
-            size_ratio = original_size / target_size
-            if size_ratio > 7.0:
-                configs.extend([
-                    {'scale': 0.3, 'fps': max(
-                        4, fps-25), 'colors': 24, 'lossy': 100},
-                    {'scale': 0.25, 'fps': max(
-                        3, fps-25), 'colors': 16, 'lossy': 100}
-                ])
-
-            # Check if this is a video file that needs keyframe handling
-            is_video = self._is_video_file(str(file_path))
-            keyframe_flags = ['-ignore_loop', '0',
-                              '-vsync', '0'] if is_video else []
-
-            # Calculate aspect ratio for scaling
-            width, height = dimensions
-            aspect_ratio = width / height
-            self.logger.info(
-                f"Original dimensions: {width}x{height}, aspect ratio: {aspect_ratio:.3f}")
-
-            # Try each configuration until we get one that works
-            best_result = None
-            for i, config in enumerate(configs):
-                try:
-                    # Calculate dimensions while preserving aspect ratio
-                    scale_factor = config['scale']
-
-                    if width > height:  # Landscape orientation
-                        new_width = int(width * scale_factor // 2 * 2)
-                        new_height = int(
-                            new_width / aspect_ratio + 0.5) // 2 * 2
-                    else:  # Portrait orientation
-                        new_height = int(height * scale_factor // 2 * 2)
-                        new_width = int(
-                            new_height * aspect_ratio + 0.5) // 2 * 2
-
-                    # Ensure minimum dimensions
-                    new_width = max(new_width, 160)
-                    new_height = max(new_height, 120)
-
-                    # Verify aspect ratio is preserved
-                    new_aspect = new_width / new_height
-                    if abs(new_aspect - aspect_ratio) / aspect_ratio > 0.05:
-                        # Recalculate if aspect ratio is off by more than 5%
-                        if width > height:
-                            new_width = max(
-                                int(width * scale_factor) // 2 * 2, 160)
-                            new_height = max(
-                                int(new_width / aspect_ratio + 0.5) // 2 * 2, 120)
-                        else:
-                            new_height = max(
-                                int(height * scale_factor) // 2 * 2, 120)
-                            new_width = max(
-                                int(new_height * aspect_ratio + 0.5) // 2 * 2, 160)
-
-                    self.logger.info(
-                        f"Config {i+1}: Using dimensions {new_width}x{new_height}")
-
-                    # Use UUID-based filenames to avoid FFmpeg warnings
-                    config_id = f"{unique_id}_{i}"
-                    temp_palette = temp_dir / f"palette_{config_id}.png"
-                    temp_output = temp_dir / f"output_{config_id}.gif"
-
-                    # Create palette
-                    palette_cmd = ['ffmpeg']
-                    if is_video:
-                        palette_cmd.extend(keyframe_flags)
-
-                    palette_cmd.extend([
-                        '-i', str(file_path),
-                        '-vf', f"fps={config['fps']},scale={new_width}:{new_height}:flags=lanczos,palettegen=max_colors={config['colors']}:stats_mode=diff",
-                        '-y', str(temp_palette)
-                    ])
-
-                    if not run_ffmpeg_command(palette_cmd):
-                        continue
-
-                    # Create GIF
-                    gif_cmd = ['ffmpeg']
-                    if is_video:
-                        gif_cmd.extend(keyframe_flags)
-
-                    gif_cmd.extend([
-                        '-i', str(file_path),
-                        '-i', str(temp_palette),
-                        '-lavfi', f"fps={config['fps']},scale={new_width}:{new_height}:flags=lanczos[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=3:diff_mode=rectangle",
-                        '-y', str(temp_output)
-                    ])
-
-                    if not run_ffmpeg_command(gif_cmd):
-                        continue
-
-                    # Optimize with gifsicle
-                    if temp_output.exists():
-                        # Verify the file is valid
-                        try:
-                            with Image.open(temp_output) as img:
-                                if img.format != 'GIF':
-                                    self.logger.warning(
-                                        f"Output is not a valid GIF: {img.format}")
-                                    continue
-                        except Exception as e:
-                            self.logger.warning(f"Invalid GIF created: {e}")
-                            continue
-
-                        optimized_output = temp_dir / \
-                            f"optimized_{config['colors']}.gif"
-
-                        gifsicle_cmd = [
-                            'gifsicle',
-                            '--optimize=3',
-                            '--colors', str(config['colors']),
-                            f"--lossy={config['lossy']}",
-                            '--no-conserve-memory',
-                            str(temp_output),
-                            '-o', str(optimized_output)
-                        ]
-
-                        if run_ffmpeg_command(gifsicle_cmd) and optimized_output.exists():
-                            # Check size
-                            size = self.get_file_size(optimized_output)
-                            self.logger.info(
-                                f"Config {i+1}: {size:.2f}MB (target: {target_size:.2f}MB)")
-
-                            # Store result if it's the first valid one or better than previous
-                            if (size <= target_size and
-                                (best_result is None or
-                                 # prefer larger file within target size
-                                 size > best_result['size'])):
-
-                                best_result = {
-                                    'path': optimized_output,
-                                    'size': size,
-                                    'config': config
-                                }
-
-                                # If we're close enough to target size, stop
-                                if target_size - size < 0.5:
-                                    break
-                            elif best_result is None or size < best_result['size']:
-                                # Keep track of the best result even if it's not under target
-                                best_result = {
-                                    'path': optimized_output,
-                                    'size': size,
-                                    'config': config
-                                }
-
-                except Exception as e:
-                    self.logger.error(f"Error with config {config}: {e}")
-                    continue
-
-            # Use best result or most aggressive as fallback
-            if best_result is not None:
-                shutil.copy2(best_result['path'], output_path)
-                success_message = "Successfully optimized"
-                if best_result['size'] <= target_size:
-                    success_message = f"Aggressive optimization succeeded"
-                else:
-                    success_message = f"Couldn't reach target size but optimized"
-
-                self.logger.success(
-                    f"{success_message}: {best_result['size']:.2f}MB (Target: {target_size}MB)"
-                )
-                return True
-            else:
-                # Last attempt with maximum compression
-                try:
-                    final_id = str(uuid.uuid4())
-                    last_chance = temp_dir / f"last_attempt_{final_id}.gif"
-                    final_palette = temp_dir / f"final_palette_{final_id}.png"
-
-                    # Extremely reduced settings while preserving aspect ratio
-                    scale_factor = 0.2
-                    if width > height:  # Landscape
-                        min_width = max(
-                            160, int(width * scale_factor) // 2 * 2)
-                        min_height = max(
-                            120, int(min_width / aspect_ratio + 0.5) // 2 * 2)
-                    else:  # Portrait
-                        min_height = max(
-                            120, int(height * scale_factor) // 2 * 2)
-                        min_width = max(
-                            160, int(min_height * aspect_ratio + 0.5) // 2 * 2)
-
-                    min_fps = max(3, fps // 5)
-
-                    # Create palette
-                    palette_cmd = ['ffmpeg']
-                    if is_video:
-                        palette_cmd.extend(keyframe_flags)
-
-                    palette_cmd.extend([
-                        '-i', str(file_path),
-                        '-vf', f"fps={min_fps},scale={min_width}:{min_height}:flags=fast_bilinear,palettegen=max_colors=16",
-                        '-y', str(final_palette)
-                    ])
-
-                    if run_ffmpeg_command(palette_cmd):
-                        # Create GIF
-                        gif_cmd = ['ffmpeg']
-                        if is_video:
-                            gif_cmd.extend(keyframe_flags)
-
-                        gif_cmd.extend([
-                            '-i', str(file_path),
-                            '-i', str(final_palette),
-                            '-lavfi', f"fps={min_fps},scale={min_width}:{min_height}:flags=fast_bilinear[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=1",
-                            '-y', str(last_chance)
-                        ])
-
-                        if run_ffmpeg_command(gif_cmd) and last_chance.exists():
-                            # Final gifsicle pass with maximum compression
-                            final_output = temp_dir / \
-                                f"final_output_{final_id}.gif"
-                            gifsicle_cmd = [
-                                'gifsicle',
-                                '--optimize=3',
-                                '--colors', '16',
-                                '--lossy=100',
-                                '--scale', '0.5',
-                                '--no-conserve-memory',
-                                str(last_chance),
-                                '-o', str(final_output)
-                            ]
-
-                            if run_ffmpeg_command(gifsicle_cmd) and final_output.exists():
-                                final_size = self.get_file_size(final_output)
-
-                                if final_size <= target_size:
-                                    shutil.copy2(final_output, output_path)
-                                    self.logger.success(
-                                        f"Final aggressive attempt succeeded: {final_size:.2f}MB"
-                                    )
-                                    return True
-                                else:
-                                    # Use this result anyway as our best effort
-                                    shutil.copy2(final_output, output_path)
-                                    self.logger.warning(
-                                        f"Used best effort result: {final_size:.2f}MB (target: {target_size:.2f}MB)"
-                                    )
-                                    return True
-
-                except Exception as e:
-                    self.logger.error(f"Final compression attempt failed: {e}")
-
-            self.logger.error(
-                f"Failed to compress GIF within target size: {target_size}MB")
-            return False
-
         except Exception as e:
-            self.logger.error(f"Aggressive GIF creation error: {str(e)}")
+            self.logger.error(f"Error creating GIF from {file_path.name}: {e}")
+            self.complete_progress(
+                operation_id, success=False, message=f"Error: {str(e)}")
             return False
-        finally:
-            # Clean up temp directory and files
-            try:
-                if temp_dir.exists():
-                    shutil.rmtree(temp_dir, ignore_errors=True)
-            except Exception as e:
-                self.logger.error(f"Failed to clean up temp directory: {e}")
 
     def _check_early_exit(self, results: List[Dict]) -> bool:
         """Check if we can exit early with good enough results."""
@@ -1735,9 +1250,53 @@ class GIFProcessor(BaseProcessor):
                                     f"Final optimization successful: {optimized_size:.2f}MB")
                                 return True
 
+                        # If still not meeting target, try going even more extreme with a desperate attempt
+                        if final_size > target_size and final_size <= target_size * 1.5:
+                            self.logger.warning(
+                                "Target size not met, trying desperate optimization measures")
+
+                            # Create a temporary file for the desperate attempt
+                            temp_desperate = Path(
+                                TEMP_FILE_DIR) / f"desperate_{uuid.uuid4().hex}.gif"
+                            temp_files.append(temp_desperate)
+
+                            # Use the most extreme compression settings available
+                            success = self._compress_with_gifsicle(
+                                temp_output,
+                                temp_desperate,
+                                colors=16,  # Ultra-low colors
+                                scale=0.12,  # Ultra-low scale
+                                lossy=180,  # Maximum lossy value
+                                optimize_level=3
+                            )
+
+                            if success and temp_desperate.exists():
+                                desperate_size = self.get_file_size(
+                                    temp_desperate)
+
+                                if desperate_size <= target_size:
+                                    shutil.copy2(temp_desperate, output_path)
+                                    self.logger.success(
+                                        f"Desperate optimization successful: {desperate_size:.2f}MB")
+                                    return True
+                                elif desperate_size < final_size:
+                                    # Use it if it's at least better than what we had
+                                    final_size = desperate_size
+                                    temp_output = temp_desperate
+                                    self.logger.warning(
+                                        f"Desperate optimization improved size but still exceeds target: {desperate_size:.2f}MB > {target_size:.2f}MB")
+
                         # If we get here, optimization failed to meet the target size
                         self.logger.warning(
                             f"All optimization attempts failed to meet target size of {target_size:.2f}MB")
+
+                        # Fallback: Use the best result we have, even if it doesn't meet the target size
+                        if temp_output.exists():
+                            self.logger.warning(
+                                f"Using best available result ({final_size:.2f}MB) despite exceeding target size")
+                            shutil.copy2(temp_output, output_path)
+                            return True  # Return success but with warning already logged
+
                         return False
 
                 # If we reach here, processing failed or size requirement wasn't met
@@ -1908,13 +1467,15 @@ class GIFProcessor(BaseProcessor):
             return 15.0  # Default to 15 FPS as a reasonable value
 
     def optimize_gif(self, input_path: Path, output_path: Path, target_size_mb: float = None, original_colors: int = None) -> Tuple[float, bool]:
-        """Optimize GIF to target size with quality preservation strategy.
+        """Optimize GIF to target size.
+
+        This is now a wrapper around EnhancedGIFOptimizer for backward compatibility.
 
         Args:
             input_path: Source GIF file
             output_path: Output path for optimized GIF
             target_size_mb: Target size in MB (use class setting if None)
-            original_colors: Number of colors in original GIF (will be analyzed if None)
+            original_colors: Number of colors in original GIF (not used in enhanced optimizer)
 
         Returns:
             Tuple[float, bool]: Tuple of (final_size, success)
@@ -1946,37 +1507,32 @@ class GIFProcessor(BaseProcessor):
                 shutil.copy2(input_path, output_path)
                 return original_size, True
 
-            # Use smart optimization approach
-            self._log_message("STARTING",
-                              f"Starting optimization with target: {target_size_mb:.2f}MB",
-                              f"optimize_start_{str(input_path)}")
+            # Create an instance of the enhanced optimizer
+            enhanced_optimizer = EnhancedGIFOptimizer(
+                max_workers=4,
+                compression_settings=self.compression_settings
+            )
 
-            # Get result from smart optimization
-            result = self._smart_gif_optimization(
-                input_path, output_path, target_size_mb, original_colors)
+            # Perform the optimization
+            final_size, success = enhanced_optimizer.optimize_gif(
+                input_path, output_path, target_size_mb
+            )
 
-            # Check result
-            final_size = result.size
-
-            if result.success and final_size <= target_size_mb:
+            # Log the result
+            if success:
                 self._log_message("SUCCESS",
-                                  f"Optimization successful: {final_size:.2f}MB",
+                                  f"Enhanced optimization successful: {final_size:.2f}MB",
                                   f"optimize_success_{str(input_path)}")
-                return final_size, True
             else:
-                # Don't copy to output if size exceeds target
-                if result.path and Path(result.path).exists() and final_size <= target_size_mb:
-                    # Only copy if we're within the target size
-                    shutil.copy2(Path(result.path), output_path)
-                    self._log_message("SUCCESS",
-                                      f"Optimization met target: {final_size:.2f}MB <= {target_size_mb:.2f}MB",
-                                      f"optimize_success_copy_{str(input_path)}")
+                self._log_message("ERROR",
+                                  f"Enhanced optimization failed to meet target size: {final_size:.2f}MB > {target_size_mb:.2f}MB",
+                                  f"optimize_size_fail_{str(input_path)}")
+
+                # Even if we didn't meet the target size, we still have a file to use
+                if output_path.exists():
                     return final_size, True
-                else:
-                    self._log_message("ERROR",
-                                      f"Optimization failed to meet target size: {final_size:.2f}MB > {target_size_mb:.2f}MB",
-                                      f"optimize_size_fail_{str(input_path)}")
-                    return original_size, False
+
+            return final_size, success
 
         except Exception as e:
             self._log_message("ERROR",
@@ -1987,1070 +1543,6 @@ class GIFProcessor(BaseProcessor):
             # End the performance timer and phase
             self._end_timer("gif_optimization", include_system_stats=True)
             self.logger.end_phase("GIF optimization")
-
-    def _smart_gif_optimization(self, input_path: Path, output_path: Path, target_size_mb: float, original_colors: int = None) -> ProcessingResult:
-        """Smart GIF optimization with content-adaptive approach.
-
-        Uses a combination of techniques to efficiently optimize GIFs:
-        1. Frame optimization - removes duplicate pixels between frames
-        2. Smart color quantization - uses perceptual quality metrics
-        3. Adaptive frame rate - adjusts based on content motion
-        4. Selective dithering - applies only where visually beneficial
-
-        Args:
-            input_path: Source GIF path
-            output_path: Destination path for optimized GIF
-            target_size_mb: Target size in MB
-            original_colors: Original color count (will be analyzed if None)
-
-        Returns:
-            ProcessingResult: Result of the optimization
-        """
-        # Start performance tracking
-        self._start_timer("smart_gif_optimization")
-        self.logger.start_phase("Smart GIF Optimization")
-
-        temp_files = []
-
-        try:
-            self._log_message("STARTING",
-                              f"Starting smart optimization for {input_path.name}",
-                              f"smart_opt_start_{str(input_path)}")
-
-            # Analyze content if needed
-            if original_colors is None:
-                self._log_message("PROCESSING",
-                                  "Analyzing color palette",
-                                  f"color_analysis_{str(input_path)}")
-                original_colors = self._analyze_color_count(input_path)
-                self._log_message("INFO",
-                                  f"Detected {original_colors} colors in original GIF",
-                                  f"color_count_{str(input_path)}")
-
-            # Get original dimensions
-            dimensions = self._get_dimensions_with_retry(input_path)
-            if not dimensions:
-                self._log_message("ERROR",
-                                  "Failed to get GIF dimensions",
-                                  f"dimension_error_{str(input_path)}")
-                return ProcessingResult(
-                    fps=0,
-                    size=0,
-                    path=None,
-                    status=ProcessingStatus.DIMENSION_ERROR,
-                    message="Failed to get dimensions"
-                )
-            width, height = dimensions
-            self._log_message("INFO",
-                              f"GIF dimensions: {width}x{height}",
-                              f"dimensions_{str(input_path)}")
-
-            # Analyze motion in the GIF
-            self._log_message("PROCESSING",
-                              "Analyzing motion patterns",
-                              f"motion_start_{str(input_path)}")
-            motion_score = self._analyze_gif_motion(input_path)
-
-            # Begin optimization process - first with lossless pass
-            self._log_message("OPTIMIZING",
-                              "Starting initial lossless optimization",
-                              f"lossless_start_{str(input_path)}")
-
-            # Create intermediate optimized GIF using gifsicle's built-in optimization
-            temp_optimized = Path(TEMP_FILE_DIR) / \
-                f"opt_base_{uuid.uuid4().hex}.gif"
-            temp_files.append(temp_optimized)
-
-            # First pass - lossless optimization with gifsicle
-            if not self._compress_with_gifsicle(
-                input_path,
-                temp_optimized,
-                # Already using 256 colors maximum - use a lower color count to avoid size increase
-                colors=min(original_colors, 224),
-                optimize_level=3,
-                lossy=0
-            ):
-                self._log_message("ERROR",
-                                  "Initial lossless optimization failed",
-                                  f"lossless_fail_{str(input_path)}")
-                return ProcessingResult(
-                    fps=0,
-                    size=0,
-                    path=None,
-                    status=ProcessingStatus.OPTIMIZATION_ERROR,
-                    message="Initial optimization failed"
-                )
-
-            # Check if first pass is enough
-            optimized_size = self.get_file_size(temp_optimized)
-            original_size = self.get_file_size(input_path)
-            savings_percent = (1 - optimized_size / original_size) * 100
-
-            self._log_message("INFO",
-                              f"Lossless optimization: {original_size:.2f}MB → {optimized_size:.2f}MB ({savings_percent:.1f}% reduction)",
-                              f"lossless_result_{str(input_path)}")
-
-            if optimized_size <= target_size_mb:
-                self._log_message("SUCCESS",
-                                  f"Target size achieved with lossless optimization: {optimized_size:.2f}MB (target: {target_size_mb:.2f}MB)",
-                                  f"lossless_success_{str(input_path)}")
-                shutil.copy2(temp_optimized, output_path)
-                return ProcessingResult(
-                    fps=0,
-                    size=optimized_size,
-                    path=str(output_path),
-                    status=ProcessingStatus.SUCCESS,
-                    message=f"Lossless optimization achieved target size"
-                )
-
-            # Determine adaptive settings based on content
-            # Low motion = can reduce FPS, high detail = need more colors
-            # Increased thresholds to classify more content as high quality
-            is_high_motion = motion_score > 0.2  # Lower threshold for better quality
-            is_high_detail = original_colors > 32  # Lower threshold to preserve colors
-
-            # Log the content classification for better diagnostics
-            content_type = []
-            if is_high_motion:
-                content_type.append("high motion")
-            else:
-                content_type.append("low motion")
-
-            if is_high_detail:
-                content_type.append("high detail")
-            else:
-                content_type.append("low detail")
-
-            content_description = " + ".join(content_type)
-
-            self._log_message("INFO",
-                              f"Content classified as: {content_description}",
-                              f"content_class_{str(input_path)}")
-
-            # Log progress before starting the appropriate optimization strategy
-            self.logger.log_progress(
-                "GIF optimization progress",
-                1,  # Completed lossless phase
-                3,  # Total phases (lossless, content-specific, validation)
-                details={
-                    "Content type": content_description,
-                    "Target size": f"{target_size_mb:.2f}MB",
-                    "Current size": f"{optimized_size:.2f}MB"
-                }
-            )
-
-            # Choose appropriate optimization path based on content type
-            self._log_message("PROCESSING",
-                              f"Starting content-adaptive optimization for {content_description} content",
-                              f"adaptive_start_{str(input_path)}")
-
-            if is_high_motion and is_high_detail:
-                # High motion, high detail - prioritize frame rate, reduce colors moderately
-                self._log_message("PROCESSING",
-                                  "Using high motion + high detail optimization strategy",
-                                  f"hmhd_start_{str(input_path)}")
-                result = self._optimize_high_motion_high_detail(
-                    temp_optimized, output_path, target_size_mb)
-            elif is_high_motion and not is_high_detail:
-                # High motion, low detail - maintain frame rate, reduce colors aggressively
-                self._log_message("PROCESSING",
-                                  "Using high motion + low detail optimization strategy",
-                                  f"hmld_start_{str(input_path)}")
-                result = self._optimize_high_motion_low_detail(
-                    temp_optimized, output_path, target_size_mb)
-            elif not is_high_motion and is_high_detail:
-                # Low motion, high detail - reduce frame rate, maintain colors
-                self._log_message("PROCESSING",
-                                  "Using low motion + high detail optimization strategy",
-                                  f"lmhd_start_{str(input_path)}")
-                result = self._optimize_low_motion_high_detail(
-                    temp_optimized, output_path, target_size_mb)
-            else:
-                # Low motion, low detail - aggressive optimization on both
-                self._log_message("PROCESSING",
-                                  "Using low motion + low detail optimization strategy",
-                                  f"lmld_start_{str(input_path)}")
-                result = self._optimize_low_motion_low_detail(
-                    temp_optimized, output_path, target_size_mb)
-
-            # Log progress after content-specific optimization
-            if result.success:
-                status = GIFProcessingStatus.SUCCESS
-                log_level = "SUCCESS"
-            else:
-                status = GIFProcessingStatus.WARNING if result.path else GIFProcessingStatus.ERROR
-                log_level = "WARNING" if result.path else "ERROR"
-
-            # Log the optimization result
-            if result.path:
-                result_size = self.get_file_size(Path(result.path))
-                size_desc = f"{result_size:.2f}MB"
-                size_ratio = result_size / original_size
-                percent_reduction = (1 - size_ratio) * 100
-
-                self._log_message(log_level,
-                                  f"Optimization result: {original_size:.2f}MB → {size_desc} ({percent_reduction:.1f}% reduction)",
-                                  f"opt_result_{str(input_path)}")
-
-                # Update progress with final result
-                self.logger.log_progress(
-                    "GIF optimization complete",
-                    3,  # Final phase
-                    3,  # Total phases
-                    details={
-                        "Original size": f"{original_size:.2f}MB",
-                        "Final size": size_desc,
-                        "Reduction": f"{percent_reduction:.1f}%",
-                        "Target met": "Yes" if result_size <= target_size_mb else "No"
-                    }
-                )
-            else:
-                self._log_message("ERROR",
-                                  "Optimization failed to produce a valid file",
-                                  f"opt_result_fail_{str(input_path)}")
-
-            # Final validation
-            if result.success and Path(result.path).exists():
-                # Validate the optimized GIF
-                self._log_message("PROCESSING",
-                                  "Validating optimized GIF",
-                                  f"validation_start_{str(input_path)}")
-                try:
-                    with Image.open(result.path) as img:
-                        if img.format != 'GIF':
-                            self._log_message("ERROR",
-                                              "Output is not a valid GIF",
-                                              f"validation_format_{str(input_path)}")
-                            return ProcessingResult(
-                                fps=0,
-                                size=0,
-                                path=None,
-                                status=ProcessingStatus.CONVERSION_ERROR,
-                                message="Output is not a valid GIF"
-                            )
-
-                    self._log_message("SUCCESS",
-                                      "GIF validation successful",
-                                      f"validation_success_{str(input_path)}")
-                except Exception as e:
-                    self._log_message("ERROR",
-                                      f"Invalid output file: {e}",
-                                      f"validation_error_{str(input_path)}")
-                    return ProcessingResult(
-                        fps=0,
-                        size=0,
-                        path=None,
-                        status=ProcessingStatus.FILE_ERROR,
-                        message=f"Invalid output file: {e}"
-                    )
-
-                # Copy to output if not already there
-                if result.path != str(output_path):
-                    self._log_message("INFO",
-                                      "Copying optimized GIF to final location",
-                                      f"copy_start_{str(input_path)}")
-                    shutil.copy2(result.path, output_path)
-                    self._log_message("SUCCESS",
-                                      f"Copied optimized GIF to {output_path.name}",
-                                      f"copy_success_{str(input_path)}")
-
-            return result
-
-        except Exception as e:
-            self._log_message("ERROR",
-                              f"Smart optimization error: {e}",
-                              f"smart_opt_error_{str(input_path)}")
-            return ProcessingResult(
-                fps=0,
-                size=0,
-                path=None,
-                status=ProcessingStatus.OPTIMIZATION_ERROR,
-                message=f"Optimization error: {e}"
-            )
-        finally:
-            # Clean up temp files
-            self._log_message("INFO",
-                              f"Cleaning up {len(temp_files)} temporary files",
-                              f"cleanup_{str(input_path)}")
-            self._safe_cleanup_temp_files([Path(f) for f in temp_files])
-
-            # End performance monitoring
-            self._end_timer("smart_gif_optimization",
-                            include_system_stats=True)
-            self.logger.end_phase("Smart GIF Optimization")
-
-    def _analyze_gif_motion(self, gif_path: Path) -> float:
-        """Analyze motion intensity in a GIF.
-
-        Returns a score from 0.0 (static) to 1.0 (high motion)
-        """
-        # Start performance timer for motion analysis
-        self._start_timer("gif_motion_analysis")
-        self.logger.start_phase("GIF motion analysis")
-
-        try:
-            self._log_message("PROCESSING",
-                              f"Analyzing motion in {gif_path.name}",
-                              f"motion_analysis_start_{str(gif_path)}")
-
-            frames = []
-            frame_count = 0
-            with Image.open(gif_path) as img:
-                # Extract frames
-                try:
-                    while True:
-                        # Convert to grayscale
-                        frames.append(img.copy().convert('L'))
-                        frame_count += 1
-                        img.seek(img.tell() + 1)
-                except EOFError:
-                    pass
-
-            # If fewer than 2 frames, return 0 motion
-            if len(frames) < 2:
-                self._log_message("INFO",
-                                  f"GIF has only {len(frames)} frame(s) - considering as static",
-                                  f"motion_static_{str(gif_path)}")
-                return 0.0
-
-            # Log frame count for diagnostics
-            self._log_message("INFO",
-                              f"Analyzing {len(frames)} frames for motion detection",
-                              f"motion_frames_{str(gif_path)}")
-
-            # Calculate motion score based on frame differences
-            total_diff = 0
-            total_pixels = frames[0].width * frames[0].height
-
-            # Track progress for large GIFs
-            if len(frames) > 10:
-                self.logger.log_progress(
-                    "Calculating frame differences",
-                    0,
-                    len(frames) - 1
-                )
-
-            for i in range(len(frames) - 1):
-                # Calculate frame difference
-                diff = ImageChops.difference(frames[i], frames[i+1])
-                diff_sum = sum(diff.getdata())
-                avg_diff = diff_sum / (total_pixels * 255)  # Normalize
-                total_diff += avg_diff
-
-                # Update progress for large GIFs
-                if len(frames) > 10 and i % 5 == 0:
-                    self.logger.log_progress(
-                        "Calculating frame differences",
-                        i + 1,
-                        len(frames) - 1
-                    )
-
-            motion_score = min(1.0, total_diff / (len(frames) - 1))
-
-            # Log the result with appropriate status icon based on motion level
-            if motion_score < 0.3:
-                log_level = "INFO"
-                motion_desc = "low"
-            elif motion_score < 0.7:
-                log_level = "INFO"
-                motion_desc = "medium"
-            else:
-                log_level = "INFO"
-                motion_desc = "high"
-
-            self._log_message(log_level,
-                              f"GIF motion score: {motion_score:.3f} ({motion_desc} motion)",
-                              f"motion_result_{str(gif_path)}")
-
-            return motion_score
-
-        except Exception as e:
-            self._log_message("ERROR",
-                              f"Error analyzing GIF motion: {e}",
-                              f"motion_error_{str(gif_path)}")
-            return 0.5  # Default to medium motion on error
-        finally:
-            # End performance monitoring
-            self._end_timer("gif_motion_analysis", include_system_stats=True)
-            self.logger.end_phase("GIF motion analysis")
-
-    def _optimize_high_motion_high_detail(self, input_path: Path, output_path: Path, target_size_mb: float) -> ProcessingResult:
-        """Optimize GIF with high motion and high detail.
-
-        Strategy: Preserve frame rate, use perceptual color reduction, apply minimal lossy compression.
-        Multi-pass encoding with progressive quality reduction until target size is met.
-        """
-        # Start performance timer for this strategy
-        self._start_timer("optimize_high_motion_high_detail")
-        self.logger.start_phase("High motion + high detail optimization")
-
-        # Create a unique temp file for each attempt
-        temp_files = []
-        best_size = float('inf')
-        best_file = None
-        best_settings = None
-
-        try:
-            # Get dimensions
-            dimensions = self._get_dimensions_with_retry(input_path)
-            if not dimensions:
-                self._log_message("ERROR",
-                                  "Failed to get dimensions for optimization",
-                                  f"hmhd_dim_error_{str(input_path)}")
-                return ProcessingResult(0, 0, None, ProcessingStatus.DIMENSION_ERROR)
-
-            width, height = dimensions
-
-            # Get original size
-            original_size = self.get_file_size(input_path)
-            size_ratio = original_size / target_size_mb
-
-            self._log_message("INFO",
-                              f"Size ratio: {size_ratio:.2f}x target size ({original_size:.2f}MB / {target_size_mb:.2f}MB)",
-                              f"hmhd_size_ratio_{str(input_path)}")
-
-            # Define multi-pass settings with progressively stronger compression
-            # Start with less aggressive settings and gradually increase compression
-            optimization_passes = [
-                # Pass 1: Minimal compression, preserve quality
-                {"scale": 0.95, "colors": 256, "lossy": 0},
-                # Pass 2: Light compression
-                {"scale": 0.9, "colors": 240, "lossy": 0},
-                # Pass 3: Moderate compression
-                {"scale": 0.85, "colors": 224, "lossy": 10},
-                # Pass 4: Medium compression
-                {"scale": 0.8, "colors": 208, "lossy": 20},
-                # Pass 5: Higher compression
-                {"scale": 0.75, "colors": 192, "lossy": 30},
-                # Pass 6: Strong compression
-                {"scale": 0.7, "colors": 176, "lossy": 40},
-                # Pass 7: Very strong compression
-                {"scale": 0.65, "colors": 160, "lossy": 50},
-                # Pass 8: Extreme compression
-                {"scale": 0.6, "colors": 144, "lossy": 60},
-                # Pass 9: Maximum compression
-                {"scale": 0.55, "colors": 128, "lossy": 80}
-            ]
-
-            # Skip early passes if file is much larger than target
-            start_pass = 0
-            if size_ratio > 5:
-                start_pass = 4  # Start with higher compression for large files
-            elif size_ratio > 3:
-                start_pass = 2  # Start with moderate compression
-
-            # Log starting strategy
-            self._log_message("INFO",
-                              f"Starting at optimization pass {start_pass+1}/{len(optimization_passes)} for {size_ratio:.1f}x target size",
-                              f"hmhd_strategy_{str(input_path)}")
-
-            # Process each pass until we reach target size
-            for i, settings in enumerate(optimization_passes[start_pass:], start=start_pass + 1):
-                # Create temp file for this pass
-                temp_output = Path(TEMP_FILE_DIR) / \
-                    f"hmhd_pass{i}_{uuid.uuid4().hex}.gif"
-                temp_files.append(temp_output)
-
-                # Log current pass
-                self._log_message("OPTIMIZING",
-                                  f"Pass {i}/{len(optimization_passes)}: scale={settings['scale']:.2f}, colors={settings['colors']}, lossy={settings['lossy']}",
-                                  f"hmhd_pass{i}_{str(input_path)}")
-
-                # Run optimization
-                success = self._compress_with_gifsicle(
-                    input_path,
-                    temp_output,
-                    colors=settings['colors'],
-                    scale=settings['scale'],
-                    lossy=settings['lossy'],
-                    optimize_level=3  # Use maximum optimization level
-                )
-
-                if success and temp_output.exists():
-                    # Check result size
-                    result_size = self.get_file_size(temp_output)
-
-                    # Log result
-                    self._log_message("INFO",
-                                      f"Pass {i} result: {result_size:.2f}MB (target: {target_size_mb:.2f}MB)",
-                                      f"hmhd_pass{i}_result_{str(input_path)}")
-
-                    # Validate the file is a valid GIF
-                    try:
-                        with Image.open(temp_output) as img:
-                            if img.format != 'GIF':
-                                continue  # Skip invalid files
-                    except Exception:
-                        continue  # Skip on error
-
-                    # Update best result if this is better
-                    if result_size < best_size:
-                        best_size = result_size
-                        best_file = temp_output
-                        best_settings = settings
-
-                    # Stop if we've reached target size
-                    if result_size <= target_size_mb:
-                        self._log_message("SUCCESS",
-                                          f"Target size achieved in pass {i}: {result_size:.2f}MB",
-                                          f"hmhd_target_met_{str(input_path)}")
-                        break
-
-            # Process results
-            if best_file and best_file.exists():
-                # Copy best result to output
-                shutil.copy2(best_file, output_path)
-
-                # Determine success based on size
-                success = best_size <= target_size_mb
-                status = ProcessingStatus.SUCCESS if success else ProcessingStatus.SIZE_THRESHOLD_EXCEEDED
-
-                message = (f"Optimized to {best_size:.2f}MB (target: {target_size_mb:.2f}MB)"
-                           f" with scale={best_settings['scale']:.2f}, colors={best_settings['colors']}, lossy={best_settings['lossy']}")
-
-                # Create optimization config from settings
-                settings = OptimizationConfig(
-                    scale_factor=best_settings['scale'],
-                    colors=best_settings['colors'],
-                    lossy_value=best_settings['lossy']
-                )
-
-                return ProcessingResult(
-                    fps=0,  # FPS is preserved in GIF
-                    size=best_size,
-                    path=str(output_path),
-                    status=status,
-                    message=message,
-                    settings=settings,
-                    success=success
-                )
-            else:
-                # No valid result found
-                self._log_message("ERROR",
-                                  "Failed to produce valid output in any pass",
-                                  f"hmhd_all_failed_{str(input_path)}")
-
-                return ProcessingResult(
-                    fps=0,
-                    size=0,
-                    path=None,
-                    status=ProcessingStatus.OPTIMIZATION_ERROR,
-                    message="All optimization passes failed"
-                )
-        except Exception as e:
-            self._log_message("ERROR",
-                              f"High motion optimization error: {e}",
-                              f"hmhd_error_{str(input_path)}")
-
-            return ProcessingResult(
-                fps=0,
-                size=0,
-                path=None,
-                status=ProcessingStatus.OPTIMIZATION_ERROR,
-                message=f"Optimization error: {str(e)}"
-            )
-        finally:
-            # Clean up temp files
-            for temp_file in temp_files:
-                if temp_file != best_file and temp_file.exists():
-                    try:
-                        temp_file.unlink()
-                    except:
-                        pass
-
-            # End performance monitoring
-            self._end_timer("optimize_high_motion_high_detail",
-                            include_system_stats=True)
-            self.logger.end_phase("High motion + high detail optimization")
-
-    def _optimize_high_motion_low_detail(self, input_path: Path, output_path: Path, target_size_mb: float) -> ProcessingResult:
-        """Optimize GIF with high motion but low detail.
-
-        Strategy: Maintain frame rate, aggressively reduce colors, apply moderate scaling.
-        """
-        temp_output = Path(TEMP_FILE_DIR) / f"hmld_{uuid.uuid4().hex}.gif"
-
-        try:
-            # Get dimensions
-            dimensions = self._get_dimensions_with_retry(input_path)
-            if not dimensions:
-                return ProcessingResult(0, 0, None, ProcessingStatus.DIMENSION_ERROR)
-
-            width, height = dimensions
-
-            # Calculate compression parameters
-            original_size = self.get_file_size(input_path)
-            size_ratio = original_size / target_size_mb
-
-            # Adaptive scaling - can be more aggressive since low detail
-            scale = 1.0
-            if size_ratio > 4:
-                scale = 0.6
-            elif size_ratio > 2.5:
-                scale = 0.7
-            elif size_ratio > 1.5:
-                scale = 0.8
-
-            # Aggressively reduce colors for low detail content
-            colors = 256
-            if size_ratio > 4:
-                colors = 196  # Changed from 64 to 196 (75.56% of 256)
-            elif size_ratio > 2:
-                colors = 216  # Changed from 96
-
-            # Higher lossy value since detail is less important
-            lossy = int(min(70, size_ratio * 15))
-
-            # For low detail, Bayer dithering often works better than Floyd-Steinberg
-            success = self._compress_with_gifsicle(
-                input_path,
-                temp_output,
-                colors=colors,
-                scale=scale,
-                lossy=lossy,
-                optimize_level=3
-            )
-
-            if success and temp_output.exists():
-                result_size = self.get_file_size(temp_output)
-
-                # Try more aggressive approach if needed
-                if result_size > target_size_mb:
-                    second_temp = Path(TEMP_FILE_DIR) / \
-                        f"hmld_2_{uuid.uuid4().hex}.gif"
-
-                    # More aggressive settings
-                    new_scale = max(0.4, scale - 0.15)
-                    new_colors = max(32, colors // 2)
-                    new_lossy = min(90, lossy + 30)
-
-                    if self._compress_with_gifsicle(
-                        input_path,
-                        second_temp,
-                        colors=new_colors,
-                        scale=new_scale,
-                        lossy=new_lossy,
-                        optimize_level=3
-                    ) and second_temp.exists():
-                        second_size = self.get_file_size(second_temp)
-
-                        if second_size < result_size:
-                            temp_output = second_temp
-                            result_size = second_size
-
-                # Copy to output path
-                shutil.copy2(temp_output, output_path)
-
-                return ProcessingResult(
-                    fps=0,
-                    size=result_size,
-                    path=str(output_path),
-                    status=ProcessingStatus.SUCCESS if result_size <= target_size_mb else ProcessingStatus.SIZE_THRESHOLD_EXCEEDED,
-                    message=f"Optimized to {result_size:.2f}MB (target: {target_size_mb:.2f}MB)",
-                    settings=OptimizationConfig(
-                        scale_factor=scale,
-                        colors=colors,
-                        lossy_value=lossy,
-                        dither_mode='bayer',
-                        bayer_scale=3
-                    )
-                )
-            else:
-                return ProcessingResult(0, 0, None, ProcessingStatus.OPTIMIZATION_ERROR, "Optimization failed")
-
-        except Exception as e:
-            return ProcessingResult(0, 0, None, ProcessingStatus.OPTIMIZATION_ERROR, f"Error: {e}")
-
-    def _optimize_low_motion_high_detail(self, input_path: Path, output_path: Path, target_size_mb: float) -> ProcessingResult:
-        """Optimize GIF with low motion but high detail.
-
-        Strategy: Reduce frame rate, preserve colors and detail, minimal scaling.
-        """
-        # For low motion, we can use ffmpeg to reduce the frame rate
-        temp_reduced_fps = Path(TEMP_FILE_DIR) / \
-            f"lmhd_fps_{uuid.uuid4().hex}.gif"
-        temp_output = Path(TEMP_FILE_DIR) / f"lmhd_{uuid.uuid4().hex}.gif"
-
-        try:
-            # Calculate compression parameters
-            original_size = self.get_file_size(input_path)
-            size_ratio = original_size / target_size_mb
-
-            # First reduce the frame rate based on motion and size ratio
-            target_fps = 10
-            if size_ratio > 3:
-                target_fps = 8
-            elif size_ratio > 2:
-                target_fps = 10
-            elif size_ratio > 1.5:
-                target_fps = 12
-
-            # Generate lower FPS GIF using FFmpeg
-            fps_cmd = [
-                'ffmpeg',
-                '-i', str(input_path),
-                '-vf', f'fps={target_fps}',
-                '-y', str(temp_reduced_fps)
-            ]
-
-            if not run_ffmpeg_command(fps_cmd, timeout=180, capture_output=True) or not temp_reduced_fps.exists():
-                # Fall back to the original if FPS reduction fails
-                shutil.copy2(input_path, temp_reduced_fps)
-
-            # Now optimize with emphasis on color preservation
-            scale = 1.0
-            if size_ratio > 4:
-                scale = 0.8
-            elif size_ratio > 2:
-                scale = 0.9
-
-            # Preserve more colors for high detail
-            colors = 256  # Changed from 192 to 256
-            if size_ratio > 3:
-                colors = 196  # Changed from 160 to 196 (75.56% of 256)
-
-            # Less lossy compression to preserve detail
-            lossy = int(min(40, size_ratio * 8))
-
-            # Run optimization with focus on detail preservation
-            success = self._compress_with_gifsicle(
-                temp_reduced_fps,
-                temp_output,
-                colors=colors,
-                scale=scale,
-                lossy=lossy,
-                optimize_level=3
-            )
-
-            if success and temp_output.exists():
-                result_size = self.get_file_size(temp_output)
-
-                # If still too large, try more aggressive scaling
-                if result_size > target_size_mb:
-                    second_temp = Path(TEMP_FILE_DIR) / \
-                        f"lmhd_2_{uuid.uuid4().hex}.gif"
-
-                    # Focus more on scaling than color reduction
-                    new_scale = max(0.6, scale - 0.15)
-                    new_colors = max(128, colors - 32)
-                    new_lossy = min(50, lossy + 15)
-
-                    if self._compress_with_gifsicle(
-                        temp_reduced_fps,
-                        second_temp,
-                        colors=new_colors,
-                        scale=new_scale,
-                        lossy=new_lossy,
-                        optimize_level=3
-                    ) and second_temp.exists():
-                        second_size = self.get_file_size(second_temp)
-
-                        if second_size < result_size:
-                            temp_output = second_temp
-                            result_size = second_size
-
-                # Copy to output path
-                shutil.copy2(temp_output, output_path)
-
-                return ProcessingResult(
-                    fps=target_fps,
-                    size=result_size,
-                    path=str(output_path),
-                    status=ProcessingStatus.SUCCESS if result_size <= target_size_mb else ProcessingStatus.SIZE_THRESHOLD_EXCEEDED,
-                    message=f"Optimized to {result_size:.2f}MB (target: {target_size_mb:.2f}MB)",
-                    settings=OptimizationConfig(
-                        scale_factor=scale,
-                        colors=colors,
-                        lossy_value=lossy,
-                        dither_mode='floyd_steinberg'
-                    )
-                )
-            else:
-                return ProcessingResult(0, 0, None, ProcessingStatus.OPTIMIZATION_ERROR, "Optimization failed")
-
-        except Exception as e:
-            return ProcessingResult(0, 0, None, ProcessingStatus.OPTIMIZATION_ERROR, f"Error: {e}")
-
-    def _optimize_low_motion_low_detail(self, input_path: Path, output_path: Path, target_size_mb: float) -> ProcessingResult:
-        """Optimize GIF with low motion and low detail.
-
-        Strategy: Aggressive optimization on all parameters (FPS, colors, scale, lossy).
-        """
-        # We can be very aggressive with optimization here
-        temp_reduced_fps = Path(TEMP_FILE_DIR) / \
-            f"lmld_fps_{uuid.uuid4().hex}.gif"
-        temp_output = Path(TEMP_FILE_DIR) / f"lmld_{uuid.uuid4().hex}.gif"
-
-        try:
-            # Calculate compression parameters
-            original_size = self.get_file_size(input_path)
-            size_ratio = original_size / target_size_mb
-
-            # Aggressive FPS reduction
-            target_fps = 8
-            if size_ratio > 3:
-                target_fps = 5
-            elif size_ratio > 2:
-                target_fps = 6
-            elif size_ratio > 1.5:
-                target_fps = 8
-
-            # Generate lower FPS GIF
-            fps_cmd = [
-                'ffmpeg',
-                '-i', str(input_path),
-                '-vf', f'fps={target_fps}',
-                '-y', str(temp_reduced_fps)
-            ]
-
-            if not run_ffmpeg_command(fps_cmd, timeout=180, capture_output=True) or not temp_reduced_fps.exists():
-                # Fall back to original
-                shutil.copy2(input_path, temp_reduced_fps)
-
-            # Very aggressive scaling
-            scale = 0.8
-            if size_ratio > 4:
-                scale = 0.5
-            elif size_ratio > 2.5:
-                scale = 0.6
-            elif size_ratio > 1.5:
-                scale = 0.7
-
-            # Minimal colors for low detail
-            colors = 256  # Changed from 96 to preserve more colors
-            if size_ratio > 3:
-                colors = 196  # Changed from 64 to 196 (75.56% of 256)
-            elif size_ratio > 2:
-                colors = 216  # Changed from 80 to higher value
-
-            # Heavy lossy compression
-            # Reduced from min(100, size_ratio * 20)
-            lossy = int(min(70, size_ratio * 12))
-
-            # Run aggressive optimization
-            success = self._compress_with_gifsicle(
-                temp_reduced_fps,
-                temp_output,
-                colors=colors,
-                scale=scale,
-                lossy=lossy,
-                optimize_level=3
-            )
-
-            if success and temp_output.exists():
-                result_size = self.get_file_size(temp_output)
-
-                # If incredibly still too large, one last extreme attempt
-                if result_size > target_size_mb:
-                    second_temp = Path(TEMP_FILE_DIR) / \
-                        f"lmld_extreme_{uuid.uuid4().hex}.gif"
-
-                    # Maximum compression settings
-                    if self._compress_with_gifsicle(
-                        temp_reduced_fps,
-                        second_temp,
-                        # Changed from 128 to 196 (75.56% of 256, rounded to whole number)
-                        colors=196,
-                        scale=0.5,  # Kept as is
-                        lossy=80,   # Kept as is
-                        optimize_level=3
-                    ) and second_temp.exists():
-                        second_size = self.get_file_size(second_temp)
-
-                        if second_size < result_size:
-                            temp_output = second_temp
-                            result_size = second_size
-
-                # Copy to output path
-                shutil.copy2(temp_output, output_path)
-
-                return ProcessingResult(
-                    fps=target_fps,
-                    size=result_size,
-                    path=str(output_path),
-                    status=ProcessingStatus.SUCCESS if result_size <= target_size_mb else ProcessingStatus.SIZE_THRESHOLD_EXCEEDED,
-                    message=f"Optimized to {result_size:.2f}MB (target: {target_size_mb:.2f}MB)",
-                    settings=OptimizationConfig(
-                        scale_factor=scale,
-                        colors=colors,
-                        lossy_value=lossy,
-                        dither_mode='bayer',
-                        bayer_scale=5
-                    )
-                )
-            else:
-                return ProcessingResult(0, 0, None, ProcessingStatus.OPTIMIZATION_ERROR, "Optimization failed")
-
-        except Exception as e:
-            return ProcessingResult(0, 0, None, ProcessingStatus.OPTIMIZATION_ERROR, f"Error: {e}")
-
-    def _compress_large_with_ffmpeg(self, input_path: Path, output_path: Path, scale_factor: float = 0.7, colors: int = 192, dither_method: str = 'floyd_steinberg') -> bool:
-        """Compress large GIF using FFmpeg with enhanced quality settings.
-
-        Args:
-            input_path: Path to input GIF
-            output_path: Path to output GIF
-            scale_factor: How much to scale dimensions (between 0.0-1.0)
-            colors: Number of colors in palette (higher = better quality but larger file)
-            dither_method: Dithering method ('floyd_steinberg' or 'bayer')
-
-        Returns:
-            bool: Success status
-        """
-        try:
-            # Check if we need to process at all - skip if already small enough
-            file_size_mb = self.get_file_size(input_path)
-            target_size_mb = self.compression_settings.get('min_size_mb', 10)
-
-            if file_size_mb <= target_size_mb * 0.95:  # Leave 5% margin
-                self.logger.info(
-                    f"Skipping FFmpeg - already optimized: {file_size_mb:.2f}MB < {target_size_mb:.2f}MB")
-                if input_path != output_path:
-                    shutil.copy2(input_path, output_path)
-                return True
-
-            # Get dimensions
-            dimensions = self._get_dimensions_with_retry(input_path)
-            if not dimensions:
-                self.logger.error(
-                    "Failed to get dimensions, cannot process file")
-                return False
-
-            width, height = dimensions
-            self.logger.info(
-                f"Got dimensions: ({width}, {height})")
-
-            # Validate dimensions to avoid invalid FFmpeg input
-            if width <= 0 or height <= 0:
-                self.logger.error(f"Invalid dimensions: {width}x{height}")
-                return False
-
-            # Calculate scaled dimensions while preserving aspect ratio
-            aspect_ratio = width / height
-
-            # Recalculate dimensions more accurately to preserve aspect ratio
-            if width > height:  # Landscape orientation
-                new_width = max(320, int(width * scale_factor) // 2 * 2)
-                new_height = max(
-                    180, int(new_width / aspect_ratio + 0.5) // 2 * 2)
-            else:  # Portrait orientation
-                new_height = max(180, int(height * scale_factor) // 2 * 2)
-                new_width = max(
-                    320, int(new_height * aspect_ratio + 0.5) // 2 * 2)
-
-            # Double-check aspect ratio
-            new_aspect = new_width / new_height
-            aspect_error = abs(new_aspect - aspect_ratio) / aspect_ratio
-            if aspect_error > 0.05:  # More than 5% error
-                self.logger.warning(
-                    f"Aspect ratio deviation detected ({aspect_error:.2%}). Recalculating dimensions...")
-                # Recalculate to preserve aspect ratio
-                if width > height:  # Landscape
-                    new_width = max(320, int(width * scale_factor) // 2 * 2)
-                    new_height = max(
-                        180, int(round(new_width / aspect_ratio)) // 2 * 2)
-                else:  # Portrait
-                    new_height = max(180, int(height * scale_factor) // 2 * 2)
-                    new_width = max(
-                        320, int(round(new_height * aspect_ratio)) // 2 * 2)
-
-            self.logger.info(
-                f"Using dimensions {new_width}x{new_height} (original: {width}x{height}, aspect ratio: {aspect_ratio:.3f})")
-
-            # Use appropriate frames per second - maintain higher FPS for better quality
-            fps = 15
-            if file_size_mb > target_size_mb * 5:
-                fps = 12
-            elif file_size_mb > target_size_mb * 10:
-                fps = 10
-
-            # Skip direct FFmpeg conversion and only use the two-pass method
-            self.logger.info(
-                f"File is {file_size_mb/target_size_mb:.1f}x too large, using two-pass FFmpeg conversion")
-
-            # Create a unique temporary filename for intermediate GIF
-            temp_palette = Path(TEMP_FILE_DIR) / \
-                f"palette_{uuid.uuid4().hex}.png"
-            temp_gif = Path(TEMP_FILE_DIR) / \
-                f"temp_twopass_{uuid.uuid4().hex}.gif"
-
-            try:
-                # Check if this is a video file that needs keyframe handling
-                is_video = self._is_video_file(str(input_path))
-                keyframe_flags = ['-ignore_loop', '0',
-                                  '-vsync', '0'] if is_video else []
-
-                # Create palette with enhanced settings for better quality
-                stats_mode = 'full'  # Always use full mode for better quality
-
-                # Create palette command
-                palette_cmd = ['ffmpeg']
-                if is_video:
-                    palette_cmd.extend(keyframe_flags)
-
-                palette_cmd.extend([
-                    '-i', str(input_path),
-                    '-vf', f'fps={fps},scale={new_width}:{new_height}:flags=lanczos,palettegen=max_colors={colors}:reserve_transparent=0:stats_mode={stats_mode}',
-                    '-y', str(temp_palette)
-                ])
-
-                # Run palette command with timeout
-                if not run_ffmpeg_command(palette_cmd, timeout=180, capture_output=True) or not temp_palette.exists():
-                    self.logger.error("Failed to generate palette")
-                    return False
-
-                # Setup dithering parameters - always use floyd_steinberg for best quality
-                dither_params = 'dither=floyd_steinberg:diff_mode=rectangle'
-
-                # Create GIF command
-                gif_cmd = ['ffmpeg']
-                if is_video:
-                    gif_cmd.extend(keyframe_flags)
-
-                gif_cmd.extend([
-                    '-i', str(input_path),
-                    '-i', str(temp_palette),
-                    '-lavfi', f'fps={fps},scale={new_width}:{new_height}:flags=lanczos[x];[x][1:v]paletteuse={dither_params}',
-                    '-y', str(temp_gif)
-                ])
-
-                # Run GIF command with timeout
-                if not run_ffmpeg_command(gif_cmd, timeout=180, capture_output=True) or not temp_gif.exists():
-                    self.logger.error("Failed to create GIF")
-                    return False
-
-                # Verify the file is valid
-                try:
-                    with Image.open(temp_gif) as img:
-                        if img.format != 'GIF':
-                            self.logger.warning(
-                                f"Output is not a valid GIF: {img.format}")
-                            return False
-                except Exception as e:
-                    self.logger.warning(f"Invalid GIF created: {e}")
-                    return False
-
-                # Copy to the output path
-                shutil.copy2(temp_gif, output_path)
-                return True
-
-            finally:
-                # Clean up temporary files safely
-                try:
-                    if temp_palette.exists():
-                        temp_palette.unlink(missing_ok=True)
-                    if temp_gif.exists():
-                        temp_gif.unlink(missing_ok=True)
-                except Exception as e:
-                    self.logger.error(
-                        f"Failed to clean up temporary files: {e}")
-
-                # Force garbage collection to release file handles
-                gc.collect()
-
-        except Exception as e:
-            self.logger.error(f"FFmpeg compression error: {e}", exc_info=True)
-            return False
 
     def _is_video_file(self, file_path: str) -> bool:
         """Check if a file is a video file based on its extension.
@@ -3634,15 +2126,17 @@ class GIFProcessor(BaseProcessor):
                 result = self._progressive_optimize(
                     temp_gif, output_path, target_size_mb)
 
-                # Only return success if target size was met
-                return result.success and result.size <= target_size_mb
+                # Return success regardless of whether target size was met
+                # (as long as we have a valid result file)
+                return result.success and result.path is not None
             else:
                 # For existing GIFs, optimize directly
                 result = self._progressive_optimize(
                     file_path, output_path, target_size_mb)
 
-                # Only return success if target size was met
-                return result.success and result.size <= target_size_mb
+                # Return success regardless of whether target size was met
+                # (as long as we have a valid result file)
+                return result.success and result.path is not None
 
         except Exception as e:
             self.logger.error(
@@ -3730,7 +2224,14 @@ class GIFProcessor(BaseProcessor):
                 # Extreme last resort option
                 {"scale": 0.3, "colors": 80, "lossy": 100},
                 # Absolute last resort with extreme compression
-                {"scale": 0.25, "colors": 64, "lossy": 120}
+                {"scale": 0.25, "colors": 64, "lossy": 120},
+                # Ultra aggressive options added for more optimization attempts
+                {"scale": 0.22, "colors": 56, "lossy": 130},
+                {"scale": 0.2, "colors": 48, "lossy": 140},
+                {"scale": 0.18, "colors": 40, "lossy": 150},
+                {"scale": 0.16, "colors": 32, "lossy": 160},
+                {"scale": 0.14, "colors": 24, "lossy": 170},
+                {"scale": 0.12, "colors": 16, "lossy": 180}
             ]
 
             # Skip early passes for large files to save processing time
@@ -3850,7 +2351,6 @@ class GIFProcessor(BaseProcessor):
 
                     # Determine status based on size
                     met_target = best_size <= target_size_mb
-
                     if met_target:
                         status = ProcessingStatus.SUCCESS
                         message = f"Optimized successfully: {best_size:.2f}MB (target: {target_size_mb:.2f}MB)"
@@ -3859,9 +2359,9 @@ class GIFProcessor(BaseProcessor):
                             message,
                             f"prog_opt_success_{str(input_path)}")
                     else:
-                        # We couldn't meet the target size
+                        # We couldn't meet the target size but still using best result
                         status = ProcessingStatus.SIZE_THRESHOLD_EXCEEDED
-                        message = f"Best optimization still exceeds target: {best_size:.2f}MB > {target_size_mb:.2f}MB"
+                        message = f"Best optimization still exceeds target: {best_size:.2f}MB > {target_size_mb:.2f}MB, using anyway"
                         self._log_message(
                             "WARNING",
                             message,
@@ -3881,7 +2381,7 @@ class GIFProcessor(BaseProcessor):
                         status=status,
                         message=message,
                         settings=opt_config,
-                        success=met_target  # Only count as success if target size is met
+                        success=True  # Always return success if we have a best result, even if not meeting target
                     )
                 except Exception as e:
                     self._log_message(
@@ -3984,7 +2484,8 @@ class GIFProcessor(BaseProcessor):
 
             # Add lossy parameter if needed
             if lossy > 0:
-                cmd.append(f"--lossy={lossy}")
+                # Updated to use consistent parameter style
+                cmd.extend(['--lossy', str(lossy)])
 
             # Add scale parameter if needed
             if scale < 1.0:
@@ -4043,165 +2544,87 @@ class GIFProcessor(BaseProcessor):
             self._end_timer(
                 f"gifsicle_{colors}_{scale}_{lossy}", include_system_stats=True)
 
-    def _run_command_with_logging(self, command: list, timeout=None) -> bool:
-        """Run a command with proper logging.
+    def update_progress(self, operation_id: str, current: int, total: int,
+                        description: str, file_name: str = None, status: str = "PROCESSING",
+                        start_time: float = None, force_update: bool = False):
+        """Update progress for a specific operation with real-time display.
 
         Args:
-            command: Command list to run
-            timeout: Optional timeout in seconds
-
-        Returns:
-            bool: Success status
+            operation_id: Unique identifier for this operation
+            current: Current progress value
+            total: Total progress value
+            description: Description of the operation
+            file_name: Current file being processed
+            status: Status message (processing, optimizing, etc.)
+            start_time: Start time for ETA calculation
+            force_update: Whether to force an update regardless of the interval
         """
-        # Start performance timer
-        cmd_name = command[0] if command else "unknown"
-        timer_name = f"cmd_{cmd_name}_{uuid.uuid4().hex[:6]}"
-        self._start_timer(timer_name)
+        with self.progress_lock:
+            current_time = time.time()
 
-        try:
-            # Log the command details
-            cmd_str = ' '.join(command)
-            truncated_cmd = cmd_str[:100] + \
-                "..." if len(cmd_str) > 100 else cmd_str
-
-            self._log_message("INFO",
-                              f"Running command: {truncated_cmd}",
-                              f"cmd_start_{cmd_name}")
-
-            # Log detailed command information
-            self.logger.debug(f"Executing command with timeout {timeout}s", extra={
-                'details': {
-                    "Command": truncated_cmd,
-                    "Timeout": f"{timeout}s" if timeout else "None"
+            # Store progress data
+            if operation_id not in self.active_progress_bars:
+                self.active_progress_bars[operation_id] = {
+                    'start_time': start_time or current_time,
+                    'last_update': 0,
+                    'description': description,
+                    'file_name': file_name,
+                    'status': status
                 }
-            })
 
-            # Run the command
-            process = subprocess.run(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=timeout,
-                check=False,  # Don't raise exception on non-zero exit
-                text=True
-            )
+            # Update values
+            progress_data = self.active_progress_bars[operation_id]
+            progress_data['current'] = current
+            progress_data['total'] = total
+            progress_data['description'] = description
+            progress_data['file_name'] = file_name
+            progress_data['status'] = status
 
-            # Process the results
-            exit_code = process.returncode
-            success = exit_code == 0
+            # Check if it's time to update the display
+            if force_update or (current_time - self.last_progress_update) >= self.progress_update_interval:
+                # Update display
+                display_progress_update(
+                    current, total,
+                    description=description,
+                    file_name=file_name,
+                    status=status,
+                    start_time=progress_data['start_time'],
+                    is_new_line=(progress_data['last_update'] == 0)
+                )
 
-            # Log command outcome
-            if success:
-                self._log_message("SUCCESS",
-                                  f"Command completed successfully (exit code: {exit_code})",
-                                  f"cmd_success_{cmd_name}")
-            else:
-                # Log error with details
-                stderr_preview = process.stderr[:200] + "..." if len(
-                    process.stderr) > 200 else process.stderr
-                self._log_message("ERROR",
-                                  f"Command failed with exit code {exit_code}",
-                                  f"cmd_error_{cmd_name}")
+                # Update timestamps
+                progress_data['last_update'] = current_time
+                self.last_progress_update = current_time
 
-                # Log stderr to help with debugging
-                if stderr_preview.strip():
-                    self.logger.error(f"Command error output", extra={
-                        'details': {
-                            "Exit code": str(exit_code),
-                            "Command": truncated_cmd,
-                            "Error": stderr_preview
-                        }
-                    })
+                # Log to logger as well
+                if current == total:
+                    self.logger.info(f"{description} complete: {file_name}")
+                else:
+                    self.logger.debug(
+                        f"{description} progress: {current}/{total} - {file_name}")
 
-            return success
-        except subprocess.TimeoutExpired:
-            self._log_message("ERROR",
-                              f"Command timed out after {timeout} seconds",
-                              f"cmd_timeout_{cmd_name}")
-            return False
-        except Exception as e:
-            self._log_message("ERROR",
-                              f"Error running command: {e}",
-                              f"cmd_exception_{cmd_name}")
-
-            # Log exception details
-            self.logger.error(f"Command execution error", extra={
-                'details': {
-                    "Exception": str(e),
-                    "Command": truncated_cmd
-                }
-            }, exc_info=True)
-
-            return False
-        finally:
-            # End performance timer
-            self._end_timer(timer_name)
-
-    def _safe_cleanup_temp_files(self, temp_files: List[Path]) -> None:
-        """Safely clean up temporary files with proper error handling.
+    def complete_progress(self, operation_id: str, success: bool = True, message: str = None):
+        """Mark a progress operation as complete.
 
         Args:
-            temp_files: List of Path objects to clean up
+            operation_id: The operation ID to complete
+            success: Whether the operation was successful
+            message: Optional final message
         """
-        for file_path in temp_files:
-            try:
-                if file_path and file_path.exists():
-                    file_path.unlink(missing_ok=True)
-            except Exception as e:
-                self.logger.debug(
-                    f"Failed to clean up temp file {file_path}: {e}")
+        with self.progress_lock:
+            if operation_id in self.active_progress_bars:
+                progress_data = self.active_progress_bars[operation_id]
+                status = "SUCCESS" if success else "ERROR"
+                final_message = message or f"{'Completed' if success else 'Failed'}: {progress_data['description']}"
 
-        # Force garbage collection to help release file handles
-        gc.collect()
+                # Show final progress
+                display_progress_update(
+                    progress_data['total'], progress_data['total'],
+                    description=final_message,
+                    file_name=progress_data['file_name'],
+                    status=status,
+                    start_time=progress_data['start_time']
+                )
 
-    def _log_optimization_result(self, original_size: float, result_size: float,
-                                 target_size_mb: float, strategy_name: str, file_path: Path) -> None:
-        """Log the results of an optimization strategy with consistent formatting.
-
-        Args:
-            original_size: Size in MB before optimization
-            result_size: Size in MB after optimization
-            target_size_mb: Target size in MB
-            strategy_name: Name of the optimization strategy used
-            file_path: Path to the optimized file
-        """
-        # Calculate reduction statistics
-        reduction = (1 - result_size / original_size) * 100
-        target_met = result_size <= target_size_mb
-
-        # Determine status based on whether target was met
-        if target_met:
-            status = GIFProcessingStatus.SUCCESS
-            log_level = "SUCCESS"
-        else:
-            status = GIFProcessingStatus.WARNING
-            log_level = "WARNING"
-
-        # Create details dictionary for extended logging
-        details = {
-            "Original size": f"{original_size:.2f}MB",
-            "Final size": f"{result_size:.2f}MB",
-            "Reduction": f"{reduction:.1f}%",
-            "Target": f"{target_size_mb:.2f}MB",
-            "Target met": "Yes" if target_met else "No",
-            "Strategy": strategy_name
-        }
-
-        # Log the main message with appropriate level and icon
-        icon, color = status.value
-        message = f"{strategy_name} optimization: {original_size:.2f}MB → {result_size:.2f}MB ({reduction:.1f}% reduction)"
-
-        if target_met:
-            message += f" - Target met ({target_size_mb:.2f}MB)"
-        else:
-            message += f" - Target not met ({result_size:.2f}MB > {target_size_mb:.2f}MB)"
-
-        self._log_message(log_level, message,
-                          f"opt_result_{strategy_name}_{str(file_path)}")
-
-        # Log extended details with the logger
-        self.logger.log(
-            SUCCESS_LEVEL if target_met else logging.WARNING,
-            f"Optimization result [{strategy_name}]",
-            extra={'details': details}
-        )
+                # Remove from active tracking
+                del self.active_progress_bars[operation_id]

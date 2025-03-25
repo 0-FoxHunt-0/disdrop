@@ -24,7 +24,7 @@ VIDEO_COMPRESSION = {
         'crf': 26,
         'preset': 'medium'
     },
-    'min_size_mb': 15.0,      # Target maximum size for gifs in MB
+    'min_size_mb': 10.0,      # Target maximum size for gifs in MB
     'fps_range': (15, 30),
     'quality_presets': ['faster', 'medium', 'slower']
 }
@@ -55,47 +55,47 @@ VIDEO_SETTINGS = {
 }
 
 GIF_COMPRESSION = {
-    'fps_range': (10, 30),  # Frame rate range for gif optimization
-    'colors': 224,          # Lowered from 256 to avoid file size increase in lossless mode
-    'lossy_value': 0,       # Prioritize scaling over lossy compression
-    'min_size_mb': 10.0,    # Target maximum size for gifs in MB
-    'min_width': 0,
-    'min_height': 120,
-    'quality': 95,          # Increased from 85 to preserve quality
-    'scale_priority': True  # New flag to prioritize scaling over other reductions
+    'fps_range': (20, 15),    # Good middle ground for quality vs size
+    'colors': 256,            # Keep max colors for better quality
+    # Balanced compression (lower than 55 but higher than 20)
+    'lossy_value': 35,
+    'min_size_mb': 10,        # Return to 10MB limit as required
+    'min_width': 320,         # Keep higher resolution minimum width
+    'min_height': 240,        # Keep higher resolution minimum height
+    'quality_priority': True  # New flag to optimize for quality within size constraints
 }
 
-# Strategies for multiple pass overs after failed attempts - updated to prioritize scaling
+# Strategies for multiple pass overs after failed attempts - updated for better quality
 GIF_PASS_OVERS = [
-    {
+    {  # First pass: try higher FPS with full colors but higher lossy value
+        'fps_range': (18, 15),
+        'colors': 256,
+        'lossy_value': 40,
+        'scale_factor': 0.9,
+    },
+    {  # Second pass: reduce FPS slightly, keep colors, increase compression
         'fps_range': (15, 15),
         'colors': 224,
-        'lossy_value': 0,
-        'scale_factor': 0.85,
+        'lossy_value': 50,
+        'scale_factor': 0.8,
     },
-    {
-        'fps_range': (15, 12),
-        'colors': 192,
-        'lossy_value': 0,
-        'scale_factor': 0.7,
-    },
-    {
+    {  # Third pass: reduce FPS more, lower colors slightly
         'fps_range': (12, 12),
         'colors': 192,
-        'lossy_value': 30,
+        'lossy_value': 60,
+        'scale_factor': 0.7,
+    },
+    {  # Fourth pass: further reductions while maintaining recognizability
+        'fps_range': (10, 10),
+        'colors': 160,
+        'lossy_value': 70,
         'scale_factor': 0.6,
     },
-    {
-        'fps_range': (12, 10),
-        'colors': 160,
-        'lossy_value': 50,
-        'scale_factor': 0.5,
-    },
-    {
-        'fps_range': (10, 10),
+    {  # Last resort: aggressive optimization
+        'fps_range': (8, 8),
         'colors': 128,
-        'lossy_value': 60,
-        'scale_factor': 0.4,
+        'lossy_value': 80,
+        'scale_factor': 0.5,
     },
 ]
 
