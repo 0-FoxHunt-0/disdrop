@@ -8,6 +8,9 @@ psutil>=5.8.0
 typing-extensions>=4.7.0
 python-magic>=0.4.27
 
+# Terminal UI
+blessed>=1.19.0
+
 # Performance optimization
 numpy>=1.21.0
 cachetools>=5.0.0
