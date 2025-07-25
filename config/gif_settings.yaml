@@ -1,0 +1,72 @@
+# GIF Generation Configuration
+# Note: Width and height are maximum dimensions. The actual dimensions will preserve the original video's aspect ratio.
+gif_settings:
+  # General settings
+  max_file_size_mb: 10
+  max_duration_seconds: 15
+  
+  # Quality settings
+  fps: 15
+  width: 480  # Maximum width (aspect ratio will be preserved)
+  height: 480  # Maximum height (aspect ratio will be preserved)
+  
+  # Optimization settings
+  palette_size: 256
+  dither: "bayer"  # none, bayer, floyd_steinberg
+  lossy: 80  # 0-200, higher means more compression
+  
+  # Color reduction
+  colors: 256
+  stats_mode: "diff"  # full, diff
+  
+  # Quality optimization settings
+  quality_optimization:
+    enabled: true  # Enable iterative quality optimization
+    max_attempts_per_stage: 3  # Reduced from 5 for better performance
+    target_size_efficiency: 0.98  # Increased from 0.9 to encourage using more of the limit
+    quality_stages:
+      - name: "Maximum Quality"
+        colors: 256
+        fps_multiplier: 2.0
+        resolution_multiplier: 1.5
+        lossy: 0
+        dither: "floyd_steinberg"
+      - name: "High Quality"
+        colors: 256
+        fps_multiplier: 1.5
+        resolution_multiplier: 1.2
+        lossy: 20
+        dither: "floyd_steinberg"
+      - name: "Medium Quality"
+        colors: 192
+        fps_multiplier: 1.2
+        resolution_multiplier: 1.0
+        lossy: 40
+        dither: "bayer"
+      - name: "Standard Quality"
+        colors: 128
+        fps_multiplier: 1.0
+        resolution_multiplier: 1.0
+        lossy: 80
+        dither: "bayer"
+  
+  # Platform specific settings
+  platforms:
+    twitter:
+      max_width: 506
+      max_height: 506
+      max_duration: 15
+    
+    discord:
+      max_width: 400
+      max_height: 400
+      max_duration: 10
+      colors: 192
+      max_file_size_mb: 8  # Discord's 8MB limit for free users
+      dither: "floyd_steinberg"
+      lossy: 40
+    
+    slack:
+      max_width: 360
+      max_height: 360
+      max_duration: 8 

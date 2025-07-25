@@ -1,0 +1,62 @@
+# Video Compression Configuration
+video_compression:
+  # General settings
+  max_file_size_mb: 10
+  temp_dir: "./temp"
+  
+  # Hardware acceleration settings
+  hardware_acceleration:
+    nvidia: "h264_nvenc"
+    amd: "h264_amf"
+    fallback: "libx264"
+  
+  # Social media platform presets
+  platforms:
+    instagram:
+      max_width: 1080
+      max_height: 1080
+      aspect_ratio: "1:1"
+      bitrate: "1000k"
+      fps: 30
+    
+    twitter:
+      max_width: 1280
+      max_height: 720
+      aspect_ratio: "16:9"
+      bitrate: "1200k"
+      fps: 30
+    
+    tiktok:
+      max_width: 1080
+      max_height: 1920
+      aspect_ratio: "9:16"
+      bitrate: "1500k"
+      fps: 30
+    
+    youtube_shorts:
+      max_width: 1080
+      max_height: 1920
+      aspect_ratio: "9:16"
+      bitrate: "2000k"
+      fps: 30
+    
+    facebook:
+      max_width: 1280
+      max_height: 720
+      aspect_ratio: "16:9"
+      bitrate: "1000k"
+      fps: 30
+    
+    discord:
+      max_width: 1280
+      max_height: 720
+      aspect_ratio: "16:9"
+      bitrate: "800k"
+      fps: 30
+      max_file_size_mb: 8  # Discord's 8MB limit for free users
+  
+  # Quality settings
+  quality:
+    crf: 28  # Constant Rate Factor (lower = higher quality)
+    preset: "medium"  # ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow
+    tune: "film"  # film, animation, grain, stillimage, fastdecode, zerolatency 
