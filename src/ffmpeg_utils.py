@@ -130,13 +130,11 @@ class FFmpegUtils:
                 qp_value = max(18, min(51, int(params['crf'])))
                 cmd.extend(['-qp', str(qp_value)])
             
-            # AMD-specific optimizations - simplified
-            if params.get('platform') in ['youtube_shorts', 'tiktok']:
-                # Optimize for vertical video platforms - use main profile for compatibility
-                cmd.extend(['-profile:v', 'main'])
-            else:
-                # Use main profile instead of high for better compatibility
-                cmd.extend(['-profile:v', 'main'])
+            # AMD-specific optimizations - simplified for compatibility
+            # Use baseline profile for maximum compatibility
+            cmd.extend(['-profile:v', 'baseline'])
+            
+            # Remove any problematic parameters that might cause invalid argument errors
         
         elif acceleration_type == 'nvidia' and 'nvenc' in encoder:
             # NVIDIA NVENC-specific settings
@@ -159,8 +157,8 @@ class FFmpegUtils:
             
             # AMD AMF bitrate limiting - prevent extremely high bitrates that cause failures
             if params.get('acceleration_type') == 'amd' and 'amf' in params.get('encoder', ''):
-                # Limit AMD AMF bitrate to prevent failures (max ~6 Mbps for better compatibility)
-                max_amd_bitrate = 6000  # 6 Mbps - more conservative
+                # Limit AMD AMF bitrate to prevent failures (max ~4 Mbps for better compatibility)
+                max_amd_bitrate = 4000  # 4 Mbps - very conservative
                 if bitrate > max_amd_bitrate:
                     logger.warning(f"Limiting AMD AMF bitrate from {bitrate}k to {max_amd_bitrate}k for compatibility")
                     bitrate = max_amd_bitrate
@@ -171,16 +169,16 @@ class FFmpegUtils:
             maxrate_multiplier = params.get('maxrate_multiplier', 1.2)
             maxrate = int(bitrate * maxrate_multiplier)
             
-            # For AMD AMF, use more conservative maxrate
+            # For AMD AMF, use very conservative maxrate
             if params.get('acceleration_type') == 'amd' and 'amf' in params.get('encoder', ''):
-                maxrate_multiplier = 1.1  # More conservative for AMD
+                maxrate_multiplier = 1.05  # Very conservative for AMD
                 maxrate = int(bitrate * maxrate_multiplier)
             
             cmd.extend(['-maxrate', f"{maxrate}k"])
             
-            # Buffer size - more conservative for AMD AMF
+            # Buffer size - very conservative for AMD AMF
             if params.get('acceleration_type') == 'amd' and 'amf' in params.get('encoder', ''):
-                buffer_multiplier = 1.5  # More conservative buffer
+                buffer_multiplier = 1.2  # Very conservative buffer
             
             cmd.extend(['-bufsize', f"{int(bitrate * buffer_multiplier)}k"])
         

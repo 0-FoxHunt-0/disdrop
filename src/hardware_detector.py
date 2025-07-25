@@ -286,21 +286,20 @@ class HardwareDetector:
         options = []
         
         if encoder == 'h264_amf':
+            # Simplified AMD AMF options for maximum compatibility
             options.extend([
                 '-usage', 'transcoding',  # Optimize for transcoding
-                '-quality', 'balanced',   # Use balanced quality for best compatibility
-                # Remove -rc parameter as it's not supported in this FFmpeg build
+                '-quality', 'speed',      # Use speed instead of balanced for better compatibility
             ])
         elif encoder == 'hevc_amf':
             options.extend([
                 '-usage', 'transcoding',
-                '-quality', 'balanced',   # Use balanced quality
-                # Remove -rc parameter as it's not supported in this FFmpeg build
+                '-quality', 'speed',      # Use speed instead of balanced
             ])
         elif encoder == 'av1_amf':
             options.extend([
                 '-usage', 'transcoding',
-                '-quality', 'balanced',   # Use balanced quality
+                '-quality', 'speed',      # Use speed instead of balanced
             ])
         
         return options

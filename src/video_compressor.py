@@ -994,6 +994,25 @@ class DynamicVideoCompressor:
         
         if return_code != 0:
             error_output = process.stderr.read()
+            
+            # Check if this is an AMD AMF encoder error
+            if any(encoder in ' '.join(cmd) for encoder in ['h264_amf', 'hevc_amf', 'av1_amf']):
+                # Check for specific AMD AMF error codes
+                if str(return_code) in ['4294967274', '-22'] or 'Invalid argument' in error_output:
+                    logger.warning(f"AMD AMF encoder failed with error code {return_code}, attempting software fallback...")
+                    # Create software fallback command
+                    fallback_cmd = self._create_software_fallback_command(cmd)
+                    if fallback_cmd:
+                        logger.info("Attempting software fallback...")
+                        # Try the fallback command
+                        try:
+                            return self._execute_ffmpeg_command(fallback_cmd, duration)
+                        except subprocess.CalledProcessError as fallback_error:
+                            logger.error(f"Software fallback also failed: {fallback_error}")
+                            raise fallback_error
+                    else:
+                        logger.error("Failed to create software fallback command")
+            
             raise subprocess.CalledProcessError(return_code, cmd, error_output)
     
     def _create_software_fallback_command(self, cmd: List[str]) -> Optional[List[str]]:
@@ -1018,6 +1037,8 @@ class DynamicVideoCompressor:
             
             # Remove hardware-specific options that don't work with software encoders
             hardware_options = ['-hwaccel', 'cuda', '-hwaccel', 'auto', '-hwaccel', 'qsv']
+            amd_specific_options = ['-usage', 'transcoding', '-quality', 'speed', '-quality', 'balanced']
+            
             i = 0
             while i < len(fallback_cmd):
                 if fallback_cmd[i] in hardware_options:
@@ -1027,8 +1048,19 @@ class DynamicVideoCompressor:
                         fallback_cmd.pop(i)  # Remove value
                     else:
                         fallback_cmd.pop(i)  # Remove option only
+                elif fallback_cmd[i] in amd_specific_options:
+                    # Remove AMD-specific options
+                    fallback_cmd.pop(i)
                 else:
                     i += 1
+            
+            # Add software encoder specific options
+            if 'libx264' in fallback_cmd:
+                # Add CRF instead of QP for libx264
+                for i, arg in enumerate(fallback_cmd):
+                    if arg == '-qp':
+                        fallback_cmd[i] = '-crf'
+                        break
             
             return fallback_cmd
             
