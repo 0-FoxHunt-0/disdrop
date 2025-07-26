@@ -167,6 +167,7 @@ output/*
 !output/.gitkeep
 input/*
 !input/.gitkeep
+temp_move/*
 *.mp4
 *.mov
 *.avi

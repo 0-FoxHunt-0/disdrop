@@ -9,6 +9,7 @@ import logging.config
 import yaml
 from colorama import init, Fore, Style
 from typing import Optional
+import codecs
 
 # Initialize colorama for Windows compatibility
 init(autoreset=True)
@@ -30,6 +31,24 @@ class ColoredFormatter(logging.Formatter):
             record.levelname = f"{self.COLORS[record.levelname]}{record.levelname}{Style.RESET_ALL}"
         
         return super().format(record)
+
+class UTF8StreamHandler(logging.StreamHandler):
+    """Stream handler that forces UTF-8 encoding"""
+    
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            stream = self.stream
+            # Force UTF-8 encoding
+            if hasattr(stream, 'buffer'):
+                stream.buffer.write(msg.encode('utf-8'))
+                stream.buffer.write(b'\n')
+                stream.buffer.flush()
+            else:
+                stream.write(msg + self.terminator)
+                self.flush()
+        except Exception:
+            self.handleError(record)
 
 def setup_logging(config_path: str = "config/logging.yaml", log_level: Optional[str] = None):
     """

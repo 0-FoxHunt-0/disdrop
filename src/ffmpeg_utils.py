@@ -124,17 +124,32 @@ class FFmpegUtils:
                 cmd.extend(['-preset', params['preset']])
         
         elif acceleration_type == 'amd' and 'amf' in encoder:
-            # AMD AMF-specific quality settings - simplified for maximum compatibility
+            # AMD AMF-specific quality settings - ultra-conservative for maximum compatibility
+            # Avoid advanced features that might cause "Invalid argument" errors
+            
             if 'crf' in params:
-                # AMF uses qp instead of crf, but keep it simple
-                qp_value = max(18, min(51, int(params['crf'])))
+                # AMF uses qp instead of crf - use conservative values
+                # Map CRF to QP more conservatively to avoid errors
+                crf_value = params['crf']
+                if crf_value < 18:
+                    qp_value = 18  # Minimum safe QP
+                elif crf_value > 40:
+                    qp_value = 40  # Maximum safe QP for compatibility
+                else:
+                    qp_value = int(crf_value)
                 cmd.extend(['-qp', str(qp_value)])
             
-            # AMD-specific optimizations - simplified for compatibility
-            # Use baseline profile for maximum compatibility
+            # Use most conservative profile for maximum compatibility
             cmd.extend(['-profile:v', 'baseline'])
             
+            # Conservative level setting
+            cmd.extend(['-level', '3.1'])
+            
+            # Disable advanced features that might cause issues
+            cmd.extend(['-refs', '1'])  # Single reference frame
+            
             # Remove any problematic parameters that might cause invalid argument errors
+            # Don't add any experimental or advanced AMD-specific flags
         
         elif acceleration_type == 'nvidia' and 'nvenc' in encoder:
             # NVIDIA NVENC-specific settings
@@ -157,11 +172,17 @@ class FFmpegUtils:
             
             # AMD AMF bitrate limiting - prevent extremely high bitrates that cause failures
             if params.get('acceleration_type') == 'amd' and 'amf' in params.get('encoder', ''):
-                # Limit AMD AMF bitrate to prevent failures (max ~4 Mbps for better compatibility)
-                max_amd_bitrate = 4000  # 4 Mbps - very conservative
+                # Ultra-conservative bitrate limiting for AMD AMF to prevent failures
+                max_amd_bitrate = 3000  # 3 Mbps - extremely conservative
                 if bitrate > max_amd_bitrate:
                     logger.warning(f"Limiting AMD AMF bitrate from {bitrate}k to {max_amd_bitrate}k for compatibility")
                     bitrate = max_amd_bitrate
+                
+                # Also ensure minimum bitrate to avoid edge cases
+                min_amd_bitrate = 200  # 200 kbps minimum
+                if bitrate < min_amd_bitrate:
+                    logger.info(f"Increasing AMD AMF bitrate from {bitrate}k to {min_amd_bitrate}k for stability")
+                    bitrate = min_amd_bitrate
             
             cmd.extend(['-b:v', f"{bitrate}k"])
             
@@ -171,16 +192,22 @@ class FFmpegUtils:
             
             # For AMD AMF, use very conservative maxrate
             if params.get('acceleration_type') == 'amd' and 'amf' in params.get('encoder', ''):
-                maxrate_multiplier = 1.05  # Very conservative for AMD
+                maxrate_multiplier = 1.02  # Extremely conservative for AMD (2% above target)
                 maxrate = int(bitrate * maxrate_multiplier)
+                # Ensure maxrate is at least slightly above bitrate
+                if maxrate <= bitrate:
+                    maxrate = bitrate + 50  # Add 50kbps minimum headroom
             
             cmd.extend(['-maxrate', f"{maxrate}k"])
             
             # Buffer size - very conservative for AMD AMF
             if params.get('acceleration_type') == 'amd' and 'amf' in params.get('encoder', ''):
-                buffer_multiplier = 1.2  # Very conservative buffer
-            
-            cmd.extend(['-bufsize', f"{int(bitrate * buffer_multiplier)}k"])
+                buffer_multiplier = 1.1  # Extremely conservative buffer (10% above bitrate)
+                # Ensure minimum buffer size
+                buffer_size = max(int(bitrate * buffer_multiplier), bitrate + 100)
+                cmd.extend(['-bufsize', f"{buffer_size}k"])
+            else:
+                cmd.extend(['-bufsize', f"{int(bitrate * buffer_multiplier)}k"])
         
         return cmd
     
@@ -314,3 +341,261 @@ class FFmpegUtils:
         except Exception as e:
             logger.error(f"Failed to extract video segment: {e}")
             return False 
+
+    @staticmethod
+    def get_detailed_file_specifications(file_path: str) -> Dict[str, Any]:
+        """
+        Get detailed file specifications for logging purposes
+        
+        Args:
+            file_path: Path to the video or GIF file
+            
+        Returns:
+            Dictionary containing detailed file specifications
+        """
+        try:
+            # Check if it's a GIF file
+            if file_path.lower().endswith('.gif'):
+                return FFmpegUtils._get_gif_specifications(file_path)
+            else:
+                return FFmpegUtils._get_video_specifications(file_path)
+                
+        except Exception as e:
+            logger.warning(f"Failed to get detailed specifications for {file_path}: {e}")
+            return {
+                'file_type': 'unknown',
+                'error': str(e)
+            }
+    
+    @staticmethod
+    def _get_video_specifications(video_path: str) -> Dict[str, Any]:
+        """Get detailed video file specifications"""
+        try:
+            cmd = [
+                'ffprobe', '-v', 'quiet', '-print_format', 'json',
+                '-show_format', '-show_streams', video_path
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            
+            if result.returncode != 0:
+                raise subprocess.CalledProcessError(result.returncode, cmd, result.stderr)
+            
+            import json
+            data = json.loads(result.stdout)
+            
+            # Find video stream
+            video_stream = None
+            audio_stream = None
+            for stream in data.get('streams', []):
+                if stream.get('codec_type') == 'video':
+                    video_stream = stream
+                elif stream.get('codec_type') == 'audio':
+                    audio_stream = stream
+            
+            format_info = data.get('format', {})
+            
+            # Basic file info
+            file_size = int(format_info.get('size', 0))
+            duration = float(format_info.get('duration', 0))
+            bitrate = int(format_info.get('bit_rate', 0))
+            
+            specs = {
+                'file_type': 'video',
+                'file_size_mb': file_size / (1024 * 1024),
+                'duration_seconds': duration,
+                'bitrate_kbps': bitrate // 1000,
+                'container_format': format_info.get('format_name', 'unknown')
+            }
+            
+            # Video stream specifications
+            if video_stream:
+                width = int(video_stream.get('width', 0))
+                height = int(video_stream.get('height', 0))
+                fps_str = video_stream.get('r_frame_rate', '30/1')
+                
+                # Parse FPS (handle fractions like "30000/1001")
+                try:
+                    if '/' in fps_str:
+                        num, den = map(int, fps_str.split('/'))
+                        fps = num / den
+                    else:
+                        fps = float(fps_str)
+                except:
+                    fps = 30.0
+                
+                specs.update({
+                    'width': width,
+                    'height': height,
+                    'resolution': f"{width}x{height}",
+                    'fps': fps,
+                    'video_codec': video_stream.get('codec_name', 'unknown'),
+                    'video_profile': video_stream.get('profile', 'unknown'),
+                    'pixel_format': video_stream.get('pix_fmt', 'unknown'),
+                    'aspect_ratio': video_stream.get('display_aspect_ratio', 'unknown'),
+                    'frame_count': int(video_stream.get('nb_frames', 0)),
+                    'video_bitrate_kbps': int(video_stream.get('bit_rate', 0)) // 1000 if video_stream.get('bit_rate') else 0
+                })
+            
+            # Audio stream specifications
+            if audio_stream:
+                specs.update({
+                    'audio_codec': audio_stream.get('codec_name', 'unknown'),
+                    'audio_channels': int(audio_stream.get('channels', 0)),
+                    'audio_sample_rate': int(audio_stream.get('sample_rate', 0)),
+                    'audio_bitrate_kbps': int(audio_stream.get('bit_rate', 0)) // 1000 if audio_stream.get('bit_rate') else 0
+                })
+            
+            return specs
+            
+        except Exception as e:
+            logger.warning(f"Failed to get video specifications for {video_path}: {e}")
+            return {
+                'file_type': 'video',
+                'error': str(e)
+            }
+    
+    @staticmethod
+    def _get_gif_specifications(gif_path: str) -> Dict[str, Any]:
+        """Get detailed GIF file specifications"""
+        try:
+            cmd = [
+                'ffprobe', '-v', 'quiet', '-print_format', 'json',
+                '-show_format', '-show_streams', gif_path
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            
+            if result.returncode != 0:
+                raise subprocess.CalledProcessError(result.returncode, cmd, result.stderr)
+            
+            import json
+            data = json.loads(result.stdout)
+            
+            format_info = data.get('format', {})
+            video_stream = next((s for s in data.get('streams', []) if s.get('codec_type') == 'video'), None)
+            
+            # Basic file info
+            file_size = int(format_info.get('size', 0))
+            duration = float(format_info.get('duration', 0))
+            
+            specs = {
+                'file_type': 'gif',
+                'file_size_mb': file_size / (1024 * 1024),
+                'duration_seconds': duration,
+                'container_format': 'gif'
+            }
+            
+            # GIF-specific specifications
+            if video_stream:
+                width = int(video_stream.get('width', 0))
+                height = int(video_stream.get('height', 0))
+                fps_str = video_stream.get('r_frame_rate', '10/1')
+                
+                # Parse FPS for GIF
+                try:
+                    if '/' in fps_str:
+                        num, den = map(int, fps_str.split('/'))
+                        fps = num / den
+                    else:
+                        fps = float(fps_str)
+                except:
+                    fps = 10.0
+                
+                frame_count = int(video_stream.get('nb_frames', 0))
+                
+                specs.update({
+                    'width': width,
+                    'height': height,
+                    'resolution': f"{width}x{height}",
+                    'fps': fps,
+                    'frame_count': frame_count,
+                    'video_codec': 'gif',
+                    'pixel_format': video_stream.get('pix_fmt', 'unknown'),
+                    'colors': 256,  # GIFs typically use 256 colors
+                    'loop_count': format_info.get('tags', {}).get('loop', '0') if format_info.get('tags') else '0'
+                })
+            
+            return specs
+            
+        except Exception as e:
+            logger.warning(f"Failed to get GIF specifications for {gif_path}: {e}")
+            return {
+                'file_type': 'gif',
+                'error': str(e)
+            } 
+
+    @staticmethod
+    def format_file_specifications_for_logging(specs: Dict[str, Any]) -> str:
+        """
+        Format file specifications into a readable log message
+        
+        Args:
+            specs: Dictionary containing file specifications from get_detailed_file_specifications
+            
+        Returns:
+            Formatted string for logging
+        """
+        if 'error' in specs:
+            return f"File specifications unavailable: {specs['error']}"
+        
+        file_type = specs.get('file_type', 'unknown')
+        
+        if file_type == 'video':
+            return FFmpegUtils._format_video_specifications_for_logging(specs)
+        elif file_type == 'gif':
+            return FFmpegUtils._format_gif_specifications_for_logging(specs)
+        else:
+            return f"Unknown file type: {file_type}"
+    
+    @staticmethod
+    def _format_video_specifications_for_logging(specs: Dict[str, Any]) -> str:
+        """Format video specifications for logging"""
+        parts = []
+        
+        # Basic info
+        parts.append(f"Size: {specs.get('file_size_mb', 0):.2f}MB")
+        parts.append(f"Duration: {specs.get('duration_seconds', 0):.2f}s")
+        
+        # Video specs
+        if 'resolution' in specs:
+            parts.append(f"Resolution: {specs['resolution']}")
+        if 'fps' in specs:
+            parts.append(f"FPS: {specs['fps']:.1f}")
+        if 'video_codec' in specs:
+            parts.append(f"Codec: {specs['video_codec']}")
+        if 'bitrate_kbps' in specs and specs['bitrate_kbps'] > 0:
+            parts.append(f"Bitrate: {specs['bitrate_kbps']}kbps")
+        if 'frame_count' in specs and specs['frame_count'] > 0:
+            parts.append(f"Frames: {specs['frame_count']}")
+        
+        # Audio specs (if available)
+        if 'audio_codec' in specs and specs['audio_codec'] != 'unknown':
+            parts.append(f"Audio: {specs['audio_codec']}")
+            if 'audio_channels' in specs:
+                parts.append(f"Channels: {specs['audio_channels']}")
+            if 'audio_sample_rate' in specs:
+                parts.append(f"Sample Rate: {specs['audio_sample_rate']}Hz")
+        
+        return f"Video specs: {' | '.join(parts)}"
+    
+    @staticmethod
+    def _format_gif_specifications_for_logging(specs: Dict[str, Any]) -> str:
+        """Format GIF specifications for logging"""
+        parts = []
+        
+        # Basic info
+        parts.append(f"Size: {specs.get('file_size_mb', 0):.2f}MB")
+        parts.append(f"Duration: {specs.get('duration_seconds', 0):.2f}s")
+        
+        # GIF specs
+        if 'resolution' in specs:
+            parts.append(f"Resolution: {specs['resolution']}")
+        if 'fps' in specs:
+            parts.append(f"FPS: {specs['fps']:.1f}")
+        if 'frame_count' in specs and specs['frame_count'] > 0:
+            parts.append(f"Frames: {specs['frame_count']}")
+        if 'colors' in specs:
+            parts.append(f"Colors: {specs['colors']}")
+        if 'loop_count' in specs:
+            parts.append(f"Loop: {specs['loop_count']}")
+        
+        return f"GIF specs: {' | '.join(parts)}" 

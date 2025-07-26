@@ -28,9 +28,25 @@ class DynamicVideoCompressor:
         self.hardware = hardware_detector
         self.temp_dir = self.config.get_temp_dir()
         
+        # Performance enhancement
+        self.performance_enhancer = PerformanceEnhancer(config_manager)
+        
+        # Shutdown handling
+        self.shutdown_requested = False
+        self.current_ffmpeg_process = None
+        
+        # Statistics
+        self.stats = {
+            'total_compressions': 0,
+            'successful_compressions': 0,
+            'failed_compressions': 0,
+            'hardware_fallbacks': 0,
+            'average_compression_time': 0,
+            'total_processing_time': 0
+        }
+        
         # Initialize advanced components
         self.advanced_optimizer = AdvancedVideoOptimizer(config_manager, hardware_detector)
-        self.performance_enhancer = PerformanceEnhancer(config_manager)
         
         # Optimize system resources
         self.system_optimizations = self.performance_enhancer.optimize_system_resources()
@@ -288,8 +304,8 @@ class DynamicVideoCompressor:
             results['quality_score'] = best_result.get('quality_score', 0)
             results['attempts_made'] = len(compression_attempts)
             
-            logger.info(f"Dynamic compression completed: {results['compression_ratio']:.1f}% reduction, "
-                       f"strategy: {best_result['strategy']}")
+            logger.info(f"Dynamic compression completed: {results.get('compression_ratio', 0):.1f}% reduction, "
+                       f"strategy: {best_result.get('strategy', 'unknown')}")
             
             return results
             
@@ -937,14 +953,48 @@ class DynamicVideoCompressor:
         except subprocess.CalledProcessError as e:
             # Check if it's a hardware acceleration error
             error_output = str(e.stderr) if e.stderr else str(e)
-            logger.error(f"FFmpeg command failed with error: {error_output}")  # Add detailed error logging
+            logger.error(f"FFmpeg command failed with error: {error_output[:500]}...")  # Limit error output length
             
-            is_hardware_error = any(error in error_output.lower() for error in [
-                'mfx session', 'h264_qsv', 'h264_nvenc', 'h264_amf', 'hardware', 'qsv', 'nvenc', 'amf'
-            ])
+            # Enhanced hardware error detection patterns
+            hardware_error_patterns = [
+                # AMD AMF specific errors
+                'amf', 'h264_amf', 'hevc_amf', 'av1_amf',
+                'failed to initialize amf', 'amf encoder init failed',
+                'cannot load amfrt64.dll', 'cannot load amfrt32.dll',
+                'no amf device found', 'amf session init failed',
+                
+                # NVIDIA NVENC specific errors
+                'nvenc', 'h264_nvenc', 'hevc_nvenc', 'av1_nvenc',
+                'cannot load nvcuda.dll', 'cuda driver not found',
+                'nvenc init failed', 'no nvidia device found',
+                
+                # Intel QuickSync specific errors
+                'qsv', 'h264_qsv', 'hevc_qsv', 'mfx session',
+                'qsv init failed', 'no qsv device found',
+                
+                # General hardware acceleration errors
+                'hardware', 'hwaccel', 'gpu', 'device not found',
+                'encoder not found', 'codec not supported'
+            ]
+            
+            is_hardware_error = any(pattern in error_output.lower() for pattern in hardware_error_patterns)
+            
+            # Additional check for specific error codes that indicate hardware issues
+            hardware_error_codes = [4294967274, -22, -12, -2]  # Common hardware failure codes
+            is_hardware_error = is_hardware_error or (hasattr(e, 'returncode') and e.returncode in hardware_error_codes)
             
             if is_hardware_error:
-                logger.warning("Hardware acceleration failed, trying software fallback...")
+                # Determine the type of hardware encoder that failed
+                encoder_type = "Unknown"
+                if any(amd in error_output.lower() for amd in ['amf', 'h264_amf', 'hevc_amf']):
+                    encoder_type = "AMD AMF"
+                elif any(nvidia in error_output.lower() for nvidia in ['nvenc', 'h264_nvenc', 'hevc_nvenc']):
+                    encoder_type = "NVIDIA NVENC"
+                elif any(intel in error_output.lower() for intel in ['qsv', 'h264_qsv', 'hevc_qsv']):
+                    encoder_type = "Intel QuickSync"
+                
+                logger.warning(f"{encoder_type} hardware acceleration failed, trying software fallback...")
+                
                 # Replace hardware encoder with software encoder
                 fallback_cmd = self._create_software_fallback_command(cmd)
                 if fallback_cmd:
@@ -953,14 +1003,21 @@ class DynamicVideoCompressor:
                         self._execute_ffmpeg_command(fallback_cmd, duration)
                         logger.info("FFmpeg compression completed with software fallback")
                         return
-                    except subprocess.CalledProcessError:
+                    except subprocess.CalledProcessError as fallback_error:
+                        logger.error(f"Software fallback also failed: {str(fallback_error)[:200]}...")
                         pass  # Fall through to original error
+                else:
+                    logger.error("Failed to create software fallback command")
             
             # Re-raise original error if fallback didn't work or wasn't attempted
             raise e
     
     def _execute_ffmpeg_command(self, cmd: List[str], duration: float):
         """Execute FFmpeg command with progress bar (internal method)"""
+        # Check for shutdown before starting
+        if self.shutdown_requested:
+            raise subprocess.CalledProcessError(1, cmd, "Shutdown requested before FFmpeg execution")
+        
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -969,40 +1026,100 @@ class DynamicVideoCompressor:
             bufsize=1
         )
         
-        # Create progress bar
-        with tqdm(total=100, desc="Compressing", unit="%", bar_format="{l_bar}{bar}| {n:.1f}%") as pbar:
-            
-            while True:
-                output = process.stderr.readline()
-                if output == '' and process.poll() is not None:
-                    break
-                
-                if output:
-                    # Parse FFmpeg progress output
-                    if 'time=' in output:
-                        try:
-                            time_str = output.split('time=')[1].split()[0]
-                            current_seconds = self._parse_time_to_seconds(time_str)
-                            progress = min((current_seconds / duration) * 100, 100)
-                            pbar.n = progress
-                            pbar.refresh()
-                        except:
-                            pass  # Ignore parsing errors
+        # Store reference to current process for shutdown handling
+        self.current_ffmpeg_process = process
         
-        # Wait for process to complete
-        return_code = process.wait()
+        # Capture stderr output for error analysis
+        stderr_output = []
+        
+        try:
+            # Create progress bar
+            with tqdm(total=100, desc="Compressing", unit="%", bar_format="{l_bar}{bar}| {n:.1f}%") as pbar:
+                
+                while True:
+                    # Check for shutdown request
+                    if self.shutdown_requested:
+                        logger.info("Shutdown requested during FFmpeg execution, terminating process...")
+                        self._terminate_ffmpeg_process()
+                        raise subprocess.CalledProcessError(1, cmd, "Shutdown requested during execution")
+                    
+                    # Check if process has finished
+                    if process.poll() is not None:
+                        break
+                    
+                    # Read stderr output with timeout to allow shutdown checking
+                    try:
+                        output = process.stderr.readline()
+                        if output == '':
+                            # No more output, check if process is done
+                            if process.poll() is not None:
+                                break
+                            continue
+                        
+                        if output:
+                            # Store stderr output for error analysis
+                            stderr_output.append(output)
+                            
+                            # Parse FFmpeg progress output
+                            if 'time=' in output:
+                                try:
+                                    time_str = output.split('time=')[1].split()[0]
+                                    current_seconds = self._parse_time_to_seconds(time_str)
+                                    progress = min((current_seconds / duration) * 100, 100)
+                                    pbar.n = progress
+                                    pbar.refresh()
+                                except:
+                                    pass  # Ignore parsing errors
+                    except Exception as e:
+                        logger.debug(f"Error reading FFmpeg output: {e}")
+                        break
+            
+            # Wait for process to complete (with timeout for shutdown checking)
+            return_code = process.wait()
+            
+        except Exception as e:
+            # Ensure process is cleaned up
+            if process.poll() is None:
+                self._terminate_ffmpeg_process()
+            raise e
+        finally:
+            # Clear current process reference
+            self.current_ffmpeg_process = None
         
         if return_code != 0:
-            error_output = process.stderr.read()
+            # Join all stderr output for error analysis
+            full_stderr_output = ''.join(stderr_output)
             
             # Check if this is an AMD AMF encoder error
             if any(encoder in ' '.join(cmd) for encoder in ['h264_amf', 'hevc_amf', 'av1_amf']):
-                # Check for specific AMD AMF error codes
-                if str(return_code) in ['4294967274', '-22'] or 'Invalid argument' in error_output:
-                    logger.warning(f"AMD AMF encoder failed with error code {return_code}, attempting software fallback...")
+                # Check for specific AMD AMF error patterns
+                amd_error_patterns = [
+                    'Invalid argument',
+                    'Failed to initialize AMF',
+                    'AMF encoder init failed',
+                    'No AMF device found',
+                    'AMF session init failed',
+                    'Cannot load amfrt64.dll',
+                    'Cannot load amfrt32.dll'
+                ]
+                
+                # Convert unsigned error code to signed for comparison
+                signed_return_code = return_code if return_code < 2147483648 else return_code - 4294967296
+                
+                is_amd_error = (
+                    str(return_code) == '4294967274' or  # Unsigned version of -22
+                    signed_return_code == -22 or          # Signed version (Invalid argument)
+                    any(pattern in full_stderr_output for pattern in amd_error_patterns)
+                )
+                
+                if is_amd_error:
+                    logger.warning(f"AMD AMF encoder failed with error code {return_code} (signed: {signed_return_code}), attempting software fallback...")
+                    logger.debug(f"AMD AMF error details: {full_stderr_output[-500:]}")  # Log last 500 chars of stderr
+                    
                     # Create software fallback command
                     fallback_cmd = self._create_software_fallback_command(cmd)
                     if fallback_cmd:
+                        logger.info("Replaced h264_amf with libx264 for software fallback")
                         logger.info("Attempting software fallback...")
                         # Try the fallback command
                         try:
@@ -1013,7 +1130,7 @@ class DynamicVideoCompressor:
                     else:
                         logger.error("Failed to create software fallback command")
             
-            raise subprocess.CalledProcessError(return_code, cmd, error_output)
+            raise subprocess.CalledProcessError(return_code, cmd, full_stderr_output)
     
     def _create_software_fallback_command(self, cmd: List[str]) -> Optional[List[str]]:
         """Create a software fallback version of an FFmpeg command"""
@@ -1027,40 +1144,79 @@ class DynamicVideoCompressor:
                 'h264_amf': 'libx264',
                 'hevc_qsv': 'libx265',
                 'hevc_nvenc': 'libx265',
-                'hevc_amf': 'libx265'
+                'hevc_amf': 'libx265',
+                'av1_amf': 'libsvtav1'  # AV1 software encoder
             }
             
+            encoder_replaced = False
             for i, arg in enumerate(fallback_cmd):
                 if arg in encoder_replacements:
-                    fallback_cmd[i] = encoder_replacements[arg]
-                    logger.info(f"Replaced {arg} with {encoder_replacements[arg]} for software fallback")
+                    old_encoder = arg
+                    new_encoder = encoder_replacements[arg]
+                    fallback_cmd[i] = new_encoder
+                    encoder_replaced = True
+                    logger.info(f"Replaced {old_encoder} with {new_encoder} for software fallback")
+            
+            if not encoder_replaced:
+                logger.warning("No hardware encoder found to replace in fallback command")
             
             # Remove hardware-specific options that don't work with software encoders
-            hardware_options = ['-hwaccel', 'cuda', '-hwaccel', 'auto', '-hwaccel', 'qsv']
-            amd_specific_options = ['-usage', 'transcoding', '-quality', 'speed', '-quality', 'balanced']
+            hardware_options_to_remove = [
+                '-hwaccel', 'cuda', '-hwaccel', 'auto', '-hwaccel', 'qsv', '-hwaccel', 'dxva2',
+                # AMD AMF specific options
+                '-usage', 'transcoding', '-usage', 'lowlatency', '-usage', 'ultralowlatency',
+                '-quality', 'speed', '-quality', 'balanced', '-quality', 'quality',
+                '-rc', 'cbr', '-rc', 'vbr', '-rc', 'cqp',
+                '-enforce_hrd', '-filler_data', '-frame_skipping', '-vbaq', '-preanalysis',
+                # NVIDIA NVENC specific options
+                '-preset', 'p1', '-preset', 'p2', '-preset', 'p3', '-preset', 'p4', 
+                '-preset', 'p5', '-preset', 'p6', '-preset', 'p7',
+                '-tune', 'hq', '-tune', 'll', '-tune', 'ull',
+                # Intel QSV specific options
+                '-global_quality', '-look_ahead', '-look_ahead_depth'
+            ]
             
+            # Remove hardware options and their values
             i = 0
             while i < len(fallback_cmd):
-                if fallback_cmd[i] in hardware_options:
-                    # Remove the option and its value (if it has one)
-                    if i + 1 < len(fallback_cmd) and not fallback_cmd[i + 1].startswith('-'):
-                        fallback_cmd.pop(i)  # Remove option
-                        fallback_cmd.pop(i)  # Remove value
+                if fallback_cmd[i] in hardware_options_to_remove:
+                    option = fallback_cmd[i]
+                    fallback_cmd.pop(i)  # Remove the option
+                    # Check if the next argument is a value (not starting with -)
+                    if i < len(fallback_cmd) and not fallback_cmd[i].startswith('-'):
+                        value = fallback_cmd[i]
+                        fallback_cmd.pop(i)  # Remove the value
+                        logger.debug(f"Removed hardware option: {option} {value}")
                     else:
-                        fallback_cmd.pop(i)  # Remove option only
-                elif fallback_cmd[i] in amd_specific_options:
-                    # Remove AMD-specific options
-                    fallback_cmd.pop(i)
+                        logger.debug(f"Removed hardware option: {option}")
                 else:
                     i += 1
             
-            # Add software encoder specific options
+            # Convert hardware-specific quality settings to software equivalents
+            for i, arg in enumerate(fallback_cmd):
+                # Convert QP (quantization parameter) to CRF for software encoders
+                if arg == '-qp' and i + 1 < len(fallback_cmd):
+                    fallback_cmd[i] = '-crf'
+                    # QP and CRF have similar ranges, so keep the value
+                    logger.debug(f"Converted -qp to -crf for software encoding")
+                
+                # Convert NVENC CQ to CRF
+                elif arg == '-cq' and i + 1 < len(fallback_cmd):
+                    fallback_cmd[i] = '-crf'
+                    logger.debug(f"Converted -cq to -crf for software encoding")
+            
+            # Add software encoder optimizations
             if 'libx264' in fallback_cmd:
-                # Add CRF instead of QP for libx264
-                for i, arg in enumerate(fallback_cmd):
-                    if arg == '-qp':
-                        fallback_cmd[i] = '-crf'
-                        break
+                # Add reasonable preset if not present
+                if '-preset' not in fallback_cmd:
+                    fallback_cmd.extend(['-preset', 'medium'])
+                    logger.debug("Added -preset medium for libx264")
+            
+            elif 'libx265' in fallback_cmd:
+                # Add reasonable preset if not present
+                if '-preset' not in fallback_cmd:
+                    fallback_cmd.extend(['-preset', 'medium'])
+                    logger.debug("Added -preset medium for libx265")
             
             return fallback_cmd
             
@@ -1088,6 +1244,15 @@ class DynamicVideoCompressor:
         
         compression_ratio = ((original_size - compressed_size) / original_size) * 100
         compressed_size_mb = compressed_size / (1024 * 1024)
+        
+        # Log detailed file specifications
+        try:
+            from .ffmpeg_utils import FFmpegUtils
+            specs = FFmpegUtils.get_detailed_file_specifications(output_path)
+            specs_log = FFmpegUtils.format_file_specifications_for_logging(specs)
+            logger.info(f"Video compression completed successfully - {specs_log}")
+        except Exception as e:
+            logger.warning(f"Could not log detailed video specifications: {e}")
         
         return {
             'success': True,  # Add success flag for automated workflow
@@ -1231,6 +1396,36 @@ class DynamicVideoCompressor:
         }
         
         return stats
+
+    def request_shutdown(self):
+        """Request graceful shutdown of the compressor"""
+        logger.info("Shutdown requested for video compressor")
+        self.shutdown_requested = True
+        if self.current_ffmpeg_process:
+            logger.info("Terminating current FFmpeg process...")
+            self._terminate_ffmpeg_process()
+    
+    def _terminate_ffmpeg_process(self):
+        """Terminate the current FFmpeg process gracefully"""
+        if self.current_ffmpeg_process and self.current_ffmpeg_process.poll() is None:
+            try:
+                # Try graceful termination first
+                self.current_ffmpeg_process.terminate()
+                
+                # Wait a bit for graceful termination
+                try:
+                    self.current_ffmpeg_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    # Force kill if graceful termination fails
+                    logger.warning("FFmpeg process did not terminate gracefully, forcing kill...")
+                    self.current_ffmpeg_process.kill()
+                    self.current_ffmpeg_process.wait()
+                
+                logger.info("FFmpeg process terminated successfully")
+            except Exception as e:
+                logger.error(f"Error terminating FFmpeg process: {e}")
+            finally:
+                self.current_ffmpeg_process = None
 
 # Keep all the existing methods from the original VideoCompressor class
 # by creating an alias for backward compatibility

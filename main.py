@@ -13,6 +13,14 @@ When run without arguments, automatically processes videos from the 'input' fold
 import sys
 import os
 
+# Force UTF-8 encoding for console output
+if sys.platform.startswith('win'):
+    # Set console code page to UTF-8 on Windows
+    os.system('chcp 65001 > nul')
+    # Reconfigure stdout to use UTF-8
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
+
 # Add src directory to Python path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 

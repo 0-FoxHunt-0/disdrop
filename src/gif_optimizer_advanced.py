@@ -885,6 +885,15 @@ class AdvancedGifOptimizer:
         logger.info(f"Selected best GIF candidate: '{best_result['candidate_name']}' "
                    f"({best_result['size_mb']:.2f}MB, quality: {best_result['quality_score']:.1f})")
         
+        # Log detailed file specifications
+        try:
+            from .ffmpeg_utils import FFmpegUtils
+            specs = FFmpegUtils.get_detailed_file_specifications(output_path)
+            specs_log = FFmpegUtils.format_file_specifications_for_logging(specs)
+            logger.info(f"Advanced GIF optimization final file specifications - {specs_log}")
+        except Exception as e:
+            logger.warning(f"Could not log detailed GIF specifications: {e}")
+        
         return best_result
     
     def _create_gif_candidate(self, candidate: Dict[str, Any], max_size_mb: float) -> Optional[Dict[str, Any]]:
@@ -1323,6 +1332,15 @@ class AdvancedGifOptimizer:
             final_output = result['temp_file'].replace('temp_', 'final_')
             shutil.move(result['temp_file'], final_output)
             result['output_file'] = final_output
+            
+            # Log detailed file specifications
+            try:
+                from .ffmpeg_utils import FFmpegUtils
+                specs = FFmpegUtils.get_detailed_file_specifications(final_output)
+                specs_log = FFmpegUtils.format_file_specifications_for_logging(specs)
+                logger.info(f"Final GIF optimization file specifications - {specs_log}")
+            except Exception as e:
+                logger.warning(f"Could not log detailed GIF specifications: {e}")
         
         # Calculate final quality score
         result['quality_score'] = self._calculate_comprehensive_quality_score(

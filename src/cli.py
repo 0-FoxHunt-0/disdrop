@@ -4,8 +4,11 @@ Main entry point with argument parsing and command execution
 """
 
 import argparse
+import atexit
 import os
 import sys
+import shutil
+import signal
 import traceback
 from typing import Dict, Any, Optional
 import logging
@@ -38,6 +41,12 @@ class VideoCompressorCLI:
             global logger
             logger = setup_logging(log_level=args.log_level)
             
+            # Setup signal handlers for graceful cleanup
+            self._setup_signal_handlers()
+            
+            # Register atexit handler for cleanup
+            atexit.register(self._cleanup_temp_files_on_exit)
+            
             # Initialize components
             self._initialize_components(args)
             
@@ -55,6 +64,63 @@ class VideoCompressorCLI:
             else:
                 print(f"Error: {e}")
             sys.exit(1)
+    
+    def _setup_signal_handlers(self):
+        """Setup signal handlers for graceful cleanup"""
+        def signal_handler(signum, frame):
+            signal_name = signal.Signals(signum).name
+            if logger:
+                logger.info(f"Received {signal_name} signal, initiating graceful shutdown...")
+            else:
+                print(f"\nReceived {signal_name} signal, cleaning up...")
+            
+            # Request shutdown for all components
+            if hasattr(self, 'gif_generator') and self.gif_generator:
+                self.gif_generator.request_shutdown()
+            if hasattr(self, 'video_compressor') and self.video_compressor:
+                self.video_compressor.request_shutdown()
+            if hasattr(self, 'automated_workflow') and self.automated_workflow:
+                # Automated workflow uses shutdown_requested flag instead of method
+                self.automated_workflow.shutdown_requested = True
+            
+            # Clean up any remaining temp files
+            self._cleanup_temp_files_on_exit()
+            
+            if logger:
+                logger.info("Graceful shutdown completed")
+            sys.exit(0)
+        
+        # Register handlers for common termination signals
+        signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
+        if hasattr(signal, 'SIGTERM'):
+            signal.signal(signal.SIGTERM, signal_handler)  # Termination request
+    
+    def _cleanup_temp_files_on_exit(self):
+        """Clean up temporary files on program exit"""
+        try:
+            if hasattr(self, 'config') and self.config:
+                temp_dir = self.config.get_temp_dir()
+                if temp_dir and os.path.exists(temp_dir):
+                    # Look for segment temp folders and other temp files
+                    for item in os.listdir(temp_dir):
+                        item_path = os.path.join(temp_dir, item)
+                        try:
+                            if os.path.isdir(item_path) and '_segments_temp' in item:
+                                # Clean up segment temp folders
+                                shutil.rmtree(item_path)
+                                if logger:
+                                    logger.info(f"Cleaned up temp segment folder: {item}")
+                            elif os.path.isfile(item_path) and ('temp_' in item or item.startswith('candidate_')):
+                                # Clean up other temp files
+                                os.remove(item_path)
+                                if logger:
+                                    logger.debug(f"Cleaned up temp file: {item}")
+                        except Exception as e:
+                            if logger:
+                                logger.warning(f"Could not clean up {item}: {e}")
+        except Exception as e:
+            if logger:
+                logger.warning(f"Error during temp file cleanup: {e}")
     
     def _parse_arguments(self) -> argparse.Namespace:
         """Parse command line arguments"""
@@ -76,6 +142,8 @@ class VideoCompressorCLI:
         parser.add_argument('--temp-dir', help='Temporary directory for processing')
         parser.add_argument('--max-size', type=float, metavar='MB',
                           help='Maximum output file size in MB (overrides platform defaults)')
+        parser.add_argument('--force-software', action='store_true',
+                          help='Force software encoding (bypass hardware acceleration)')
         
         # Create subcommands
         subparsers = parser.add_subparsers(dest='command', help='Available commands')
@@ -175,34 +243,30 @@ class VideoCompressorCLI:
         return args
     
     def _initialize_components(self, args: argparse.Namespace):
-        """Initialize all components"""
-        logger.info("Initializing Video Compressor...")
-        
-        # Initialize configuration manager
-        config_dir = args.config_dir
-        self.config = ConfigManager(config_dir)
-        
-        # Update config with CLI arguments
-        cli_overrides = self._extract_config_overrides(args)
-        if cli_overrides:
-            self.config.update_from_args(cli_overrides)
-        
-        # Validate configuration
-        if not self.config.validate_config():
-            raise RuntimeError("Configuration validation failed")
-        
-        # Initialize hardware detector
-        logger.info("Detecting hardware acceleration capabilities...")
-        self.hardware = HardwareDetector()
-        
-        # Initialize processors
-        self.video_compressor = DynamicVideoCompressor(self.config, self.hardware)
-        self.gif_generator = GifGenerator(self.config)
-        self.advanced_optimizer = AdvancedGifOptimizer(self.config)
-        self.automated_workflow = AutomatedWorkflow(self.config, self.hardware, 
-                                                   self.video_compressor, self.gif_generator)
-        
-        logger.info("Initialization complete")
+        """Initialize all components with configuration"""
+        try:
+            # Load configuration
+            self.config = ConfigManager(args.config_dir)
+            
+            # Initialize hardware detector
+            self.hardware = HardwareDetector()
+            
+            # Force software encoding if requested
+            if args.force_software:
+                self.hardware.force_software_encoding()
+            
+            # Initialize video compressor
+            self.video_compressor = DynamicVideoCompressor(self.config, self.hardware)
+            
+            # Initialize GIF components
+            self.gif_generator = GifGenerator(self.config)
+            self.automated_workflow = AutomatedWorkflow(self.config, self.hardware)
+            
+            logger.info("All components initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize components: {e}")
+            raise
     
     def _extract_config_overrides(self, args: argparse.Namespace) -> Dict[str, Any]:
         """Extract configuration overrides from CLI arguments"""
@@ -338,8 +402,11 @@ class VideoCompressorCLI:
                 duration=args.duration
             )
             
-            # Display results
-            self._display_gif_results(results)
+            # Display results based on method used
+            if results.get('method') == 'Video Segmentation':
+                self._display_segmentation_results(results)
+            else:
+                self._display_quality_gif_results(results)
             
         except Exception as e:
             logger.error(f"GIF creation failed: {e}")
@@ -369,6 +436,21 @@ class VideoCompressorCLI:
                 # Generate output filename
                 basename = os.path.splitext(os.path.basename(input_file))[0]
                 output_file = os.path.join(args.output_dir, f"{basename}{args.suffix}.mp4")
+                
+                # NEW: Check if output already exists and is valid
+                if os.path.exists(output_file):
+                    is_valid, _ = self.file_validator.is_valid_video(output_file)
+                    if is_valid:
+                        logger.info(f"Skipping {basename} - valid compressed output already exists")
+                        return {
+                            'success': True, 
+                            'input': input_file, 
+                            'output': output_file, 
+                            'result': {'method': 'Skipped - Already Compressed'},
+                            'skipped': True
+                        }
+                    else:
+                        logger.info(f"Recompressing {basename} - existing output is invalid")
                 
                 # Compress video
                 result = self.video_compressor.compress_video(
@@ -419,6 +501,17 @@ class VideoCompressorCLI:
                 basename = os.path.splitext(os.path.basename(input_file))[0]
                 output_file = os.path.join(args.output_dir, f"{basename}.gif")
                 
+                # NEW: Comprehensive check for existing outputs before processing
+                if self._has_existing_output_cli(input_file, args.output_dir):
+                    logger.info(f"Skipping {basename} - output already exists")
+                    return {
+                        'success': True,
+                        'input_file': input_file,
+                        'output_info': 'Existing output found',
+                        'method': 'Skipped - Already Processed',
+                        'skipped': True
+                    }
+                
                 # Create GIF
                 result = self.gif_generator.create_gif(
                     input_video=input_file,
@@ -428,7 +521,94 @@ class VideoCompressorCLI:
                     duration=args.duration
                 )
                 
-                return {'success': True, 'input': input_file, 'output': output_file, 'result': result}
+                # Handle both single GIF and segmented results
+                output_info = output_file
+                if result.get('method') == 'Video Segmentation':
+                    if result.get('success', False):
+                        # For successful segmentation, move temp files to final location
+                        temp_segments_folder = result.get('temp_segments_folder')
+                        base_name = result.get('base_name')
+                        segments = result.get('segments', [])
+                        
+                        if temp_segments_folder and base_name and segments:
+                            # Create final segments folder
+                            final_segments_folder = os.path.join(args.output_dir, f"{base_name}_segments")
+                            os.makedirs(final_segments_folder, exist_ok=True)
+                            
+                            # Move segments from temp to final location
+                            moved_segments = 0
+                            for segment in segments:
+                                temp_path = segment.get('temp_path')
+                                segment_name = segment.get('name')
+                                
+                                if temp_path and segment_name and os.path.exists(temp_path):
+                                    final_path = os.path.join(final_segments_folder, segment_name)
+                                    try:
+                                        shutil.move(temp_path, final_path)
+                                        moved_segments += 1
+                                        logger.debug(f"Moved segment: {segment_name} -> {final_path}")
+                                    except Exception as e:
+                                        logger.error(f"Failed to move segment {segment_name}: {e}")
+                            
+                            # Move summary file if it exists
+                            summary_file = os.path.join(temp_segments_folder, f"{base_name}_segments_info.txt")
+                            if os.path.exists(summary_file):
+                                final_summary = os.path.join(final_segments_folder, f"{base_name}_segments_info.txt")
+                                try:
+                                    shutil.move(summary_file, final_summary)
+                                except Exception as e:
+                                    logger.warning(f"Failed to move summary file: {e}")
+                            
+                            # Clean up temp folder
+                            try:
+                                if os.path.exists(temp_segments_folder):
+                                    shutil.rmtree(temp_segments_folder)
+                                    logger.info(f"Cleaned up temp segments folder: {temp_segments_folder}")
+                            except Exception as e:
+                                logger.warning(f"Could not clean up temp folder: {e}")
+                            
+                            output_info = final_segments_folder
+                        else:
+                            # Segmentation data incomplete, clean up temp files
+                            temp_folder = result.get('temp_segments_folder')
+                            temp_files = result.get('temp_files_to_cleanup', [])
+                            
+                            if temp_files:
+                                for temp_file in temp_files:
+                                    try:
+                                        if os.path.exists(temp_file):
+                                            os.remove(temp_file)
+                                    except Exception:
+                                        pass
+                            
+                            if temp_folder and os.path.exists(temp_folder):
+                                try:
+                                    shutil.rmtree(temp_folder)
+                                except Exception:
+                                    pass
+                    else:
+                        # Failed segmentation - clean up temp files
+                        temp_folder = result.get('temp_segments_folder')
+                        temp_files = result.get('temp_files_to_cleanup', [])
+                        
+                        if temp_files:
+                            for temp_file in temp_files:
+                                try:
+                                    if os.path.exists(temp_file):
+                                        os.remove(temp_file)
+                                except Exception:
+                                    pass
+                        
+                        if temp_folder and os.path.exists(temp_folder):
+                            try:
+                                shutil.rmtree(temp_folder)
+                            except Exception:
+                                pass
+                        
+                        # Return failure for failed segmentation
+                        return {'success': False, 'input': input_file, 'error': result.get('error', 'Segmentation failed')}
+                
+                return {'success': True, 'input': input_file, 'output': output_info, 'result': result}
                 
             except Exception as e:
                 logger.error(f"Failed to create GIF from {input_file}: {e}")
@@ -529,7 +709,7 @@ class VideoCompressorCLI:
     def _validate_config(self):
         """Validate configuration"""
         if self.config.validate_config():
-            logger.info("✓ Configuration is valid")
+            logger.info("OK Configuration is valid")
         else:
             logger.error("✗ Configuration validation failed")
             sys.exit(1)
@@ -539,34 +719,68 @@ class VideoCompressorCLI:
         print("\n" + "="*60)
         print("VIDEO COMPRESSION RESULTS")
         print("="*60)
-        print(f"Input File:       {results['input_file']}")
-        print(f"Output File:      {results['output_file']}")
-        print(f"Method:           {results['method']}")
-        print(f"Original Size:    {results['original_size_mb']:.2f} MB")
-        print(f"Compressed Size:  {results['compressed_size_mb']:.2f} MB")
-        print(f"Compression:      {results['compression_ratio']:.1f}% reduction")
-        print(f"Space Saved:      {results['space_saved_mb']:.2f} MB")
+        print(f"Input File:       {results.get('input_file', 'N/A')}")
+        print(f"Output File:      {results.get('output_file', 'N/A')}")
+        print(f"Method:           {results.get('method', 'N/A')}")
+        print(f"Original Size:    {results.get('original_size_mb', 0):.2f} MB")
+        print(f"Compressed Size:  {results.get('compressed_size_mb', 0):.2f} MB")
+        print(f"Compression:      {results.get('compression_ratio', 0):.1f}% reduction")
+        print(f"Space Saved:      {results.get('space_saved_mb', 0):.2f} MB")
         
-        video_info = results['video_info']
-        print(f"Resolution:       {video_info['width']}x{video_info['height']}")
-        print(f"Duration:         {video_info['duration']:.1f} seconds")
-        print(f"Frame Rate:       {video_info['fps']:.1f} fps")
+        video_info = results.get('video_info', {})
+        print(f"Resolution:       {video_info.get('width', 0)}x{video_info.get('height', 0)}")
+        print(f"Duration:         {video_info.get('duration', 0):.1f} seconds")
+        print(f"Frame Rate:       {video_info.get('fps', 0):.1f} fps")
         print("="*60)
     
+    def _display_segmentation_results(self, results: Dict[str, Any]):
+        """Display video segmentation results"""
+        print("\n" + "="*60)
+        print("🎬 VIDEO SEGMENTATION RESULTS")
+        print("="*60)
+        print(f"Method:            Video Segmentation (High Quality)")
+        print(f"Segments Folder:   {results.get('segments_folder', 'N/A')}")
+        print(f"Segments Created:  {results.get('segments_created', 0)}")
+        print(f"Segments Failed:   {results.get('segments_failed', 0)}")
+        print(f"Total Size:        {results.get('total_size_mb', 0):.2f} MB")
+        print(f"Total Frames:      {results.get('frame_count', 0)}")
+        print()
+        
+        # Display individual segment details
+        segments = results.get('segments', [])
+        if segments:
+            print("Individual Segments:")
+            print("-" * 60)
+            for i, segment in enumerate(segments, 1):
+                duration = segment.get('duration', 0)
+                start_time = segment.get('start_time', 0)
+                end_time = start_time + duration
+                
+                print(f"{i:2d}. {segment.get('name', 'N/A')}")
+                print(f"    Time:   {start_time:.1f}s - {end_time:.1f}s ({duration:.1f}s)")
+                print(f"    Size:   {segment.get('size_mb', 0):.2f} MB")
+                print(f"    Frames: {segment.get('frame_count', 0)}")
+                print()
+        
+        print("📁 All segments are saved in the segments folder above.")
+        print("📤 Each segment can be uploaded individually to Discord, Twitter, etc.")
+        print("🎯 High quality maintained while respecting platform size limits!")
+        print("="*60)
+
     def _display_gif_results(self, results: Dict[str, Any]):
         """Display GIF creation results"""
         print("\n" + "="*60)
         print("GIF CREATION RESULTS")
         print("="*60)
-        print(f"Input Video:      {results['input_video']}")
-        print(f"Output GIF:       {results['output_gif']}")
-        print(f"File Size:        {results['file_size_mb']:.2f} MB")
-        print(f"Duration:         {results['duration_seconds']:.1f} seconds")
-        print(f"Frame Count:      {results['frame_count']}")
-        print(f"Frame Rate:       {results['fps']} fps")
-        print(f"Resolution:       {results['width']}x{results['height']}")
-        print(f"Colors:           {results['colors']}")
-        print(f"Compression:      {results['compression_ratio']:.1f}% from original video")
+        print(f"Input Video:      {results.get('input_video', 'N/A')}")
+        print(f"Output GIF:       {results.get('output_gif', 'N/A')}")
+        print(f"File Size:        {results.get('file_size_mb', 0):.2f} MB")
+        print(f"Duration:         {results.get('duration_seconds', 0):.1f} seconds")
+        print(f"Frame Count:      {results.get('frame_count', 0)}")
+        print(f"Frame Rate:       {results.get('fps', 0)} fps")
+        print(f"Resolution:       {results.get('width', 0)}x{results.get('height', 0)}")
+        print(f"Colors:           {results.get('colors', 0)}")
+        print(f"Compression:      {results.get('compression_ratio', 0):.1f}% from original video")
         print("="*60)
     
     def _display_gif_optimization_results(self, results: Dict[str, Any]):
@@ -574,13 +788,13 @@ class VideoCompressorCLI:
         print("\n" + "="*60)
         print("GIF OPTIMIZATION RESULTS")
         print("="*60)
-        print(f"Input GIF:        {results['input_gif']}")
-        print(f"Output GIF:       {results['output_gif']}")
-        print(f"Method:           {results['method']}")
-        print(f"Original Size:    {results['original_size_mb']:.2f} MB")
-        print(f"Optimized Size:   {results['optimized_size_mb']:.2f} MB")
-        print(f"Compression:      {results['compression_ratio']:.1f}% reduction")
-        print(f"Space Saved:      {results['space_saved_mb']:.2f} MB")
+        print(f"Input GIF:        {results.get('input_gif', 'N/A')}")
+        print(f"Output GIF:       {results.get('output_gif', 'N/A')}")
+        print(f"Method:           {results.get('method', 'N/A')}")
+        print(f"Original Size:    {results.get('original_size_mb', 0):.2f} MB")
+        print(f"Optimized Size:   {results.get('optimized_size_mb', 0):.2f} MB")
+        print(f"Compression:      {results.get('compression_ratio', 0):.1f}% reduction")
+        print(f"Space Saved:      {results.get('space_saved_mb', 0):.2f} MB")
         print("="*60)
     
     def _display_quality_gif_results(self, results: Dict[str, Any]):
@@ -605,6 +819,199 @@ class VideoCompressorCLI:
         
         print(f"Frame Count:       {results.get('frame_count', 'N/A')}")
         print("="*60)
+    
+    def _validate_segment_folder_gifs_cli(self, segments_folder: str, max_size_mb: float) -> tuple:
+        """
+        Validates all GIFs in a segment folder for CLI usage.
+        Returns a tuple of (valid_gifs, invalid_gifs).
+        """
+        valid_gifs = []
+        invalid_gifs = []
+        
+        if not os.path.exists(segments_folder) or not os.path.isdir(segments_folder):
+            logger.warning(f"Segments folder not found or not a directory: {segments_folder}")
+            return [], []
+        
+        for filename in os.listdir(segments_folder):
+            if filename.lower().endswith('.gif'):
+                gif_path = os.path.join(segments_folder, filename)
+                try:
+                    is_valid, error_msg = self.file_validator.is_valid_gif_with_enhanced_checks(
+                        gif_path,
+                        original_path=gif_path,  # No original path for segment GIFs
+                        max_size_mb=max_size_mb
+                    )
+                    if is_valid:
+                        valid_gifs.append(gif_path)
+                    else:
+                        invalid_gifs.append(gif_path)
+                        logger.debug(f"Invalid GIF {filename}: {error_msg}")
+                except Exception as e:
+                    logger.warning(f"Error validating GIF {filename}: {e}")
+                    invalid_gifs.append(gif_path)
+        
+        return valid_gifs, invalid_gifs
+    
+    def _has_existing_output_cli(self, input_file: str, output_dir: str) -> bool:
+        """
+        Comprehensive check for existing output files in CLI batch processing.
+        
+        Checks for:
+        1. Optimized MP4 in output directory
+        2. Single GIF in output directory  
+        3. Segment folder in output directory
+        4. Any of the above in subdirectories (recursive search)
+        
+        Args:
+            input_file: Path to the input video file (string)
+            output_dir: Output directory path (string)
+            
+        Returns:
+            True if any valid output exists, False otherwise
+        """
+        if not os.path.exists(output_dir):
+            return False
+        
+        base_name = os.path.splitext(os.path.basename(input_file))[0]
+        
+        # Define all possible output patterns
+        output_patterns = [
+            f"{base_name}.mp4",           # Optimized MP4
+            f"{base_name}.gif",           # Single GIF
+            f"{base_name}_segments"       # Segment folder
+        ]
+        
+        # Check root output directory first (most common case)
+        for pattern in output_patterns:
+            output_path = os.path.join(output_dir, pattern)
+            if self._is_valid_existing_output_cli(output_path, pattern, input_file):
+                logger.info(f"Found existing output for {os.path.basename(input_file)}: {output_path}")
+                return True
+        
+        # Recursive search in all subdirectories
+        try:
+            for root, dirs, files in os.walk(output_dir):
+                # Check files in this directory
+                for pattern in output_patterns:
+                    if pattern.endswith('_segments'):
+                        # Check for segment folders
+                        if pattern in dirs:
+                            output_path = os.path.join(root, pattern)
+                            if self._is_valid_existing_output_cli(output_path, pattern, input_file):
+                                logger.info(f"Found existing output for {os.path.basename(input_file)}: {output_path}")
+                                return True
+                    else:
+                        # Check for files
+                        if pattern in files:
+                            output_path = os.path.join(root, pattern)
+                            if self._is_valid_existing_output_cli(output_path, pattern, input_file):
+                                logger.info(f"Found existing output for {os.path.basename(input_file)}: {output_path}")
+                                return True
+        except Exception as e:
+            logger.warning(f"Error during recursive output search for {os.path.basename(input_file)}: {e}")
+        
+        return False
+    
+    def _is_valid_existing_output_cli(self, output_path: str, pattern_type: str, input_file: str = None) -> bool:
+        """
+        Validate that an existing output is actually valid and was created from the specific input (CLI version).
+        
+        Args:
+            output_path: Path to the potential output (string)
+            pattern_type: Type of output ('*.mp4', '*.gif', or '*_segments')
+            input_file: Path to the original input file for verification
+            
+        Returns:
+            True if the output exists, is valid, and was created from the input
+        """
+        try:
+            if not os.path.exists(output_path):
+                return False
+            
+            # Basic validation first
+            basic_valid = False
+            if pattern_type.endswith('.mp4'):
+                # Validate MP4 file
+                is_valid, _ = self.file_validator.is_valid_video(output_path)
+                basic_valid = is_valid
+                
+            elif pattern_type.endswith('.gif'):
+                # Validate single GIF file
+                is_valid, _ = self.file_validator.is_valid_gif(output_path, max_size_mb=10.0)
+                basic_valid = is_valid
+                
+            elif pattern_type.endswith('_segments'):
+                # Validate segment folder - check if it contains valid GIFs
+                if os.path.isdir(output_path):
+                    valid_gifs, invalid_gifs = self._validate_segment_folder_gifs_cli(output_path, 10.0)
+                    basic_valid = len(valid_gifs) > 0  # At least one valid GIF makes it usable
+            
+            if not basic_valid:
+                return False
+            
+            # Enhanced validation: verify the output was created from this specific input
+            if input_file and os.path.exists(input_file):
+                return self._verify_output_source_relationship_cli(input_file, output_path, pattern_type)
+            
+            # If no input file provided, just return basic validation
+            return basic_valid
+                    
+        except Exception as e:
+            logger.debug(f"Error validating existing output {output_path}: {e}")
+            return False
+        
+        return False
+    
+    def _verify_output_source_relationship_cli(self, input_file: str, output_path: str, pattern_type: str) -> bool:
+        """
+        CLI version of source relationship verification.
+        """
+        try:
+            # Get input file modification time
+            input_mtime = os.path.getmtime(input_file)
+            output_mtime = os.path.getmtime(output_path)
+            
+            # Output should be created after input (with tolerance)
+            if output_mtime < input_mtime - 60:  # Allow 1 minute tolerance
+                logger.debug(f"Output {os.path.basename(output_path)} is older than input {os.path.basename(input_file)}")
+                return False
+            
+            # Get input duration for comparison
+            try:
+                from .ffmpeg_utils import FFmpegUtils
+                input_duration = FFmpegUtils.get_video_duration(input_file)
+            except Exception:
+                input_duration = None
+            
+            # Type-specific validation (simplified for CLI)
+            if pattern_type.endswith('.mp4') and input_duration:
+                try:
+                    output_duration = FFmpegUtils.get_video_duration(output_path)
+                    duration_diff = abs(input_duration - output_duration)
+                    if duration_diff > 2.0:  # Allow 2 second difference
+                        logger.debug(f"MP4 duration mismatch: {duration_diff:.1f}s difference")
+                        return False
+                except Exception:
+                    pass  # If we can't verify, assume valid
+            
+            elif pattern_type.endswith('_segments') and input_duration:
+                # Check segment count makes sense for input duration
+                try:
+                    segment_files = [f for f in os.listdir(output_path) if f.lower().endswith('.gif')]
+                    expected_segments = max(1, int(input_duration / 20))
+                    actual_segments = len(segment_files)
+                    
+                    if actual_segments < 1 or actual_segments > expected_segments * 3:
+                        logger.debug(f"Segment count mismatch: {actual_segments} segments for {input_duration:.1f}s video")
+                        return False
+                except Exception:
+                    pass  # If we can't verify, assume valid
+            
+            return True
+            
+        except Exception as e:
+            logger.debug(f"Error verifying CLI output source relationship: {e}")
+            return True  # Default to valid on error
     
     def _run_automated_workflow(self, args: argparse.Namespace):
         """Handle automated workflow command"""

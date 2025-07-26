@@ -834,6 +834,15 @@ class AdvancedVideoOptimizer:
         logger.info(f"Advanced optimization completed: {result['size_mb']:.2f}MB, "
                    f"quality: {result['quality_score']:.1f}, strategy: {result['candidate_name']}")
         
+        # Log detailed file specifications
+        try:
+            from .ffmpeg_utils import FFmpegUtils
+            specs = FFmpegUtils.get_detailed_file_specifications(output_path)
+            specs_log = FFmpegUtils.format_file_specifications_for_logging(specs)
+            logger.info(f"Advanced optimization final file specifications - {specs_log}")
+        except Exception as e:
+            logger.warning(f"Could not log detailed file specifications: {e}")
+        
         return result
     
     def _get_video_duration(self, input_path: str) -> float:

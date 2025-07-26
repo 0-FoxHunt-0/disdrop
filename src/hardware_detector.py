@@ -23,6 +23,7 @@ class HardwareDetector:
         self.system_info = self._get_system_info()
         self.gpu_info = self._detect_gpus()
         self.ffmpeg_encoders = self._detect_ffmpeg_encoders()
+        self.validation_results = {}  # Track validation results for encoders
     
     def _get_system_info(self) -> Dict[str, str]:
         """Get basic system information"""
@@ -213,6 +214,10 @@ class HardwareDetector:
                 # For AMD AMF encoders, perform additional validation
                 if encoders.get('h264_amf') or encoders.get('hevc_amf'):
                     self._validate_amd_amf_support(encoders)
+                
+                # For NVIDIA NVENC encoders, perform basic validation
+                if encoders.get('h264_nvenc') or encoders.get('hevc_nvenc'):
+                    self._validate_nvidia_nvenc_support(encoders)
                     
             else:
                 logger.warning("FFmpeg not found or not working properly")
@@ -223,28 +228,190 @@ class HardwareDetector:
         return encoders
     
     def _validate_amd_amf_support(self, encoders: Dict[str, bool]) -> None:
-        """Validate AMD AMF encoder support with a quick test"""
-        try:
-            # Test if AMF can actually initialize (basic validation)
-            test_cmd = [
+        """Validate AMD AMF encoder support with comprehensive testing"""
+        if not (encoders.get('h264_amf') or encoders.get('hevc_amf')):
+            return
+            
+        logger.info("Validating AMD AMF encoder functionality...")
+        
+        # Ensure validation_results is initialized
+        if not hasattr(self, 'validation_results'):
+            self.validation_results = {}
+        
+        # Test with ultra-conservative settings to match our encoding parameters
+        test_commands = [
+            # Test h264_amf with our conservative settings
+            [
                 'ffmpeg', '-f', 'lavfi', '-i', 'testsrc=duration=1:size=320x240:rate=1',
-                '-c:v', 'h264_amf', '-frames:v', '1', '-f', 'null', '-'
+                '-c:v', 'h264_amf', 
+                '-usage', 'transcoding', '-quality', 'speed', '-rc', 'cbr',
+                '-b:v', '500k', '-maxrate', '510k', '-bufsize', '550k',
+                '-profile:v', 'baseline', '-level', '3.1', '-refs', '1',
+                '-qp', '25', '-frames:v', '5', '-f', 'null', '-'
             ]
-            
-            result = subprocess.run(test_cmd, capture_output=True, text=True, timeout=10)
-            
-            if result.returncode != 0:
-                error_output = result.stderr.lower()
-                if any(error in error_output for error in ['amf', 'failed to initialize', 'no device']):
-                    logger.warning("AMD AMF encoder detected but not functional - may need driver update")
-                    # Don't disable the encoder completely, but warn the user
-                else:
-                    logger.debug("AMD AMF validation completed successfully")
-            else:
-                logger.info("AMD AMF hardware acceleration validated successfully")
+        ]
+        
+        validation_results = []
+        
+        for i, test_cmd in enumerate(test_commands):
+            try:
+                logger.debug(f"Running AMD AMF validation test {i+1}...")
+                result = subprocess.run(test_cmd, capture_output=True, text=True, timeout=15)
                 
-        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError):
-            logger.debug("AMD AMF validation test failed - encoder may still work")
+                if result.returncode == 0:
+                    validation_results.append(True)
+                    logger.debug(f"AMD AMF validation test {i+1} passed")
+                else:
+                    validation_results.append(False)
+                    error_output = result.stderr.lower()
+                    
+                    # Analyze specific error patterns
+                    if 'invalid argument' in error_output:
+                        logger.warning("AMD AMF validation failed: Invalid argument error detected - encoder may have compatibility issues")
+                    elif 'failed to initialize' in error_output or 'amf' in error_output:
+                        logger.warning("AMD AMF validation failed: Encoder initialization failed - may need driver update")
+                    elif 'no device' in error_output:
+                        logger.warning("AMD AMF validation failed: No compatible device found")
+                    else:
+                        logger.warning(f"AMD AMF validation failed with unknown error: {result.stderr[:200]}")
+                    
+                    logger.debug(f"Full AMD AMF validation error: {result.stderr}")
+                        
+            except subprocess.TimeoutExpired:
+                validation_results.append(False)
+                logger.warning("AMD AMF validation test timed out - encoder may be unstable")
+            except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                validation_results.append(False)
+                logger.warning(f"AMD AMF validation test failed: {e}")
+        
+        # Report overall validation results and disable failed encoders
+        if any(validation_results):
+            successful_tests = sum(validation_results)
+            total_tests = len(validation_results)
+            if successful_tests == total_tests:
+                logger.info("AMD AMF hardware acceleration validated successfully")
+                # Mark AMD AMF encoders as validated
+                if encoders.get('h264_amf'):
+                    self.validation_results['h264_amf'] = True
+                if encoders.get('hevc_amf'):
+                    self.validation_results['hevc_amf'] = True
+            else:
+                logger.warning(f"AMD AMF validation partially successful ({successful_tests}/{total_tests} tests passed)")
+                logger.info("AMD AMF encoder will be used but may fallback to software encoding on errors")
+                # Mark as partially validated
+                if encoders.get('h264_amf'):
+                    self.validation_results['h264_amf'] = 'partial'
+                if encoders.get('hevc_amf'):
+                    self.validation_results['hevc_amf'] = 'partial'
+        else:
+            logger.warning("All AMD AMF validation tests failed - encoder detected but may not function properly")
+            logger.info("Software fallback will be used automatically if AMD AMF fails during encoding")
+            # Disable AMD AMF encoders that failed validation
+            if encoders.get('h264_amf'):
+                encoders['h264_amf'] = False
+                self.validation_results['h264_amf'] = False
+                logger.info("Disabled h264_amf encoder due to validation failure")
+            if encoders.get('hevc_amf'):
+                encoders['hevc_amf'] = False
+                self.validation_results['hevc_amf'] = False
+                logger.info("Disabled hevc_amf encoder due to validation failure")
+    
+    def _validate_nvidia_nvenc_support(self, encoders: Dict[str, bool]) -> None:
+        """Validate NVIDIA NVENC encoder support with comprehensive testing"""
+        if not (encoders.get('h264_nvenc') or encoders.get('hevc_nvenc')):
+            return
+            
+        logger.info("Validating NVIDIA NVENC encoder functionality...")
+        
+        # Ensure validation_results is initialized
+        if not hasattr(self, 'validation_results'):
+            self.validation_results = {}
+        
+        # Test with ultra-conservative settings to match our encoding parameters
+        test_commands = [
+            # Test h264_nvenc with our conservative settings
+            [
+                'ffmpeg', '-f', 'lavfi', '-i', 'testsrc=duration=1:size=320x240:rate=1',
+                '-c:v', 'h264_nvenc', 
+                '-usage', 'transcoding', '-quality', 'speed', '-rc', 'cbr',
+                '-b:v', '500k', '-maxrate', '510k', '-bufsize', '550k',
+                '-profile:v', 'baseline', '-level', '3.1', '-refs', '1',
+                '-qp', '25', '-frames:v', '5', '-f', 'null', '-'
+            ]
+        ]
+        
+        validation_results = []
+        
+        for i, test_cmd in enumerate(test_commands):
+            try:
+                logger.debug(f"Running NVIDIA NVENC validation test {i+1}...")
+                result = subprocess.run(test_cmd, capture_output=True, text=True, timeout=15)
+                
+                if result.returncode == 0:
+                    validation_results.append(True)
+                    logger.debug(f"NVIDIA NVENC validation test {i+1} passed")
+                else:
+                    validation_results.append(False)
+                    error_output = result.stderr.lower()
+                    
+                    # Analyze specific error patterns
+                    if 'invalid argument' in error_output:
+                        logger.warning("NVIDIA NVENC validation failed: Invalid argument error detected - encoder may have compatibility issues")
+                    elif 'failed to initialize' in error_output or 'nvenc' in error_output:
+                        logger.warning("NVIDIA NVENC validation failed: Encoder initialization failed - may need driver update")
+                    elif 'no device' in error_output:
+                        logger.warning("NVIDIA NVENC validation failed: No compatible device found")
+                    else:
+                        logger.warning(f"NVIDIA NVENC validation failed with unknown error: {result.stderr[:200]}")
+                    
+                    logger.debug(f"Full NVIDIA NVENC validation error: {result.stderr}")
+                        
+            except subprocess.TimeoutExpired:
+                validation_results.append(False)
+                logger.warning("NVIDIA NVENC validation test timed out - encoder may be unstable")
+            except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                validation_results.append(False)
+                logger.warning(f"NVIDIA NVENC validation test failed: {e}")
+        
+        # Report overall validation results and disable failed encoders
+        if any(validation_results):
+            successful_tests = sum(validation_results)
+            total_tests = len(validation_results)
+            if successful_tests == total_tests:
+                logger.info("NVIDIA NVENC hardware acceleration validated successfully")
+                # Mark NVIDIA NVENC encoders as validated
+                if encoders.get('h264_nvenc'):
+                    self.validation_results['h264_nvenc'] = True
+                if encoders.get('hevc_nvenc'):
+                    self.validation_results['hevc_nvenc'] = True
+            else:
+                logger.warning(f"NVIDIA NVENC validation partially successful ({successful_tests}/{total_tests} tests passed)")
+                logger.info("NVIDIA NVENC encoder will be used but may fallback to software encoding on errors")
+                # Mark as partially validated
+                if encoders.get('h264_nvenc'):
+                    self.validation_results['h264_nvenc'] = 'partial'
+                if encoders.get('hevc_nvenc'):
+                    self.validation_results['hevc_nvenc'] = 'partial'
+        else:
+            logger.warning("All NVIDIA NVENC validation tests failed - encoder detected but may not function properly")
+            logger.info("Software fallback will be used automatically if NVIDIA NVENC fails during encoding")
+            # Disable NVIDIA NVENC encoders that failed validation
+            if encoders.get('h264_nvenc'):
+                encoders['h264_nvenc'] = False
+                self.validation_results['h264_nvenc'] = False
+                logger.info("Disabled h264_nvenc encoder due to validation failure")
+            if encoders.get('hevc_nvenc'):
+                encoders['hevc_nvenc'] = False
+                self.validation_results['hevc_nvenc'] = False
+                logger.info("Disabled hevc_nvenc encoder due to validation failure")
+    
+    def is_encoder_validated(self, encoder: str) -> bool:
+        """Check if an encoder has been validated and is working properly"""
+        if not hasattr(self, 'validation_results'):
+            return True  # Assume valid if not tested
+        if encoder not in self.validation_results:
+            return True  # Assume valid if not tested
+        return self.validation_results[encoder] is True
     
     def get_best_encoder(self, codec: str = "h264") -> Tuple[str, str]:
         """
@@ -253,9 +420,14 @@ class HardwareDetector:
         """
         if codec.lower() == "h264":
             # Priority order: NVIDIA -> AMD -> Intel -> Software
-            if self.ffmpeg_encoders.get('h264_nvenc') and self.has_nvidia_gpu():
+            # Only use encoders that are available AND validated
+            if (self.ffmpeg_encoders.get('h264_nvenc') and 
+                self.has_nvidia_gpu() and 
+                self.is_encoder_validated('h264_nvenc')):
                 return 'h264_nvenc', 'nvidia'
-            elif self.ffmpeg_encoders.get('h264_amf') and self.has_amd_gpu():
+            elif (self.ffmpeg_encoders.get('h264_amf') and 
+                  self.has_amd_gpu() and 
+                  self.is_encoder_validated('h264_amf')):
                 return 'h264_amf', 'amd'
             elif self.ffmpeg_encoders.get('h264_qsv'):
                 return 'h264_qsv', 'intel'
@@ -263,9 +435,13 @@ class HardwareDetector:
                 return 'libx264', 'software'
         
         elif codec.lower() == "h265" or codec.lower() == "hevc":
-            if self.ffmpeg_encoders.get('hevc_nvenc') and self.has_nvidia_gpu():
+            if (self.ffmpeg_encoders.get('hevc_nvenc') and 
+                self.has_nvidia_gpu() and 
+                self.is_encoder_validated('hevc_nvenc')):
                 return 'hevc_nvenc', 'nvidia'
-            elif self.ffmpeg_encoders.get('hevc_amf') and self.has_amd_gpu():
+            elif (self.ffmpeg_encoders.get('hevc_amf') and 
+                  self.has_amd_gpu() and 
+                  self.is_encoder_validated('hevc_amf')):
                 return 'hevc_amf', 'amd'
             elif self.ffmpeg_encoders.get('hevc_qsv'):
                 return 'hevc_qsv', 'intel'
@@ -273,7 +449,9 @@ class HardwareDetector:
                 return 'libx265', 'software'
         
         elif codec.lower() == "av1":
-            if self.ffmpeg_encoders.get('av1_amf') and self.has_amd_gpu():
+            if (self.ffmpeg_encoders.get('av1_amf') and 
+                self.has_amd_gpu() and 
+                self.is_encoder_validated('av1_amf')):
                 return 'av1_amf', 'amd'
             # Add other AV1 encoders in the future
         
@@ -282,24 +460,37 @@ class HardwareDetector:
         return 'libx264' if codec.lower() == "h264" else 'libx265', 'software'
     
     def get_amd_encoder_options(self, encoder: str) -> List[str]:
-        """Get AMD AMF-specific encoder options for better performance"""
+        """Get AMD AMF-specific encoder options for better performance and compatibility"""
         options = []
         
         if encoder == 'h264_amf':
-            # Simplified AMD AMF options for maximum compatibility
+            # Ultra-conservative AMD AMF options for maximum compatibility
+            # Avoid advanced features that might cause "Invalid argument" errors
             options.extend([
-                '-usage', 'transcoding',  # Optimize for transcoding
-                '-quality', 'speed',      # Use speed instead of balanced for better compatibility
+                '-usage', 'transcoding',      # Standard transcoding usage
+                '-quality', 'speed',          # Speed quality mode (most compatible)
+                '-rc', 'cbr',                 # Constant bitrate (most stable)
+                '-enforce_hrd', '1',          # Enforce HRD compliance
+                '-filler_data', '1',          # Add filler data for bitrate compliance
+                '-frame_skipping', '0',       # Disable frame skipping
+                '-vbaq', '0',                 # Disable VBAQ (can cause issues)
+                '-preanalysis', '0'           # Disable preanalysis (can cause issues)
             ])
         elif encoder == 'hevc_amf':
+            # Conservative HEVC AMF options
             options.extend([
                 '-usage', 'transcoding',
-                '-quality', 'speed',      # Use speed instead of balanced
+                '-quality', 'speed',
+                '-rc', 'cbr',
+                '-enforce_hrd', '1',
+                '-filler_data', '1',
+                '-frame_skipping', '0'
             ])
         elif encoder == 'av1_amf':
+            # Conservative AV1 AMF options (minimal settings)
             options.extend([
                 '-usage', 'transcoding',
-                '-quality', 'speed',      # Use speed instead of balanced
+                '-quality', 'speed'
             ])
         
         return options
@@ -316,6 +507,15 @@ class HardwareDetector:
         """Check if any hardware acceleration is available"""
         hardware_encoders = ['h264_nvenc', 'hevc_nvenc', 'h264_amf', 'hevc_amf', 'av1_amf', 'h264_qsv', 'hevc_qsv']
         return any(self.ffmpeg_encoders.get(encoder, False) for encoder in hardware_encoders)
+    
+    def force_software_encoding(self) -> None:
+        """Force software encoding by disabling all hardware encoders"""
+        logger.info("Forcing software encoding mode")
+        for encoder in ['h264_nvenc', 'hevc_nvenc', 'h264_amf', 'hevc_amf', 'av1_amf', 'h264_qsv', 'hevc_qsv']:
+            if encoder in self.ffmpeg_encoders:
+                self.ffmpeg_encoders[encoder] = False
+                self.validation_results[encoder] = False
+        logger.info("All hardware encoders disabled - will use software encoding only")
     
     def get_system_report(self) -> str:
         """Generate a comprehensive system report"""
@@ -347,7 +547,19 @@ class HardwareDetector:
                     'qsv': 'Intel'
                 }
                 vendor = next((v for k, v in vendor_map.items() if k in encoder), 'Unknown')
-                report.append(f"  ✓ {encoder} ({vendor})")
+                if not hasattr(self, 'validation_results'):
+                    status = "? Not tested"
+                else:
+                    validation_status = self.validation_results.get(encoder, 'Not tested')
+                    if validation_status is True:
+                        status = "OK Validated"
+                    elif validation_status is False:
+                        status = "✗ Failed validation"
+                    elif validation_status == 'partial':
+                        status = "⚠ Partially validated"
+                    else:
+                        status = "? Not tested"
+                report.append(f"  {status} {encoder} ({vendor})")
         else:
             report.append("  No hardware encoders detected")
         
@@ -358,7 +570,7 @@ class HardwareDetector:
         
         if available_sw_encoders:
             for encoder in available_sw_encoders:
-                report.append(f"  ✓ {encoder}")
+                report.append(f"  OK {encoder}")
         else:
             report.append("  No software encoders detected")
         
