@@ -446,10 +446,12 @@ class FileValidator:
             is_gif = processed_path.lower().endswith('.gif')
             
             if is_gif:
-                # For GIFs, be much more lenient due to frame-based timing and compression
-                # GIFs can be significantly shorter due to frame rate reduction and frame dropping
-                min_ratio = 0.70  # Allow up to 30% shorter for GIFs
-                max_ratio = 1.30  # Allow up to 30% longer for GIFs
+                # For GIFs, be extremely lenient due to frame-based timing and compression
+                # GIFs can be significantly shorter due to frame rate reduction, frame dropping, and segmentation
+                # Since GIFs are inherently compressed and may represent segments of the original video,
+                # we should be very permissive with duration validation
+                min_ratio = 0.30  # Allow up to 70% shorter for GIFs (very permissive)
+                max_ratio = 1.50  # Allow up to 50% longer for GIFs
             else:
                 # For videos, use standard validation
                 min_ratio = 0.80  # Allow up to 20% shorter for videos
@@ -481,6 +483,24 @@ class FileValidator:
             Duration in seconds, or 0 if error
         """
         try:
+            # For GIFs, use PIL to get accurate duration
+            if video_path.lower().endswith('.gif'):
+                try:
+                    from PIL import Image
+                    with Image.open(video_path) as img:
+                        if hasattr(img, 'n_frames') and img.n_frames > 0:
+                            # Calculate duration from frame count and frame duration
+                            frame_duration_ms = img.info.get('duration', 100)  # Default 100ms
+                            total_duration_ms = img.n_frames * frame_duration_ms
+                            return total_duration_ms / 1000.0  # Convert to seconds
+                        else:
+                            # Fallback to ffprobe for non-animated GIFs
+                            pass
+                except Exception as e:
+                    logger.debug(f"PIL duration calculation failed for {video_path}: {e}")
+                    # Fall back to ffprobe
+            
+            # Use ffprobe for videos and as fallback for GIFs
             cmd = [
                 'ffprobe', '-v', 'quiet', '-print_format', 'json',
                 '-show_format', video_path

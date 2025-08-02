@@ -2182,13 +2182,27 @@ class GifGenerator:
         try:
             # Calculate optimal segment duration
             segment_duration = self._calculate_optimal_segment_duration(duration, video_info)
-            num_segments = max(1, int(duration / segment_duration))
+            
+            # Calculate number of segments to ensure full video coverage
+            # Use ceiling division to ensure we don't lose any content
+            import math
+            num_segments = max(1, math.ceil(duration / segment_duration))
+            
+            # Smart segment adjustment: If the last segment would be short (< 50% of segment_duration),
+            # reduce the number of segments and extend the previous segments to include the short content
+            if num_segments > 1:
+                remaining_duration = duration - ((num_segments - 1) * segment_duration)
+                if remaining_duration < (segment_duration * 0.5):  # Last segment would be < 50% of normal size
+                    logger.info(f"Last segment would be short ({remaining_duration:.1f}s < {segment_duration * 0.5:.1f}s) - reducing to {num_segments - 1} segments")
+                    num_segments = num_segments - 1
+                    # Recalculate segment duration to distribute remaining content evenly
+                    segment_duration = duration / num_segments
             
             # Validate segmentation parameters
             if segment_duration < 5.0:
                 logger.warning(f"Very short segment duration calculated: {segment_duration:.1f}s - adjusting to minimum 15s")
                 segment_duration = 15.0
-                num_segments = max(1, int(duration / segment_duration))
+                num_segments = max(1, math.ceil(duration / segment_duration))
             
             if num_segments > 10:
                 logger.warning(f"Too many segments calculated: {num_segments} - limiting to 10 segments")
@@ -2208,8 +2222,10 @@ class GifGenerator:
                 remaining_duration = duration - (i * segment_duration)
                 actual_segment_duration = min(segment_duration, remaining_duration)
                 
-                if actual_segment_duration < 1.0:  # Skip very short segments
-                    continue
+                # Only skip if we have no remaining content (duration <= 0)
+                # Always include the last segment even if it's short to ensure full video coverage
+                if remaining_duration <= 0:
+                    break
                 
                 segment_name = f"001_{base_name}_part{i+1:02d}.gif"
                 temp_segment_path = os.path.join(temp_segments_folder, segment_name)
