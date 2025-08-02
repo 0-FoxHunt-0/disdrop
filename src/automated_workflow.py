@@ -854,8 +854,8 @@ class AutomatedWorkflow:
                 
                 if temp_segments_folder and base_name and segments:
                     # Create final segments folder in output directory
-                    final_segments_folder = os.path.join(self.output_dir, f"{base_name}_segments")
-                    os.makedirs(final_segments_folder, exist_ok=True)
+                    final_segments_folder = self.output_dir / f"{base_name}_segments"
+                    final_segments_folder.mkdir(exist_ok=True)
                     
                     moved_segments = 0
                     total_moved_size = 0
@@ -866,7 +866,7 @@ class AutomatedWorkflow:
                         segment_name = segment.get('name')
                         
                         if temp_path and segment_name and os.path.exists(temp_path):
-                            final_path = os.path.join(final_segments_folder, segment_name)
+                            final_path = final_segments_folder / segment_name
                             
                             try:
                                 shutil.move(temp_path, final_path)
@@ -889,8 +889,8 @@ class AutomatedWorkflow:
                     
                     # Move the optimized MP4 video into the segments folder for easy access
                     mp4_source_path = str(mp4_file)
-                    mp4_filename = os.path.basename(mp4_source_path)
-                    mp4_dest_path = os.path.join(final_segments_folder, mp4_filename)
+                    mp4_filename = mp4_file.name
+                    mp4_dest_path = final_segments_folder / mp4_filename
                     
                     try:
                         if os.path.exists(mp4_source_path):
@@ -904,10 +904,10 @@ class AutomatedWorkflow:
                         print(f"    ❌ Failed to move optimized video to segments folder")
                     
                     # Move summary file LAST (after all media files) so it doesn't interfere with Windows thumbnails
-                    summary_file = os.path.join(temp_segments_folder, f"{base_name}_segments_info.txt")
-                    if os.path.exists(summary_file):
+                    summary_file = Path(temp_segments_folder) / f"{base_name}_segments_info.txt"
+                    if summary_file.exists():
                         # Rename summary to start with 'z' to ensure it comes last alphabetically
-                        final_summary = os.path.join(final_segments_folder, f"zzz_{base_name}_segments_info.txt")
+                        final_summary = final_segments_folder / f"zzz_{base_name}_segments_info.txt"
                         try:
                             shutil.move(summary_file, final_summary)
                             logger.info(f"Moved summary file: {final_summary}")
@@ -916,11 +916,12 @@ class AutomatedWorkflow:
                     
                     # Clean up temp folder - use more robust cleanup
                     try:
-                        if os.path.exists(temp_segments_folder):
+                        temp_segments_path = Path(temp_segments_folder)
+                        if temp_segments_path.exists():
                             # First try to remove any remaining files
                             remaining_files = []
                             try:
-                                remaining_files = os.listdir(temp_segments_folder)
+                                remaining_files = list(temp_segments_path.iterdir())
                             except Exception:
                                 pass
                             
@@ -928,15 +929,14 @@ class AutomatedWorkflow:
                                 logger.info(f"Cleaning up {len(remaining_files)} remaining files in temp folder")
                                 for remaining_file in remaining_files:
                                     try:
-                                        file_path = os.path.join(temp_segments_folder, remaining_file)
-                                        if os.path.isfile(file_path):
-                                            os.remove(file_path)
-                                            logger.debug(f"Removed remaining file: {remaining_file}")
+                                        if remaining_file.is_file():
+                                            remaining_file.unlink()
+                                            logger.debug(f"Removed remaining file: {remaining_file.name}")
                                     except Exception as file_e:
-                                        logger.warning(f"Could not remove remaining file {remaining_file}: {file_e}")
+                                        logger.warning(f"Could not remove remaining file {remaining_file.name}: {file_e}")
                             
                             # Now remove the folder
-                            os.rmdir(temp_segments_folder)
+                            temp_segments_path.rmdir()
                             logger.info(f"Successfully cleaned up temp segments folder: {temp_segments_folder}")
                     except Exception as e:
                         logger.warning(f"Could not remove temp segments folder: {e}")
@@ -959,7 +959,7 @@ class AutomatedWorkflow:
                                      capture_output=True, check=False)
                         
                         # 2. Refresh the folder to help Windows recognize the media files
-                        subprocess.run(['cmd', '/c', 'dir', final_segments_folder, '>nul'], 
+                        subprocess.run(['cmd', '/c', 'dir', str(final_segments_folder), '>nul'], 
                                      capture_output=True, check=False)
                         
                         # 3. Force Windows Explorer to refresh (if possible)

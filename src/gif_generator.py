@@ -120,6 +120,22 @@ class GifGenerator:
                 'file_size_mb': results.get('total_size_mb', 0),
                 'frame_count': sum(seg.get('frame_count', 0) for seg in results.get('segments', []))
             }
+        elif results.get('method') == 'Single Segment Conversion':
+            # For single segment conversions, return as regular GIF
+            logger.info(f"Single segment converted to regular GIF: {results.get('file_size_mb', 0):.2f}MB")
+            print(f"🎬 Single segment converted to regular GIF: {results.get('file_size_mb', 0):.2f}MB")
+            
+            return {
+                'success': results.get('success', False),
+                'method': results.get('method', 'Single Segment Conversion'),
+                'output_file': results.get('output_file', output_path),
+                'file_size_mb': results.get('file_size_mb', 0),
+                'frame_count': results.get('frame_count', 0),
+                'width': results.get('width', 0),
+                'height': results.get('height', 0),
+                'fps': results.get('fps', 0),
+                'optimization_type': results.get('optimization_type', 'segment_conversion')
+            }
         else:
             # For single GIF results, return as before
             return results
@@ -709,16 +725,14 @@ class GifGenerator:
             if not frames:
                 raise ValueError("No frames extracted from video")
             
-            # SIMPLE AND CORRECT: Calculate frame duration to maintain the original segment duration
-            # Formula: Frame_delay_ms = (duration * 1000) / frames_extracted
+            # CORRECT: Calculate frame duration based on target FPS to maintain proper timing
+            # Formula: Frame_delay_ms = 1000 / target_fps
             
             actual_frames_extracted = len(frames)
             
-            # Calculate frame delay to maintain original duration
-            if actual_frames_extracted > 0:
-                frame_duration = int((duration * 1000) / actual_frames_extracted)
-            else:
-                frame_duration = int(1000 / params['fps'])  # Fallback
+            # Calculate frame duration based on target FPS to maintain proper timing
+            target_fps = params['fps']
+            frame_duration = int(1000 / target_fps) if target_fps > 0 else 100
             
             # Ensure minimum frame duration of 10ms (100fps max) to prevent too-fast GIFs
             frame_duration = max(frame_duration, 10)
@@ -2090,25 +2104,28 @@ class GifGenerator:
         estimated_size_mb = self._estimate_gif_size(estimation_params, duration, video_info)
         
         # Primary decision: split if estimated size exceeds limit significantly
-        size_threshold_multiplier = self.config.get('gif_settings.segmentation.size_threshold_multiplier', 2.5)
+        # Make this more conservative - only split if clearly too large
+        size_threshold_multiplier = self.config.get('gif_settings.segmentation.size_threshold_multiplier', 3.0)  # Increased from 2.5
         if estimated_size_mb > max_size_mb * size_threshold_multiplier:
             logger.info(f"Video splitting recommended: estimated size {estimated_size_mb:.1f}MB > "
                        f"{max_size_mb * size_threshold_multiplier:.1f}MB threshold")
             return True
         
         # Secondary decision: split if estimated size is close to limit but video has challenging characteristics
-        if estimated_size_mb > max_size_mb * 1.5:  # Within 1.5x of limit
+        # Make this more conservative - only for very challenging content
+        if estimated_size_mb > max_size_mb * 2.0:  # Increased from 1.5x to 2.0x
             complexity = video_info.get('complexity_score', 5.0)
             motion_level = video_info.get('motion_level', 'medium')
             
-            # Split if high complexity or motion makes compression unpredictable
-            if complexity >= 7 or motion_level == 'high':
+            # Split only if very high complexity or motion makes compression unpredictable
+            if complexity >= 8.5 or motion_level == 'very_high':  # Increased complexity threshold from 7 to 8.5
                 logger.info(f"Video splitting recommended: estimated size {estimated_size_mb:.1f}MB with "
-                           f"challenging characteristics (complexity: {complexity:.1f}, motion: {motion_level})")
+                           f"very challenging characteristics (complexity: {complexity:.1f}, motion: {motion_level})")
                 return True
         
         # Fallback: still split extremely long videos regardless of estimated size
-        fallback_duration_limit = self.config.get('gif_settings.segmentation.fallback_duration_limit', 120)
+        # Make this more conservative - only for very long videos
+        fallback_duration_limit = self.config.get('gif_settings.segmentation.fallback_duration_limit', 180)  # Increased from 120
         if duration > fallback_duration_limit:
             logger.info(f"Video splitting recommended: duration {duration}s exceeds fallback limit {fallback_duration_limit}s")
             return True
@@ -2123,9 +2140,10 @@ class GifGenerator:
         
         aggressive_size_mb = self._estimate_gif_size(aggressive_params, duration, video_info)
         
-        if aggressive_size_mb > max_size_mb * 1.2:  # Even aggressive compression won't work well
+        # Make this more conservative - only split if even aggressive compression won't work
+        if aggressive_size_mb > max_size_mb * 1.5:  # Increased from 1.2x to 1.5x
             logger.info(f"Video splitting recommended: even aggressive compression estimates {aggressive_size_mb:.1f}MB > "
-                       f"{max_size_mb * 1.2:.1f}MB")
+                       f"{max_size_mb * 1.5:.1f}MB")
             return True
         
         logger.info(f"Single GIF recommended: estimated size {estimated_size_mb:.1f}MB (aggressive: {aggressive_size_mb:.1f}MB) "
@@ -2242,7 +2260,53 @@ class GifGenerator:
             
             total_size_mb = sum(seg['size_mb'] for seg in segments_created)
             
-            # If we have successful segments, return them (cleanup will happen later during move)
+            # Check if we only created one segment - if so, convert to regular GIF
+            if len(segments_created) == 1:
+                logger.info(f"Only one segment created ({total_size_mb:.2f}MB) - converting to regular GIF")
+                
+                # Get the single segment
+                single_segment = segments_created[0]
+                temp_segment_path = single_segment['temp_path']
+                
+                # Move the single segment to the original output path
+                try:
+                    shutil.move(temp_segment_path, output_base_path)
+                    logger.info(f"Converted single segment to regular GIF: {output_base_path}")
+                    
+                    # Clean up temp folder and files
+                    self._cleanup_temp_files(temp_files_to_cleanup)
+                    self._cleanup_temp_folder(temp_segments_folder)
+                    
+                    # Return as a regular GIF result
+                    return {
+                        'success': True,
+                        'method': 'Single Segment Conversion',
+                        'output_file': output_base_path,
+                        'file_size_mb': single_segment['size_mb'],
+                        'frame_count': single_segment['frame_count'],
+                        'width': single_segment.get('width', 0),
+                        'height': single_segment.get('height', 0),
+                        'fps': single_segment.get('fps', 0),
+                        'optimization_type': single_segment.get('optimization_type', 'segment_conversion')
+                    }
+                    
+                except Exception as e:
+                    logger.error(f"Failed to convert single segment to regular GIF: {e}")
+                    # Fall back to segmentation result
+                    return {
+                        'success': True,
+                        'temp_segments_folder': temp_segments_folder,
+                        'segments_created': len(segments_created),
+                        'segments_failed': len(failed_segments),
+                        'total_size_mb': total_size_mb,
+                        'segments': segments_created,
+                        'method': 'Video Segmentation',
+                        'base_name': base_name,
+                        'original_output_path': output_base_path,
+                        'temp_files_to_cleanup': temp_files_to_cleanup
+                    }
+            
+            # If we have multiple successful segments, return them (cleanup will happen later during move)
             if segments_created:
                 return {
                     'success': True,

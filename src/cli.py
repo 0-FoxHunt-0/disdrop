@@ -402,9 +402,99 @@ class VideoCompressorCLI:
                 duration=args.duration
             )
             
+            # Handle segmentation results by moving files from temp to output
+            if results.get('method') == 'Video Segmentation':
+                if results.get('success', False):
+                    # For successful segmentation, move temp files to final location
+                    temp_segments_folder = results.get('temp_segments_folder')
+                    base_name = results.get('base_name')
+                    segments = results.get('segments', [])
+                    
+                    if temp_segments_folder and base_name and segments:
+                        # Create final segments folder
+                        output_dir = os.path.dirname(args.output)
+                        final_segments_folder = os.path.join(output_dir, f"{base_name}_segments")
+                        os.makedirs(final_segments_folder, exist_ok=True)
+                        
+                        # Move segments from temp to final location
+                        moved_segments = 0
+                        for segment in segments:
+                            temp_path = segment.get('temp_path')
+                            segment_name = segment.get('name')
+                            
+                            if temp_path and segment_name and os.path.exists(temp_path):
+                                final_path = os.path.join(final_segments_folder, segment_name)
+                                try:
+                                    shutil.move(temp_path, final_path)
+                                    moved_segments += 1
+                                    logger.debug(f"Moved segment: {segment_name} -> {final_path}")
+                                except Exception as e:
+                                    logger.error(f"Failed to move segment {segment_name}: {e}")
+                        
+                        # Move summary file if it exists
+                        summary_file = os.path.join(temp_segments_folder, f"{base_name}_segments_info.txt")
+                        if os.path.exists(summary_file):
+                            final_summary = os.path.join(final_segments_folder, f"zzz_{base_name}_segments_info.txt")
+                            try:
+                                shutil.move(summary_file, final_summary)
+                            except Exception as e:
+                                logger.warning(f"Failed to move summary file: {e}")
+                        
+                        # Clean up temp folder
+                        try:
+                            if os.path.exists(temp_segments_folder):
+                                shutil.rmtree(temp_segments_folder)
+                                logger.info(f"Cleaned up temp segments folder: {temp_segments_folder}")
+                        except Exception as e:
+                            logger.warning(f"Could not clean up temp folder: {e}")
+                        
+                        # Update results to show the final segments folder
+                        results['segments_folder'] = final_segments_folder
+                        results['output_file'] = final_segments_folder
+                    else:
+                        # Segmentation data incomplete, clean up temp files
+                        temp_folder = results.get('temp_segments_folder')
+                        temp_files = results.get('temp_files_to_cleanup', [])
+                        
+                        if temp_files:
+                            for temp_file in temp_files:
+                                try:
+                                    if os.path.exists(temp_file):
+                                        os.remove(temp_file)
+                                except Exception:
+                                    pass
+                        
+                        if temp_folder and os.path.exists(temp_folder):
+                            try:
+                                shutil.rmtree(temp_folder)
+                            except Exception:
+                                pass
+                else:
+                    # Failed segmentation - clean up temp files
+                    temp_folder = results.get('temp_segments_folder')
+                    temp_files = results.get('temp_files_to_cleanup', [])
+                    
+                    if temp_files:
+                        for temp_file in temp_files:
+                            try:
+                                if os.path.exists(temp_file):
+                                    os.remove(temp_file)
+                            except Exception:
+                                pass
+                    
+                    if temp_folder and os.path.exists(temp_folder):
+                        try:
+                            shutil.rmtree(temp_folder)
+                        except Exception:
+                            pass
+                    
+                    raise Exception(f"Segmentation failed: {results.get('error', 'Unknown error')}")
+            
             # Display results based on method used
             if results.get('method') == 'Video Segmentation':
                 self._display_segmentation_results(results)
+            elif results.get('method') == 'Single Segment Conversion':
+                self._display_single_segment_conversion_results(results)
             else:
                 self._display_quality_gif_results(results)
             
@@ -607,6 +697,11 @@ class VideoCompressorCLI:
                         
                         # Return failure for failed segmentation
                         return {'success': False, 'input': input_file, 'error': result.get('error', 'Segmentation failed')}
+                elif result.get('method') == 'Single Segment Conversion':
+                    # For single segment conversion, the file is already at the correct location
+                    # Just update the output info to point to the correct file
+                    output_info = result.get('output_file', output_file)
+                    logger.info(f"Single segment conversion completed: {output_info}")
                 
                 return {'success': True, 'input': input_file, 'output': output_info, 'result': result}
                 
@@ -765,6 +860,24 @@ class VideoCompressorCLI:
         print("📁 All segments are saved in the segments folder above.")
         print("📤 Each segment can be uploaded individually to Discord, Twitter, etc.")
         print("🎯 High quality maintained while respecting platform size limits!")
+        print("="*60)
+
+    def _display_single_segment_conversion_results(self, results: Dict[str, Any]):
+        """Display single segment conversion results"""
+        print("\n" + "="*60)
+        print("🎬 SINGLE SEGMENT CONVERSION RESULTS")
+        print("="*60)
+        print(f"Method:            Single Segment Conversion")
+        print(f"Output File:       {results.get('output_file', 'N/A')}")
+        print(f"File Size:         {results.get('file_size_mb', 0):.2f} MB")
+        print(f"Frame Count:       {results.get('frame_count', 0)}")
+        print(f"Resolution:        {results.get('width', 0)}x{results.get('height', 0)}")
+        print(f"Frame Rate:        {results.get('fps', 0)} fps")
+        print(f"Optimization Type: {results.get('optimization_type', 'N/A')}")
+        print()
+        print("✅ Video was processed using segmentation but only one segment was needed.")
+        print("✅ Converted to regular GIF format for simplicity.")
+        print("✅ High quality maintained while staying under size limits!")
         print("="*60)
 
     def _display_gif_results(self, results: Dict[str, Any]):

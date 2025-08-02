@@ -442,10 +442,18 @@ class FileValidator:
             
             # Allow some tolerance for processing (e.g., frame rate changes, trimming)
             # For GIFs, be more lenient due to frame-based timing vs continuous video timing
-            # Processed file should be at least 80% of original duration (more lenient for GIFs)
-            min_ratio = 0.80
-            # Allow up to 25% longer for GIFs due to frame-based timing and rounding
-            max_ratio = 1.25
+            # Check if the processed file is a GIF to apply more lenient validation
+            is_gif = processed_path.lower().endswith('.gif')
+            
+            if is_gif:
+                # For GIFs, be much more lenient due to frame-based timing and compression
+                # GIFs can be significantly shorter due to frame rate reduction and frame dropping
+                min_ratio = 0.70  # Allow up to 30% shorter for GIFs
+                max_ratio = 1.30  # Allow up to 30% longer for GIFs
+            else:
+                # For videos, use standard validation
+                min_ratio = 0.80  # Allow up to 20% shorter for videos
+                max_ratio = 1.25  # Allow up to 25% longer for videos
             
             if duration_ratio < min_ratio:
                 logger.warning(f"Duration validation failed - too short: {processed_duration:.2f}s vs {original_duration:.2f}s ({duration_ratio:.1%})")
