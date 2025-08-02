@@ -69,8 +69,21 @@ class GifGenerator:
             # If duration is explicitly provided, use it (don't limit by max_duration)
             actual_duration = min(duration, video_info['duration'] - start_time)
         else:
-            # If no duration provided, use the config max_duration limit
-            actual_duration = min(max_duration, video_info['duration'] - start_time)
+            # For segmentation, use full video duration to ensure complete coverage
+            # For single GIF, use the config max_duration limit
+            full_duration = video_info['duration'] - start_time
+            
+            # Check if this video would need segmentation
+            estimated_size = self._estimate_gif_size(gif_params, full_duration, video_info)
+            needs_segmentation = estimated_size > gif_params['max_size_mb'] * 2.0  # Conservative threshold
+            
+            if needs_segmentation:
+                # Use full duration for segmentation to ensure complete video coverage
+                actual_duration = full_duration
+                logger.info(f"Using full video duration ({actual_duration:.1f}s) for segmentation")
+            else:
+                # Use max_duration limit for single GIF creation
+                actual_duration = min(max_duration, full_duration)
         
         logger.info(f"Creating GIF: {gif_params['width']}x{gif_params['height']}, "
                    f"{actual_duration:.1f}s @ {gif_params['fps']}fps")
@@ -433,7 +446,14 @@ class GifGenerator:
         
         # Calculate dynamic size limit based on video characteristics
         base_size_mb = max_size_mb or self.config.get('gif_settings.max_file_size_mb', 10)
-        actual_duration = duration or self.config.get('gif_settings.max_duration_seconds', 15)
+        
+        # For segmentation, don't limit duration - let the segmentation logic handle long videos
+        # Only apply duration limit for single GIF creation
+        if duration is not None:
+            actual_duration = duration
+        else:
+            # Use max_duration only for single GIF creation, not for segmentation
+            actual_duration = self.config.get('gif_settings.max_duration_seconds', 15)
         
         # Perform content analysis if input video is provided
         if input_video and os.path.exists(input_video):
@@ -683,10 +703,9 @@ class GifGenerator:
                 frame_interval *= frame_skip
                 logger.debug(f"Applying frame skip factor {frame_skip}, new interval: {frame_interval}")
             
-            # Calculate expected number of output frames for validation
+            # Calculate expected number of output frames for validation (but don't limit extraction)
             expected_frames = int(duration * params['fps'] / frame_skip)
-            
-
+            total_frames_to_extract = end_frame - start_frame
             
             # Set starting frame
             cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
@@ -696,10 +715,10 @@ class GifGenerator:
             extracted_frames = 0
             
             logger.debug(f"Extracting frames: original_fps={original_fps:.1f}, target_fps={params['fps']}, "
-                        f"interval={frame_interval}, expected_frames={expected_frames}")
+                        f"interval={frame_interval}, expected_frames={expected_frames}, total_frames_available={total_frames_to_extract}")
             
-            with tqdm(total=expected_frames, desc="Extracting frames") as pbar:
-                while cap.isOpened() and frame_count < end_frame - start_frame and extracted_frames < expected_frames:
+            with tqdm(total=total_frames_to_extract, desc="Extracting frames") as pbar:
+                while cap.isOpened() and frame_count < total_frames_to_extract:
                     ret, frame = cap.read()
                     
                     if not ret:
@@ -730,9 +749,15 @@ class GifGenerator:
             
             actual_frames_extracted = len(frames)
             
-            # Calculate frame duration based on target FPS to maintain proper timing
-            target_fps = params['fps']
-            frame_duration = int(1000 / target_fps) if target_fps > 0 else 100
+            # Calculate frame duration to maintain the original segment duration
+            # Formula: Frame_delay_ms = (duration * 1000) / frames_extracted
+            # This ensures the GIF plays for exactly the intended duration
+            if actual_frames_extracted > 0:
+                frame_duration = int((duration * 1000) / actual_frames_extracted)
+            else:
+                # Fallback to target FPS calculation
+                target_fps = params['fps']
+                frame_duration = int(1000 / target_fps) if target_fps > 0 else 100
             
             # Ensure minimum frame duration of 10ms (100fps max) to prevent too-fast GIFs
             frame_duration = max(frame_duration, 10)
