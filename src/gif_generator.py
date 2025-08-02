@@ -422,18 +422,30 @@ class GifGenerator:
         # Perform content analysis if input video is provided
         if input_video and os.path.exists(input_video):
             content_analysis = self._analyze_video_content(input_video, start_time, actual_duration)
-            # Merge content analysis with existing video_info
-            video_info_merged = {**(video_info or {}), **content_analysis}
+            # Merge content analysis with existing video_info, but prioritize original video info
+            video_info_merged = {**content_analysis, **(video_info or {})}
+            
+            # Ensure we don't override the original video dimensions with fallback values
+            if video_info and video_info.get('width') and video_info.get('height'):
+                video_info_merged['width'] = video_info['width']
+                video_info_merged['height'] = video_info['height']
         else:
             video_info_merged = video_info or {}
         
         dynamic_size_mb = self._calculate_dynamic_size_limit(actual_duration, video_info_merged, base_size_mb)
         
         # Base parameters from config
+        # Use original video FPS as starting point, with config as fallback
+        original_fps = video_info_merged.get('fps', self.config.get('gif_settings.fps', 15))
+        # Cap the maximum initial FPS to avoid extremely high values that would create large files
+        base_fps = min(original_fps, 30)  # Cap at 30 FPS for reasonable file sizes
+        
+        logger.info(f"Using original video FPS: {original_fps:.1f}, base GIF FPS: {base_fps:.1f}")
+        
         params = {
             'width': self.config.get('gif_settings.width', 480),
             'height': self.config.get('gif_settings.height', 480),
-            'fps': self.config.get('gif_settings.fps', 15),
+            'fps': base_fps,  # Use original video FPS as base
             'max_duration': self.config.get('gif_settings.max_duration_seconds', 15),
             'max_size_mb': dynamic_size_mb,  # Use dynamic size limit
             'colors': self.config.get('gif_settings.colors', 256),
@@ -466,6 +478,9 @@ class GifGenerator:
             max_width = params['width']
             max_height = params['height']
             
+            logger.info(f"Initial aspect ratio calculation: {original_width}x{original_height} (ratio: {original_aspect_ratio:.2f})")
+            logger.info(f"Max dimensions from config: {max_width}x{max_height}")
+            
             # Calculate new dimensions while preserving aspect ratio
             if original_aspect_ratio > 1:  # Landscape
                 # Width is the limiting factor
@@ -484,14 +499,16 @@ class GifGenerator:
                     new_width = max_width
                     new_height = int(new_width / original_aspect_ratio)
             
-            # Ensure dimensions are even numbers (required for some codecs)
-            new_width = new_width - (new_width % 2)
-            new_height = new_height - (new_height % 2)
+            # Ensure dimensions are even numbers while preserving aspect ratio
+            even_width = new_width - (new_width % 2)
+            even_height = int(even_width / original_aspect_ratio)
+            even_height = even_height - (even_height % 2)
             
-            params['width'] = new_width
-            params['height'] = new_height
+            params['width'] = even_width
+            params['height'] = even_height
             
-            logger.info(f"Preserving aspect ratio: {original_width}x{original_height} -> {new_width}x{new_height} (ratio: {original_aspect_ratio:.2f})")
+            logger.info(f"Final aspect ratio calculation: {original_width}x{original_height} -> {new_width}x{new_height} (ratio: {original_aspect_ratio:.2f})")
+            logger.info(f"Final params dimensions: {params['width']}x{params['height']}")
         
         logger.debug(f"GIF parameters: {params}")
         return params
@@ -501,6 +518,7 @@ class GifGenerator:
         """Create GIF using FFmpeg with optimized palette (highest quality)"""
         
         logger.info("Creating GIF using FFmpeg with palette optimization")
+        logger.info(f"Final GIF creation parameters: {params['width']}x{params['height']}, {params['fps']}fps, {params['colors']} colors")
         
         # Check for shutdown before starting
         if self.shutdown_requested:
@@ -587,6 +605,7 @@ class GifGenerator:
         """Create GIF using direct FFmpeg conversion"""
         
         logger.info("Creating GIF using direct FFmpeg conversion")
+        logger.info(f"Direct GIF creation parameters: {params['width']}x{params['height']}, {params['fps']}fps, {params['colors']} colors")
         
         # Check for shutdown before starting
         if self.shutdown_requested:
@@ -628,6 +647,7 @@ class GifGenerator:
         """Create GIF using OpenCV + PIL (fallback method)"""
         
         logger.info("Creating GIF using OpenCV + PIL (fallback method)")
+        logger.info(f"OpenCV/PIL GIF creation parameters: {params['width']}x{params['height']}, {params['fps']}fps, {params['colors']} colors")
         
         cap = cv2.VideoCapture(input_video)
         
@@ -689,20 +709,31 @@ class GifGenerator:
             if not frames:
                 raise ValueError("No frames extracted from video")
             
-            # FIXED: Calculate frame duration based on TARGET FPS, not actual frame count
-            # This ensures the GIF plays at the intended FPS regardless of frame skipping
-            target_frame_duration = int(1000 / params['fps'])  # ms per frame for target FPS
+            # SIMPLE AND CORRECT: Calculate frame duration to maintain the original segment duration
+            # Formula: Frame_delay_ms = (duration * 1000) / frames_extracted
+            
+            actual_frames_extracted = len(frames)
+            
+            # Calculate frame delay to maintain original duration
+            if actual_frames_extracted > 0:
+                frame_duration = int((duration * 1000) / actual_frames_extracted)
+            else:
+                frame_duration = int(1000 / params['fps'])  # Fallback
             
             # Ensure minimum frame duration of 10ms (100fps max) to prevent too-fast GIFs
-            frame_duration = max(target_frame_duration, 10)
+            frame_duration = max(frame_duration, 10)
+            
+            # Debug logging for timing calculation
+            actual_fps = 1000 / frame_duration if frame_duration > 0 else 0
+            actual_duration = actual_frames_extracted * frame_duration / 1000.0
+            logger.debug(f"Timing: {actual_frames_extracted} frames @ {frame_duration}ms/frame = {actual_fps:.1f}fps, {actual_duration:.2f}s duration")
             
             # Calculate actual effective FPS and total duration with the extracted frames
-            effective_fps = 1000 / frame_duration
+            effective_fps = 1000 / frame_duration if frame_duration > 0 else params['fps']
             actual_total_duration = len(frames) * frame_duration / 1000.0
             
-            logger.debug(f"Extracted {len(frames)} frames for {duration:.2f}s duration, "
-                        f"using {frame_duration}ms per frame (effective fps: {effective_fps:.1f}, "
-                        f"actual total duration: {actual_total_duration:.1f}s)")
+            logger.debug(f"GIF timing: {len(frames)} frames @ {frame_duration}ms/frame = "
+                        f"{actual_total_duration:.2f}s duration (effective fps: {effective_fps:.1f})")
             
             # Save as GIF with optimization
             frames[0].save(
@@ -759,7 +790,8 @@ class GifGenerator:
             params['width'] = new_width
             params['height'] = new_height
             
-            logger.debug(f"Reduced resolution while preserving original aspect ratio ({original_aspect_ratio:.2f}): {new_width}x{new_height}")
+            logger.info(f"Reduced resolution while preserving original aspect ratio ({original_aspect_ratio:.2f}): {new_width}x{new_height}")
+            logger.info(f"Reduced params dimensions: {params['width']}x{params['height']}")
         
         # Increase lossy compression
         params['lossy'] = min(params['lossy'] + 20, 150)
@@ -912,7 +944,7 @@ class GifGenerator:
         
         return estimated_bytes / (1024 * 1024)  # Convert to MB
 
-    def _increase_params_for_quality(self, params: Dict[str, Any], current_size_mb: float, target_size_mb: float) -> Dict[str, Any]:
+    def _increase_params_for_quality(self, params: Dict[str, Any], current_size_mb: float, target_size_mb: float, video_info: Dict[str, Any] = None) -> Dict[str, Any]:
         """Increase parameters to use more of the available size for better quality"""
         size_ratio = current_size_mb / target_size_mb
         
@@ -926,13 +958,27 @@ class GifGenerator:
             if params['fps'] < 30:
                 params['fps'] = min(params['fps'] + 2, 30)
             
-            # Increase resolution if possible
+            # Increase resolution if possible while preserving aspect ratio
             if params['width'] < 800 and params['height'] < 800:
-                params['width'] = min(params['width'] + 20, 800)
-                params['height'] = min(params['height'] + 20, 800)
+                # Get original aspect ratio from video info if available
+                if video_info and video_info.get('width') and video_info.get('height'):
+                    original_aspect_ratio = video_info['width'] / video_info['height']
+                else:
+                    # Fallback to current aspect ratio
+                    original_aspect_ratio = params['width'] / params['height']
+                
+                # Increase width and calculate height to preserve aspect ratio
+                new_width = min(params['width'] + 20, 800)
+                new_height = int(new_width / original_aspect_ratio)
+                
+                # Ensure height doesn't exceed maximum
+                if new_height > 800:
+                    new_height = 800
+                    new_width = int(new_height * original_aspect_ratio)
+                
                 # Ensure even dimensions
-                params['width'] = params['width'] - (params['width'] % 2)
-                params['height'] = params['height'] - (params['height'] % 2)
+                params['width'] = new_width - (new_width % 2)
+                params['height'] = new_height - (new_height % 2)
             
             # Reduce lossy compression if possible
             if params['lossy'] > 0:
@@ -1070,19 +1116,31 @@ class GifGenerator:
         # Start with aggressive compression to ensure we get something under the limit
         current_params = initial_params.copy()
         
-        # Reduce parameters significantly to get under size limit quickly
+        # Reduce parameters significantly to get under size limit quickly while preserving aspect ratio
+        original_aspect_ratio = current_params['width'] / current_params['height']
+        new_width = int(current_params['width'] * 0.7)
+        new_height = int(new_width / original_aspect_ratio)
+        
+        logger.info(f"Baseline reduction: {current_params['width']}x{current_params['height']} -> {new_width}x{new_height} (ratio: {original_aspect_ratio:.2f})")
+        
         current_params.update({
             'colors': 64,
             'fps': max(6, current_params['fps'] * 0.5),
-            'width': int(current_params['width'] * 0.7),
-            'height': int(current_params['height'] * 0.7),
+            'width': new_width,
+            'height': new_height,
             'lossy': 100,
             'dither': 'bayer'
         })
         
-        # Ensure even dimensions
-        current_params['width'] = current_params['width'] - (current_params['width'] % 2)
-        current_params['height'] = current_params['height'] - (current_params['height'] % 2)
+        # Ensure even dimensions while preserving aspect ratio
+        even_width = current_params['width'] - (current_params['width'] % 2)
+        even_height = int(even_width / original_aspect_ratio)
+        even_height = even_height - (even_height % 2)
+        
+        current_params['width'] = even_width
+        current_params['height'] = even_height
+        
+        logger.info(f"Baseline after even dimensions: {current_params['width']}x{current_params['height']} (ratio: {original_aspect_ratio:.2f})")
         
         temp_gif = os.path.join(self.temp_dir, "baseline_candidate.gif")
         temp_files_to_cleanup.append(temp_gif)
@@ -1129,17 +1187,35 @@ class GifGenerator:
         
         for i, improvement in enumerate(improvements):
             test_params = baseline_params.copy()
+            
+            # Preserve aspect ratio when improving resolution
+            # Use the previous improvement's result as the base, or baseline if this is the first improvement
+            base_width = baseline_params['width']
+            base_height = baseline_params['height']
+            
+            original_aspect_ratio = base_width / base_height
+            new_width = int(base_width * improvement['res_mult'])
+            new_height = int(new_width / original_aspect_ratio)
+            
+            logger.info(f"Quality improvement {i+1}: {base_width}x{base_height} -> {new_width}x{new_height} (ratio: {original_aspect_ratio:.2f})")
+            
             test_params.update({
                 'colors': improvement['colors'],
                 'fps': max(6, int(baseline_params['fps'] * improvement['fps_mult'])),
-                'width': int(baseline_params['width'] * improvement['res_mult']),
-                'height': int(baseline_params['height'] * improvement['res_mult']),
+                'width': new_width,
+                'height': new_height,
                 'lossy': improvement['lossy']
             })
             
-            # Ensure even dimensions
-            test_params['width'] = test_params['width'] - (test_params['width'] % 2)
-            test_params['height'] = test_params['height'] - (test_params['height'] % 2)
+            # Ensure even dimensions while preserving aspect ratio
+            even_width = test_params['width'] - (test_params['width'] % 2)
+            even_height = int(even_width / original_aspect_ratio)
+            even_height = even_height - (even_height % 2)
+            
+            test_params['width'] = even_width
+            test_params['height'] = even_height
+            
+            logger.info(f"Quality improvement {i+1} after even dimensions: {test_params['width']}x{test_params['height']} (ratio: {original_aspect_ratio:.2f})")
             
             temp_gif = os.path.join(self.temp_dir, f"improved_candidate_{i}.gif")
             temp_files_to_cleanup.append(temp_gif)
@@ -1289,19 +1365,29 @@ class GifGenerator:
             try:
                 # Use compressed parameters for segments - balanced for 10MB limit with better FPS
                 segment_params = initial_params.copy()
+                
+                # Preserve aspect ratio when reducing dimensions for segments
+                original_aspect_ratio = segment_params['width'] / segment_params['height']
+                new_width = int(segment_params['width'] * 0.6)
+                new_height = int(new_width / original_aspect_ratio)
+                
                 segment_params.update({
                     'colors': 64,  # More reasonable color reduction (was 32)
                     'fps': max(10, int(segment_params['fps'] * 0.6)),  # Less aggressive FPS reduction (was 0.4)
-                    'width': int(segment_params['width'] * 0.6),  # Less aggressive resolution reduction
-                    'height': int(segment_params['height'] * 0.6),
+                    'width': new_width,
+                    'height': new_height,
                     'lossy': 140,  # Slightly reduced lossy compression (was 160)
                     'dither': 'bayer',  # Use some dithering for better quality
                     'frame_skip': 2  # Keep frame skipping for size control
                 })
                 
-                # Ensure even dimensions and lower minimums for extreme compression
-                segment_params['width'] = max(segment_params['width'] - (segment_params['width'] % 2), 120)
-                segment_params['height'] = max(segment_params['height'] - (segment_params['height'] % 2), 90)
+                # Ensure even dimensions and lower minimums for extreme compression while preserving aspect ratio
+                even_width = segment_params['width'] - (segment_params['width'] % 2)
+                even_height = int(even_width / original_aspect_ratio)
+                even_height = even_height - (even_height % 2)
+                
+                segment_params['width'] = max(even_width, 120)
+                segment_params['height'] = max(even_height, 90)
                 
                 self._create_gif_opencv_pil(input_video, temp_gif, segment_params, segment_start, segment_duration)
                 
@@ -1339,19 +1425,34 @@ class GifGenerator:
         try:
             # Aggressive but more reasonable parameters for 10MB constraint
             ultra_params = initial_params.copy()
+            
+            # Preserve aspect ratio when reducing dimensions
+            original_aspect_ratio = initial_params['width'] / initial_params['height']
+            new_width = max(120, int(initial_params['width'] * 0.4))
+            new_height = int(new_width / original_aspect_ratio)
+            
+            # Ensure height doesn't go below minimum
+            if new_height < 90:
+                new_height = 90
+                new_width = int(new_height * original_aspect_ratio)
+            
             ultra_params.update({
                 'colors': 32,  # Increased from 8 for better quality
                 'fps': max(8, int(initial_params['fps'] * 0.4)),  # Less aggressive FPS reduction (was 0.1)
-                'width': max(120, int(initial_params['width'] * 0.4)),  # Less aggressive resolution reduction
-                'height': max(90, int(initial_params['height'] * 0.4)),
+                'width': new_width,
+                'height': new_height,
                 'lossy': 150,  # Reduced from 200 for better quality
                 'dither': 'bayer',  # Use some dithering for better quality
                 'frame_skip': max(3, int(duration / 10))  # Less aggressive frame skipping (was duration/5)
             })
             
-            # Ensure even dimensions
-            ultra_params['width'] = ultra_params['width'] - (ultra_params['width'] % 2)
-            ultra_params['height'] = ultra_params['height'] - (ultra_params['height'] % 2)
+            # Ensure even dimensions while preserving aspect ratio
+            even_width = ultra_params['width'] - (ultra_params['width'] % 2)
+            even_height = int(even_width / original_aspect_ratio)
+            even_height = even_height - (even_height % 2)
+            
+            ultra_params['width'] = even_width
+            ultra_params['height'] = even_height
             
             self._create_gif_opencv_pil(input_video, temp_gif, ultra_params, start_time, duration)
             
@@ -1386,19 +1487,29 @@ class GifGenerator:
         try:
             # Parameters optimized for keyframe extraction
             keyframe_params = initial_params.copy()
+            
+            # Preserve aspect ratio when reducing dimensions
+            original_aspect_ratio = initial_params['width'] / initial_params['height']
+            new_width = int(initial_params['width'] * 0.7)
+            new_height = int(new_width / original_aspect_ratio)
+            
             keyframe_params.update({
                 'colors': 128,
                 'fps': max(2, int(initial_params['fps'] * 0.1)),  # Very low FPS for keyframes
-                'width': int(initial_params['width'] * 0.7),
-                'height': int(initial_params['height'] * 0.7),
+                'width': new_width,
+                'height': new_height,
                 'lossy': 100,
                 'dither': 'bayer',
                 'frame_skip': 8  # Extract every 8th frame
             })
             
-            # Ensure even dimensions
-            keyframe_params['width'] = keyframe_params['width'] - (keyframe_params['width'] % 2)
-            keyframe_params['height'] = keyframe_params['height'] - (keyframe_params['height'] % 2)
+            # Ensure even dimensions while preserving aspect ratio
+            even_width = keyframe_params['width'] - (keyframe_params['width'] % 2)
+            even_height = int(even_width / original_aspect_ratio)
+            even_height = even_height - (even_height % 2)
+            
+            keyframe_params['width'] = even_width
+            keyframe_params['height'] = even_height
             
             self._create_gif_opencv_pil(input_video, temp_gif, keyframe_params, start_time, duration)
             
@@ -1433,19 +1544,29 @@ class GifGenerator:
         try:
             # Time-lapse parameters - Better balance of skip rate and quality
             timelapse_params = initial_params.copy()
+            
+            # Preserve aspect ratio when reducing dimensions
+            original_aspect_ratio = initial_params['width'] / initial_params['height']
+            new_width = int(initial_params['width'] * 0.85)
+            new_height = int(new_width / original_aspect_ratio)
+            
             timelapse_params.update({
                 'colors': 128,  # Increased from 96 for better quality
                 'fps': max(12, int(initial_params['fps'] * 0.6)),  # Less aggressive FPS reduction
-                'width': int(initial_params['width'] * 0.85),  # Less aggressive resolution reduction
-                'height': int(initial_params['height'] * 0.85),
+                'width': new_width,
+                'height': new_height,
                 'lossy': 70,  # Reduced from 80 for better quality
                 'dither': 'floyd_steinberg',  # Better dithering for quality
                 'frame_skip': max(3, int(duration / 15))  # Less aggressive skipping for smoother motion
             })
             
-            # Ensure even dimensions
-            timelapse_params['width'] = timelapse_params['width'] - (timelapse_params['width'] % 2)
-            timelapse_params['height'] = timelapse_params['height'] - (timelapse_params['height'] % 2)
+            # Ensure even dimensions while preserving aspect ratio
+            even_width = timelapse_params['width'] - (timelapse_params['width'] % 2)
+            even_height = int(even_width / original_aspect_ratio)
+            even_height = even_height - (even_height % 2)
+            
+            timelapse_params['width'] = even_width
+            timelapse_params['height'] = even_height
             
             self._create_gif_opencv_pil(input_video, temp_gif, timelapse_params, start_time, duration)
             
@@ -1539,12 +1660,19 @@ class GifGenerator:
             params['fps'] = min(30, int(params['fps'] * stage_config['fps_multiplier']))
         
         if 'resolution_multiplier' in stage_config:
-            params['width'] = min(800, int(params['width'] * stage_config['resolution_multiplier']))
-            params['height'] = min(800, int(params['height'] * stage_config['resolution_multiplier']))
+            # Preserve aspect ratio when adjusting resolution
+            original_aspect_ratio = params['width'] / params['height']
+            new_width = min(800, int(params['width'] * stage_config['resolution_multiplier']))
+            new_height = int(new_width / original_aspect_ratio)
+            
+            # Ensure height doesn't exceed maximum
+            if new_height > 800:
+                new_height = 800
+                new_width = int(new_height * original_aspect_ratio)
             
             # Ensure even dimensions
-            params['width'] = params['width'] - (params['width'] % 2)
-            params['height'] = params['height'] - (params['height'] % 2)
+            params['width'] = new_width - (new_width % 2)
+            params['height'] = new_height - (new_height % 2)
         
         if 'lossy' in stage_config:
             params['lossy'] = stage_config['lossy']
@@ -1564,13 +1692,19 @@ class GifGenerator:
         params['lossy'] = 0  # No lossy compression
         params['dither'] = 'floyd_steinberg'  # Best dithering
         
-        # Try to increase resolution if possible
-        params['width'] = min(params['width'] * 1.5, 800)  # Increase width but cap at 800
-        params['height'] = min(params['height'] * 1.5, 800)  # Increase height but cap at 800
+        # Try to increase resolution if possible while preserving aspect ratio
+        original_aspect_ratio = params['width'] / params['height']
+        new_width = min(params['width'] * 1.5, 800)  # Increase width but cap at 800
+        new_height = int(new_width / original_aspect_ratio)
+        
+        # Ensure height doesn't exceed maximum
+        if new_height > 800:
+            new_height = 800
+            new_width = int(new_height * original_aspect_ratio)
         
         # Ensure even dimensions
-        params['width'] = int(params['width']) - (int(params['width']) % 2)
-        params['height'] = int(params['height']) - (int(params['height']) % 2)
+        params['width'] = int(new_width) - (int(new_width) % 2)
+        params['height'] = int(new_height) - (int(new_height) % 2)
         
         return params
 
@@ -1584,13 +1718,19 @@ class GifGenerator:
         params['lossy'] = 20  # Minimal lossy compression
         params['dither'] = 'floyd_steinberg'
         
-        # Slightly increased resolution
-        params['width'] = min(params['width'] * 1.2, 600)
-        params['height'] = min(params['height'] * 1.2, 600)
+        # Slightly increased resolution while preserving aspect ratio
+        original_aspect_ratio = params['width'] / params['height']
+        new_width = min(params['width'] * 1.2, 600)
+        new_height = int(new_width / original_aspect_ratio)
+        
+        # Ensure height doesn't exceed maximum
+        if new_height > 600:
+            new_height = 600
+            new_width = int(new_height * original_aspect_ratio)
         
         # Ensure even dimensions
-        params['width'] = int(params['width']) - (int(params['width']) % 2)
-        params['height'] = int(params['height']) - (int(params['height']) % 2)
+        params['width'] = int(new_width) - (int(new_width) % 2)
+        params['height'] = int(new_height) - (int(new_height) % 2)
         
         return params
 
@@ -1669,12 +1809,35 @@ class GifGenerator:
             else:
                 color_reduction = reduction_factor
             
-            # Calculate progressive parameters
+            # Calculate progressive parameters while preserving aspect ratio
+            # Get original aspect ratio from video info if available
+            if video_info and video_info.get('width') and video_info.get('height'):
+                original_aspect_ratio = video_info['width'] / video_info['height']
+            else:
+                # Fallback to current aspect ratio
+                original_aspect_ratio = stage_params['width'] / stage_params['height']
+            
+            # Calculate new dimensions while preserving aspect ratio
+            reduction_factor_with_offset = reduction_factor + 0.2
+            new_width = max(120, int(stage_params['width'] * reduction_factor_with_offset))
+            new_height = int(new_width / original_aspect_ratio)  # Calculate height from width using original ratio
+            
+            # Ensure dimensions are even numbers
+            new_width = new_width - (new_width % 2)
+            new_height = new_height - (new_height % 2)
+            
+            # Ensure minimum dimensions while preserving aspect ratio
+            min_width = 120
+            min_height = int(min_width / original_aspect_ratio)
+            
+            new_width = max(new_width, min_width)
+            new_height = max(new_height, min_height)
+            
             stage_params.update({
                 'colors': max(16, int(256 * color_reduction)),
                 'fps': max(3, int(stage_params['fps'] * fps_reduction)),
-                'width': max(120, int(stage_params['width'] * (reduction_factor + 0.2))),
-                'height': max(90, int(stage_params['height'] * (reduction_factor + 0.2))),
+                'width': new_width,
+                'height': new_height,
                 'lossy': min(200, int(20 + (1 - reduction_factor) * 180)),  # Progressive lossy compression
             })
             
@@ -1686,9 +1849,8 @@ class GifGenerator:
             else:
                 stage_params['dither'] = 'none'  # No dithering for highly compressed stages
             
-            # Ensure even dimensions and reasonable minimums
-            stage_params['width'] = max(stage_params['width'] - (stage_params['width'] % 2), 120)
-            stage_params['height'] = max(stage_params['height'] - (stage_params['height'] % 2), 90)
+            logger.info(f"Progressive stage {i+1}: {new_width}x{new_height} (aspect ratio: {original_aspect_ratio:.2f})")
+            logger.info(f"Stage {i+1} params dimensions: {stage_params['width']}x{stage_params['height']}")
             
             stages.append({
                 'name': f"Progressive {config['quality_level'].replace('_', ' ').title()}",
@@ -2180,33 +2342,39 @@ class GifGenerator:
         long_segment_duration = config_base.get('long_segment_duration', 30)
         very_long_segment_duration = config_base.get('very_long_segment_duration', 35)
         
-        # Enhanced base segment durations from config
-        if total_duration <= short_video_max:
-            base_duration = short_segment_duration
-        elif total_duration <= medium_video_max:
-            base_duration = medium_segment_duration
-        elif total_duration <= long_video_max:
-            base_duration = long_segment_duration
-        else:
-            base_duration = very_long_segment_duration
+        # Ultra-aggressive segmentation for much better quality
+        # Prioritize quality over number of segments - create many small segments
+        if total_duration <= 20:  # Short videos
+            base_duration = 8   # Very short segments
+        elif total_duration <= 40:  # Medium videos  
+            base_duration = 10  # Short segments
+        elif total_duration <= 80:  # Long videos
+            base_duration = 12  # Still short
+        else:  # Very long videos
+            base_duration = 15  # Maximum segment length
         
-        # More conservative complexity adjustments - less aggressive reduction
-        if complexity >= 9 or motion_level == 'high':
-            # Only reduce for extremely complex content
-            base_duration *= 0.85  # Less aggressive reduction (was 0.8)
-        elif complexity >= 7:
-            # Moderate reduction for high complexity
-            base_duration *= 0.9
-        elif complexity <= 3 and motion_level == 'low':
-            # Simple content can use even longer segments
-            base_duration *= 1.3  # More aggressive increase (was 1.2)
+        # Ultra-aggressive segmentation adjustments - prioritize quality over everything else
+        if complexity >= 7 or motion_level == 'high':
+            # Ultra-aggressive reduction for complex content
+            base_duration *= 0.6  # Very aggressive
+        elif complexity >= 5:
+            # Very aggressive reduction for medium-high complexity
+            base_duration *= 0.7
+        elif complexity >= 3:
+            # Significant reduction for moderate complexity
+            base_duration *= 0.8
+        # All content gets shorter segments to ensure quality
         
-        # Get bounds from config
-        min_duration = self.config.get('gif_settings.segmentation.min_segment_duration', 15)
-        max_duration = self.config.get('gif_settings.segmentation.max_segment_duration', 45)
+        # Get bounds from config - ultra-permissive for quality
+        min_duration = self.config.get('gif_settings.segmentation.min_segment_duration', 5)  # Allow ultra-short segments
+        max_duration = self.config.get('gif_settings.segmentation.max_segment_duration', 18)  # Much lower max for better quality
         
         # Apply bounds from config
-        return max(min_duration, min(max_duration, base_duration))
+        final_duration = max(min_duration, min(max_duration, base_duration))
+        
+        logger.debug(f"Segment duration calculation: base={base_duration:.1f}s, final={final_duration:.1f}s (bounds: {min_duration}-{max_duration}s)")
+        
+        return final_duration
     
     def _create_high_quality_segment(self, input_video: str, output_path: str, 
                                    start_time: float, duration: float, 
@@ -2224,30 +2392,35 @@ class GifGenerator:
         try:
             # Create initial parameters optimized for longer segments using config - IMPROVED FPS
             quality_scaling_enabled = self.config.get('gif_settings.segmentation.quality_scaling.enabled', True)
-            base_fps = self.config.get('gif_settings.fps', 20)  # Use improved base FPS from config
+            # Use original video FPS as base, with config as fallback
+            original_fps = video_info.get('fps', self.config.get('gif_settings.fps', 20))
+            base_fps = min(original_fps, 30)  # Cap at 30 FPS for reasonable file sizes
             
-            if quality_scaling_enabled and duration >= 30:
-                # Longer segments - apply quality scaling from config
-                fps_reduction = self.config.get('gif_settings.segmentation.quality_scaling.long_segment_fps_reduction', 0.9)
-                color_reduction = self.config.get('gif_settings.segmentation.quality_scaling.long_segment_color_reduction', 0.9)
-                
-                initial_fps = max(15, int(base_fps * fps_reduction))  # Use base_fps instead of hardcoded 15
-                initial_colors = max(128, int(256 * color_reduction))  # Minimum 128 colors
-                initial_lossy = 40
-            elif duration >= 20:
-                # Medium segments - balanced approach with improved FPS
-                initial_fps = max(16, int(base_fps * 0.8))  # Use base_fps (20 * 0.8 = 16 FPS)
-                initial_colors = 256
-                initial_lossy = 30
-            else:
-                # Shorter segments - can use full FPS for better quality
-                initial_fps = base_fps  # Use full 20 FPS for short segments
-                initial_colors = 256
-                initial_lossy = 20
+            # Start with more reasonable parameters and let the quality levels handle optimization
+            # The size estimation is rough and we shouldn't make drastic cuts upfront
+            width = min(480, video_info.get('width', 480))
+            height = min(480, video_info.get('height', 480))
+            
+            # Be more conservative with initial FPS - start closer to original and let optimization reduce it gradually
+            if duration > 25:  # Very long segments - moderate reduction
+                initial_fps = max(15, int(base_fps * 0.6))  # More conservative: 30*0.6 = 18fps
+                initial_colors = 128  # Start with reasonable colors
+                initial_lossy = 60  # Moderate lossy compression
+                logger.info(f"Using moderate compression for long segment ({duration:.1f}s)")
+            elif duration > 15:  # Long segments - slight reduction
+                initial_fps = max(18, int(base_fps * 0.7))  # Conservative: 30*0.7 = 21fps  
+                initial_colors = 160  # Good color count
+                initial_lossy = 40  # Light lossy compression
+                logger.info(f"Using light compression for medium segment ({duration:.1f}s)")
+            else:  # Short segments - minimal reduction
+                initial_fps = max(20, int(base_fps * 0.8))  # Very conservative: 30*0.8 = 24fps
+                initial_colors = 200  # High color count
+                initial_lossy = 30  # Very light lossy compression
+                logger.info(f"Using minimal compression for short segment ({duration:.1f}s)")
             
             segment_params = {
-                'width': min(480, video_info.get('width', 480)),
-                'height': min(480, video_info.get('height', 480)),
+                'width': width,  # Use calculated width (may be reduced for large content)
+                'height': height,  # Use calculated height (may be reduced for large content)
                 'fps': initial_fps,
                 'colors': initial_colors,
                 'dither': 'floyd_steinberg',
@@ -2328,37 +2501,53 @@ class GifGenerator:
         try:
             # Try progressive quality levels for segments - more aggressive for size compliance
             quality_levels = [
-                # Level 1: Balanced quality (less aggressive FPS reduction)
+                # Level 1: High quality - minimal reduction
                 {
-                    'colors': max(192, int(segment_params['colors'] * 0.75)),
-                    'fps': max(15, int(segment_params['fps'] * 0.9)),  # Improved: 0.9 instead of 0.8
+                    'colors': max(160, int(segment_params['colors'] * 0.85)),
+                    'fps': max(18, int(segment_params['fps'] * 0.95)),  # Very conservative
+                    'lossy': min(60, segment_params['lossy'] + 10),
+                    'frame_skip': 1,
+                    'method': 'High Quality Segment'
+                },
+                # Level 2: Good quality - light reduction
+                {
+                    'colors': max(128, int(segment_params['colors'] * 0.75)),
+                    'fps': max(15, int(segment_params['fps'] * 0.85)),  # Still conservative
                     'lossy': min(80, segment_params['lossy'] + 20),
                     'frame_skip': 1,
+                    'method': 'Good Quality Segment'
+                },
+                # Level 3: Balanced quality - moderate reduction
+                {
+                    'colors': max(96, int(segment_params['colors'] * 0.6)),
+                    'fps': max(12, int(segment_params['fps'] * 0.7)),  # More reasonable
+                    'lossy': min(100, segment_params['lossy'] + 30),
+                    'frame_skip': 2,
                     'method': 'Balanced Quality Segment'
                 },
-                # Level 2: Efficient quality (less aggressive FPS reduction)
+                # Level 4: Compact quality - stronger reduction
                 {
-                    'colors': max(128, int(segment_params['colors'] * 0.6)),
-                    'fps': max(12, int(segment_params['fps'] * 0.75)),  # Improved: 0.75 instead of 0.65
-                    'lossy': min(100, segment_params['lossy'] + 40),
-                    'frame_skip': 1,
-                    'method': 'Efficient Quality Segment'
-                },
-                # Level 3: Compact quality (less aggressive FPS reduction)
-                {
-                    'colors': max(96, int(segment_params['colors'] * 0.45)),
-                    'fps': max(10, int(segment_params['fps'] * 0.65)),  # Improved: 0.65 instead of 0.5
-                    'lossy': min(140, segment_params['lossy'] + 60),
+                    'colors': max(64, int(segment_params['colors'] * 0.45)),
+                    'fps': max(10, int(segment_params['fps'] * 0.55)),  # Still reasonable
+                    'lossy': min(120, segment_params['lossy'] + 40),
                     'frame_skip': 2,
                     'method': 'Compact Quality Segment'
                 },
-                # Level 4: Compressed quality (still reasonable FPS)
+                # Level 5: Compressed quality - aggressive but not extreme
                 {
-                    'colors': max(64, int(segment_params['colors'] * 0.3)),
-                    'fps': max(8, int(segment_params['fps'] * 0.5)),  # Improved: min 8 FPS instead of 5
-                    'lossy': min(160, segment_params['lossy'] + 80),
+                    'colors': max(48, int(segment_params['colors'] * 0.35)),
+                    'fps': max(8, int(segment_params['fps'] * 0.4)),  # More aggressive
+                    'lossy': min(140, segment_params['lossy'] + 50),
                     'frame_skip': 3,
                     'method': 'Compressed Quality Segment'
+                },
+                # Level 6: Ultra-compressed - very aggressive (fallback)
+                {
+                    'colors': max(32, int(segment_params['colors'] * 0.25)),
+                    'fps': max(6, int(segment_params['fps'] * 0.3)),
+                    'lossy': min(160, segment_params['lossy'] + 60),
+                    'frame_skip': 4,
+                    'method': 'Ultra-Compressed Segment'
                 }
             ]
             
@@ -2384,20 +2573,30 @@ class GifGenerator:
                             # Success! Move to final location
                             shutil.move(temp_gif, output_path)
                             
-                            # Calculate frame count for reporting
-                            frame_count = int(duration * level_params['fps'])
+                            # Calculate actual FPS from the GIF file
+                            try:
+                                from PIL import Image
+                                with Image.open(output_path) as gif:
+                                    actual_frame_count = gif.n_frames
+                                    frame_delay_ms = gif.info.get('duration', 100)  # Default 100ms if not found
+                                    actual_fps = 1000 / frame_delay_ms if frame_delay_ms > 0 else 0
+                            except:
+                                # Fallback calculation
+                                actual_frame_count = int(duration * level_params['fps'])
+                                actual_fps = level_params['fps']
                             
                             # Clean up remaining temp files
                             self._cleanup_temp_files(temp_files_to_cleanup)
                             
                             logger.info(f"Segment created successfully with {quality_level['method']}: "
-                                       f"{file_size_mb:.2f}MB, ~{frame_count} frames")
+                                       f"{file_size_mb:.2f}MB, {actual_frame_count} frames @ {actual_fps:.1f}fps")
                             
                             return {
                                 'success': True,
                                 'size_mb': file_size_mb,
                                 'file_size_mb': file_size_mb,  # Compatibility
-                                'frame_count': frame_count,
+                                'frame_count': actual_frame_count,
+                                'fps': actual_fps,
                                 'method': quality_level['method'],
                                 'quality_score': self._calculate_quality_score(level_params, file_size_mb, max_size_mb),
                                 'optimization_type': 'segment_direct'

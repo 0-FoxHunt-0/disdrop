@@ -803,10 +803,25 @@ class VideoCompressorCLI:
         print("QUALITY-OPTIMIZED GIF RESULTS")
         print("="*60)
         print(f"Output File:       {results.get('output_file', 'N/A')}")
-        print(f"Target Size:       {results.get('target_size_mb', 'N/A')} MB")
-        print(f"Actual Size:       {results.get('size_mb', 'N/A'):.2f} MB")
-        print(f"Size Efficiency:   {results.get('size_efficiency', 'N/A'):.1%} of target")
-        print(f"Quality Score:     {results.get('quality_score', 'N/A'):.2f}/10")
+        # Handle target size formatting
+        target_size = results.get('target_size_mb', 'N/A')
+        target_size_str = f"{target_size:.2f} MB" if isinstance(target_size, (int, float)) else f"{target_size} MB"
+        print(f"Target Size:       {target_size_str}")
+        
+        # Handle actual size formatting
+        actual_size = results.get('size_mb', 'N/A')
+        actual_size_str = f"{actual_size:.2f} MB" if isinstance(actual_size, (int, float)) else f"{actual_size} MB"
+        print(f"Actual Size:       {actual_size_str}")
+        
+        # Handle size efficiency formatting
+        efficiency = results.get('size_efficiency', 'N/A')
+        efficiency_str = f"{efficiency:.1%} of target" if isinstance(efficiency, (int, float)) else f"{efficiency} of target"
+        print(f"Size Efficiency:   {efficiency_str}")
+        
+        # Handle quality score formatting
+        quality = results.get('quality_score', 'N/A')
+        quality_str = f"{quality:.2f}/10" if isinstance(quality, (int, float)) else f"{quality}/10"
+        print(f"Quality Score:     {quality_str}")
         print(f"Optimization Method: {results.get('optimization_method', 'N/A')}")
         
         if 'params' in results:

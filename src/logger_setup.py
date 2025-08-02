@@ -124,19 +124,34 @@ def setup_logging(config_path: str = "config/logging.yaml", log_level: Optional[
                 logging_config['handlers']['console']['level'] = log_level
         
         # Apply logging configuration
-        logging.config.dictConfig(logging_config)
+        try:
+            logging.config.dictConfig(logging_config)
+        except Exception as config_error:
+            # If dictConfig fails, fall back to basic configuration
+            logging.basicConfig(
+                level=logging.INFO,
+                format='%(asctime)s | %(levelname)-8s | %(message)s',
+                datefmt='%H:%M:%S'
+            )
+            logger = logging.getLogger('video_compressor')
+            logger.error(f"Failed to apply logging configuration: {config_error}")
+            logger.info("Using basic logging configuration as fallback")
+            return logger
         
         # Get the main logger and add colored formatter to console handler
         logger = logging.getLogger('video_compressor')
         
         # Find console handler and apply colored formatter
-        for handler in logger.handlers:
-            if isinstance(handler, logging.StreamHandler) and handler.stream.name == '<stdout>':
-                colored_formatter = ColoredFormatter(
-                    fmt='%(asctime)s | %(levelname)-8s | %(message)s',
-                    datefmt='%H:%M:%S'
-                )
-                handler.setFormatter(colored_formatter)
+        try:
+            for handler in logger.handlers:
+                if isinstance(handler, logging.StreamHandler) and hasattr(handler.stream, 'name') and handler.stream.name == '<stdout>':
+                    colored_formatter = ColoredFormatter(
+                        fmt='%(asctime)s | %(levelname)-8s | %(message)s',
+                        datefmt='%H:%M:%S'
+                    )
+                    handler.setFormatter(colored_formatter)
+        except Exception as format_error:
+            logger.debug(f"Could not apply colored formatter: {format_error}")
         
         logger.info("Logging system initialized successfully")
         

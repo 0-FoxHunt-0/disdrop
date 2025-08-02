@@ -21,7 +21,6 @@ logging:
       level: INFO
       formatter: console
       stream: ext://sys.stdout
-      encoding: utf-8
     
     file:
       class: logging.FileHandler
@@ -29,7 +28,6 @@ logging:
       formatter: detailed
       filename: logs/video_compressor.log
       mode: a
-      encoding: utf-8
     
     error_file:
       class: logging.FileHandler
@@ -37,7 +35,6 @@ logging:
       formatter: detailed
       filename: logs/errors.log
       mode: a
-      encoding: utf-8
   
   loggers:
     video_compressor:
