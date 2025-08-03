@@ -57,6 +57,172 @@ class AdvancedGifOptimizer:
         
         return final_result
     
+    def optimize_gif(self, gif_path: str, max_size_mb: float) -> bool:
+        """
+        Optimize an existing GIF file to meet size requirements using multiple strategies
+        
+        Args:
+            gif_path: Path to existing GIF file
+            max_size_mb: Maximum file size in MB
+            
+        Returns:
+            True if optimization was successful, False otherwise
+        """
+        try:
+            if not os.path.exists(gif_path):
+                logger.error(f"GIF file not found: {gif_path}")
+                return False
+            
+            current_size = os.path.getsize(gif_path) / (1024 * 1024)
+            if current_size <= max_size_mb:
+                logger.info(f"GIF already within size limit: {current_size:.2f}MB <= {max_size_mb:.2f}MB")
+                return True
+            
+            logger.info(f"Optimizing existing GIF: {current_size:.2f}MB -> target {max_size_mb:.2f}MB")
+            
+            # Define optimization strategies in order of aggressiveness
+            optimization_strategies = [
+                # Strategy 1: Standard optimization
+                {
+                    'name': 'Standard optimization',
+                    'cmd': ['gifsicle', '--optimize=3', '--colors=256', '--output', '{temp}', '{input}']
+                },
+                # Strategy 2: Reduced colors
+                {
+                    'name': 'Reduced colors (128)',
+                    'cmd': ['gifsicle', '--optimize=3', '--colors=128', '--output', '{temp}', '{input}']
+                },
+                # Strategy 3: More aggressive color reduction
+                {
+                    'name': 'Reduced colors (64)',
+                    'cmd': ['gifsicle', '--optimize=3', '--colors=64', '--output', '{temp}', '{input}']
+                },
+                # Strategy 4: Very aggressive color reduction
+                {
+                    'name': 'Reduced colors (32)',
+                    'cmd': ['gifsicle', '--optimize=3', '--colors=32', '--output', '{temp}', '{input}']
+                },
+                # Strategy 5: Lossy optimization
+                {
+                    'name': 'Lossy optimization',
+                    'cmd': ['gifsicle', '--optimize=3', '--colors=128', '--lossy=80', '--output', '{temp}', '{input}']
+                },
+                # Strategy 6: Very aggressive lossy optimization
+                {
+                    'name': 'Very aggressive lossy',
+                    'cmd': ['gifsicle', '--optimize=3', '--colors=64', '--lossy=120', '--output', '{temp}', '{input}']
+                },
+                # Strategy 7: Extreme optimization
+                {
+                    'name': 'Extreme optimization',
+                    'cmd': ['gifsicle', '--optimize=3', '--colors=32', '--lossy=150', '--output', '{temp}', '{input}']
+                }
+            ]
+            
+            # Try each optimization strategy
+            for i, strategy in enumerate(optimization_strategies):
+                temp_output = gif_path + f'.tmp{i}'
+                
+                # Prepare command
+                cmd = [arg.replace('{temp}', temp_output).replace('{input}', gif_path) for arg in strategy['cmd']]
+                
+                logger.info(f"Trying {strategy['name']} (strategy {i+1}/{len(optimization_strategies)})")
+                
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                
+                if result.returncode == 0 and os.path.exists(temp_output):
+                    optimized_size = os.path.getsize(temp_output) / (1024 * 1024)
+                    
+                    if optimized_size <= max_size_mb:
+                        # Replace original with optimized version
+                        os.replace(temp_output, gif_path)
+                        logger.info(f"GIF optimized successfully with {strategy['name']}: {current_size:.2f}MB -> {optimized_size:.2f}MB")
+                        return True
+                    else:
+                        # Remove temporary file and try next strategy
+                        os.remove(temp_output)
+                        logger.info(f"{strategy['name']} insufficient: {optimized_size:.2f}MB > {max_size_mb:.2f}MB")
+                else:
+                    logger.warning(f"{strategy['name']} failed: {result.stderr}")
+                    if os.path.exists(temp_output):
+                        os.remove(temp_output)
+            
+            # If all strategies failed, try FFmpeg-based re-encoding as last resort
+            logger.info("All gifsicle strategies failed, trying FFmpeg re-encoding")
+            return self._try_ffmpeg_reencoding(gif_path, max_size_mb, current_size)
+                
+        except Exception as e:
+            logger.error(f"Error optimizing GIF: {e}")
+            return False
+    
+    def _try_ffmpeg_reencoding(self, gif_path: str, max_size_mb: float, original_size: float) -> bool:
+        """Try FFmpeg-based re-encoding as last resort"""
+        try:
+            temp_output = gif_path + '.ffmpeg.tmp'
+            
+            # Try different FFmpeg strategies
+            ffmpeg_strategies = [
+                # Strategy 1: Standard re-encoding with reduced colors
+                {
+                    'name': 'FFmpeg re-encode (256 colors)',
+                    'cmd': ['ffmpeg', '-i', gif_path, '-vf', 'fps=10,scale=480:360:flags=lanczos,palettegen=max_colors=256:stats_mode=single', '-frames:v', '1', '-y', temp_output + '.palette'],
+                    'gif_cmd': ['ffmpeg', '-i', gif_path, '-i', temp_output + '.palette', '-lavfi', 'fps=10,scale=480:360:flags=lanczos [x]; [x][1:v] paletteuse', '-y', temp_output]
+                },
+                # Strategy 2: More aggressive scaling and color reduction
+                {
+                    'name': 'FFmpeg re-encode (128 colors, smaller scale)',
+                    'cmd': ['ffmpeg', '-i', gif_path, '-vf', 'fps=8,scale=320:240:flags=lanczos,palettegen=max_colors=128:stats_mode=single', '-frames:v', '1', '-y', temp_output + '.palette'],
+                    'gif_cmd': ['ffmpeg', '-i', gif_path, '-i', temp_output + '.palette', '-lavfi', 'fps=8,scale=320:240:flags=lanczos [x]; [x][1:v] paletteuse', '-y', temp_output]
+                },
+                # Strategy 3: Very aggressive optimization
+                {
+                    'name': 'FFmpeg re-encode (64 colors, very small scale)',
+                    'cmd': ['ffmpeg', '-i', gif_path, '-vf', 'fps=6,scale=240:180:flags=lanczos,palettegen=max_colors=64:stats_mode=single', '-frames:v', '1', '-y', temp_output + '.palette'],
+                    'gif_cmd': ['ffmpeg', '-i', gif_path, '-i', temp_output + '.palette', '-lavfi', 'fps=6,scale=240:180:flags=lanczos [x]; [x][1:v] paletteuse', '-y', temp_output]
+                }
+            ]
+            
+            for strategy in ffmpeg_strategies:
+                logger.info(f"Trying {strategy['name']}")
+                
+                # Generate palette
+                palette_result = subprocess.run(strategy['cmd'], capture_output=True, text=True, timeout=60)
+                
+                if palette_result.returncode == 0 and os.path.exists(temp_output + '.palette'):
+                    # Create optimized GIF
+                    gif_result = subprocess.run(strategy['gif_cmd'], capture_output=True, text=True, timeout=120)
+                    
+                    if gif_result.returncode == 0 and os.path.exists(temp_output):
+                        optimized_size = os.path.getsize(temp_output) / (1024 * 1024)
+                        
+                        if optimized_size <= max_size_mb:
+                            # Replace original with optimized version
+                            os.replace(temp_output, gif_path)
+                            logger.info(f"GIF optimized successfully with {strategy['name']}: {original_size:.2f}MB -> {optimized_size:.2f}MB")
+                            
+                            # Clean up palette file
+                            if os.path.exists(temp_output + '.palette'):
+                                os.remove(temp_output + '.palette')
+                            return True
+                        else:
+                            logger.info(f"{strategy['name']} insufficient: {optimized_size:.2f}MB > {max_size_mb:.2f}MB")
+                            os.remove(temp_output)
+                    else:
+                        logger.warning(f"{strategy['name']} failed: {gif_result.stderr}")
+                        if os.path.exists(temp_output):
+                            os.remove(temp_output)
+                
+                # Clean up palette file
+                if os.path.exists(temp_output + '.palette'):
+                    os.remove(temp_output + '.palette')
+            
+            logger.warning(f"All optimization strategies failed. Could not reduce GIF below {max_size_mb:.2f}MB")
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error in FFmpeg re-encoding: {e}")
+            return False
+    
     def optimize_gif_with_quality_target(self, input_video: str, output_path: str, 
                                        max_size_mb: float, platform: str = None,
                                        start_time: float = 0, duration: float = None,
@@ -426,6 +592,7 @@ class AdvancedGifOptimizer:
         cmd = [
             'ffmpeg', '-i', input_video, '-vf',
             f'fps=2,scale=320:240,palettegen=max_colors={colors}:stats_mode=diff',
+            '-frames:v', '1',
             '-y', palette_file
         ]
         
@@ -496,6 +663,7 @@ class AdvancedGifOptimizer:
         cmd = [
             'ffmpeg', '-i', input_video, '-vf',
             f'fps=1,scale=240:180,palettegen=max_colors={colors}:stats_mode=full',
+            '-frames:v', '1',
             '-y', palette_file
         ]
         

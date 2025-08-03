@@ -19,11 +19,11 @@ gif_settings:
   colors: 256
   stats_mode: "diff"  # full, diff
   
-  # Segmentation settings - Optimized for better FPS
+  # Segmentation settings - DISABLED for segmented videos
   segmentation:
-    # Size-based thresholds (primary decision factors)
-    size_threshold_multiplier: 2.2  # Reduced slightly to allow more segments with better quality
-    fallback_duration_limit: 120  # Still split extremely long videos (in seconds)
+    # Size-based thresholds (primary decision factors) - More conservative
+    size_threshold_multiplier: 2.5  # Increased from 2.2 to be more conservative
+    fallback_duration_limit: 180  # Increased from 120 to 3 minutes
     
     # Segment duration preferences - Shorter segments for better FPS
     min_segment_duration: 12  # Reduced from 15s for more consistent quality

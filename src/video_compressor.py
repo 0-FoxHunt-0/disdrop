@@ -19,6 +19,7 @@ from .config_manager import ConfigManager
 from .advanced_optimizer import AdvancedVideoOptimizer
 from .performance_enhancer import PerformanceEnhancer
 from .ffmpeg_utils import FFmpegUtils
+from .video_segmenter import VideoSegmenter
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,7 @@ class DynamicVideoCompressor:
         
         # Initialize advanced components
         self.advanced_optimizer = AdvancedVideoOptimizer(config_manager, hardware_detector)
+        self.video_segmenter = VideoSegmenter(config_manager, hardware_detector)
         
         # Optimize system resources
         self.system_optimizations = self.performance_enhancer.optimize_system_resources()
@@ -85,6 +87,17 @@ class DynamicVideoCompressor:
         logger.info(f"Original video: {video_info['width']}x{video_info['height']}, "
                    f"{video_info['duration']:.2f}s, {original_size_mb:.2f}MB, "
                    f"complexity: {video_info['complexity_score']:.2f}")
+        
+        # Check if video should be segmented instead of compressed as single file
+        logger.info(f"Checking video segmentation: original size {original_size_mb:.1f}MB, target {target_size_mb}MB")
+        logger.info(f"Video info keys: {list(video_info.keys())}")
+        logger.info(f"Video info size_bytes: {video_info.get('size_bytes', 'NOT FOUND')}")
+        
+        if self.video_segmenter.should_segment_video(video_info['duration'], video_info, target_size_mb):
+            logger.info("Video will be segmented instead of compressed as single file")
+            return self._compress_with_segmentation(
+                input_path, output_path, target_size_mb, platform_config, video_info, platform
+            )
         
         # If already under target size and no platform specified, just copy
         if original_size_mb <= target_size_mb and not platform:
@@ -327,7 +340,7 @@ class DynamicVideoCompressor:
                 video_path
             ]
             
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
             
             if result.returncode != 0:
                 raise subprocess.CalledProcessError(result.returncode, cmd, result.stderr)
@@ -522,6 +535,63 @@ class DynamicVideoCompressor:
         except Exception as e:
             logger.warning(f"Adaptive resolution compression failed: {e}")
             return None
+    
+    def _compress_with_segmentation(self, input_path: str, output_path: str, target_size_mb: float,
+                                  platform_config: Dict[str, Any], video_info: Dict[str, Any], 
+                                  platform: str = None) -> Dict[str, Any]:
+        """Compress video using segmentation approach"""
+        try:
+            logger.info("Starting video segmentation compression")
+            
+            # Use video segmenter to handle the segmentation
+            result = self.video_segmenter.segment_video(
+                input_video=input_path,
+                output_base_path=output_path,
+                platform=platform,
+                max_size_mb=target_size_mb
+            )
+            
+            if result.get('success', False):
+                # If segmentation was successful, return the results
+                if 'segments' in result:
+                    # Multiple segments were created
+                    total_size = sum(segment.get('size_mb', 0) for segment in result['segments'])
+                    return {
+                        'success': True,
+                        'input_file': input_path,
+                        'output_file': output_path,
+                        'method': 'segmentation',
+                        'original_size_mb': os.path.getsize(input_path) / (1024 * 1024),
+                        'compressed_size_mb': total_size,
+                        'size_mb': total_size,
+                        'compression_ratio': ((os.path.getsize(input_path) - (total_size * 1024 * 1024)) / os.path.getsize(input_path)) * 100,
+                        'space_saved_mb': (os.path.getsize(input_path) - (total_size * 1024 * 1024)) / (1024 * 1024),
+                        'video_info': video_info,
+                        'optimization_strategy': 'segmentation',
+                        'quality_score': 8.0,  # High quality for segments
+                        'attempts_made': 1,
+                        'encoder_used': 'segmentation',
+                        'segments': result['segments'],
+                        'num_segments': result['num_segments'],
+                        'output_folder': result.get('output_folder', ''),
+                        'segment_duration': result.get('segment_duration', 0)
+                    }
+                else:
+                    # Single file was processed
+                    return result
+            else:
+                # Segmentation failed, fall back to standard compression
+                logger.warning("Video segmentation failed, falling back to standard compression")
+                return self._compress_with_standard_optimization(
+                    input_path, output_path, target_size_mb, platform_config, video_info
+                )
+                
+        except Exception as e:
+            logger.error(f"Error in video segmentation compression: {e}")
+            # Fall back to standard compression
+            return self._compress_with_standard_optimization(
+                input_path, output_path, target_size_mb, platform_config, video_info
+            )
     
     def _compress_with_aggressive_optimization(self, input_path: str, video_info: Dict[str, Any], 
                                              platform_config: Dict[str, Any], target_size_mb: float) -> Optional[Dict[str, Any]]:
@@ -719,7 +789,7 @@ class DynamicVideoCompressor:
                 video_path
             ]
             
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
             
             if result.returncode != 0:
                 raise subprocess.CalledProcessError(result.returncode, cmd, result.stderr)

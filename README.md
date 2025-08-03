@@ -5,7 +5,9 @@ A comprehensive Python tool for compressing videos and creating optimized GIFs f
 ## Features
 
 - **Video Compression**: Optimize videos for various social media platforms
+- **Video Segmentation**: Automatically split large videos into smaller, manageable segments
 - **GIF Generation**: Create high-quality GIFs from videos with iterative quality optimization
+- **GIF Segmentation**: Split long videos into multiple high-quality GIF segments
 - **Hardware Acceleration**: Automatic detection and utilization of GPU acceleration
 - **Platform Optimization**: Tailored settings for Twitter, Instagram, TikTok, YouTube Shorts, Facebook, Discord, and Slack
 - **Batch Processing**: Process multiple files automatically
@@ -51,6 +53,46 @@ python main.py gif input.mp4 output.gif --platform twitter
 ### Quality-Optimized GIF Creation
 ```bash
 python main.py gif input.mp4 output.gif --max-size 5.0
+```
+
+### Video Segmentation
+
+The tool now includes intelligent video segmentation that automatically splits large videos into smaller, manageable segments when they would exceed size limits. This is particularly useful for:
+
+- **Long videos** that would be too large when compressed
+- **High-resolution content** that needs to be split for platform limits
+- **Complex videos** with high motion or detail that are challenging to compress
+
+#### How Video Segmentation Works
+
+1. **Size Estimation**: The system estimates the final file size based on video characteristics
+2. **Segmentation Decision**: If the estimated size exceeds the target by 2.5x, segmentation is triggered
+3. **Optimal Duration**: Calculates the best segment duration based on:
+   - Video length (shorter videos get shorter segments)
+   - Content complexity (complex content gets shorter segments)
+   - Motion level (high motion gets shorter segments)
+4. **Quality Preservation**: Each segment is compressed with optimal settings to maintain quality
+5. **Output Organization**: Creates a folder with numbered segments and a summary file
+
+#### Configuration
+
+Video segmentation can be configured in `config/video_compression.yaml`:
+
+```yaml
+video_compression:
+  segmentation:
+    size_threshold_multiplier: 2.5  # Split if estimated size > 2.5x target
+    fallback_duration_limit: 300    # Split videos longer than 5 minutes
+    min_segment_duration: 15        # Minimum 15 seconds per segment
+    max_segment_duration: 120       # Maximum 2 minutes per segment
+    base_durations:
+      short_video_max: 60           # Videos up to 1 minute
+      short_segment_duration: 30    # 30-second segments
+      medium_video_max: 180         # Videos up to 3 minutes
+      medium_segment_duration: 45   # 45-second segments
+      long_video_max: 600           # Videos up to 10 minutes
+      long_segment_duration: 60     # 1-minute segments
+      very_long_segment_duration: 90 # 1.5-minute segments
 ```
 
 ## Advanced Features

@@ -20,6 +20,7 @@ from .video_compressor import DynamicVideoCompressor
 from .gif_generator import GifGenerator
 from .gif_optimizer_advanced import AdvancedGifOptimizer
 from .automated_workflow import AutomatedWorkflow
+from .file_validator import FileValidator
 
 logger = None  # Will be initialized after logging setup
 
@@ -260,6 +261,8 @@ class VideoCompressorCLI:
             
             # Initialize GIF components
             self.gif_generator = GifGenerator(self.config)
+            self.advanced_optimizer = AdvancedGifOptimizer(self.config)
+            self.file_validator = FileValidator()
             self.automated_workflow = AutomatedWorkflow(self.config, self.hardware)
             
             logger.info("All components initialized successfully")

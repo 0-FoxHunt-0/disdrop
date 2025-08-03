@@ -40,7 +40,7 @@ class FileValidator:
                 '-show_format', '-show_streams', video_path
             ]
             
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
             
             if result.returncode != 0:
                 return False, f"FFprobe validation failed: {result.stderr.strip()}"
@@ -172,7 +172,7 @@ class FileValidator:
                 video_path
             ]
             
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=15)
             
             if result.returncode == 0:
                 codec = result.stdout.strip().lower()
@@ -571,7 +571,7 @@ class FileValidator:
                 '-show_format', '-show_streams', file_path
             ]
             
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=15)
             
             if result.returncode != 0:
                 return False, f"FFprobe cannot parse file: {result.stderr.strip()}"
