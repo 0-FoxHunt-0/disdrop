@@ -212,12 +212,16 @@ class HardwareDetector:
                 logger.info(f"Detected {sum(encoders.values())} available FFmpeg encoders")
                 
                 # For AMD AMF encoders, perform additional validation
-                if encoders.get('h264_amf') or encoders.get('hevc_amf'):
+                if (encoders.get('h264_amf') or encoders.get('hevc_amf')) and self.has_amd_gpu():
                     self._validate_amd_amf_support(encoders)
+                elif encoders.get('h264_amf') or encoders.get('hevc_amf'):
+                    logger.info("Skipping AMD AMF validation: no AMD GPU detected")
                 
                 # For NVIDIA NVENC encoders, perform basic validation
-                if encoders.get('h264_nvenc') or encoders.get('hevc_nvenc'):
+                if (encoders.get('h264_nvenc') or encoders.get('hevc_nvenc')) and self.has_nvidia_gpu():
                     self._validate_nvidia_nvenc_support(encoders)
+                elif encoders.get('h264_nvenc') or encoders.get('hevc_nvenc'):
+                    logger.info("Skipping NVIDIA NVENC validation: no NVIDIA GPU detected")
                     
             else:
                 logger.warning("FFmpeg not found or not working properly")
@@ -240,14 +244,11 @@ class HardwareDetector:
         
         # Test with ultra-conservative settings to match our encoding parameters
         test_commands = [
-            # Test h264_amf with our conservative settings
+            # Minimal init test for h264_amf to avoid option-related false negatives
             [
                 'ffmpeg', '-f', 'lavfi', '-i', 'testsrc=duration=1:size=320x240:rate=1',
-                '-c:v', 'h264_amf', 
-                '-usage', 'transcoding', '-quality', 'speed', '-rc', 'cbr',
-                '-b:v', '500k', '-maxrate', '510k', '-bufsize', '550k',
-                '-profile:v', 'baseline', '-level', '3.1', '-refs', '1',
-                '-qp', '25', '-frames:v', '5', '-f', 'null', '-'
+                '-c:v', 'h264_amf',
+                '-frames:v', '5', '-f', 'null', '-'
             ]
         ]
         
@@ -336,7 +337,7 @@ class HardwareDetector:
                 '-usage', 'transcoding', '-quality', 'speed', '-rc', 'cbr',
                 '-b:v', '500k', '-maxrate', '510k', '-bufsize', '550k',
                 '-profile:v', 'baseline', '-level', '3.1', '-refs', '1',
-                '-qp', '25', '-frames:v', '5', '-f', 'null', '-'
+                '-frames:v', '5', '-f', 'null', '-'
             ]
         ]
         
@@ -431,7 +432,8 @@ class HardwareDetector:
                 return 'h264_amf', 'amd'
             # Require validation for Intel QSV as well; otherwise skip to software
             elif (self.ffmpeg_encoders.get('h264_qsv') and 
-                  self.is_encoder_validated('h264_qsv')):
+                  self.is_encoder_validated('h264_qsv') and
+                  self.has_intel_gpu()):
                 return 'h264_qsv', 'intel'
             elif self.ffmpeg_encoders.get('libx264'):
                 return 'libx264', 'software'
@@ -446,7 +448,8 @@ class HardwareDetector:
                   self.is_encoder_validated('hevc_amf')):
                 return 'hevc_amf', 'amd'
             elif (self.ffmpeg_encoders.get('hevc_qsv') and 
-                  self.is_encoder_validated('hevc_qsv')):
+                  self.is_encoder_validated('hevc_qsv') and
+                  self.has_intel_gpu()):
                 return 'hevc_qsv', 'intel'
             elif self.ffmpeg_encoders.get('libx265'):
                 return 'libx265', 'software'
@@ -505,6 +508,10 @@ class HardwareDetector:
     def has_amd_gpu(self) -> bool:
         """Check if AMD GPU is available"""
         return any(gpu['vendor'] == GPUVendor.AMD.value for gpu in self.gpu_info)
+    
+    def has_intel_gpu(self) -> bool:
+        """Check if Intel GPU is available"""
+        return any(gpu['vendor'] == GPUVendor.INTEL.value for gpu in self.gpu_info)
     
     def has_hardware_acceleration(self) -> bool:
         """Check if any hardware acceleration is available"""

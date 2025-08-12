@@ -1563,10 +1563,15 @@ class AutomatedWorkflow:
             if duration and duration > 0 and num_segments > 0:
                 segment_duration = max(min_seg, min(max_seg, duration / num_segments))
 
-            # Prepare output directory path per asset (defer creation until first success)
+            # Prepare output directory path per asset (defer creation of segments dir until first success)
             output_dir = self.output_dir
             base_name = gif_file.stem
+            # Decide if we truly need multiple segments. If only one is needed,
+            # we will output a single GIF directly to the output directory
+            # instead of creating a "_segments" folder.
+            use_segments_folder = num_segments > 1
             segments_dir = output_dir / f"{base_name}_segments"
+            single_output_path = output_dir / f"{base_name}.gif"
             segments_dir_created = False
 
             # Process each segment
@@ -1638,8 +1643,12 @@ class AutomatedWorkflow:
                         pass
                     continue
 
-                # Validate and move to final segments directory
-                final_seg = segments_dir / f"{base_name}_segment_{i+1:02d}.gif"
+                # Validate and move to final location
+                if use_segments_folder:
+                    final_seg = segments_dir / f"{base_name}_segment_{i+1:02d}.gif"
+                else:
+                    # Single segment case → write as a single GIF at output root
+                    final_seg = single_output_path
                 is_valid, _ = self.file_validator.is_valid_gif_with_enhanced_checks(
                     str(temp_seg), original_path=None, max_size_mb=max_size_mb
                 )
@@ -1652,7 +1661,7 @@ class AutomatedWorkflow:
                     continue
 
                 # Create the segments directory only when we have the first valid segment
-                if not segments_dir_created:
+                if use_segments_folder and not segments_dir_created:
                     try:
                         segments_dir.mkdir(parents=True, exist_ok=True)
                     except Exception:
@@ -1660,6 +1669,12 @@ class AutomatedWorkflow:
                     segments_dir_created = True
 
                 try:
+                    # Replace existing file if needed in single-output case
+                    if not use_segments_folder and final_seg.exists():
+                        try:
+                            final_seg.unlink()
+                        except Exception:
+                            pass
                     shutil.move(str(temp_seg), str(final_seg))
                 except Exception:
                     try:
@@ -1681,8 +1696,13 @@ class AutomatedWorkflow:
                 logger.info(f"Created GIF segment {i+1}/{num_segments}: {final_seg} ({seg_size:.2f}MB)")
 
             if successful > 0:
-                print(f"    📂 Segmented GIFs saved to: {segments_dir.name} ({successful} segment(s), {total_size_mb:.2f}MB total)")
-                logger.info(f"GIF segmentation complete: {successful} segments at {segments_dir}")
+                if use_segments_folder:
+                    print(f"    📂 Segmented GIFs saved to: {segments_dir.name} ({successful} segment(s), {total_size_mb:.2f}MB total)")
+                    logger.info(f"GIF segmentation complete: {successful} segments at {segments_dir}")
+                else:
+                    # Single segment result saved directly as a single GIF
+                    print(f"    📁 Saved optimized GIF to output: {single_output_path.name} ({total_size_mb:.2f}MB)")
+                    logger.info(f"Single-segment GIF saved to output: {single_output_path} ({total_size_mb:.2f}MB)")
                 return True
 
             print("    ❌ GIF segmentation produced no valid segments")
