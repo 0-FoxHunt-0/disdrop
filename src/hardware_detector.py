@@ -429,7 +429,9 @@ class HardwareDetector:
                   self.has_amd_gpu() and 
                   self.is_encoder_validated('h264_amf')):
                 return 'h264_amf', 'amd'
-            elif self.ffmpeg_encoders.get('h264_qsv'):
+            # Require validation for Intel QSV as well; otherwise skip to software
+            elif (self.ffmpeg_encoders.get('h264_qsv') and 
+                  self.is_encoder_validated('h264_qsv')):
                 return 'h264_qsv', 'intel'
             elif self.ffmpeg_encoders.get('libx264'):
                 return 'libx264', 'software'
@@ -443,7 +445,8 @@ class HardwareDetector:
                   self.has_amd_gpu() and 
                   self.is_encoder_validated('hevc_amf')):
                 return 'hevc_amf', 'amd'
-            elif self.ffmpeg_encoders.get('hevc_qsv'):
+            elif (self.ffmpeg_encoders.get('hevc_qsv') and 
+                  self.is_encoder_validated('hevc_qsv')):
                 return 'hevc_qsv', 'intel'
             elif self.ffmpeg_encoders.get('libx265'):
                 return 'libx265', 'software'

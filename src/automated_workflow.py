@@ -105,6 +105,14 @@ class AutomatedWorkflow:
         for directory in [self.input_dir, self.output_dir, self.temp_dir, self.failures_dir]:
             directory.mkdir(exist_ok=True)
             logger.debug(f"Directory ensured: {directory}")
+
+        # Ensure nested cache directory exists for performance caching
+        try:
+            cache_dir = self.temp_dir / 'cache'
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            logger.debug(f"Cache directory ensured: {cache_dir}")
+        except Exception as e:
+            logger.warning(f"Could not ensure cache directory: {e}")
     
     def _interruptible_sleep(self, duration: float, check_interval: float = 0.1):
         """Sleep that can be interrupted by shutdown signal"""
@@ -140,6 +148,7 @@ class AutomatedWorkflow:
         processed_files = set()
         processing_stats = {'successful': 0, 'skipped': 0, 'errors': 0}
         first_scan = True
+        idle_announced = False
         
         try:
             while not self.shutdown_requested:
@@ -149,6 +158,8 @@ class AutomatedWorkflow:
                     first_scan = False
                     
                     if video_files:
+                        # Reset idle announcement when work resumes
+                        idle_announced = False
                         logger.info(f"Found {len(video_files)} new file(s) to process")
                         self._vprint(f"\n🎬 {len(video_files)} new file(s) to process")
                         
@@ -200,11 +211,26 @@ class AutomatedWorkflow:
                         if video_files:
                             total = processing_stats['successful'] + processing_stats['skipped'] + processing_stats['errors']
                             self._vprint(f"\n📊 Summary: ✅ {processing_stats['successful']} | ⚠️ {processing_stats['skipped']} | ❌ {processing_stats['errors']} (Total {total})")
+                            # Immediately announce standby if we are now idle (no more files ready)
+                            try:
+                                more_files = self._find_new_files(processed_files, skip_stability_check=True)
+                                if not more_files and not self.verbose and not idle_announced:
+                                    print("✅ All caught up. Standing by for new files…", flush=True)
+                                    logger.info("All caught up. Standing by for new files")
+                                    idle_announced = True
+                            except Exception:
+                                pass
                     else:
                         # Show waiting status periodically (only when verbose)
                         if self.verbose:
                             current_time = time.strftime("%H:%M:%S")
                             print(f"\r⏳ [{current_time}] Waiting for files...", end="", flush=True)
+                        else:
+                            # In normal mode, show a one-time standby message when idle
+                            if not idle_announced:
+                                print("✅ All caught up. Standing by for new files…", flush=True)
+                                logger.info("All caught up. Standing by for new files")
+                                idle_announced = True
                     
                     # Sleep before next check (with interrupt checking)
                     if not self.shutdown_requested:

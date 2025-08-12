@@ -379,6 +379,8 @@ class PerformanceEnhancer:
         cache_file = os.path.join(self.cache_dir, f"{cache_key}.cache")
         
         try:
+            # Ensure cache directory exists even if it was removed mid-run
+            os.makedirs(self.cache_dir, exist_ok=True)
             with open(cache_file, 'wb') as f:
                 pickle.dump(data, f)
         except Exception as e:
