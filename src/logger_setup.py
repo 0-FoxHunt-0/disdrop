@@ -4,12 +4,15 @@ Initializes logging configuration from YAML file
 """
 
 import os
+import sys
 import logging
 import logging.config
 import yaml
 from colorama import init, Fore, Style
 from typing import Optional
 import codecs
+import atexit
+from datetime import datetime
 
 # Initialize colorama for Windows compatibility
 init(autoreset=True)
@@ -50,6 +53,112 @@ class UTF8StreamHandler(logging.StreamHandler):
         except Exception:
             self.handleError(record)
 
+class TeeStream:
+    """A stream that writes to the original stream and a log file."""
+
+    def __init__(self, original_stream, tee_file, name_label: str):
+        self._original_stream = original_stream
+        self._tee_file = tee_file
+        # Preserve behavior expected by formatter logic
+        self.name = name_label  # e.g., '<stdout>' or '<stderr>'
+        # Expose encoding attribute like standard streams
+        self.encoding = getattr(original_stream, 'encoding', 'utf-8')
+
+    def write(self, data):
+        try:
+            if isinstance(data, bytes):
+                text = data.decode('utf-8', errors='replace')
+            else:
+                text = data
+            # Write to console first
+            self._original_stream.write(text)
+            # Then to file
+            self._tee_file.write(text)
+        except Exception:
+            # Avoid crashing stdout on errors
+            try:
+                self._original_stream.write(text)
+            except Exception:
+                pass
+
+    def flush(self):
+        try:
+            self._original_stream.flush()
+        except Exception:
+            pass
+        try:
+            self._tee_file.flush()
+        except Exception:
+            pass
+
+    def isatty(self):
+        try:
+            return self._original_stream.isatty()
+        except Exception:
+            return False
+
+    def fileno(self):
+        try:
+            return self._original_stream.fileno()
+        except Exception:
+            raise OSError("fileno not supported for TeeStream")
+
+
+# Module-level state to avoid double-wrapping
+_TEE_ENABLED = False
+_ORIGINAL_STDOUT = None
+_ORIGINAL_STDERR = None
+_TEE_FILE_HANDLE = None
+
+def _enable_terminal_tee(logs_dir: str = "logs") -> str:
+    """Enable teeing of stdout/stderr to a timestamped terminal log file.
+
+    Returns the path to the terminal log file.
+    """
+    global _TEE_ENABLED, _ORIGINAL_STDOUT, _ORIGINAL_STDERR, _TEE_FILE_HANDLE
+
+    if _TEE_ENABLED:
+        # Already enabled; try to expose the current file path if possible
+        try:
+            return getattr(_TEE_FILE_HANDLE, 'name', os.path.join(logs_dir, 'terminal.log'))
+        except Exception:
+            return os.path.join(logs_dir, 'terminal.log')
+
+    os.makedirs(logs_dir, exist_ok=True)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    terminal_log_path = os.path.join(logs_dir, f'terminal_{timestamp}.log')
+    _TEE_FILE_HANDLE = open(terminal_log_path, 'a', encoding='utf-8', newline='')
+
+    # Remember originals and wrap
+    _ORIGINAL_STDOUT = sys.stdout
+    _ORIGINAL_STDERR = sys.stderr
+    sys.stdout = TeeStream(_ORIGINAL_STDOUT, _TEE_FILE_HANDLE, name_label='<stdout>')
+    sys.stderr = TeeStream(_ORIGINAL_STDERR, _TEE_FILE_HANDLE, name_label='<stderr>')
+
+    def _restore_streams():
+        global _TEE_ENABLED, _TEE_FILE_HANDLE, _ORIGINAL_STDOUT, _ORIGINAL_STDERR
+        try:
+            if _TEE_FILE_HANDLE:
+                _TEE_FILE_HANDLE.flush()
+        except Exception:
+            pass
+        try:
+            if _TEE_FILE_HANDLE:
+                _TEE_FILE_HANDLE.close()
+        except Exception:
+            pass
+        # Restore original streams
+        if _ORIGINAL_STDOUT is not None:
+            sys.stdout = _ORIGINAL_STDOUT
+        if _ORIGINAL_STDERR is not None:
+            sys.stderr = _ORIGINAL_STDERR
+        _TEE_ENABLED = False
+        _TEE_FILE_HANDLE = None
+
+    atexit.register(_restore_streams)
+    _TEE_ENABLED = True
+    return terminal_log_path
+
 def setup_logging(config_path: str = "config/logging.yaml", log_level: Optional[str] = None):
     """
     Setup logging configuration from YAML file
@@ -80,7 +189,7 @@ def setup_logging(config_path: str = "config/logging.yaml", log_level: Optional[
         'handlers': {
             'console': {
                 'class': 'logging.StreamHandler',
-                'level': 'INFO',
+                'level': 'WARNING',
                 'formatter': 'console',
                 'stream': 'ext://sys.stdout'
             },
@@ -114,7 +223,20 @@ def setup_logging(config_path: str = "config/logging.yaml", log_level: Optional[
         else:
             print(f"Warning: Logging config file not found at {config_path}, using default configuration")
             logging_config = default_config
-        
+
+        # Clean logs at program start
+        try:
+            video_log = os.path.join(logs_dir, 'video_compressor.log')
+            error_log = os.path.join(logs_dir, 'errors.log')
+            # Truncate files
+            open(video_log, 'w', encoding='utf-8').close()
+            open(error_log, 'w', encoding='utf-8').close()
+        except Exception:
+            pass
+
+        # Enable terminal tee BEFORE applying logging config so console handler uses the tee stream
+        terminal_log_path = _enable_terminal_tee(logs_dir)
+
         # Override log level if specified
         if log_level:
             log_level = log_level.upper()
@@ -122,7 +244,7 @@ def setup_logging(config_path: str = "config/logging.yaml", log_level: Optional[
                 logging_config['root']['level'] = log_level
             if 'handlers' in logging_config and 'console' in logging_config['handlers']:
                 logging_config['handlers']['console']['level'] = log_level
-        
+
         # Apply logging configuration
         try:
             logging.config.dictConfig(logging_config)
@@ -153,7 +275,8 @@ def setup_logging(config_path: str = "config/logging.yaml", log_level: Optional[
         except Exception as format_error:
             logger.debug(f"Could not apply colored formatter: {format_error}")
         
-        logger.info("Logging system initialized successfully")
+        logger.info("Logging initialized")
+        logger.debug(f"Terminal output tee: {terminal_log_path}")
         
         return logger
         

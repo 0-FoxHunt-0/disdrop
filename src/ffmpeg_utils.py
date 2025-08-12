@@ -8,6 +8,7 @@ import os
 import subprocess
 import logging
 from typing import Dict, Any, List, Optional, Tuple
+import shlex
 
 logger = logging.getLogger(__name__)
 
@@ -15,19 +16,58 @@ class FFmpegUtils:
     """Shared utilities for FFmpeg operations"""
     
     @staticmethod
+    def _safe_file_path(file_path: str) -> str:
+        """Safely handle file paths with special characters"""
+        try:
+            # Convert to absolute path and normalize
+            abs_path = os.path.abspath(file_path)
+            # On Windows, ensure proper path handling
+            if os.name == 'nt':
+                # Remove any double quotes that might cause issues
+                abs_path = abs_path.replace('"', '')
+            return abs_path
+        except Exception as e:
+            logger.warning(f"Error normalizing file path {file_path}: {e}")
+            return file_path
+    
+    @staticmethod
     def get_video_duration(video_path: str) -> float:
         """Get video duration using ffprobe"""
         try:
+            # Safely handle the file path
+            safe_path = FFmpegUtils._safe_file_path(video_path)
+            
+            # Check if file exists before running ffprobe
+            if not os.path.exists(safe_path):
+                logger.error(f"Video file not found: {safe_path}")
+                return 30.0  # Default fallback
+            
+            # Check if file is accessible
+            if not os.access(safe_path, os.R_OK):
+                logger.error(f"Video file not accessible: {safe_path}")
+                return 30.0  # Default fallback
+            
             cmd = ['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration', 
-                   '-of', 'csv=p=0', video_path]
+                   '-of', 'csv=p=0', safe_path]
             result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
             
             if result.returncode == 0:
-                return float(result.stdout.strip())
+                duration_str = result.stdout.strip()
+                if duration_str and duration_str != 'N/A':
+                    return float(duration_str)
+                else:
+                    logger.warning(f"Invalid duration returned for {video_path}: {duration_str}")
+                    return 30.0  # Default fallback
+            else:
+                logger.warning(f"FFprobe failed for {video_path}: {result.stderr}")
+                return 30.0  # Default fallback
+                
+        except FileNotFoundError as e:
+            logger.error(f"File not found error for {safe_path}: {e}")
+            return 30.0  # Default fallback
         except Exception as e:
-            logger.warning(f"Failed to get video duration for {video_path}: {e}")
-        
-        return 30.0  # Default fallback
+            logger.warning(f"Failed to get video duration for {safe_path}: {e}")
+            return 30.0  # Default fallback
     
     @staticmethod
     def get_video_info(video_path: str) -> Dict[str, Any]:
@@ -99,6 +139,67 @@ class FFmpegUtils:
                 amd_options = hardware.get_amd_encoder_options(params['encoder'])
                 cmd.extend(amd_options)
         
+        return cmd
+
+    @staticmethod
+    def get_default_thread_counts() -> Tuple[int, int]:
+        """Return sensible defaults for FFmpeg thread and filter thread counts.
+
+        Caps threads to avoid contention on machines with many cores.
+        """
+        try:
+            cpu_count = os.cpu_count() or 4
+            threads = min(8, max(2, cpu_count))
+            filter_threads = min(8, max(2, cpu_count // 2 or 1))
+            return threads, filter_threads
+        except Exception:
+            return 4, 2
+
+    @staticmethod
+    def add_ffmpeg_perf_flags(cmd: List[str], threads: Optional[int] = None, filter_threads: Optional[int] = None,
+                              add_probe: bool = True) -> List[str]:
+        """Insert common performance and noise-reduction flags into an FFmpeg command list.
+
+        - Adds: -hide_banner -loglevel error -probesize 2M -analyzeduration 10M
+        - Adds: -threads N -filter_threads N
+
+        This function mutates and returns the same list for convenience.
+        """
+        try:
+            if not cmd:
+                return cmd
+            # Determine insertion point (after program name 'ffmpeg')
+            insert_index = 1 if cmd[0].lower() == 'ffmpeg' else 0
+
+            # Threads
+            t, ft = FFmpegUtils.get_default_thread_counts()
+            if threads is None:
+                threads = t
+            if filter_threads is None:
+                filter_threads = ft
+
+            perf_flags: List[str] = []
+            perf_flags.extend(['-hide_banner', '-loglevel', 'error'])
+            if add_probe:
+                perf_flags.extend(['-probesize', '2M', '-analyzeduration', '10M'])
+            # Only add if not already present
+            def _missing(flag: str) -> bool:
+                try:
+                    return flag not in cmd
+                except Exception:
+                    return True
+
+            if _missing('-threads'):
+                perf_flags.extend(['-threads', str(threads)])
+            if _missing('-filter_threads'):
+                perf_flags.extend(['-filter_threads', str(filter_threads)])
+
+            # Insert after program name
+            for i, flag in enumerate(perf_flags):
+                cmd.insert(insert_index + i, flag)
+        except Exception:
+            # Best-effort; ignore if anything goes wrong
+            pass
         return cmd
     
     @staticmethod

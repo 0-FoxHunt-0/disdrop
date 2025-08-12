@@ -116,7 +116,8 @@ class FileValidator:
         if file_size_mb == 0:
             return False, "File is empty"
         
-        if file_size_mb > max_size_mb:
+        # Skip size validation if max_size_mb is None
+        if max_size_mb is not None and file_size_mb > max_size_mb:
             return False, f"File too large: {file_size_mb:.2f}MB > {max_size_mb}MB"
         
         try:
@@ -252,7 +253,7 @@ class FileValidator:
             Tuple of (is_valid, error_message)
         """
         # Basic validation first
-        is_valid, error_msg = FileValidator.is_valid_gif(gif_path, max_size_mb or 10.0)
+        is_valid, error_msg = FileValidator.is_valid_gif(gif_path, max_size_mb)
         if not is_valid:
             return False, error_msg
         

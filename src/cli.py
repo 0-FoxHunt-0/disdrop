@@ -41,6 +41,9 @@ class VideoCompressorCLI:
             # Setup logging
             global logger
             logger = setup_logging(log_level=args.log_level)
+
+            # Clear failures directory at startup to avoid mix-ups/clutter
+            self._clear_failures_directory()
             
             # Setup signal handlers for graceful cleanup
             self._setup_signal_handlers()
@@ -242,6 +245,35 @@ class VideoCompressorCLI:
             args.max_size = 10.0
             
         return args
+    
+    def _clear_failures_directory(self):
+        """Remove all contents of the failures directory at program start.
+
+        Keeps the directory itself present for later use.
+        """
+        try:
+            failures_dir = os.path.join(os.getcwd(), 'failures')
+            # Ensure the folder exists
+            os.makedirs(failures_dir, exist_ok=True)
+
+            removed_items = 0
+            for name in os.listdir(failures_dir):
+                path = os.path.join(failures_dir, name)
+                try:
+                    if os.path.isfile(path) or os.path.islink(path):
+                        os.remove(path)
+                        removed_items += 1
+                    elif os.path.isdir(path):
+                        shutil.rmtree(path)
+                        removed_items += 1
+                except Exception as e:
+                    if logger:
+                        logger.debug(f"Could not remove item in failures dir '{name}': {e}")
+            if logger:
+                logger.info(f"Failures directory cleaned ({removed_items} item(s) removed)")
+        except Exception as e:
+            if logger:
+                logger.warning(f"Failed to clean failures directory: {e}")
     
     def _initialize_components(self, args: argparse.Namespace):
         """Initialize all components with configuration"""
@@ -969,7 +1001,7 @@ class VideoCompressorCLI:
                 try:
                     is_valid, error_msg = self.file_validator.is_valid_gif_with_enhanced_checks(
                         gif_path,
-                        original_path=gif_path,  # No original path for segment GIFs
+                        original_path=None,
                         max_size_mb=max_size_mb
                     )
                     if is_valid:

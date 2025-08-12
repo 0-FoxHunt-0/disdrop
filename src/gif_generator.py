@@ -15,6 +15,7 @@ import cv2
 from tqdm import tqdm
 import time # Added for time.sleep
 import json
+import hashlib
 import re
 
 from .config_manager import ConfigManager
@@ -30,6 +31,8 @@ class GifGenerator:
         self.config = config_manager
         self.ffmpeg_utils = FFmpegUtils()
         self.optimizer = AdvancedGifOptimizer(config_manager)
+        self.shutdown_requested = False
+        self.current_ffmpeg_process = None
         
         # Platform-specific settings
         self.platform_settings = {
@@ -210,34 +213,70 @@ class GifGenerator:
                           start_time: float, duration: float) -> Dict[str, Any]:
         """Create a single optimized GIF"""
         try:
+            # Check if input video still exists
+            if not os.path.exists(input_video):
+                return {'success': False, 'error': f'Input video no longer exists: {input_video}'}
+            
             # Create output directory if it doesn't exist
             output_dir = os.path.dirname(output_path)
             if output_dir and not os.path.exists(output_dir):
                 os.makedirs(output_dir)
             
-            # Generate palette first
-            palette_path = self._generate_palette(input_video, settings, start_time, duration)
-            if not palette_path:
-                return {'success': False, 'error': 'Failed to generate palette'}
+            # First try a single-pass split palette pipeline with mpdecimate and optional crop
+            split_success = self._create_gif_split_palette(input_video, output_path, settings, start_time, duration)
             
-            # Create GIF with palette
-            success = self._create_gif_with_palette(input_video, output_path, palette_path, settings, start_time, duration)
-            
-            # Clean up palette
-            if os.path.exists(palette_path):
-                os.unlink(palette_path)
+            if not split_success:
+                # Fallback: two-step palette path
+                palette_path = self._generate_palette(input_video, settings, start_time, duration)
+                if not palette_path:
+                    return {'success': False, 'error': 'Failed to generate palette'}
+                
+                # Double-check input video exists before creating GIF
+                if not os.path.exists(input_video):
+                    if os.path.exists(palette_path):
+                        os.unlink(palette_path)
+                    return {'success': False, 'error': f'Input video disappeared during processing: {input_video}'}
+                
+                # Create GIF with palette
+                success = self._create_gif_with_palette(input_video, output_path, palette_path, settings, start_time, duration)
+                
+                # Clean up palette
+                if os.path.exists(palette_path):
+                    os.unlink(palette_path)
+            else:
+                success = True
             
             if success:
                 # Get final file size
                 if os.path.exists(output_path):
                     size_mb = os.path.getsize(output_path) / (1024 * 1024)
                     
-                    # Optimize if needed
+                    # If still over limit, use iterative optimizer to target size precisely
                     if size_mb > settings['max_size_mb']:
-                        logger.info(f"GIF size ({size_mb:.2f}MB) exceeds limit ({settings['max_size_mb']:.2f}MB), optimizing...")
-                        optimized = self.optimizer.optimize_gif(output_path, settings['max_size_mb'])
-                        if optimized:
-                            size_mb = os.path.getsize(output_path) / (1024 * 1024)
+                        logger.info(f"GIF size ({size_mb:.2f}MB) exceeds limit ({settings['max_size_mb']:.2f}MB), iterative optimization...")
+                        try:
+                            # Use iterative optimizer to generate best-under-limit GIF, then move to output_path
+                            opt_result = self.optimizer.optimize_gif_with_quality_target(
+                                input_video=input_video,
+                                output_path=output_path,
+                                max_size_mb=settings['max_size_mb'],
+                                platform=None,
+                                start_time=start_time,
+                                duration=duration,
+                                quality_preference='balanced'
+                            )
+                            if opt_result and opt_result.get('output_file') and os.path.exists(opt_result['output_file']):
+                                # Move final optimized result to desired output_path
+                                if opt_result['output_file'] != output_path:
+                                    try:
+                                        shutil.move(opt_result['output_file'], output_path)
+                                    except Exception:
+                                        # Fallback to copy
+                                        shutil.copy2(opt_result['output_file'], output_path)
+                                        os.remove(opt_result['output_file'])
+                                size_mb = os.path.getsize(output_path) / (1024 * 1024)
+                        except Exception as e:
+                            logger.warning(f"Iterative optimization failed: {e}")
                     
                     return {
                         'success': True,
@@ -259,8 +298,46 @@ class GifGenerator:
                          start_time: float, duration: float) -> Optional[str]:
         """Generate optimized palette for GIF creation"""
         try:
-            # Create temporary palette file with unique name
-            palette_path = tempfile.mktemp(suffix='.png')
+            if self.shutdown_requested:
+                return None
+            # Safely handle the input video path
+            safe_input_path = FFmpegUtils._safe_file_path(input_video)
+            
+            # Check if input video exists before starting
+            if not os.path.exists(safe_input_path):
+                logger.error(f"Input video not found for palette generation: {safe_input_path}")
+                return None
+            
+            # Detect crop and build filter with mpdecimate + fps + scale
+            crop_filter = self._detect_crop_filter(safe_input_path, start_time, duration)
+            pre_chain = []
+            if crop_filter:
+                pre_chain.append(crop_filter)
+            pre_chain.append('mpdecimate=hi=768:lo=512:frac=0.5')
+            pre_chain.append(f"fps={settings['fps']}")
+            pre_chain.append(f"scale={settings['scale']}:-1:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1")
+            vf = ','.join(pre_chain + ["palettegen=max_colors=256:stats_mode=diff"])  # diff by default
+
+            # Palette cache key
+            cache_dir = os.path.join(self.config.get_temp_dir(), 'palette_cache')
+            os.makedirs(cache_dir, exist_ok=True)
+            key_payload = {
+                'path': safe_input_path,
+                'mtime': os.path.getmtime(safe_input_path),
+                'start': float(start_time or 0),
+                'duration': float(duration or 0),
+                'fps': settings.get('fps'),
+                'scale': settings.get('scale'),
+                'vf': vf,
+            }
+            key_str = json.dumps(key_payload, sort_keys=True, separators=(',', ':'))
+            digest = hashlib.sha1(key_str.encode('utf-8')).hexdigest()
+            palette_path = os.path.join(cache_dir, f"pal_{digest}.png")
+
+            # Return cached palette if exists
+            if os.path.exists(palette_path):
+                logger.debug(f"Using cached palette: {palette_path}")
+                return palette_path
             
             # Build FFmpeg command for palette generation
             # Use -frames:v 1 to ensure only one frame is output
@@ -268,17 +345,22 @@ class GifGenerator:
                 'ffmpeg', '-y',
                 '-ss', str(start_time),
                 '-t', str(duration),
-                '-i', input_video,
-                '-vf', f'fps={settings["fps"]},scale={settings["scale"]}:-1:flags=lanczos,palettegen=max_colors=256:stats_mode=single',
+                '-i', safe_input_path,
+                '-vf', vf,
                 '-frames:v', '1',
                 '-f', 'image2',
                 palette_path
             ]
+            # Add performance flags
+            FFmpegUtils.add_ffmpeg_perf_flags(cmd)
+            
+            # Log the command for debugging
+            logger.debug(f"Palette generation command: {' '.join(cmd)}")
             
             logger.debug(f"Generating palette: {' '.join(cmd)}")
             
             # Run FFmpeg
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+            result = self._run_ffmpeg(cmd, timeout=30)
             
             if result.returncode == 0 and os.path.exists(palette_path):
                 return palette_path
@@ -286,6 +368,9 @@ class GifGenerator:
                 logger.error(f"Palette generation failed: {result.stderr}")
                 return None
                 
+        except FileNotFoundError as e:
+            logger.error(f"File not found error during palette generation: {e}")
+            return None
         except Exception as e:
             logger.error(f"Error generating palette: {e}")
             return None
@@ -294,22 +379,51 @@ class GifGenerator:
                                 settings: Dict[str, Any], start_time: float, duration: float) -> bool:
         """Create GIF using generated palette"""
         try:
+            if self.shutdown_requested:
+                return False
+            # Safely handle the input video path
+            safe_input_path = FFmpegUtils._safe_file_path(input_video)
+            
+            # Check if input video and palette still exist
+            if not os.path.exists(safe_input_path):
+                logger.error(f"Input video not found for GIF creation: {safe_input_path}")
+                return False
+            
+            if not os.path.exists(palette_path):
+                logger.error(f"Palette file not found for GIF creation: {palette_path}")
+                return False
+            
+            # Build filter graph with optional crop, mpdecimate, fps, scale and paletteuse with high-quality dithering
+            crop_filter = self._detect_crop_filter(safe_input_path, start_time, duration)
+            pre_chain = []
+            if crop_filter:
+                pre_chain.append(crop_filter)
+            pre_chain.append('mpdecimate=hi=768:lo=512:frac=0.5')
+            pre_chain.append(f"fps={settings['fps']}")
+            pre_chain.append(f"scale={settings['scale']}:-1:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1")
+            lavfi = ','.join(pre_chain) + " [x]; [x][1:v] paletteuse=dither=sierra2_4a:diff_mode=rectangle"
+
             # Build FFmpeg command for GIF creation
             cmd = [
                 'ffmpeg', '-y',
                 '-ss', str(start_time),
                 '-t', str(duration),
-                '-i', input_video,
+                '-i', safe_input_path,
                 '-i', palette_path,
-                '-lavfi', f'fps={settings["fps"]},scale={settings["scale"]}:-1:flags=lanczos [x]; [x][1:v] paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle',
+                '-lavfi', lavfi,
                 '-f', 'gif',
                 output_path
             ]
+            # Add performance flags
+            FFmpegUtils.add_ffmpeg_perf_flags(cmd)
+            
+            # Log the command for debugging
+            logger.debug(f"GIF creation command: {' '.join(cmd)}")
             
             logger.debug(f"Creating GIF: {' '.join(cmd)}")
             
             # Run FFmpeg
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+            result = self._run_ffmpeg(cmd, timeout=120)
             
             if result.returncode == 0 and os.path.exists(output_path):
                 return True
@@ -317,9 +431,127 @@ class GifGenerator:
                 logger.error(f"GIF creation failed: {result.stderr}")
                 return False
                 
+        except FileNotFoundError as e:
+            logger.error(f"File not found error during GIF creation: {e}")
+            return False
         except Exception as e:
             logger.error(f"Error creating GIF with palette: {e}")
             return False
+
+    def _create_gif_split_palette(self, input_video: str, output_path: str,
+                                  settings: Dict[str, Any], start_time: float, duration: float) -> bool:
+        """Create GIF using split palette single-pass pipeline with mpdecimate and optional crop"""
+        try:
+            if self.shutdown_requested:
+                return False
+            safe_input_path = FFmpegUtils._safe_file_path(input_video)
+            if not os.path.exists(safe_input_path):
+                logger.error(f"Input video not found for split-palette GIF: {safe_input_path}")
+                return False
+
+            crop_filter = self._detect_crop_filter(safe_input_path, start_time, duration)
+            pre = []
+            if crop_filter:
+                pre.append(crop_filter)
+            pre.append('mpdecimate=hi=768:lo=512:frac=0.5')
+            pre.append(f"fps={settings['fps']}")
+            pre.append(f"scale={settings['scale']}: -1:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1".replace(' :', ':'))
+            chain = ','.join(pre)
+
+            filter_complex = (
+                f"{chain},split[a][b];" 
+                f"[a]palettegen=stats_mode=diff:reserve_transparent=1[p];"
+                f"[b][p]paletteuse=dither=sierra2_4a:diff_mode=rectangle"
+            )
+
+            cmd = [
+                'ffmpeg', '-y',
+                '-ss', str(start_time),
+                '-t', str(duration),
+                '-i', safe_input_path,
+                '-filter_complex', filter_complex,
+                '-f', 'gif',
+                output_path
+            ]
+            FFmpegUtils.add_ffmpeg_perf_flags(cmd)
+
+            logger.debug(f"Split-palette GIF creation: {' '.join(cmd)}")
+            result = self._run_ffmpeg(cmd, timeout=180)
+            return result.returncode == 0 and os.path.exists(output_path)
+        except Exception as e:
+            logger.debug(f"Split-palette creation failed: {e}")
+            return False
+
+    def _detect_crop_filter(self, input_video: str, start_time: float, duration: float) -> str:
+        """Detect crop suggestion using ffmpeg cropdetect and return crop filter string or empty"""
+        try:
+            cmd = [
+                'ffmpeg', '-v', 'error',
+                '-ss', str(start_time),
+                '-t', str(min(5.0, duration) if duration else 5.0),
+                '-i', input_video,
+                '-vf', 'cropdetect=24:16:0',
+                '-frames:v', '100',
+                '-f', 'null', '-'
+            ]
+            FFmpegUtils.add_ffmpeg_perf_flags(cmd)
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=20)
+            # Parse stderr for last crop=
+            crop = None
+            for line in result.stderr.splitlines():
+                if 'crop=' in line:
+                    try:
+                        crop = line.split('crop=')[-1].split()[0]
+                    except Exception:
+                        continue
+            if crop and 'x' in crop and ':' in crop:
+                return f"crop={crop}"
+        except Exception:
+            pass
+        return ''
+
+    # Shutdown/termination support for graceful exit
+    def request_shutdown(self):
+        """Request generator to stop and terminate any running FFmpeg process."""
+        self.shutdown_requested = True
+        self._terminate_ffmpeg_process()
+
+    def _terminate_ffmpeg_process(self):
+        try:
+            if self.current_ffmpeg_process and self.current_ffmpeg_process.poll() is None:
+                self.current_ffmpeg_process.terminate()
+                try:
+                    self.current_ffmpeg_process.wait(timeout=3)
+                except Exception:
+                    self.current_ffmpeg_process.kill()
+        except Exception:
+            pass
+        finally:
+            self.current_ffmpeg_process = None
+
+    def _run_ffmpeg(self, cmd: list, timeout: int = 120):
+        """Run FFmpeg with the ability to terminate early on shutdown."""
+        class FFResult:
+            pass
+        try:
+            self.current_ffmpeg_process = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
+            try:
+                stdout, stderr = self.current_ffmpeg_process.communicate(timeout=timeout)
+                rc = self.current_ffmpeg_process.returncode
+            except subprocess.TimeoutExpired:
+                self._terminate_ffmpeg_process()
+                stdout, stderr, rc = '', 'TimeoutExpired', 1
+        except Exception as e:
+            stdout, stderr, rc = '', str(e), 1
+        finally:
+            self.current_ffmpeg_process = None
+        r = FFResult()
+        r.stdout = stdout
+        r.stderr = stderr
+        r.returncode = rc
+        return r
     
     def _create_segmented_gifs(self, input_video: str, output_path: str, settings: Dict[str, Any],
                               start_time: float, duration: float) -> Dict[str, Any]:
@@ -352,6 +584,7 @@ class GifGenerator:
                 segment_name = f"{base_name}_segment_{i+1:02d}.gif"
                 segment_path = os.path.join(segments_dir, segment_name)
                 
+                # For each segment, force no further segmentation to avoid nested segmentation
                 result = self._create_single_gif(input_video, segment_path, settings, segment_start, segment_duration_actual)
                 
                 if result.get('success', False):

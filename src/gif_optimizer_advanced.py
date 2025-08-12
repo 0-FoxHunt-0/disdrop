@@ -27,6 +27,19 @@ class AdvancedGifOptimizer:
         # Advanced optimization cache
         self.palette_cache = {}
         self.frame_analysis_cache = {}
+        # Quality optimization knobs (reserved for future config use)
+        self.qo_cfg = self.config.get('gif_settings.quality_optimization', {}) or {}
+        self.early_stop_cfg = self.qo_cfg.get('early_stop', {}) or {}
+
+        # Performance configuration for gifsicle path
+        self.perf_cfg = self.config.get('gif_settings.performance', {}) or {}
+        self.fast_mode: bool = bool(self.perf_cfg.get('fast_mode', False))
+        # Time budget for gifsicle adaptive search (seconds)
+        self.gifsicle_time_budget_sec: int = int(self.perf_cfg.get('gifsicle_time_budget_seconds', 25 if self.fast_mode else 45))
+        # Cap on total gifsicle runs in adaptive search
+        self.gifsicle_max_candidates: int = int(self.perf_cfg.get('gifsicle_max_candidates', 48 if self.fast_mode else 120))
+        # gifsicle optimize level (2 is faster, 3 is heaviest)
+        self.gifsicle_optimize_level: int = int(self.perf_cfg.get('gifsicle_optimize_level', 2 if self.fast_mode else 3))
         
     def create_optimized_gif(self, input_video: str, output_path: str, 
                            max_size_mb: float, platform: str = None,
@@ -59,168 +72,1175 @@ class AdvancedGifOptimizer:
     
     def optimize_gif(self, gif_path: str, max_size_mb: float) -> bool:
         """
-        Optimize an existing GIF file to meet size requirements using multiple strategies
-        
-        Args:
-            gif_path: Path to existing GIF file
-            max_size_mb: Maximum file size in MB
-            
-        Returns:
-            True if optimization was successful, False otherwise
+        Robust, efficient input-GIF optimization with clear, bounded stages:
+          1) Lossless gifsicle pass (strip metadata, optimize structure)
+          2) If within 15% over target, bounded gifsicle search (few candidates only)
+          3) If >15% over target or gifsicle not available, ffmpeg palette re-encode with mpdecimate
+          4) Optional final gifsicle squeeze for small overage
         """
         try:
             if not os.path.exists(gif_path):
                 logger.error(f"GIF file not found: {gif_path}")
                 return False
-            
-            current_size = os.path.getsize(gif_path) / (1024 * 1024)
-            if current_size <= max_size_mb:
-                logger.info(f"GIF already within size limit: {current_size:.2f}MB <= {max_size_mb:.2f}MB")
+
+            target_bytes = int(max_size_mb * 1024 * 1024)
+            original_bytes = os.path.getsize(gif_path)
+            logger.info(
+                f"Optimizing GIF: current={original_bytes/1024/1024:.2f}MB, target={max_size_mb:.2f}MB"
+            )
+
+            # Backup original (best-effort)
+            backup_path = gif_path + ".orig.bak"
+            try:
+                if os.path.exists(backup_path):
+                    os.remove(backup_path)
+                shutil.copy2(gif_path, backup_path)
+            except Exception:
+                backup_path = None
+
+            gifsicle_available = self._is_tool_available("gifsicle")
+
+            # Stage 1: Lossless gifsicle optimize (if available)
+            if gifsicle_available:
+                temp_lossless = gif_path + ".lossless.tmp.gif"
+                if self._gifsicle_lossless_optimize(gif_path, temp_lossless) and os.path.exists(temp_lossless):
+                    os.replace(temp_lossless, gif_path)
+            # Early exit if already under target after lossless
+            current_bytes = os.path.getsize(gif_path)
+            if current_bytes <= target_bytes:
+                if backup_path and os.path.exists(backup_path):
+                    try:
+                        os.remove(backup_path)
+                    except Exception:
+                        pass
+                logger.info("GIF under target after lossless optimization")
                 return True
-            
-            logger.info(f"Optimizing existing GIF: {current_size:.2f}MB -> target {max_size_mb:.2f}MB")
-            
-            # Define optimization strategies in order of aggressiveness
-            optimization_strategies = [
-                # Strategy 1: Standard optimization
-                {
-                    'name': 'Standard optimization',
-                    'cmd': ['gifsicle', '--optimize=3', '--colors=256', '--output', '{temp}', '{input}']
-                },
-                # Strategy 2: Reduced colors
-                {
-                    'name': 'Reduced colors (128)',
-                    'cmd': ['gifsicle', '--optimize=3', '--colors=128', '--output', '{temp}', '{input}']
-                },
-                # Strategy 3: More aggressive color reduction
-                {
-                    'name': 'Reduced colors (64)',
-                    'cmd': ['gifsicle', '--optimize=3', '--colors=64', '--output', '{temp}', '{input}']
-                },
-                # Strategy 4: Very aggressive color reduction
-                {
-                    'name': 'Reduced colors (32)',
-                    'cmd': ['gifsicle', '--optimize=3', '--colors=32', '--output', '{temp}', '{input}']
-                },
-                # Strategy 5: Lossy optimization
-                {
-                    'name': 'Lossy optimization',
-                    'cmd': ['gifsicle', '--optimize=3', '--colors=128', '--lossy=80', '--output', '{temp}', '{input}']
-                },
-                # Strategy 6: Very aggressive lossy optimization
-                {
-                    'name': 'Very aggressive lossy',
-                    'cmd': ['gifsicle', '--optimize=3', '--colors=64', '--lossy=120', '--output', '{temp}', '{input}']
-                },
-                # Strategy 7: Extreme optimization
-                {
-                    'name': 'Extreme optimization',
-                    'cmd': ['gifsicle', '--optimize=3', '--colors=32', '--lossy=150', '--output', '{temp}', '{input}']
-                }
-            ]
-            
-            # Try each optimization strategy
-            for i, strategy in enumerate(optimization_strategies):
-                temp_output = gif_path + f'.tmp{i}'
-                
-                # Prepare command
-                cmd = [arg.replace('{temp}', temp_output).replace('{input}', gif_path) for arg in strategy['cmd']]
-                
-                logger.info(f"Trying {strategy['name']} (strategy {i+1}/{len(optimization_strategies)})")
-                
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-                
-                if result.returncode == 0 and os.path.exists(temp_output):
-                    optimized_size = os.path.getsize(temp_output) / (1024 * 1024)
-                    
-                    if optimized_size <= max_size_mb:
-                        # Replace original with optimized version
-                        os.replace(temp_output, gif_path)
-                        logger.info(f"GIF optimized successfully with {strategy['name']}: {current_size:.2f}MB -> {optimized_size:.2f}MB")
+
+            # Determine strategy threshold (15%)
+            over_ratio = (current_bytes - target_bytes) / float(target_bytes)
+            near_target = over_ratio <= 0.15
+
+            # Stage 2: Near-target bounded gifsicle search
+            if gifsicle_available and near_target:
+                temp_best = gif_path + ".near.tmp.gif"
+                if self._bounded_gifsicle_near_target(gif_path, temp_best, target_bytes):
+                    os.replace(temp_best, gif_path)
+                    current_bytes = os.path.getsize(gif_path)
+                    if current_bytes <= target_bytes:
+                        if backup_path and os.path.exists(backup_path):
+                            try:
+                                os.remove(backup_path)
+                            except Exception:
+                                pass
+                        logger.info("GIF met target via bounded gifsicle search")
                         return True
-                    else:
-                        # Remove temporary file and try next strategy
-                        os.remove(temp_output)
-                        logger.info(f"{strategy['name']} insufficient: {optimized_size:.2f}MB > {max_size_mb:.2f}MB")
-                else:
-                    logger.warning(f"{strategy['name']} failed: {result.stderr}")
-                    if os.path.exists(temp_output):
-                        os.remove(temp_output)
-            
-            # If all strategies failed, try FFmpeg-based re-encoding as last resort
-            logger.info("All gifsicle strategies failed, trying FFmpeg re-encoding")
-            return self._try_ffmpeg_reencoding(gif_path, max_size_mb, current_size)
-                
+                # Cleanup
+                try:
+                    if os.path.exists(temp_best):
+                        os.remove(temp_best)
+                except Exception:
+                    pass
+
+            # Stage 3: ffmpeg palette re-encode with mpdecimate (robust fallback / far-over-target)
+            info = self._get_gif_basic_info(gif_path)
+            temp_ffmpeg = gif_path + ".ffmpeg.tmp.gif"
+
+            # Compute scale factor when far over target; preserve aspect ratio, round to even dims
+            scale_factor = max(0.25, min(1.0, math.sqrt(target_bytes / float(current_bytes))))
+            if near_target:
+                scale_factor = min(1.0, max(0.85, scale_factor))  # keep resolution when close
+
+            new_width = max(2, int((info.get('width', 320) * scale_factor) // 2 * 2))
+            fps = max(6, min(15, int(round(info.get('fps', 12)))))
+
+            if self._ffmpeg_palette_reencode(gif_path, temp_ffmpeg, new_width, fps):
+                os.replace(temp_ffmpeg, gif_path)
+                current_bytes = os.path.getsize(gif_path)
+
+                # Stage 4: If slightly over, try a tiny gifsicle squeeze
+                if current_bytes > target_bytes and gifsicle_available:
+                    if self._gifsicle_squeeze_small_overage(gif_path):
+                        current_bytes = os.path.getsize(gif_path)
+
+                if current_bytes <= target_bytes:
+                    if backup_path and os.path.exists(backup_path):
+                        try:
+                            os.remove(backup_path)
+                        except Exception:
+                            pass
+                    logger.info("GIF met target via ffmpeg re-encode")
+                    return True
+
+            # Restore original if all attempts failed but original already <= target
+            if backup_path and os.path.exists(backup_path):
+                try:
+                    if os.path.getsize(backup_path) <= target_bytes:
+                        os.replace(backup_path, gif_path)
+                        logger.info("Restored original GIF (already within target)")
+                        return True
+                except Exception:
+                    pass
+
+            logger.warning("GIF optimization did not meet target")
+            return False
+
         except Exception as e:
             logger.error(f"Error optimizing GIF: {e}")
             return False
-    
-    def _try_ffmpeg_reencoding(self, gif_path: str, max_size_mb: float, original_size: float) -> bool:
-        """Try FFmpeg-based re-encoding as last resort"""
+
+    def _get_gif_basic_info(self, gif_path: str) -> Dict[str, Any]:
+        """Lightweight probe for width/height/fps/frame_count/duration."""
+        info: Dict[str, Any] = {
+            'width': 320, 'height': 240, 'fps': 12, 'frame_count': 0, 'duration': 0.0
+        }
         try:
-            temp_output = gif_path + '.ffmpeg.tmp'
-            
-            # Try different FFmpeg strategies
-            ffmpeg_strategies = [
-                # Strategy 1: Standard re-encoding with reduced colors
-                {
-                    'name': 'FFmpeg re-encode (256 colors)',
-                    'cmd': ['ffmpeg', '-i', gif_path, '-vf', 'fps=10,scale=480:360:flags=lanczos,palettegen=max_colors=256:stats_mode=single', '-frames:v', '1', '-y', temp_output + '.palette'],
-                    'gif_cmd': ['ffmpeg', '-i', gif_path, '-i', temp_output + '.palette', '-lavfi', 'fps=10,scale=480:360:flags=lanczos [x]; [x][1:v] paletteuse', '-y', temp_output]
-                },
-                # Strategy 2: More aggressive scaling and color reduction
-                {
-                    'name': 'FFmpeg re-encode (128 colors, smaller scale)',
-                    'cmd': ['ffmpeg', '-i', gif_path, '-vf', 'fps=8,scale=320:240:flags=lanczos,palettegen=max_colors=128:stats_mode=single', '-frames:v', '1', '-y', temp_output + '.palette'],
-                    'gif_cmd': ['ffmpeg', '-i', gif_path, '-i', temp_output + '.palette', '-lavfi', 'fps=8,scale=320:240:flags=lanczos [x]; [x][1:v] paletteuse', '-y', temp_output]
-                },
-                # Strategy 3: Very aggressive optimization
-                {
-                    'name': 'FFmpeg re-encode (64 colors, very small scale)',
-                    'cmd': ['ffmpeg', '-i', gif_path, '-vf', 'fps=6,scale=240:180:flags=lanczos,palettegen=max_colors=64:stats_mode=single', '-frames:v', '1', '-y', temp_output + '.palette'],
-                    'gif_cmd': ['ffmpeg', '-i', gif_path, '-i', temp_output + '.palette', '-lavfi', 'fps=6,scale=240:180:flags=lanczos [x]; [x][1:v] paletteuse', '-y', temp_output]
-                }
+            cmd = [
+                'ffprobe', '-v', 'quiet', '-print_format', 'json',
+                '-show_streams', '-show_format', gif_path
             ]
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=20)
+            if result.returncode == 0 and result.stdout:
+                import json as _json
+                data = _json.loads(result.stdout)
+                vs = next((s for s in data.get('streams', []) if s.get('codec_type') == 'video'), None)
+                if vs:
+                    info['width'] = int(vs.get('width', info['width']))
+                    info['height'] = int(vs.get('height', info['height']))
+                    fps_str = vs.get('r_frame_rate', '12/1')
+                    try:
+                        if '/' in fps_str:
+                            num, den = fps_str.split('/')
+                            info['fps'] = max(1.0, float(num) / float(den or 1))
+                        else:
+                            info['fps'] = max(1.0, float(fps_str))
+                    except Exception:
+                        pass
+                    try:
+                        info['frame_count'] = int(vs.get('nb_frames', 0))
+                    except Exception:
+                        pass
+                fmt = data.get('format', {})
+                try:
+                    info['duration'] = float(fmt.get('duration', 0.0))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return info
+
+    def _bounded_gifsicle_near_target(self, input_path: str, best_output_path: str, target_bytes: int) -> bool:
+        """Small, bounded search using gifsicle for near-target cases to avoid heavy compute."""
+        try:
+            candidates = []
+            # Conservative ladders
+            color_steps = [256, 224, 208, 192, 176, 160]
+            lossy_steps = [0, 10, 20, 30]
+            scale_steps = [1.0, 0.96, 0.92]
+
+            original_size = os.path.getsize(input_path)
+            best: Tuple[int, str] = (original_size, '')
+
+            # Try quick color-only first
+            for colors in color_steps:
+                temp = input_path + f".near_c{colors}.gif.tmp"
+                if self._run_gifsicle(input_path, temp, colors=colors, lossy=0, scale=1.0):
+                    size = os.path.getsize(temp)
+                    if size <= target_bytes:
+                        shutil.copy2(temp, best_output_path)
+                        try:
+                            os.remove(temp)
+                        except Exception:
+                            pass
+                        return True
+                    if size < best[0]:
+                        best = (size, temp)
+                    try:
+                        os.remove(temp)
+                    except Exception:
+                        pass
+
+            # Small grid over lossy and scale (hard-capped iterations)
+            max_runs = 24
+            runs = 0
+            for scale in scale_steps:
+                for colors in color_steps:
+                    for lossy in lossy_steps:
+                        temp = input_path + f".near_s{int(scale*100)}_c{colors}_l{lossy}.gif.tmp"
+                        if not self._run_gifsicle(input_path, temp, colors=colors, lossy=lossy, scale=scale):
+                            continue
+                        runs += 1
+                        size = os.path.getsize(temp)
+                        if size <= target_bytes:
+                            shutil.copy2(temp, best_output_path)
+                            try:
+                                os.remove(temp)
+                            except Exception:
+                                pass
+                            return True
+                        if size < best[0]:
+                            # Keep the best-so-far (still over target)
+                            if best[1] and os.path.exists(best[1]):
+                                try:
+                                    os.remove(best[1])
+                                except Exception:
+                                    pass
+                            best = (size, temp)
+                        else:
+                            try:
+                                os.remove(temp)
+                            except Exception:
+                                pass
+                        if runs >= max_runs:
+                            break
+                    if runs >= max_runs:
+                        break
+                if runs >= max_runs:
+                    break
+
+            # If nothing met target but we improved meaningfully (<105% of target), keep best
+            if best[1] and os.path.exists(best[1]):
+                if best[0] <= int(target_bytes * 1.05):
+                    shutil.copy2(best[1], best_output_path)
+                    try:
+                        os.remove(best[1])
+                    except Exception:
+                        pass
+                    return True
+                try:
+                    os.remove(best[1])
+                except Exception:
+                    pass
+            return False
+        except Exception as e:
+            logger.debug(f"Bounded gifsicle search failed: {e}")
+            return False
+
+    def _ffmpeg_palette_reencode(self, input_path: str, output_path: str, new_width: int, fps: int) -> bool:
+        """Re-encode GIF via ffmpeg using mpdecimate + palettegen/paletteuse preserving AR."""
+        try:
+            palette_path = input_path + ".palette.png"
+            # Build filters
+            pre = [
+                'mpdecimate=hi=768:lo=512:frac=0.5',
+                f'fps={fps}',
+                f'scale={new_width}:-2:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1'
+            ]
+            vf_palette = ','.join(pre + ['palettegen=max_colors=256:stats_mode=diff'])
+            # Palette gen
+            cmd1 = [
+                'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
+                '-i', input_path, '-vf', vf_palette, '-frames:v', '1', palette_path
+            ]
+            r1 = subprocess.run(cmd1, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=180)
+            if r1.returncode != 0 or not os.path.exists(palette_path):
+                try:
+                    if os.path.exists(palette_path):
+                        os.remove(palette_path)
+                except Exception:
+                    pass
+                return False
+
+            # Palette use
+            lavfi = ','.join(pre) + ' [x]; [x][1:v] paletteuse=dither=sierra2_4a:diff_mode=rectangle'
+            cmd2 = [
+                'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
+                '-i', input_path, '-i', palette_path,
+                '-lavfi', lavfi,
+                '-loop', '0', output_path
+            ]
+            r2 = subprocess.run(cmd2, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
+            try:
+                if os.path.exists(palette_path):
+                    os.remove(palette_path)
+            except Exception:
+                pass
+            return r2.returncode == 0 and os.path.exists(output_path)
+        except Exception as e:
+            logger.debug(f"ffmpeg palette re-encode failed: {e}")
+            return False
+
+    def _gifsicle_squeeze_small_overage(self, gif_path: str) -> bool:
+        """Tiny gifsicle squeeze for <=15% overage without major quality loss."""
+        try:
+            if not self._is_tool_available('gifsicle'):
+                return False
+            temp = gif_path + '.squeeze.tmp.gif'
+            cmd = [
+                'gifsicle', '--optimize=3', '--careful', '--lossy=30', gif_path, '--output', temp
+            ]
+            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120)
+            if r.returncode == 0 and os.path.exists(temp):
+                # Apply only if improved
+                try:
+                    if os.path.getsize(temp) < os.path.getsize(gif_path):
+                        os.replace(temp, gif_path)
+                        return True
+                finally:
+                    if os.path.exists(temp):
+                        try:
+                            os.remove(temp)
+                        except Exception:
+                            pass
+            return False
+        except Exception:
+            return False
+
+    def _is_tool_available(self, tool_name: str) -> bool:
+        try:
+            result = subprocess.run([tool_name, "--version"], capture_output=True, text=True, timeout=5)
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def _gifsicle_lossless_optimize(self, input_path: str, output_path: str) -> bool:
+        """Run a high-efficiency, lossless structural optimization preserving timing/palette."""
+        try:
+            cmd = [
+                "gifsicle",
+                f"--optimize={max(1, min(3, int(self.gifsicle_optimize_level)))}",
+                "--careful",
+                "--no-comments",
+                "--no-extensions",
+                "--no-names",
+                "--same-loopcount",
+                input_path,
+                "--output",
+                output_path,
+            ]
+            timeout_sec = 30 if self.fast_mode else 60
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+            return result.returncode == 0 and os.path.exists(output_path)
+        except Exception as e:
+            logger.debug(f"Lossless gifsicle optimize failed: {e}")
+            return False
+
+    def _gifsicle_adaptive_search(self, input_path: str, best_output_path: str, target_bytes: int) -> bool:
+        """
+        Explore parameter grid to get under target with best visual fidelity.
+        Preference order for quality: larger scale > higher colors > lower lossy.
+        """
+        try:
+            original_size = os.path.getsize(input_path)
+
+            # Parameter ladders
+            # Preserve aspect ratio by using uniform scale factors only
+            target_ratio = target_bytes / float(max(1, original_size))
+            # Adaptive ladders based on how far we need to shrink
+            if target_ratio < 0.4:
+                scale_factors = [1.0, 0.92, 0.9, 0.88, 0.85, 0.82, 0.8, 0.75, 0.7, 0.65]
+                color_steps = [192, 176, 160, 144, 128, 120, 112, 104, 96, 88, 80, 72, 64]
+                lossy_steps = [10, 15, 20, 30, 40, 60, 80, 100]
+                fps_levels = [12, 10, 8]
+            elif target_ratio < 0.6:
+                scale_factors = [1.0, 0.95, 0.92, 0.9, 0.88, 0.85, 0.82, 0.8, 0.75]
+                color_steps = [224, 208, 192, 176, 160, 144, 128, 120, 112, 104, 96]
+                lossy_steps = [5, 10, 15, 20, 30, 40, 60]
+                fps_levels = [15, 12, 10]
+            else:
+                scale_factors = [1.0, 0.98, 0.95, 0.92, 0.9, 0.88, 0.85]
+                color_steps = [256, 240, 224, 208, 192, 176, 160, 144, 128]
+                lossy_steps = [0, 5, 10, 15, 20, 30]
+                fps_levels = [None, 15]
+
+            best_candidate = None  # (bytes, scale, colors, lossy, path)
+
+            # Try fast path: reduce colors first without lossy/scale
+            for colors in color_steps:
+                temp = input_path + f".c{colors}.gif.tmp"
+                if self._run_gifsicle(input_path, temp, colors=colors, lossy=0, scale=1.0):
+                    size = os.path.getsize(temp)
+                    if size <= target_bytes:
+                        best_candidate = (size, 1.0, colors, 0, temp)
+                        break
+                    os.remove(temp)
+
+            # If not found, search grid
+            if best_candidate is None:
+                # Preprocess fps variants once (in parallel), then test combinations in parallel
+                fps_inputs = self._preprocess_fps_variants(input_path, fps_levels)
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                max_workers = max(2, min(8, (os.cpu_count() or 4)))
+                start_time = time.time()
+                runs = 0
+                for fps, pre_input in fps_inputs.items():
+                    # Build candidate set (limit explosion by sampling lossy or colors when large)
+                    candidates = []
+                    for scale in scale_factors:
+                        for colors in color_steps:
+                            for lossy in lossy_steps:
+                                candidates.append((pre_input, scale, colors, lossy))
+                    # In fast mode, sub-sample candidates for speed
+                    if self.fast_mode and len(candidates) > self.gifsicle_max_candidates:
+                        step = max(1, len(candidates) // self.gifsicle_max_candidates)
+                        candidates = candidates[::step][:self.gifsicle_max_candidates]
+                    # Run in parallel
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        future_to_cfg = {}
+                        for (pre_in, scale, colors, lossy) in candidates:
+                            temp = pre_in + f".s{int(scale*100)}_c{colors}_l{lossy}.gif.tmp"
+                            future = executor.submit(self._run_gifsicle, pre_in, temp, colors, lossy, scale)
+                            future_to_cfg[future] = (temp, scale, colors, lossy)
+                        for future in as_completed(future_to_cfg):
+                            ok = False
+                            try:
+                                ok = future.result()
+                            except Exception:
+                                ok = False
+                            temp, scale, colors, lossy = future_to_cfg[future]
+                            runs += 1
+                            # Respect time budget
+                            if time.time() - start_time > self.gifsicle_time_budget_sec:
+                                # Stop processing more futures; break out
+                                ok = ok  # no-op; retain value for current
+                                # Cancel remaining futures
+                                try:
+                                    for f in future_to_cfg:
+                                        if f is not future:
+                                            f.cancel()
+                                except Exception:
+                                    pass
+                                # Evaluate current result then break
+                                pass
+                            if not ok or not os.path.exists(temp):
+                                continue
+                            size = os.path.getsize(temp)
+                            if size <= target_bytes:
+                                cand = (size, scale, colors, lossy, temp)
+                                if best_candidate is None:
+                                    best_candidate = cand
+                                else:
+                                    b_size, b_scale, b_colors, b_lossy, _ = best_candidate
+                                    better = (
+                                        (scale > b_scale)
+                                        or (scale == b_scale and colors > b_colors)
+                                        or (scale == b_scale and colors == b_colors and lossy < b_lossy)
+                                        or (scale == b_scale and colors == b_colors and lossy == b_lossy and size > b_size)
+                                    )
+                                    if better:
+                                        try:
+                                            os.remove(best_candidate[4])
+                                        except Exception:
+                                            pass
+                                        best_candidate = cand
+                            else:
+                                try:
+                                    os.remove(temp)
+                                except Exception:
+                                    pass
+
+            if best_candidate:
+                # Move best candidate to final path
+                shutil.move(best_candidate[4], best_output_path)
+                return True
+
+            # As a last attempt, if even heavy settings cannot reach target but improved size a lot,
+            # accept the smallest file if it is at least 20% smaller than original (quality preference)
+            smallest_path = None
+            smallest_size = None
+            # Iterate remnants with known suffix pattern and pick smallest
+            base_dir = os.path.dirname(input_path) or "."
+            prefix = os.path.basename(input_path) + "."
+            for name in os.listdir(base_dir):
+                if name.startswith(os.path.basename(input_path) + ".") and name.endswith(".gif.tmp"):
+                    p = os.path.join(base_dir, name)
+                    try:
+                        s = os.path.getsize(p)
+                    except Exception:
+                        continue
+                    if smallest_size is None or s < smallest_size:
+                        smallest_size = s
+                        smallest_path = p
+            if smallest_path and smallest_size and smallest_size < original_size * 0.8:
+                shutil.move(smallest_path, best_output_path)
+                return True
+
+            return False
+        finally:
+            # Cleanup any leftover temp files from this search
+            base = os.path.basename(input_path)
+            folder = os.path.dirname(input_path) or "."
+            try:
+                for name in os.listdir(folder):
+                    if name.startswith(base + ".") and name.endswith(".gif.tmp"):
+                        try:
+                            os.remove(os.path.join(folder, name))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+    def _run_gifsicle(self, input_path: str, output_path: str, colors: int, lossy: int, scale: float) -> bool:
+        """Execute gifsicle with given parameters. Returns True on success."""
+        try:
+            cmd = [
+                "gifsicle",
+                f"--optimize={max(1, min(3, int(self.gifsicle_optimize_level)))}",
+                "--careful",
+                "--no-comments",
+                "--no-extensions",
+                "--no-names",
+            ]
+            if scale and abs(scale - 1.0) > 1e-6:
+                # Scale uniformly to preserve aspect ratio
+                cmd.extend(["--scale", f"{scale:.4f}"])
+            if colors and colors < 256:
+                cmd.extend(["--colors", str(max(2, min(256, colors)))])
+            if lossy and lossy > 0:
+                cmd.extend(["--lossy", str(max(1, min(150, int(lossy))) )])
+            cmd.extend([input_path, "--output", output_path])
+            timeout_sec = 45 if self.fast_mode else 120
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+            return result.returncode == 0 and os.path.exists(output_path)
+        except Exception as e:
+            logger.debug(f"gifsicle run failed: {e}")
+            return False
+
+    def _preprocess_gif_fps(self, input_path: str, output_path: str, fps: int) -> bool:
+        """Use ffmpeg to reduce fps and deduplicate frames while preserving aspect ratio."""
+        try:
+            cmd = [
+                'ffmpeg', '-y', '-i', input_path,
+                '-vf', f'mpdecimate=hi=768:lo=512:frac=0.5,fps={fps},scale=iw:ih:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1',
+                '-loop', '0', output_path
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            return result.returncode == 0 and os.path.exists(output_path)
+        except Exception as e:
+            logger.debug(f"fps preprocess failed: {e}")
+            return False
+
+    def _preprocess_fps_variants(self, input_path: str, fps_levels: List[Optional[int]]) -> Dict[Optional[int], str]:
+        """Create fps-reduced variants in parallel. Returns mapping fps->path (original path for None)."""
+        variants: Dict[Optional[int], str] = {}
+        variants[None] = input_path
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        tasks = {}
+        with ThreadPoolExecutor(max_workers=min(4, (os.cpu_count() or 4))) as executor:
+            for fps in fps_levels:
+                if fps is None:
+                    continue
+                out = input_path + f".pre_fps{fps}.gif.tmp"
+                future = executor.submit(self._preprocess_gif_fps, input_path, out, fps)
+                tasks[future] = (fps, out)
+            for future in as_completed(tasks):
+                fps, out = tasks[future]
+                ok = False
+                try:
+                    ok = future.result()
+                except Exception:
+                    ok = False
+                if ok and os.path.exists(out):
+                    variants[fps] = out
+        return variants
+
+    def _validate_gif_basic(self, gif_path: str, max_size_mb: float) -> Tuple[bool, Optional[str]]:
+        """Basic validity and size check for rollback decisions."""
+        try:
+            if not os.path.exists(gif_path):
+                return False, "File does not exist"
+            size_mb = os.path.getsize(gif_path) / (1024 * 1024)
+            if size_mb == 0:
+                return False, "File is empty"
+            if size_mb > max_size_mb:
+                return False, f"File too large: {size_mb:.2f}MB > {max_size_mb:.2f}MB"
+            # Quick animated check
+            with Image.open(gif_path) as img:
+                if not getattr(img, 'is_animated', False):
+                    return False, "Not animated"
+            return True, None
+        except Exception as e:
+            return False, str(e)
+    
+    def _analyze_gif_characteristics(self, gif_path: str) -> Dict[str, Any]:
+        """Analyze GIF characteristics to determine optimal optimization strategy"""
+        
+        analysis = {
+            'frame_count': 0,
+            'width': 0,
+            'height': 0,
+            'color_count': 0,
+            'file_size_mb': 0,
+            'complexity_score': 0,
+            'motion_score': 0,
+            'color_richness': 0,
+            'optimization_potential': 0
+        }
+        
+        try:
+            # Get basic file info
+            file_size = os.path.getsize(gif_path)
+            analysis['file_size_mb'] = file_size / (1024 * 1024)
             
-            for strategy in ffmpeg_strategies:
-                logger.info(f"Trying {strategy['name']}")
+            # Analyze GIF using PIL
+            with Image.open(gif_path) as img:
+                analysis['width'], analysis['height'] = img.size
                 
-                # Generate palette
-                palette_result = subprocess.run(strategy['cmd'], capture_output=True, text=True, timeout=60)
+                # Count frames
+                frames = []
+                try:
+                    for frame in ImageSequence.Iterator(img):
+                        frames.append(frame)
+                except Exception:
+                    # If we can't iterate frames, assume it's a single frame
+                    frames = [img]
                 
-                if palette_result.returncode == 0 and os.path.exists(temp_output + '.palette'):
-                    # Create optimized GIF
-                    gif_result = subprocess.run(strategy['gif_cmd'], capture_output=True, text=True, timeout=120)
-                    
+                analysis['frame_count'] = len(frames)
+                
+                # Analyze color usage
+                all_colors = set()
+                for frame in frames[:min(10, len(frames))]:  # Sample first 10 frames
+                    frame_colors = frame.getcolors()
+                    if frame_colors:
+                        all_colors.update([color for count, color in frame_colors])
+                
+                analysis['color_count'] = len(all_colors)
+                
+                # Calculate complexity score
+                pixel_count = analysis['width'] * analysis['height'] * analysis['frame_count']
+                analysis['complexity_score'] = min(10.0, (pixel_count * analysis['color_count']) / 1000000)
+                
+                # Calculate motion score (simplified)
+                if len(frames) > 1:
+                    # Compare first and last frame for motion estimation
+                    first_frame = np.array(frames[0])
+                    last_frame = np.array(frames[-1])
+                    diff = np.mean(np.abs(first_frame.astype(float) - last_frame.astype(float)))
+                    analysis['motion_score'] = min(1.0, diff / 255.0)
+                
+                # Calculate color richness
+                analysis['color_richness'] = min(1.0, analysis['color_count'] / 256.0)
+                
+                # Calculate optimization potential
+                size_factor = analysis['file_size_mb'] / 10.0  # Normalize to 10MB
+                complexity_factor = analysis['complexity_score'] / 10.0
+                analysis['optimization_potential'] = min(1.0, (size_factor + complexity_factor) / 2.0)
+            
+        except Exception as e:
+            logger.warning(f"GIF analysis failed: {e}")
+            # Set safe defaults
+            analysis.update({
+                'frame_count': 30,
+                'width': 480,
+                'height': 360,
+                'color_count': 128,
+                'complexity_score': 5.0,
+                'motion_score': 0.5,
+                'color_richness': 0.5,
+                'optimization_potential': 0.5
+            })
+        
+        return analysis
+    
+    def _get_quality_focused_strategies(self, gif_analysis: Dict[str, Any], max_size_mb: float) -> List[Dict[str, Any]]:
+        """Generate quality-focused optimization strategies based on GIF analysis"""
+        
+        strategies = []
+        
+        # Strategy 1: Intelligent resolution downscaling (primary strategy for large GIFs)
+        if gif_analysis['width'] > 400 or gif_analysis['height'] > 400:
+            # Calculate optimal scale factor based on current size and target
+            current_pixels = gif_analysis['width'] * gif_analysis['height']
+            target_pixels = current_pixels * 0.7  # Aim for 30% size reduction through resolution
+            scale_factor = min(0.9, max(0.6, (target_pixels / current_pixels) ** 0.5))
+            
+            new_width = int(gif_analysis['width'] * scale_factor)
+            new_height = int(gif_analysis['height'] * scale_factor)
+            
+            strategies.append({
+                'name': f'Intelligent resolution downscaling ({new_width}x{new_height})',
+                'method': 'ffmpeg_resize',
+                'params': {
+                    'width': new_width,
+                    'height': new_height,
+                    'colors': max(128, min(256, gif_analysis['color_count'])),
+                    'dither': 'floyd_steinberg',
+                    'fps': max(10, min(15, int(30 / (gif_analysis['frame_count'] / 15)))),
+                    'scale_factor': scale_factor
+                },
+                'min_quality': 0.75
+            })
+        
+        # Strategy 2: Conservative optimization with slight downscaling
+        if gif_analysis['width'] > 300 or gif_analysis['height'] > 300:
+            scale_factor = 0.85  # 15% downscaling
+            new_width = int(gif_analysis['width'] * scale_factor)
+            new_height = int(gif_analysis['height'] * scale_factor)
+            
+            strategies.append({
+                'name': f'Conservative downscaling ({new_width}x{new_height})',
+                'method': 'ffmpeg_resize',
+                'params': {
+                    'width': new_width,
+                    'height': new_height,
+                    'colors': max(128, min(256, gif_analysis['color_count'])),
+                    'dither': 'floyd_steinberg',
+                    'fps': max(12, min(18, int(30 / (gif_analysis['frame_count'] / 20)))),
+                    'scale_factor': scale_factor
+                },
+                'min_quality': 0.8
+            })
+        
+        # Strategy 3: Smart color reduction with resolution optimization
+        target_colors = max(96, min(192, int(gif_analysis['color_count'] * 0.8)))
+        if gif_analysis['width'] > 250 or gif_analysis['height'] > 250:
+            scale_factor = 0.75  # 25% downscaling
+            new_width = int(gif_analysis['width'] * scale_factor)
+            new_height = int(gif_analysis['height'] * scale_factor)
+            
+            strategies.append({
+                'name': f'Smart color reduction with downscaling ({new_width}x{new_height}, {target_colors} colors)',
+                'method': 'ffmpeg_resize',
+                'params': {
+                    'width': new_width,
+                    'height': new_height,
+                    'colors': target_colors,
+                    'dither': 'floyd_steinberg',
+                    'fps': max(10, min(15, int(30 / (gif_analysis['frame_count'] / 15)))),
+                    'scale_factor': scale_factor
+                },
+                'min_quality': 0.7
+            })
+        
+        # Strategy 4: Balanced optimization (moderate quality/size trade-off)
+        strategies.append({
+            'name': 'Balanced optimization',
+            'method': 'gifsicle',
+            'params': {
+                'optimize': 3,
+                'colors': max(64, min(128, int(gif_analysis['color_count'] * 0.6))),
+                'lossy': 20,  # Very light lossy compression
+                'dither': 'bayer'
+            },
+            'min_quality': 0.6
+        })
+        
+        # Strategy 5: Adaptive optimization with resolution scaling
+        if gif_analysis['optimization_potential'] > 0.7:
+            scale_factor = max(0.5, min(0.8, 1.0 - gif_analysis['optimization_potential']))
+            new_width = int(gif_analysis['width'] * scale_factor)
+            new_height = int(gif_analysis['height'] * scale_factor)
+            
+            strategies.append({
+                'name': f'Adaptive optimization with scaling ({new_width}x{new_height})',
+                'method': 'ffmpeg_adaptive',
+                'params': {
+                    'colors': max(64, min(192, int(gif_analysis['color_count'] * 0.7))),
+                    'scale_factor': scale_factor,
+                    'width': new_width,
+                    'height': new_height,
+                    'fps': max(8, min(12, int(15 / (gif_analysis['frame_count'] / 25)))),
+                    'dither': 'floyd_steinberg'
+                },
+                'min_quality': 0.55
+            })
+        
+        return strategies
+    
+    def _get_quality_improvement_strategies(self, gif_analysis: Dict[str, Any], current_size_mb: float) -> List[Dict[str, Any]]:
+        """Generate quality improvement strategies for GIFs already under size limit"""
+        
+        strategies = []
+        
+        # Strategy 1: Size-preserving optimization (maintain current size, improve quality)
+        strategies.append({
+            'name': 'Size-preserving optimization',
+            'method': 'gifsicle',
+            'params': {
+                'optimize': 3,
+                'colors': gif_analysis['color_count'],  # Keep same color count
+                'lossy': 0,
+                'dither': 'floyd_steinberg'
+            },
+            'min_quality': 0.8,
+            'max_size_increase': 0.0  # No size increase allowed
+        })
+        
+        # Strategy 2: Gentle resolution downscaling (reduce size while maintaining quality)
+        if gif_analysis['width'] > 400 or gif_analysis['height'] > 400:
+            scale_factor = 0.85  # 15% downscaling
+            new_width = int(gif_analysis['width'] * scale_factor)
+            new_height = int(gif_analysis['height'] * scale_factor)
+            
+            strategies.append({
+                'name': f'Gentle resolution downscaling ({new_width}x{new_height})',
+                'method': 'ffmpeg_resize',
+                'params': {
+                    'width': new_width,
+                    'height': new_height,
+                    'colors': gif_analysis['color_count'],  # Keep same color count
+                    'dither': 'floyd_steinberg',
+                    'fps': max(12, min(18, int(30 / (gif_analysis['frame_count'] / 20)))),
+                    'scale_factor': scale_factor
+                },
+                'min_quality': 0.75,
+                'max_size_increase': -0.5  # Must reduce size by at least 0.5MB
+            })
+        
+        # Strategy 3: Conservative color optimization (slight color reduction for better compression)
+        if gif_analysis['color_count'] > 128:
+            target_colors = max(96, int(gif_analysis['color_count'] * 0.9))  # 10% color reduction
+            
+            strategies.append({
+                'name': f'Conservative color optimization ({target_colors} colors)',
+                'method': 'gifsicle',
+                'params': {
+                    'optimize': 3,
+                    'colors': target_colors,
+                    'lossy': 0,
+                    'dither': 'floyd_steinberg'
+                },
+                'min_quality': 0.7,
+                'max_size_increase': -0.2  # Must reduce size by at least 0.2MB
+            })
+        
+        # Strategy 4: Frame rate optimization (for high frame count GIFs)
+        if gif_analysis['frame_count'] > 25:
+            target_fps = max(10, min(15, int(30 / (gif_analysis['frame_count'] / 20))))
+            
+            strategies.append({
+                'name': f'Frame rate optimization ({target_fps} fps)',
+                'method': 'ffmpeg_smart',
+                'params': {
+                    'fps': target_fps,
+                    'colors': gif_analysis['color_count'],
+                    'dither': 'floyd_steinberg'
+                },
+                'min_quality': 0.65,
+                'max_size_increase': -0.3  # Must reduce size by at least 0.3MB
+            })
+        
+        # Strategy 5: Minimal optimization (just re-encode for better compression)
+        strategies.append({
+            'name': 'Minimal re-optimization',
+            'method': 'gifsicle',
+            'params': {
+                'optimize': 3,
+                'colors': gif_analysis['color_count'],
+                'lossy': 0,
+                'dither': 'bayer'
+            },
+            'min_quality': 0.6,
+            'max_size_increase': 0.0  # No size increase allowed
+        })
+        
+        return strategies
+    
+    def _apply_optimization_strategy(self, input_path: str, output_path: str, strategy: Dict[str, Any]) -> bool:
+        """Apply a specific optimization strategy"""
+        
+        try:
+            if strategy['method'] == 'gifsicle':
+                return self._apply_gifsicle_strategy(input_path, output_path, strategy['params'])
+            elif strategy['method'] == 'ffmpeg_smart':
+                return self._apply_ffmpeg_smart_strategy(input_path, output_path, strategy['params'])
+            elif strategy['method'] == 'ffmpeg_resize':
+                return self._apply_ffmpeg_resize_strategy(input_path, output_path, strategy['params'])
+            elif strategy['method'] == 'ffmpeg_adaptive':
+                return self._apply_ffmpeg_adaptive_strategy(input_path, output_path, strategy['params'])
+            elif strategy['method'] == 'ffmpeg_upscale':
+                return self._apply_ffmpeg_upscale_strategy(input_path, output_path, strategy['params'])
+            else:
+                logger.warning(f"Unknown optimization method: {strategy['method']}")
+                return False
+                
+        except Exception as e:
+            logger.warning(f"Strategy application failed: {e}")
+            return False
+    
+    def _apply_gifsicle_strategy(self, input_path: str, output_path: str, params: Dict[str, Any]) -> bool:
+        """Apply gifsicle-based optimization strategy"""
+        
+        cmd = ['gifsicle', '--optimize=3']
+        
+        # Add color reduction if specified
+        if 'colors' in params:
+            cmd.extend(['--colors', str(params['colors'])])
+        
+        # Add lossy compression if specified
+        if 'lossy' in params and params['lossy'] > 0:
+            cmd.extend(['--lossy', str(params['lossy'])])
+        
+        # Add output file
+        cmd.extend(['--output', output_path, input_path])
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        return result.returncode == 0
+    
+    def _apply_ffmpeg_smart_strategy(self, input_path: str, output_path: str, params: Dict[str, Any]) -> bool:
+        """Apply smart FFmpeg-based optimization strategy"""
+        
+        # Generate palette first
+        palette_path = output_path + '.palette.png'
+        palette_cmd = [
+            'ffmpeg', '-i', input_path,
+            '-vf', f'fps={params["fps"]},palettegen=max_colors={params["colors"]}:stats_mode=diff',
+            '-frames:v', '1', '-y', palette_path
+        ]
+        
+        palette_result = subprocess.run(palette_cmd, capture_output=True, text=True, timeout=60)
+        if palette_result.returncode != 0:
+            return False
+        
+        # Create optimized GIF using palette
+        gif_cmd = [
+            'ffmpeg', '-i', input_path, '-i', palette_path,
+            '-lavfi', f'fps={params["fps"]},paletteuse=dither={params["dither"]}:diff_mode=rectangle',
+            '-loop', '0', '-y', output_path
+        ]
+        
+        gif_result = subprocess.run(gif_cmd, capture_output=True, text=True, timeout=120)
+        
+        # Clean up palette file
+        if os.path.exists(palette_path):
+            os.remove(palette_path)
+        
+        return gif_result.returncode == 0
+    
+    def _apply_ffmpeg_resize_strategy(self, input_path: str, output_path: str, params: Dict[str, Any]) -> bool:
+        """Apply FFmpeg-based resize optimization strategy"""
+        
+        # Generate palette first
+        palette_path = output_path + '.palette.png'
+        palette_cmd = [
+            'ffmpeg', '-i', input_path,
+            '-vf', f'scale={params["width"]}:{params["height"]}:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1,fps={params["fps"]},palettegen=max_colors={params["colors"]}:stats_mode=diff',
+            '-frames:v', '1', '-y', palette_path
+        ]
+        
+        palette_result = subprocess.run(palette_cmd, capture_output=True, text=True, timeout=60)
+        if palette_result.returncode != 0:
+            return False
+        
+        # Create optimized GIF using palette
+        gif_cmd = [
+            'ffmpeg', '-i', input_path, '-i', palette_path,
+            '-lavfi', f'scale={params["width"]}:{params["height"]}:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1,fps={params["fps"]},paletteuse=dither={params["dither"]}:diff_mode=rectangle',
+            '-loop', '0', '-y', output_path
+        ]
+        
+        gif_result = subprocess.run(gif_cmd, capture_output=True, text=True, timeout=120)
+        
+        # Clean up palette file
+        if os.path.exists(palette_path):
+            os.remove(palette_path)
+        
+        return gif_result.returncode == 0
+    
+    def _apply_ffmpeg_adaptive_strategy(self, input_path: str, output_path: str, params: Dict[str, Any]) -> bool:
+        """Apply adaptive FFmpeg-based optimization strategy"""
+        
+        # Calculate adaptive parameters
+        scale_width = int(params.get('width', 480) * params['scale_factor'])
+        scale_height = int(params.get('height', 360) * params['scale_factor'])
+        
+        # Generate palette first
+        palette_path = output_path + '.palette.png'
+        palette_cmd = [
+            'ffmpeg', '-i', input_path,
+            '-vf', f'scale={scale_width}:{scale_height}:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1,fps={params["fps"]},palettegen=max_colors={params["colors"]}:stats_mode=diff',
+            '-frames:v', '1', '-y', palette_path
+        ]
+        
+        palette_result = subprocess.run(palette_cmd, capture_output=True, text=True, timeout=60)
+        if palette_result.returncode != 0:
+            return False
+        
+        # Create optimized GIF using palette
+        gif_cmd = [
+            'ffmpeg', '-i', input_path, '-i', palette_path,
+            '-lavfi', f'scale={scale_width}:{scale_height}:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1,fps={params["fps"]},paletteuse=dither={params["dither"]}:diff_mode=rectangle',
+            '-loop', '0', '-y', output_path
+        ]
+        
+        gif_result = subprocess.run(gif_cmd, capture_output=True, text=True, timeout=120)
+        
+        # Clean up palette file
+        if os.path.exists(palette_path):
+            os.remove(palette_path)
+        
+        return gif_result.returncode == 0
+    
+    def _apply_ffmpeg_upscale_strategy(self, input_path: str, output_path: str, params: Dict[str, Any]) -> bool:
+        """Apply FFmpeg-based upscaling optimization strategy"""
+        
+        # Calculate new dimensions based on scale factor
+        scale_factor = params['scale_factor']
+        new_width = int(params.get('width', 480) * scale_factor)
+        new_height = int(params.get('height', 360) * scale_factor)
+        
+        # Generate palette first
+        palette_path = output_path + '.palette.png'
+        palette_cmd = [
+            'ffmpeg', '-i', input_path,
+            '-vf', f'scale={new_width}:{new_height}:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1,fps={params["fps"]},palettegen=max_colors={params["colors"]}:stats_mode=diff',
+            '-frames:v', '1', '-y', palette_path
+        ]
+        
+        palette_result = subprocess.run(palette_cmd, capture_output=True, text=True, timeout=60)
+        if palette_result.returncode != 0:
+            return False
+        
+        # Create upscaled GIF using palette
+        gif_cmd = [
+            'ffmpeg', '-i', input_path, '-i', palette_path,
+            '-lavfi', f'scale={new_width}:{new_height}:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1,fps={params["fps"]},paletteuse=dither={params["dither"]}:diff_mode=rectangle',
+            '-loop', '0', '-y', output_path
+        ]
+        
+        gif_result = subprocess.run(gif_cmd, capture_output=True, text=True, timeout=120)
+        
+        # Clean up palette file
+        if os.path.exists(palette_path):
+            os.remove(palette_path)
+        
+        return gif_result.returncode == 0
+    
+    def _evaluate_gif_quality(self, gif_path: str, original_analysis: Dict[str, Any]) -> float:
+        """Evaluate the quality of an optimized GIF"""
+        
+        try:
+            with Image.open(gif_path) as img:
+                # Get basic info
+                width, height = img.size
+                
+                # Count frames
+                frames = []
+                try:
+                    for frame in ImageSequence.Iterator(img):
+                        frames.append(frame)
+                except Exception:
+                    frames = [img]
+                
+                frame_count = len(frames)
+                
+                # Calculate quality factors
+                resolution_score = min(1.0, (width * height) / (original_analysis['width'] * original_analysis['height']))
+                frame_score = min(1.0, frame_count / original_analysis['frame_count'])
+                
+                # Analyze color usage
+                all_colors = set()
+                for frame in frames[:min(5, len(frames))]:  # Sample first 5 frames
+                    frame_colors = frame.getcolors()
+                    if frame_colors:
+                        all_colors.update([color for count, color in frame_colors])
+                
+                color_score = min(1.0, len(all_colors) / max(1, original_analysis['color_count']))
+                
+                # Calculate overall quality score
+                quality_score = (resolution_score * 0.4 + frame_score * 0.3 + color_score * 0.3)
+                
+                return max(0.0, min(1.0, quality_score))
+                
+        except Exception as e:
+            logger.warning(f"Quality evaluation failed: {e}")
+            return 0.5  # Default to medium quality if evaluation fails
+    
+    def _try_intelligent_reencoding(self, gif_path: str, max_size_mb: float, original_size: float, 
+                                  gif_analysis: Dict[str, Any]) -> bool:
+        """Try intelligent re-encoding as last resort with quality preservation"""
+        
+        try:
+            temp_output = gif_path + '.intelligent.tmp'
+            
+            # Calculate optimal parameters for size constraint
+            target_ratio = max_size_mb / original_size
+            
+            # Determine optimal color count based on target ratio
+            if target_ratio >= 0.8:
+                colors = max(128, min(256, gif_analysis['color_count']))
+            elif target_ratio >= 0.6:
+                colors = max(96, min(192, int(gif_analysis['color_count'] * 0.8)))
+            elif target_ratio >= 0.4:
+                colors = max(64, min(128, int(gif_analysis['color_count'] * 0.6)))
+            else:
+                colors = max(32, min(96, int(gif_analysis['color_count'] * 0.4)))
+            
+            # Determine optimal FPS
+            if gif_analysis['frame_count'] > 30:
+                fps = max(8, min(12, int(15 / (gif_analysis['frame_count'] / 25))))
+            else:
+                fps = max(10, min(15, int(30 / max(1, gif_analysis['frame_count']))))
+            
+            # Determine optimal resolution
+            if target_ratio >= 0.7:
+                scale_width = gif_analysis['width']
+                scale_height = gif_analysis['height']
+            elif target_ratio >= 0.5:
+                scale_width = int(gif_analysis['width'] * 0.8)
+                scale_height = int(gif_analysis['height'] * 0.8)
+            else:
+                scale_width = int(gif_analysis['width'] * 0.6)
+                scale_height = int(gif_analysis['height'] * 0.6)
+            
+            # Multi-tier attempts with progressively stronger settings
+            tiers = [
+                { 'scale': 0.85, 'fps': max(10, fps - 2), 'colors': max(96, colors), 'dither': 'floyd_steinberg' },
+                { 'scale': 0.75, 'fps': max(8, fps - 4),  'colors': max(80, min(128, colors)), 'dither': 'bayer' },
+                { 'scale': 0.60, 'fps': 8,                 'colors': max(64, min(96, colors)),  'dither': 'bayer' },
+                { 'scale': 0.50, 'fps': 6,                 'colors': max(48, min(80, colors)),  'dither': 'none' },
+            ]
+
+            for t in tiers:
+                try:
+                    sw = max(2, int(gif_analysis['width'] * t['scale']))
+                    sh = max(2, int(gif_analysis['height'] * t['scale']))
+                    # Round to even numbers
+                    sw = sw // 2 * 2
+                    sh = sh // 2 * 2
+
+                    palette_path = temp_output + f".palette_{sw}x{sh}_{t['fps']}_{t['colors']}.png"
+                    palette_cmd = [
+                        'ffmpeg', '-y', '-i', gif_path,
+                        '-vf', f'mpdecimate=hi=768:lo=512:frac=0.5,fps={t["fps"]},scale={sw}:{sh}:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1,palettegen=max_colors={t["colors"]}:stats_mode=diff',
+                        '-frames:v', '1', palette_path
+                    ]
+                    palette_result = subprocess.run(palette_cmd, capture_output=True, text=True, timeout=90)
+                    if palette_result.returncode != 0 or not os.path.exists(palette_path):
+                        continue
+
+                    gif_cmd = [
+                        'ffmpeg', '-y', '-i', gif_path, '-i', palette_path,
+                        '-lavfi', f'mpdecimate=hi=768:lo=512:frac=0.5,fps={t["fps"]},scale={sw}:{sh}:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1[p];[p][1:v]paletteuse=dither={t["dither"]}:diff_mode=rectangle',
+                        '-loop', '0', temp_output
+                    ]
+                    gif_result = subprocess.run(gif_cmd, capture_output=True, text=True, timeout=180)
+                    try:
+                        if os.path.exists(palette_path):
+                            os.remove(palette_path)
+                    except Exception:
+                        pass
+
                     if gif_result.returncode == 0 and os.path.exists(temp_output):
                         optimized_size = os.path.getsize(temp_output) / (1024 * 1024)
-                        
                         if optimized_size <= max_size_mb:
-                            # Replace original with optimized version
                             os.replace(temp_output, gif_path)
-                            logger.info(f"GIF optimized successfully with {strategy['name']}: {original_size:.2f}MB -> {optimized_size:.2f}MB")
-                            
-                            # Clean up palette file
-                            if os.path.exists(temp_output + '.palette'):
-                                os.remove(temp_output + '.palette')
+                            logger.info(
+                                f"GIF optimized with ffmpeg fallback tier: {optimized_size:.2f}MB (scale {t['scale']}, fps {t['fps']}, colors {t['colors']}, dither {t['dither']})"
+                            )
                             return True
                         else:
-                            logger.info(f"{strategy['name']} insufficient: {optimized_size:.2f}MB > {max_size_mb:.2f}MB")
-                            os.remove(temp_output)
-                    else:
-                        logger.warning(f"{strategy['name']} failed: {gif_result.stderr}")
+                            logger.info(
+                                f"Tier insufficient ({optimized_size:.2f}MB). Trying next tier..."
+                            )
+                            try:
+                                os.remove(temp_output)
+                            except Exception:
+                                pass
+                except Exception:
+                    # Try next tier on any error
+                    try:
                         if os.path.exists(temp_output):
                             os.remove(temp_output)
-                
-                # Clean up palette file
-                if os.path.exists(temp_output + '.palette'):
-                    os.remove(temp_output + '.palette')
-            
-            logger.warning(f"All optimization strategies failed. Could not reduce GIF below {max_size_mb:.2f}MB")
+                    except Exception:
+                        pass
+
+            logger.warning(
+                f"Intelligent re-encoding failed. Could not reduce GIF below {max_size_mb:.2f}MB"
+            )
             return False
             
         except Exception as e:
-            logger.error(f"Error in FFmpeg re-encoding: {e}")
+            logger.error(f"Error in intelligent re-encoding: {e}")
             return False
     
     def optimize_gif_with_quality_target(self, input_video: str, output_path: str, 
@@ -247,6 +1267,7 @@ class AdvancedGifOptimizer:
         
         # Initialize optimization parameters
         optimization_params = self._initialize_optimization_params(max_size_mb, quality_preference)
+        optimization_params['target_size_mb'] = max_size_mb
         
         # Perform initial frame analysis
         frame_analysis = self._perform_intelligent_frame_analysis(input_video, start_time, duration)
@@ -258,10 +1279,10 @@ class AdvancedGifOptimizer:
         best_result = None
         best_quality_score = 0
         iteration = 0
-        max_iterations = 15  # Prevent infinite loops
+        max_iterations = 20  # Allow more steps to hone in on target
         
         # Binary search parameters for fine-tuning
-        size_tolerance = 0.05  # 5% tolerance for target size
+        size_tolerance = 0.02  # 2% tolerance for target size
         quality_improvement_threshold = 0.1  # Minimum quality improvement to continue
         
         while iteration < max_iterations:
@@ -306,10 +1327,14 @@ class AdvancedGifOptimizer:
                         optimization_params, current_size_mb, max_size_mb, quality_preference
                     )
                 else:
-                    # We're over the limit - reduce quality
-                    optimization_params = self._decrease_quality_params(
-                        optimization_params, current_size_mb, max_size_mb, quality_preference
-                    )
+                    # We're over the limit - reduce quality, and try a micro-trim when close
+                    over_by = current_size_mb - max_size_mb
+                    if over_by <= max_size_mb * 0.02:  # within 2%
+                        optimization_params = self._micro_trim_params(optimization_params)
+                    else:
+                        optimization_params = self._decrease_quality_params(
+                            optimization_params, current_size_mb, max_size_mb, quality_preference
+                        )
                 
                 # Check for convergence
                 if best_result and iteration > 5:
@@ -1009,6 +2034,7 @@ class AdvancedGifOptimizer:
         logger.info(f"Evaluating {len(candidates)} GIF candidates in parallel...")
         
         successful_results = []
+        early_pick = None
         
         # Use thread pool for parallel processing
         with ThreadPoolExecutor(max_workers=min(len(candidates), 3)) as executor:
@@ -1025,12 +2051,30 @@ class AdvancedGifOptimizer:
                 try:
                     result = future.result(timeout=180)  # 3 minute timeout per candidate
                     if result and result.get('success', False):
+                        # Early-stop check
+                        if self._good_enough_result(result, max_size_mb):
+                            early_pick = result
+                            # Cancel remaining futures
+                            for f in future_to_candidate.keys():
+                                if f is not future:
+                                    f.cancel()
+                            break
                         successful_results.append(result)
                         logger.info(f"GIF candidate '{candidate['name']}' completed: "
                                   f"{result['size_mb']:.2f}MB, quality: {result['quality_score']:.1f}")
                 except Exception as e:
                     logger.warning(f"GIF candidate '{candidate['name']}' failed: {e}")
         
+        if early_pick:
+            shutil.move(early_pick['temp_file'], output_path)
+            for result in successful_results:
+                if result != early_pick and os.path.exists(result['temp_file']):
+                    os.remove(result['temp_file'])
+            early_pick['output_file'] = output_path
+            logger.info(f"Early-stopped with candidate: '{early_pick['candidate_name']}' "
+                        f"({early_pick['size_mb']:.2f}MB, quality: {early_pick['quality_score']:.1f})")
+            return early_pick
+
         if not successful_results:
             raise RuntimeError("All GIF optimization candidates failed")
         
@@ -1063,6 +2107,24 @@ class AdvancedGifOptimizer:
             logger.warning(f"Could not log detailed GIF specifications: {e}")
         
         return best_result
+
+    def _good_enough_result(self, result: Dict[str, Any], max_size_mb: float) -> bool:
+        """Determine if a candidate is good enough to stop early based on config."""
+        try:
+            if not self.early_stop_cfg.get('enabled', True):
+                return False
+            size_mb = float(result.get('size_mb', 0))
+            qs = float(result.get('quality_score', 0))
+            if size_mb <= 0 or qs <= 0:
+                return False
+            if size_mb > max_size_mb:
+                return False
+            min_util = float(self.early_stop_cfg.get('min_target_utilization', 0.92))
+            min_q = float(self.early_stop_cfg.get('min_quality_score', 7.5))
+            utilized = size_mb >= (max_size_mb * min_util)
+            return utilized and qs >= min_q
+        except Exception:
+            return False
     
     def _create_gif_candidate(self, candidate: Dict[str, Any], max_size_mb: float) -> Optional[Dict[str, Any]]:
         """
@@ -1317,6 +2379,7 @@ class AdvancedGifOptimizer:
                                    optimized_frames: Dict[str, Any], start_time: float, duration: float):
         """Create GIF using FFmpeg with optimized parameters"""
         
+        from .ffmpeg_utils import FFmpegUtils
         if palette_file and os.path.exists(palette_file):
             # Use custom palette
             cmd = [
@@ -1325,7 +2388,7 @@ class AdvancedGifOptimizer:
                 '-t', str(duration),
                 '-i', input_video,
                 '-i', palette_file,
-                '-lavfi', f'fps={params["fps"]},scale={params["width"]}:{params["height"]}:flags=lanczos[x];[x][1:v]paletteuse=dither={params["dither"]}:diff_mode=rectangle',
+                '-lavfi', f'fps={params["fps"]},scale={params["width"]}:{params["height"]}:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1[x];[x][1:v]paletteuse=dither={params["dither"]}:diff_mode=rectangle',
                 '-loop', '0',
                 output_gif
             ]
@@ -1336,11 +2399,13 @@ class AdvancedGifOptimizer:
                 '-ss', str(start_time),
                 '-t', str(duration),
                 '-i', input_video,
-                '-vf', f'fps={params["fps"]},scale={params["width"]}:{params["height"]}:flags=lanczos,palettegen=max_colors={params["colors"]}:stats_mode=diff,paletteuse=dither={params["dither"]}',
+                '-vf', f'fps={params["fps"]},scale={params["width"]}:{params["height"]}:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1,palettegen=max_colors={params["colors"]}:stats_mode=diff,paletteuse=dither={params["dither"]}',
                 '-loop', '0',
                 output_gif
             ]
-        
+        # Add performance flags
+        FFmpegUtils.add_ffmpeg_perf_flags(cmd)
+
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         
         if result.returncode != 0:
@@ -1476,6 +2541,26 @@ class AdvancedGifOptimizer:
         elif reduction_factor > 0.5 and new_params['dither'] == 'bayer':
             new_params['dither'] = 'none'
         
+        return new_params
+
+    def _micro_trim_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply tiny reductions to try to shave ~0.1-0.2MB without big quality loss."""
+        new_params = params.copy()
+        # Slightly reduce colors
+        if new_params['colors'] > 96:
+            new_params['colors'] = max(96, new_params['colors'] - 8)
+        # Prefer bayer dithering for better compressibility
+        if new_params.get('dither') == 'floyd_steinberg':
+            new_params['dither'] = 'bayer'
+        # Slight FPS nudge
+        if new_params['fps'] > 8:
+            new_params['fps'] = max(8, new_params['fps'] - 1)
+        # Tiny downscale
+        if new_params['width'] > 200 and new_params['height'] > 200:
+            new_params['width'] = max(200, new_params['width'] - 8)
+            new_params['height'] = max(200, new_params['height'] - 8)
+        # Slight lossy bump
+        new_params['lossy'] = min(150, new_params.get('lossy', 0) + 5)
         return new_params
     
     def _adjust_params_for_failure(self, params: Dict[str, Any]) -> Dict[str, Any]:
