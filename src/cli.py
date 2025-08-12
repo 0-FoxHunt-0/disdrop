@@ -38,9 +38,10 @@ class VideoCompressorCLI:
             # Parse arguments first to get log level
             args = self._parse_arguments()
             
-            # Setup logging
+            # Setup logging (quiet console by default; enable verbose console when --debug)
             global logger
-            logger = setup_logging(log_level=args.log_level)
+            effective_level = 'DEBUG' if getattr(args, 'debug', False) else args.log_level
+            logger = setup_logging(log_level=effective_level)
 
             # Clear failures directory at startup to avoid mix-ups/clutter
             self._clear_failures_directory()
@@ -141,8 +142,11 @@ class VideoCompressorCLI:
         # Global options
         parser.add_argument('--config-dir', default='config',
                           help='Configuration directory (default: config)')
+        # Default to quieter console; use --debug to enable verbose output
         parser.add_argument('--log-level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
-                          default='INFO', help='Logging level (default: INFO)')
+                          default=None, help='Override logging level (default: WARNING to console, DEBUG to file)')
+        parser.add_argument('--debug', action='store_true',
+                          help='Enable verbose debug output in console and logs')
         parser.add_argument('--temp-dir', help='Temporary directory for processing')
         parser.add_argument('--max-size', type=float, metavar='MB',
                           help='Maximum output file size in MB (overrides platform defaults)')
@@ -280,6 +284,16 @@ class VideoCompressorCLI:
         try:
             # Load configuration
             self.config = ConfigManager(args.config_dir)
+            # Apply CLI overrides to configuration
+            try:
+                overrides = self._extract_config_overrides(args)
+                if overrides:
+                    self.config.update_from_args(overrides)
+                    if logger:
+                        logger.debug(f"Applied CLI config overrides: {overrides}")
+            except Exception as e:
+                if logger:
+                    logger.warning(f"Failed to apply CLI config overrides: {e}")
             
             # Initialize hardware detector
             self.hardware = HardwareDetector()
@@ -526,9 +540,11 @@ class VideoCompressorCLI:
                     raise Exception(f"Segmentation failed: {results.get('error', 'Unknown error')}")
             
             # Display results based on method used
-            if results.get('method') == 'Video Segmentation':
+            # Normalize segmentation method values across modules
+            method = results.get('method')
+            if method in ('Video Segmentation', 'segmentation'):
                 self._display_segmentation_results(results)
-            elif results.get('method') == 'Single Segment Conversion':
+            elif method in ('Single Segment Conversion', 'single'):
                 self._display_single_segment_conversion_results(results)
             else:
                 self._display_quality_gif_results(results)
@@ -1180,22 +1196,26 @@ class VideoCompressorCLI:
         """Handle automated workflow command"""
         logger.info("Starting automated workflow...")
         
-        print("\n" + "="*60)
-        print("AUTOMATED VIDEO PROCESSING WORKFLOW")
-        print("="*60)
-        print(f"Input directory:    {os.path.abspath('input')}")
-        print(f"Output directory:   {os.path.abspath('output')}")
-        print(f"Temp directory:     {os.path.abspath('temp')}")
-        print(f"Check interval:     {args.check_interval} seconds")
-        print(f"Max file size:      {args.max_size} MB")
-        print("="*60)
-        print("\nPlace video files in the 'input' directory to process them automatically.")
-        print("Press Ctrl+C to stop the workflow gracefully.\n")
+        if getattr(args, 'debug', False):
+            print("\n" + "="*60)
+            print("AUTOMATED VIDEO PROCESSING WORKFLOW")
+            print("="*60)
+            print(f"Input directory:    {os.path.abspath('input')}")
+            print(f"Output directory:   {os.path.abspath('output')}")
+            print(f"Temp directory:     {os.path.abspath('temp')}")
+            print(f"Check interval:     {args.check_interval} seconds")
+            print(f"Max file size:      {args.max_size} MB")
+            print("="*60)
+            print("\nPlace video files in the 'input' directory to process them automatically.")
+            print("Press Ctrl+C to stop the workflow gracefully.\n")
+        else:
+            print(f"Watching '{os.path.abspath('input')}' → '{os.path.abspath('output')}' every {args.check_interval}s (max {args.max_size}MB). Ctrl+C to stop.")
         
         try:
             self.automated_workflow.run_automated_workflow(
                 check_interval=args.check_interval,
-                max_size_mb=args.max_size
+                max_size_mb=args.max_size,
+                verbose=getattr(args, 'debug', False)
             )
         except KeyboardInterrupt:
             logger.info("Automated workflow stopped by user")

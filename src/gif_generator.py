@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import shutil
 from typing import Dict, Any, Optional, Tuple, List
+import math
 import logging
 from pathlib import Path
 from PIL import Image, ImageSequence
@@ -339,15 +340,13 @@ class GifGenerator:
                 logger.debug(f"Using cached palette: {palette_path}")
                 return palette_path
             
-            # Build FFmpeg command for palette generation
-            # Use -frames:v 1 to ensure only one frame is output
+            # Build FFmpeg command for palette generation over the selected duration
             cmd = [
                 'ffmpeg', '-y',
                 '-ss', str(start_time),
                 '-t', str(duration),
                 '-i', safe_input_path,
                 '-vf', vf,
-                '-frames:v', '1',
                 '-f', 'image2',
                 palette_path
             ]
@@ -559,7 +558,14 @@ class GifGenerator:
         try:
             # Calculate segment duration
             segment_duration = min(settings['max_duration'], duration / 2)
-            num_segments = max(1, int(duration / segment_duration))
+            # Use ceiling to ensure the tail remainder is included
+            num_segments = max(1, math.ceil(duration / segment_duration))
+            # Equalize: recompute per-segment duration so final segment isn't disproportionately short
+            # This maintains the max-per-segment constraint because equalized_duration <= initial segment_duration
+            if num_segments > 0:
+                equalized_duration = duration / num_segments
+                # Safety: keep within platform limit just in case of floating point issues
+                segment_duration = min(settings['max_duration'], equalized_duration)
             
             # Create output directory for segments
             output_dir = os.path.dirname(output_path)
@@ -574,8 +580,13 @@ class GifGenerator:
             
             for i in range(num_segments):
                 segment_start = start_time + (i * segment_duration)
-                segment_end = min(start_time + duration, segment_start + segment_duration)
-                segment_duration_actual = segment_end - segment_start
+                # Correct for any accumulated floating error and ensure last segment reaches exact end
+                raw_end = start_time + duration
+                segment_end = min(raw_end, segment_start + segment_duration)
+                # If this is the last planned segment, hard-clamp to raw_end
+                if i == num_segments - 1:
+                    segment_end = raw_end
+                segment_duration_actual = max(0.0, segment_end - segment_start)
                 
                 if segment_duration_actual <= 0:
                     break

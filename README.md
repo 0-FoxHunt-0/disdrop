@@ -1,103 +1,78 @@
-# Video Compressor & GIF Generator
+## Video Compressor & GIF Generator
 
-A comprehensive Python tool for compressing videos and creating optimized GIFs for social media platforms, with intelligent hardware detection and automated workflows.
+A Python toolchain for compressing videos and creating highly optimized GIFs with smart defaults, hardware-aware acceleration, and an automated watch-folder workflow.
 
-## Features
-
-- **Video Compression**: Optimize videos for various social media platforms
-- **Video Segmentation**: Automatically split large videos into smaller, manageable segments
-- **GIF Generation**: Create high-quality GIFs from videos with iterative quality optimization
-- **GIF Segmentation**: Split long videos into multiple high-quality GIF segments
-- **Hardware Acceleration**: Automatic detection and utilization of GPU acceleration
-- **Platform Optimization**: Tailored settings for Twitter, Instagram, TikTok, YouTube Shorts, Facebook, Discord, and Slack
-- **Batch Processing**: Process multiple files automatically
-- **Automated Workflow**: Monitor input directory for new files
-- **Quality Optimization**: Iterative GIF optimization to maximize quality while staying under size limits
+### Highlights
+- **Smart video compression** with platform presets (Instagram, Twitter/X, TikTok, YouTube Shorts, Facebook, Discord)
+- **GIF creation and optimization** with iterative quality targeting and size caps
+- **Segmentation (last resort for video, adaptive for GIFs)** when single-file output cannot meet size/quality targets
+- **Automated workflow**: drop files in `input/`, results appear in `output/`
+- **Hardware detection and fallback** (NVENC/AMF/QSV → software)
+- **Batch commands**, caching, and temp/failures management
 
 ## Installation
 
-1. Clone the repository:
-```bash
-git clone <repository-url>
-cd video-compressor
-```
-
-2. Create a virtual environment:
+1) Create and activate a virtualenv, then install deps.
 ```bash
 python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-```
-
-3. Install dependencies:
-```bash
+venv\Scripts\activate  # Windows
 pip install -r requirements.txt
 ```
 
-4. Ensure FFmpeg is installed on your system:
-   - **Windows**: Download from https://ffmpeg.org/download.html
-   - **macOS**: `brew install ffmpeg`
-   - **Linux**: `sudo apt install ffmpeg` (Ubuntu/Debian)
+2) Install FFmpeg and ensure it’s on PATH.
+- Windows: download from https://ffmpeg.org/download.html
+- macOS: `brew install ffmpeg`
+- Linux: `sudo apt install ffmpeg`
 
-## Quick Start
+## Quick start
 
-### Basic Video Compression
+### Zero-argument auto mode
+```bash
+python main.py
+```
+Watches `input/` and processes new files to `output/` (defaults: max size 10 MB, check every 5s). Stop with Ctrl+C.
+
+### Compress a video
 ```bash
 python main.py compress input.mp4 output.mp4 --platform instagram
 ```
 
-### Basic GIF Creation
+### Create a GIF (standard or size-targeted)
 ```bash
+# Standard
 python main.py gif input.mp4 output.gif --platform twitter
-```
 
-### Quality-Optimized GIF Creation
-```bash
+# Size-targeted (enables iterative optimization)
 python main.py gif input.mp4 output.gif --max-size 5.0
 ```
 
-### Video Segmentation
-
-The tool now includes intelligent video segmentation that automatically splits large videos into smaller, manageable segments when they would exceed size limits. This is particularly useful for:
-
-- **Long videos** that would be too large when compressed
-- **High-resolution content** that needs to be split for platform limits
-- **Complex videos** with high motion or detail that are challenging to compress
-
-#### How Video Segmentation Works
-
-1. **Size Estimation**: The system estimates the final file size based on video characteristics
-2. **Segmentation Decision**: If the estimated size exceeds the target by 2.5x, segmentation is triggered
-3. **Optimal Duration**: Calculates the best segment duration based on:
-   - Video length (shorter videos get shorter segments)
-   - Content complexity (complex content gets shorter segments)
-   - Motion level (high motion gets shorter segments)
-4. **Quality Preservation**: Each segment is compressed with optimal settings to maintain quality
-5. **Output Organization**: Creates a folder with numbered segments and a summary file
-
-#### Configuration
-
-Video segmentation can be configured in `config/video_compression.yaml`:
-
-```yaml
-video_compression:
-  segmentation:
-    size_threshold_multiplier: 2.5  # Split if estimated size > 2.5x target
-    fallback_duration_limit: 300    # Split videos longer than 5 minutes
-    min_segment_duration: 15        # Minimum 15 seconds per segment
-    max_segment_duration: 120       # Maximum 2 minutes per segment
-    base_durations:
-      short_video_max: 60           # Videos up to 1 minute
-      short_segment_duration: 30    # 30-second segments
-      medium_video_max: 180         # Videos up to 3 minutes
-      medium_segment_duration: 45   # 45-second segments
-      long_video_max: 600           # Videos up to 10 minutes
-      long_segment_duration: 60     # 1-minute segments
-      very_long_segment_duration: 90 # 1.5-minute segments
+### Quality-optimized GIF (explicit target)
+```bash
+python main.py quality-gif input.mp4 output.gif --target-size 5.0 --quality-preference balanced [--platform discord]
 ```
 
-## Advanced Features
+### Optimize an existing GIF
+```bash
+python main.py optimize-gif input.gif output.gif
+```
 
-### Iterative Quality Optimization for GIFs
+### Batch
+```bash
+python main.py batch-compress "*.mp4" --output-dir compressed/ --platform instagram --parallel 4
+python main.py batch-gif "*.mp4" --output-dir gifs/ --platform twitter --duration 8 --parallel 4
+```
+
+### Video segmentation (last resort)
+
+Video files are split only when a single file cannot realistically meet size/quality targets.
+
+Key points (see `config/video_compression.yaml`):
+- Default trigger: estimated size ≥ 3.0× target, or extremely long inputs (≥ 10 minutes)
+- Segment duration stays within bounds and is tuned by content complexity/motion
+
+## Advanced features
+
+### Iterative quality optimization for GIFs
 
 The tool now includes an advanced iterative optimization system that automatically tries to generate the best quality GIF possible while staying within size limits. This feature performs multiple optimization attempts with different quality levels to find the optimal balance.
 
@@ -202,26 +177,27 @@ print(f"Quality score: {result['quality_score']:.2f}/10")
 print(f"Size efficiency: {result['size_efficiency']:.1%}")
 ```
 
-### Platform-Specific Optimization
+### Platform-specific optimization
 
 The tool automatically applies platform-specific optimizations:
 
-- **Twitter**: 506x506 max, 15s duration, optimized for web viewing
-- **Discord**: 400x400 max, 10s duration, 8MB limit for free users
-- **Slack**: 360x360 max, 8s duration, conservative compression
+- **Twitter/X**: 506x506 max, ~15s duration
+- **Discord**: 400x400 max, up to 15s (config), 8 MB target for free tier
+- **Slack**: 360x360 max, ~12s duration
 - **Instagram**: 1080x1080 max, optimized for mobile viewing
 - **TikTok**: 1080x1920 max, vertical format optimization
+ - Internal presets also exist for Telegram/Reddit (used by API paths), though not exposed via `--platform`.
 
-### Hardware Acceleration
+### Hardware acceleration
 
 The tool automatically detects and utilizes available hardware:
 
 - **NVIDIA GPU**: NVENC encoder for fast compression
 - **AMD GPU**: AMF encoder support
 - **Intel GPU**: QSV encoder for integrated graphics
-- **Apple Silicon**: VideoToolbox for M1/M2 Macs
+-- **Apple Silicon**: VideoToolbox for M1/M2 Macs (when available)
 
-### Batch Processing
+### Batch processing
 
 Process multiple files at once:
 
@@ -236,7 +212,7 @@ python main.py batch-gif "*.mp4" --output-dir gifs/ --platform twitter --duratio
 python main.py batch-compress "*.mp4" --output-dir compressed/ --parallel 4
 ```
 
-### Automated Workflow
+### Automated workflow
 
 Monitor a directory for new files and process them automatically:
 
@@ -260,7 +236,7 @@ The tool uses YAML configuration files in the `config/` directory:
 - `gif_settings.yaml`: GIF generation settings
 - `logging.yaml`: Logging configuration
 
-### Custom Platform Configuration
+### Custom platform configuration
 
 Add custom platform settings in `gif_settings.yaml`:
 
@@ -276,9 +252,9 @@ platforms:
     lossy: 30
 ```
 
-## Command Line Interface
+## Command line interface
 
-### Video Compression Commands
+### Video compression commands
 
 ```bash
 # Basic compression
@@ -291,7 +267,7 @@ python main.py compress input.mp4 output.mp4 --quality 23 --bitrate 1000k
 python main.py compress input.mp4 output.mp4 --resolution 1080x1080 --fps 30
 ```
 
-### GIF Commands
+### GIF commands
 
 ```bash
 # Basic GIF creation
@@ -307,7 +283,7 @@ python main.py gif input.mp4 output.gif --start 10.0 --duration 15.0
 python main.py optimize-gif input.gif output.gif
 ```
 
-### Utility Commands
+### Utility commands
 
 ```bash
 # Show hardware information
@@ -350,7 +326,7 @@ python main.py auto --check-interval 30 --max-size 8.0
 # Place videos in input/ directory and they'll be processed automatically
 ```
 
-## Performance Tips
+## Performance tips
 
 1. **Use Hardware Acceleration**: The tool automatically detects and uses GPU acceleration when available
 2. **Batch Processing**: Use batch commands for multiple files to save time
@@ -367,7 +343,7 @@ python main.py auto --check-interval 30 --max-size 8.0
 3. **Large file sizes**: Use quality optimization or reduce target resolution
 4. **Poor quality**: Increase quality settings or use quality-gif command
 
-### Debug Mode
+### Debug mode
 
 Enable debug logging for detailed information:
 

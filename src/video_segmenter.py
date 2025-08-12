@@ -423,9 +423,9 @@ class VideoSegmenter:
             # Build FFmpeg command for segment creation (always use software encoding for reliability)
             cmd = [
                 'ffmpeg', '-y',
-                '-i', input_video,
                 '-ss', str(start_time),
                 '-t', str(duration),
+                '-i', input_video,
                 '-c:v', 'libx264',  # Force software encoding for segments
                 '-crf', str(segment_params.get('crf', 23)),  # Use CRF instead of bitrate for better quality
                 '-preset', segment_params.get('preset', 'medium'),
@@ -830,7 +830,8 @@ class VideoSegmenter:
             height = int(video_stream.get('height', 0))
             duration = float(probe_data['format'].get('duration', 0))
             bitrate = int(probe_data['format'].get('bit_rate', 0))
-            fps = eval(video_stream.get('r_frame_rate', '30/1'))
+            from .ffmpeg_utils import FFmpegUtils
+            fps = FFmpegUtils.parse_fps(video_stream.get('r_frame_rate', '30/1'))
             
             # Content complexity analysis
             complexity_score = self._calculate_content_complexity(probe_data, width, height, duration)
@@ -888,7 +889,8 @@ class VideoSegmenter:
     
     def _estimate_motion_level(self, video_stream: Dict, duration: float) -> str:
         """Estimate motion level in video"""
-        fps = eval(video_stream.get('r_frame_rate', '30/1'))
+        from .ffmpeg_utils import FFmpegUtils
+        fps = FFmpegUtils.parse_fps(video_stream.get('r_frame_rate', '30/1'))
         
         if fps >= 50:
             return "high"
@@ -935,7 +937,7 @@ class VideoSegmenter:
                 'height': height,
                 'duration': duration,
                 'bitrate': int(probe_data['format'].get('bit_rate', 0)),
-                'fps': eval(video_stream.get('r_frame_rate', '30/1')),
+                'fps': FFmpegUtils.parse_fps(video_stream.get('r_frame_rate', '30/1')),
                 'codec': video_stream.get('codec_name', 'unknown'),
                 'size_bytes': int(probe_data['format'].get('size', 0)),
                 'complexity_score': 5.0,  # Default medium complexity
@@ -1073,11 +1075,7 @@ class VideoSegmenter:
                 '-pix_fmt', 'yuv420p',
                 output_path
             ]
-            
-            # Add hardware acceleration if available
-            if params.get('acceleration_type') != 'software':
-                cmd.insert(2, '-hwaccel')
-                cmd.insert(3, 'qsv' if 'qsv' in params['encoder'] else 'auto')
+            # Do not inject generic -hwaccel here; encoding choice already set by encoder
             
             # Execute FFmpeg command
             result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)

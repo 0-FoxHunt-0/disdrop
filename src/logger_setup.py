@@ -237,7 +237,30 @@ def setup_logging(config_path: str = "config/logging.yaml", log_level: Optional[
         # Enable terminal tee BEFORE applying logging config so console handler uses the tee stream
         terminal_log_path = _enable_terminal_tee(logs_dir)
 
-        # Override log level if specified
+        # Default: quieter console (WARNING) and DEBUG to file unless overridden
+        try:
+            # Ensure console handler exists
+            console_handler = logging_config['handlers'].get('console') if 'handlers' in logging_config else None
+            if console_handler:
+                console_handler['level'] = console_handler.get('level', 'WARNING')
+                # Force console to WARNING when no explicit log_level passed
+                if not log_level:
+                    console_handler['level'] = 'WARNING'
+            # Ensure file handlers are DEBUG by default
+            for hname in ('file', 'error_file'):
+                handler = logging_config.get('handlers', {}).get(hname)
+                if handler:
+                    if hname == 'file':
+                        handler['level'] = 'DEBUG'
+                    elif hname == 'error_file':
+                        handler['level'] = 'ERROR'
+            # Root level should be DEBUG to capture all into file handler
+            if 'root' in logging_config:
+                logging_config['root']['level'] = 'DEBUG'
+        except Exception:
+            pass
+
+        # Override levels if an explicit log_level was provided (e.g., --debug)
         if log_level:
             log_level = log_level.upper()
             if 'root' in logging_config:

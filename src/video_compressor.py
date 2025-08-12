@@ -361,7 +361,7 @@ class DynamicVideoCompressor:
             height = int(video_stream.get('height', 0))
             duration = float(probe_data['format'].get('duration', 0))
             bitrate = int(probe_data['format'].get('bit_rate', 0))
-            fps = eval(video_stream.get('r_frame_rate', '30/1'))
+            fps = FFmpegUtils.parse_fps(video_stream.get('r_frame_rate', '30/1'))
             
             # Content complexity analysis
             complexity_score = self._calculate_content_complexity(probe_data, width, height, duration)
@@ -814,7 +814,7 @@ class DynamicVideoCompressor:
                 'height': height,
                 'duration': duration,
                 'bitrate': int(probe_data['format'].get('bit_rate', 0)),
-                'fps': eval(video_stream.get('r_frame_rate', '30/1')),
+                'fps': FFmpegUtils.parse_fps(video_stream.get('r_frame_rate', '30/1')),
                 'codec': video_stream.get('codec_name', 'unknown'),
                 'size_bytes': int(probe_data['format'].get('size', 0)),
                 'complexity_score': 5.0,  # Default medium complexity
@@ -1013,8 +1013,8 @@ class DynamicVideoCompressor:
     def _execute_ffmpeg_with_progress(self, cmd: List[str], duration: float):
         """Execute FFmpeg command with progress bar and hardware fallback"""
         
-        logger.info("Starting FFmpeg compression...")
-        logger.info(f"FFmpeg command: {' '.join(cmd)}")  # Add command logging
+        logger.debug("Starting FFmpeg compression...")
+        logger.debug(f"FFmpeg command: {' '.join(cmd)}")
         
         # Try original command first
         try:
@@ -1068,7 +1068,7 @@ class DynamicVideoCompressor:
                 # Replace hardware encoder with software encoder
                 fallback_cmd = self._create_software_fallback_command(cmd)
                 if fallback_cmd:
-                    logger.info(f"Fallback command: {' '.join(fallback_cmd)}")  # Add fallback command logging
+                    logger.debug(f"Fallback command: {' '.join(fallback_cmd)}")
                     try:
                         self._execute_ffmpeg_command(fallback_cmd, duration)
                         logger.info("FFmpeg compression completed with software fallback")

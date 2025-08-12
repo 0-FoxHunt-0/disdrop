@@ -16,6 +16,49 @@ class FFmpegUtils:
     """Shared utilities for FFmpeg operations"""
     
     @staticmethod
+    def parse_fps(rate_str: str) -> float:
+        """Safely parse FFmpeg r_frame_rate like '30000/1001' into float FPS."""
+        try:
+            from fractions import Fraction
+            if not rate_str:
+                return 30.0
+            return float(Fraction(rate_str))
+        except Exception:
+            try:
+                return float(rate_str)
+            except Exception:
+                return 30.0
+
+    @staticmethod
+    def get_video_resolution(video_path: str) -> Tuple[int, int]:
+        """Return (width, height) of the primary video stream using ffprobe."""
+        try:
+            safe_path = FFmpegUtils._safe_file_path(video_path)
+            if not os.path.exists(safe_path):
+                return (1920, 1080)
+            cmd = [
+                'ffprobe', '-v', 'quiet', '-print_format', 'json',
+                '-show_streams', '-select_streams', 'v:0', safe_path
+            ]
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+            if result.returncode != 0:
+                return (1920, 1080)
+            import json
+            data = json.loads(result.stdout)
+            video_stream = None
+            for stream in data.get('streams', []):
+                if stream.get('codec_type') == 'video':
+                    video_stream = stream
+                    break
+            if not video_stream:
+                return (1920, 1080)
+            width = int(video_stream.get('width', 1920))
+            height = int(video_stream.get('height', 1080))
+            return (width, height)
+        except Exception:
+            return (1920, 1080)
+
+    @staticmethod
     def _safe_file_path(file_path: str) -> str:
         """Safely handle file paths with special characters"""
         try:
@@ -94,7 +137,7 @@ class FFmpegUtils:
                     return {
                         'width': int(video_stream.get('width', 1920)),
                         'height': int(video_stream.get('height', 1080)),
-                        'fps': eval(video_stream.get('r_frame_rate', '30/1')),
+                        'fps': FFmpegUtils.parse_fps(video_stream.get('r_frame_rate', '30/1')),
                         'duration': float(data.get('format', {}).get('duration', 30.0)),
                         'bitrate': int(data.get('format', {}).get('bit_rate', 1000000)) // 1000,
                         'codec': video_stream.get('codec_name', 'unknown')

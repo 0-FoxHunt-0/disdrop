@@ -37,6 +37,8 @@ class AutomatedWorkflow:
         self.video_compressor = video_compressor or DynamicVideoCompressor(config_manager, hardware_detector)
         self.gif_generator = gif_generator or GifGenerator(config_manager)
         self.file_validator = FileValidator()
+        # Console verbosity (controlled by CLI --debug)
+        self.verbose = False
         
         # Workflow directories
         self.input_dir = Path("input")
@@ -112,7 +114,7 @@ class AutomatedWorkflow:
             time.sleep(sleep_time)
             elapsed += sleep_time
     
-    def run_automated_workflow(self, check_interval: int = 5, max_size_mb: float = 10.0):
+    def run_automated_workflow(self, check_interval: int = 5, max_size_mb: float = 10.0, verbose: bool = False):
         """
         Run the automated workflow
         
@@ -120,6 +122,9 @@ class AutomatedWorkflow:
             check_interval: How often to check for new files (seconds)
             max_size_mb: Maximum file size for outputs in MB
         """
+        # Set verbosity for this run
+        self.verbose = bool(verbose)
+
         logger.info("Starting automated workflow...")
         logger.info(f"Input directory: {self.input_dir.absolute()}")
         logger.info(f"Output directory: {self.output_dir.absolute()}")
@@ -127,10 +132,10 @@ class AutomatedWorkflow:
         logger.info(f"Check interval: {check_interval} seconds")
         logger.info(f"Max file size: {max_size_mb}MB")
         
-        print(f"\n🚀 Workflow started")
-        print(f"📁 Input: {self.input_dir.absolute()}")
-        print(f"📤 Output: {self.output_dir.absolute()}")
-        print(f"⚙️  Every {check_interval}s, Max GIF {max_size_mb}MB")
+        self._vprint(f"\n🚀 Workflow started")
+        self._vprint(f"📁 Input: {self.input_dir.absolute()}")
+        self._vprint(f"📤 Output: {self.output_dir.absolute()}")
+        self._vprint(f"⚙️  Every {check_interval}s, Max GIF {max_size_mb}MB")
         
         processed_files = set()
         processing_stats = {'successful': 0, 'skipped': 0, 'errors': 0}
@@ -145,7 +150,7 @@ class AutomatedWorkflow:
                     
                     if video_files:
                         logger.info(f"Found {len(video_files)} new file(s) to process")
-                        print(f"\n🎬 {len(video_files)} new file(s) to process")
+                        self._vprint(f"\n🎬 {len(video_files)} new file(s) to process")
                         
                         for file_path in video_files:
                             if self.shutdown_requested:
@@ -194,11 +199,12 @@ class AutomatedWorkflow:
                         # Show processing summary
                         if video_files:
                             total = processing_stats['successful'] + processing_stats['skipped'] + processing_stats['errors']
-                            print(f"\n📊 Summary: ✅ {processing_stats['successful']} | ⚠️ {processing_stats['skipped']} | ❌ {processing_stats['errors']} (Total {total})")
+                            self._vprint(f"\n📊 Summary: ✅ {processing_stats['successful']} | ⚠️ {processing_stats['skipped']} | ❌ {processing_stats['errors']} (Total {total})")
                     else:
-                        # Show waiting status periodically
-                        current_time = time.strftime("%H:%M:%S")
-                        print(f"\r⏳ [{current_time}] Waiting for files...", end="", flush=True)
+                        # Show waiting status periodically (only when verbose)
+                        if self.verbose:
+                            current_time = time.strftime("%H:%M:%S")
+                            print(f"\r⏳ [{current_time}] Waiting for files...", end="", flush=True)
                     
                     # Sleep before next check (with interrupt checking)
                     if not self.shutdown_requested:
@@ -213,12 +219,17 @@ class AutomatedWorkflow:
             print(f"\n\n🛑 Workflow interrupted by user")
             logger.info("Workflow interrupted by user")
         finally:
-            print(f"\n🧹 Cleaning up temporary files...")
+            self._vprint(f"\n🧹 Cleaning up temporary files...")
             self._cleanup_temp_files()
             # Also clean nested temp artifacts created during GIF optimization
             self._cleanup_orphan_segments()
-            print(f"✅ Automated workflow stopped gracefully")
+            self._vprint(f"✅ Automated workflow stopped gracefully")
             logger.info("Automated workflow stopped")
+
+    def _vprint(self, message: str, end: str = "\n", flush: bool = False):
+        """Verbose print controlled by self.verbose."""
+        if self.verbose:
+            print(message, end=end, flush=flush)
 
     def _move_input_to_failures(self, src_path: Path) -> None:
         """Move a failed input file from input/ to failures/ with safe unique naming.
@@ -372,6 +383,7 @@ class AutomatedWorkflow:
             # Check for segmented output
             segments_folder = self.output_dir / f"{base_name}_segments"
             if segments_folder.exists() and segments_folder.is_dir():
+                # Use default 10MB when checking for generic existence, as size isn't known here
                 valid_segments, _ = self._validate_segment_folder_gifs(segments_folder, 10.0)
                 if valid_segments:
                     logger.info(f"Found existing segmented output for {input_file.name}: {segments_folder}")
@@ -1525,11 +1537,11 @@ class AutomatedWorkflow:
             if duration and duration > 0 and num_segments > 0:
                 segment_duration = max(min_seg, min(max_seg, duration / num_segments))
 
-            # Prepare output directory per asset
+            # Prepare output directory path per asset (defer creation until first success)
             output_dir = self.output_dir
             base_name = gif_file.stem
             segments_dir = output_dir / f"{base_name}_segments"
-            segments_dir.mkdir(parents=True, exist_ok=True)
+            segments_dir_created = False
 
             # Process each segment
             successful = 0
@@ -1612,6 +1624,14 @@ class AutomatedWorkflow:
                     except Exception:
                         pass
                     continue
+
+                # Create the segments directory only when we have the first valid segment
+                if not segments_dir_created:
+                    try:
+                        segments_dir.mkdir(parents=True, exist_ok=True)
+                    except Exception:
+                        pass
+                    segments_dir_created = True
 
                 try:
                     shutil.move(str(temp_seg), str(final_seg))
