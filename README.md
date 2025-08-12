@@ -1,8 +1,9 @@
-## Video Compressor & GIF Generator
+# Video Compressor & GIF Generator
 
 A Python toolchain for compressing videos and creating highly optimized GIFs with smart defaults, hardware-aware acceleration, and an automated watch-folder workflow.
 
-### Highlights
+## Highlights
+
 - **Smart video compression** with platform presets (Instagram, Twitter/X, TikTok, YouTube Shorts, Facebook, Discord)
 - **GIF creation and optimization** with iterative quality targeting and size caps
 - **Segmentation (last resort for video, adaptive for GIFs)** when single-file output cannot meet size/quality targets
@@ -12,32 +13,39 @@ A Python toolchain for compressing videos and creating highly optimized GIFs wit
 
 ## Installation
 
-1) Create and activate a virtualenv, then install deps.
+1. Create and activate a virtual environment, then install dependencies.
+
 ```bash
 python -m venv venv
 venv\Scripts\activate  # Windows
+# source venv/bin/activate  # macOS/Linux
 pip install -r requirements.txt
 ```
 
-2) Install FFmpeg and ensure it’s on PATH.
-- Windows: download from https://ffmpeg.org/download.html
+1. Install FFmpeg and ensure it’s on PATH.
+
+- Windows: download from [ffmpeg.org](https://ffmpeg.org/download.html)
 - macOS: `brew install ffmpeg`
 - Linux: `sudo apt install ffmpeg`
 
 ## Quick start
 
 ### Zero-argument auto mode
+
 ```bash
 python main.py
 ```
+
 Watches `input/` and processes new files to `output/` (defaults: max size 10 MB, check every 5s). Stop with Ctrl+C.
 
 ### Compress a video
+
 ```bash
 python main.py compress input.mp4 output.mp4 --platform instagram
 ```
 
 ### Create a GIF (standard or size-targeted)
+
 ```bash
 # Standard
 python main.py gif input.mp4 output.gif --platform twitter
@@ -47,32 +55,410 @@ python main.py gif input.mp4 output.gif --max-size 5.0
 ```
 
 ### Quality-optimized GIF (explicit target)
+
 ```bash
 python main.py quality-gif input.mp4 output.gif --target-size 5.0 --quality-preference balanced [--platform discord]
 ```
 
 ### Optimize an existing GIF
+
 ```bash
 python main.py optimize-gif input.gif output.gif
 ```
 
 ### Batch
+
 ```bash
 python main.py batch-compress "*.mp4" --output-dir compressed/ --platform instagram --parallel 4
 python main.py batch-gif "*.mp4" --output-dir gifs/ --platform twitter --duration 8 --parallel 4
 ```
 
-### Video segmentation (last resort)
+### Automated workflow (explicit)
 
-Video files are split only when a single file cannot realistically meet size/quality targets.
+```bash
+python main.py auto --check-interval 10 --max-size 10.0
+```
 
-Key points (see `config/video_compression.yaml`):
-- Default trigger: estimated size ≥ 3.0× target, or extremely long inputs (≥ 10 minutes)
-- Segment duration stays within bounds and is tuned by content complexity/motion
+## How it works
 
-## Advanced features
+### Video compression
 
-### Iterative quality optimization for GIFs
+- Content analysis (ffprobe) informs encoder, bitrate, FPS, and resolution.
+- Hardware acceleration is used when available with robust software fallback.
+- If a single output cannot reasonably meet target size, the system may invoke the video segmenter as a last resort.
+
+Video segmentation behavior (configurable in `config/video_compression.yaml`):
+
+- Default trigger: estimated size ≥ 3.0× target, or extremely long videos (≥ 10 minutes)
+- Segment duration stays within bounds and is tuned by content complexity and motion
+
+### GIF creation and optimization
+
+- Generates high-quality GIFs with a palette pipeline, `mpdecimate`, and aspect-ratio preservation (`force_original_aspect_ratio=decrease`, `setsar=1`).
+- If `--max-size` is given, an iterative optimizer searches multiple quality stages to land under the target with best visual fidelity.
+- Platforms supported by CLI: `twitter`, `discord` (8 MB), `slack`. Internal presets also exist for Telegram/Reddit.
+- GIF segmentation is adaptive: long/complex source clips can be split into multiple GIFs; nested segmentation is avoided.
+
+## CLI overview
+
+Global options:
+
+- `--log-level [DEBUG|INFO|WARNING|ERROR]`, `--debug` (verbose console + file logs)
+- `--temp-dir PATH` (defaults to `./temp`)
+- `--max-size MB` (global size cap applied to both video and GIF where relevant)
+- `--force-software` (bypass hardware encoders)
+
+Commands:
+
+- `compress <in> <out> [--platform ...] [--encoder ...] [--quality CRF] [--bitrate 1000k] [--resolution WxH] [--fps N]`
+- `gif <in> <out> [--platform twitter|discord|slack] [--start S] [--duration S] [--max-size MB] [--fps N] [--width W] [--height H] [--colors C]`
+- `quality-gif <in> <out> --target-size MB [--quality-preference quality|balanced|size] [--platform ...] [--start] [--duration]`
+- `optimize-gif <in> <out>`
+- `batch-compress <glob> --output-dir DIR [--platform ...] [--suffix _compressed] [--parallel N]`
+- `batch-gif <glob> --output-dir DIR [--platform ...] [--duration S] [--parallel N]`
+- `hardware-info`
+- `config show|validate`
+- `auto [--check-interval S] [--max-size MB]`
+
+## Configuration
+
+Configuration lives in `config/`:
+
+- `video_compression.yaml`: max size (default 10 MB), hardware encoders, conservative segmentation policy, platform presets
+- `gif_settings.yaml`: default max size (10 MB), FPS/resolution, palette/dither/lossy, quality-optimization stages, segmentation heuristics
+- `logging.yaml`: console/file logging formats and levels (logs in `logs/`)
+
+Examples (abridged):
+
+```yaml
+# video_compression.yaml
+video_compression:
+  max_file_size_mb: 10
+  segmentation:
+    size_threshold_multiplier: 3.0
+    fallback_duration_limit: 600
+
+# gif_settings.yaml
+gif_settings:
+  max_file_size_mb: 10
+  fps: 20
+  width: 360
+  height: 360
+  quality_optimization:
+    enabled: true
+```
+
+CLI overrides map into config at runtime, for example:
+
+- `--max-size 8.0` → `video_compression.max_file_size_mb` and `gif_settings.max_file_size_mb`
+- `--fps 20` → `video_compression.platforms.custom.fps` and `gif_settings.fps`
+- `--width/--height/--colors` → `gif_settings.width/height/colors`
+
+## Examples
+
+```bash
+# Create Instagram-optimized video
+python main.py compress raw_video.mp4 instagram_video.mp4 --platform instagram
+
+# Create Twitter GIF with quality optimization
+python main.py quality-gif raw_video.mp4 twitter_gif.gif --target-size 5.0 --quality-preference balanced --platform twitter
+```
+
+```bash
+# Process all videos in directory for multiple platforms
+python main.py batch-compress "videos/*.mp4" --output-dir instagram/ --platform instagram
+python main.py batch-compress "videos/*.mp4" --output-dir twitter/ --platform twitter
+python main.py batch-gif "videos/*.mp4" --output-dir gifs/ --platform discord --duration 8
+```
+
+```bash
+# Start automated processing
+python main.py auto --check-interval 30 --max-size 8.0
+
+# Place videos in input/ directory and they'll be processed automatically
+```
+
+## Performance tips
+
+1. Use hardware acceleration when available (auto-detected; fallback is automatic).
+1. Use batch commands and `--parallel` for throughput.
+1. For strict size caps, prefer `quality-gif --target-size` or lower FPS/scale.
+1. Always specify `--platform` for better defaults.
+1. Valid existing outputs in `output/` are reused to save time.
+
+## Troubleshooting
+
+- FFmpeg not found: install and ensure it’s on PATH.
+- Hardware encoder errors: app falls back to software; use `--force-software` to skip hardware.
+- Outputs slightly over target: try `quality-gif --target-size ...` or reduce FPS/scale/colors.
+
+## License
+
+MIT. See `LICENSE`.
+
+## Acknowledgments
+
+- FFmpeg, OpenCV, Pillow, PyYAML
+
+# Video Compressor & GIF Generator
+
+A Python toolchain for compressing videos and creating highly optimized GIFs with smart defaults, hardware-aware acceleration, and an automated watch-folder workflow.
+
+## Highlights
+
+- **Smart video compression** with platform presets (Instagram, Twitter/X, TikTok, YouTube Shorts, Facebook, Discord)
+- **GIF creation and optimization** with iterative quality targeting and size caps
+- **Segmentation (last resort for video, adaptive for GIFs)** when single-file output cannot meet size/quality targets
+- **Automated workflow**: drop files in `input/`, results appear in `output/`
+- **Hardware detection and fallback** (NVENC/AMF/QSV → software)
+- **Batch commands**, caching, and temp/failures management
+
+## Installation
+
+1. Create and activate a virtualenv, then install dependencies.
+
+```bash
+python -m venv venv
+venv\Scripts\activate  # Windows
+pip install -r requirements.txt
+```
+
+2. Install FFmpeg and ensure it’s on PATH.
+
+- Windows: download from [ffmpeg.org](https://ffmpeg.org/download.html)
+- macOS: `brew install ffmpeg`
+- Linux: `sudo apt install ffmpeg`
+
+## Quick start
+
+### Zero-argument auto mode
+
+```bash
+python main.py
+```
+
+Watches `input/` and processes new files to `output/` (defaults: max size 10 MB, check every 5s). Stop with Ctrl+C.
+
+### Compress a video
+
+```bash
+python main.py compress input.mp4 output.mp4 --platform instagram
+```
+
+### Create a GIF (standard or size-targeted)
+
+```bash
+# Standard
+python main.py gif input.mp4 output.gif --platform twitter
+
+# Size-targeted (enables iterative optimization)
+python main.py gif input.mp4 output.gif --max-size 5.0
+```
+
+### Quality-optimized GIF (explicit target)
+
+```bash
+python main.py quality-gif input.mp4 output.gif --target-size 5.0 --quality-preference balanced [--platform discord]
+```
+
+### Optimize an existing GIF
+
+```bash
+python main.py optimize-gif input.gif output.gif
+```
+
+### Batch
+
+```bash
+python main.py batch-compress "*.mp4" --output-dir compressed/ --platform instagram --parallel 4
+python main.py batch-gif "*.mp4" --output-dir gifs/ --platform twitter --duration 8 --parallel 4
+```
+
+### Automated workflow (explicit)
+
+```bash
+python main.py auto --check-interval 10 --max-size 10.0
+```
+
+## How it works
+
+### Video compression
+
+- Content analysis (ffprobe) informs encoder, bitrate, FPS, and resolution.
+- Hardware acceleration is used when available with robust software fallback.
+- If a single output cannot reasonably meet target size, the system may invoke the video segmenter as a last resort.
+
+Video segmentation behavior (configurable in `config/video_compression.yaml`):
+
+- Default trigger: estimated size ≥ 3.0× target, or extremely long videos (≥ 10 minutes)
+- Segment duration stays within bounds and is tuned by content complexity and motion
+
+### GIF creation and optimization
+
+- Generates high-quality GIFs with a palette pipeline, `mpdecimate`, and aspect-ratio preservation (`force_original_aspect_ratio=decrease`, `setsar=1`).
+- If `--max-size` is given, an iterative optimizer searches multiple quality stages to land under the target with best visual fidelity.
+- Platforms supported by CLI: `twitter`, `discord` (8 MB), `slack`. Internal presets also exist for Telegram/Reddit.
+- GIF segmentation is adaptive: long/complex source clips can be split into multiple GIFs; nested segmentation is avoided.
+
+## CLI overview
+
+Global options:
+
+- `--log-level [DEBUG|INFO|WARNING|ERROR]`, `--debug` (verbose console + file logs)
+- `--temp-dir PATH` (defaults to `./temp`)
+- `--max-size MB` (global size cap applied to both video and GIF where relevant)
+- `--force-software` (bypass hardware encoders)
+
+Commands:
+
+- `compress <in> <out> [--platform ...] [--encoder ...] [--quality CRF] [--bitrate 1000k] [--resolution WxH] [--fps N]`
+- `gif <in> <out> [--platform twitter|discord|slack] [--start S] [--duration S] [--max-size MB] [--fps N] [--width W] [--height H] [--colors C]`
+- `quality-gif <in> <out> --target-size MB [--quality-preference quality|balanced|size] [--platform ...] [--start] [--duration]`
+- `optimize-gif <in> <out>`
+- `batch-compress <glob> --output-dir DIR [--platform ...] [--suffix _compressed] [--parallel N]`
+- `batch-gif <glob> --output-dir DIR [--platform ...] [--duration S] [--parallel N]`
+- `hardware-info`
+- `config show|validate`
+- `auto [--check-interval S] [--max-size MB]`
+
+## Configuration
+
+Configuration lives in `config/`:
+
+- `video_compression.yaml`: max size (default 10 MB), hardware encoders, conservative segmentation policy, platform presets
+- `gif_settings.yaml`: default max size (10 MB), FPS/resolution, palette/dither/lossy, quality-optimization stages, segmentation heuristics
+- `logging.yaml`: console/file logging formats and levels (logs in `logs/`)
+
+Examples (abridged):
+
+```yaml
+# video_compression.yaml
+video_compression:
+  max_file_size_mb: 10
+  segmentation:
+    size_threshold_multiplier: 3.0
+    fallback_duration_limit: 600
+
+# gif_settings.yaml
+gif_settings:
+  max_file_size_mb: 10
+  fps: 20
+  width: 360
+  height: 360
+  quality_optimization:
+    enabled: true
+```
+
+CLI overrides map into config at runtime, for example:
+
+- `--max-size 8.0` → `video_compression.max_file_size_mb` and `gif_settings.max_file_size_mb`
+- `--fps 20` → `video_compression.platforms.custom.fps` and `gif_settings.fps`
+- `--width/--height/--colors` → `gif_settings.width/height/colors`
+
+## Examples
+
+```bash
+# Create Instagram-optimized video
+python main.py compress raw_video.mp4 instagram_video.mp4 --platform instagram
+
+# Create Twitter GIF with quality optimization
+python main.py quality-gif raw_video.mp4 twitter_gif.gif --target-size 5.0 --quality-preference balanced --platform twitter
+```
+
+```bash
+# Process all videos in directory for multiple platforms
+python main.py batch-compress "videos/*.mp4" --output-dir instagram/ --platform instagram
+python main.py batch-compress "videos/*.mp4" --output-dir twitter/ --platform twitter
+python main.py batch-gif "videos/*.mp4" --output-dir gifs/ --platform discord --duration 8
+```
+
+```bash
+# Start automated processing
+python main.py auto --check-interval 30 --max-size 8.0
+
+# Place videos in input/ directory and they'll be processed automatically
+```
+
+## Performance tips
+
+1. Use hardware acceleration when available (auto-detected; fallback is automatic).
+2. Use batch commands and `--parallel` for throughput.
+3. For strict size caps, prefer `quality-gif --target-size` or lower FPS/scale.
+4. Always specify `--platform` for better defaults.
+5. Valid existing outputs in `output/` are reused to save time.
+
+## Troubleshooting
+
+- FFmpeg not found: install and ensure it’s on PATH.
+- Hardware encoder errors: app falls back to software; use `--force-software` to skip hardware.
+- Outputs slightly over target: try `quality-gif --target-size ...` or reduce FPS/scale/colors.
+
+## License
+
+MIT. See `LICENSE`.
+
+## Acknowledgments
+
+- FFmpeg, OpenCV, Pillow, PyYAML
+
+# Video Compressor & GIF Generator
+
+A comprehensive Python tool for compressing videos and creating optimized GIFs for social media platforms, with intelligent hardware detection and automated workflows.
+
+## Features
+
+- **Video Compression**: Optimize videos for various social media platforms
+- **GIF Generation**: Create high-quality GIFs from videos with iterative quality optimization
+- **Hardware Acceleration**: Automatic detection and utilization of GPU acceleration
+- **Platform Optimization**: Tailored settings for Twitter, Instagram, TikTok, YouTube Shorts, Facebook, Discord, and Slack
+- **Batch Processing**: Process multiple files automatically
+- **Automated Workflow**: Monitor input directory for new files
+- **Quality Optimization**: Iterative GIF optimization to maximize quality while staying under size limits
+
+## Installation
+
+1. Clone the repository:
+```bash
+git clone <repository-url>
+cd video-compressor
+```
+
+2. Create a virtual environment:
+```bash
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+```
+
+3. Install dependencies:
+```bash
+pip install -r requirements.txt
+```
+
+4. Ensure FFmpeg is installed on your system:
+   - **Windows**: Download from https://ffmpeg.org/download.html
+   - **macOS**: `brew install ffmpeg`
+   - **Linux**: `sudo apt install ffmpeg` (Ubuntu/Debian)
+
+## Quick Start
+
+### Basic Video Compression
+```bash
+python main.py compress input.mp4 output.mp4 --platform instagram
+```
+
+### Basic GIF Creation
+```bash
+python main.py gif input.mp4 output.gif --platform twitter
+```
+
+### Quality-Optimized GIF Creation
+```bash
+python main.py gif input.mp4 output.gif --max-size 5.0
+```
+
+## Advanced Features
+
+### Iterative Quality Optimization for GIFs
 
 The tool now includes an advanced iterative optimization system that automatically tries to generate the best quality GIF possible while staying within size limits. This feature performs multiple optimization attempts with different quality levels to find the optimal balance.
 
@@ -177,27 +563,26 @@ print(f"Quality score: {result['quality_score']:.2f}/10")
 print(f"Size efficiency: {result['size_efficiency']:.1%}")
 ```
 
-### Platform-specific optimization
+### Platform-Specific Optimization
 
 The tool automatically applies platform-specific optimizations:
 
-- **Twitter/X**: 506x506 max, ~15s duration
-- **Discord**: 400x400 max, up to 15s (config), 8 MB target for free tier
-- **Slack**: 360x360 max, ~12s duration
+- **Twitter**: 506x506 max, 15s duration, optimized for web viewing
+- **Discord**: 400x400 max, 10s duration, 8MB limit for free users
+- **Slack**: 360x360 max, 8s duration, conservative compression
 - **Instagram**: 1080x1080 max, optimized for mobile viewing
 - **TikTok**: 1080x1920 max, vertical format optimization
- - Internal presets also exist for Telegram/Reddit (used by API paths), though not exposed via `--platform`.
 
-### Hardware acceleration
+### Hardware Acceleration
 
 The tool automatically detects and utilizes available hardware:
 
 - **NVIDIA GPU**: NVENC encoder for fast compression
 - **AMD GPU**: AMF encoder support
 - **Intel GPU**: QSV encoder for integrated graphics
--- **Apple Silicon**: VideoToolbox for M1/M2 Macs (when available)
+- **Apple Silicon**: VideoToolbox for M1/M2 Macs
 
-### Batch processing
+### Batch Processing
 
 Process multiple files at once:
 
@@ -212,7 +597,7 @@ python main.py batch-gif "*.mp4" --output-dir gifs/ --platform twitter --duratio
 python main.py batch-compress "*.mp4" --output-dir compressed/ --parallel 4
 ```
 
-### Automated workflow
+### Automated Workflow
 
 Monitor a directory for new files and process them automatically:
 
@@ -236,7 +621,7 @@ The tool uses YAML configuration files in the `config/` directory:
 - `gif_settings.yaml`: GIF generation settings
 - `logging.yaml`: Logging configuration
 
-### Custom platform configuration
+### Custom Platform Configuration
 
 Add custom platform settings in `gif_settings.yaml`:
 
@@ -252,9 +637,9 @@ platforms:
     lossy: 30
 ```
 
-## Command line interface
+## Command Line Interface
 
-### Video compression commands
+### Video Compression Commands
 
 ```bash
 # Basic compression
@@ -267,7 +652,7 @@ python main.py compress input.mp4 output.mp4 --quality 23 --bitrate 1000k
 python main.py compress input.mp4 output.mp4 --resolution 1080x1080 --fps 30
 ```
 
-### GIF commands
+### GIF Commands
 
 ```bash
 # Basic GIF creation
@@ -283,7 +668,7 @@ python main.py gif input.mp4 output.gif --start 10.0 --duration 15.0
 python main.py optimize-gif input.gif output.gif
 ```
 
-### Utility commands
+### Utility Commands
 
 ```bash
 # Show hardware information
@@ -326,7 +711,7 @@ python main.py auto --check-interval 30 --max-size 8.0
 # Place videos in input/ directory and they'll be processed automatically
 ```
 
-## Performance tips
+## Performance Tips
 
 1. **Use Hardware Acceleration**: The tool automatically detects and uses GPU acceleration when available
 2. **Batch Processing**: Use batch commands for multiple files to save time
@@ -343,7 +728,7 @@ python main.py auto --check-interval 30 --max-size 8.0
 3. **Large file sizes**: Use quality optimization or reduce target resolution
 4. **Poor quality**: Increase quality settings or use quality-gif command
 
-### Debug mode
+### Debug Mode
 
 Enable debug logging for detailed information:
 
