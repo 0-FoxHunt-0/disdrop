@@ -1507,8 +1507,11 @@ class AutomatedWorkflow:
             max_duration_cfg = self.config.get('gif_settings.max_duration_seconds', 30)
             min_seg = max(5.0, float(seg_cfg.get('min_segment_duration', 12)))
             max_seg = max(min_seg, float(seg_cfg.get('max_segment_duration', 35)))
+            size_threshold_multiplier = float(seg_cfg.get('size_threshold_multiplier', 2.5))
 
-            # Heuristic: segment if file is over target, or duration is long
+            # Heuristic: segment if file is over target (slightly), or duration is long
+            # Keep the 1.05 safety to trigger fallback after optimization failure,
+            # but we will decide the NUMBER of segments using the configured multiplier.
             should_segment = (
                 (max_size_mb is not None and original_size_mb > max_size_mb * 1.05)
                 or (duration > max_duration_cfg)
@@ -1544,10 +1547,14 @@ class AutomatedWorkflow:
             segment_duration = pick_segment_duration(duration if duration > 0 else max_seg)
 
             # Size-aware segment count based on original file size and target per-file size
+            # Use the configured multiplier so small overages do not force multiple segments.
             size_segments = 1
             if max_size_mb and max_size_mb > 0:
                 try:
-                    size_segments = max(1, int(math.ceil(original_size_mb / max_size_mb)))
+                    if original_size_mb > max_size_mb * size_threshold_multiplier:
+                        size_segments = max(1, int(math.ceil(original_size_mb / max_size_mb)))
+                    else:
+                        size_segments = 1
                 except Exception:
                     size_segments = 1
 
@@ -1697,6 +1704,35 @@ class AutomatedWorkflow:
 
             if successful > 0:
                 if use_segments_folder:
+                    # If exactly one segment succeeded, prefer to present it as a single GIF
+                    if successful == 1:
+                        try:
+                            seg_files = list(segments_dir.glob(f"{base_name}_segment_*.gif"))
+                            if seg_files:
+                                src = seg_files[0]
+                                # Replace existing file if present
+                                if single_output_path.exists():
+                                    try:
+                                        single_output_path.unlink()
+                                    except Exception:
+                                        pass
+                                shutil.move(str(src), str(single_output_path))
+                                # Attempt to clean up empty segments folder
+                                try:
+                                    for extra in segments_dir.iterdir():
+                                        try:
+                                            extra.unlink()
+                                        except Exception:
+                                            pass
+                                    segments_dir.rmdir()
+                                except Exception:
+                                    pass
+                                print(f"    📁 Saved optimized GIF to output: {single_output_path.name} ({total_size_mb:.2f}MB)")
+                                logger.info(f"Single-segment GIF moved to output: {single_output_path} ({total_size_mb:.2f}MB)")
+                                return True
+                        except Exception:
+                            # If relocation fails, fall back to reporting segments folder
+                            pass
                     print(f"    📂 Segmented GIFs saved to: {segments_dir.name} ({successful} segment(s), {total_size_mb:.2f}MB total)")
                     logger.info(f"GIF segmentation complete: {successful} segments at {segments_dir}")
                 else:

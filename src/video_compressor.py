@@ -855,8 +855,11 @@ class DynamicVideoCompressor:
     def _calculate_two_pass_params(self, video_info: Dict[str, Any], platform_config: Dict[str, Any], 
                                  target_bitrate: int, previous_result: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         """Calculate parameters for two-pass encoding"""
-        
+        # Force software encoding for two-pass; hardware encoders generally don't support it reliably
         encoder, accel_type = self.hardware.get_best_encoder("h264")
+        if accel_type != 'software':
+            encoder = 'libx264'
+            accel_type = 'software'
         
         params = {
             'encoder': encoder,
