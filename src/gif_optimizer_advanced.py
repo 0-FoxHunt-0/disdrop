@@ -9,7 +9,7 @@ import json
 import math
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple, Optional, Callable
 import logging
 from PIL import Image, ImageSequence, ImageOps, ImageEnhance, ImageFilter
 import numpy as np
@@ -20,9 +20,11 @@ import shutil
 logger = logging.getLogger(__name__)
 
 class AdvancedGifOptimizer:
-    def __init__(self, config_manager):
+    def __init__(self, config_manager, shutdown_checker: Optional[Callable[[], bool]] = None):
         self.config = config_manager
         self.temp_dir = self.config.get_temp_dir()
+        # Shutdown checker provided by caller; if not provided, never indicates shutdown
+        self._shutdown_checker: Callable[[], bool] = shutdown_checker or (lambda: False)
         
         # Advanced optimization cache
         self.palette_cache = {}
@@ -40,6 +42,10 @@ class AdvancedGifOptimizer:
         self.gifsicle_max_candidates: int = int(self.perf_cfg.get('gifsicle_max_candidates', 48 if self.fast_mode else 120))
         # gifsicle optimize level (2 is faster, 3 is heaviest)
         self.gifsicle_optimize_level: int = int(self.perf_cfg.get('gifsicle_optimize_level', 2 if self.fast_mode else 3))
+        # Skip gifsicle passes when far over target to avoid heavy futile searches
+        self.skip_gifsicle_far_over_ratio: float = float(self.perf_cfg.get('skip_gifsicle_far_over_ratio', 0.35 if self.fast_mode else 0.5))
+        # Limit for near-target bounded search iterations
+        self.near_target_max_runs: int = int(self.perf_cfg.get('near_target_max_runs', 12 if self.fast_mode else 24))
         
     def create_optimized_gif(self, input_video: str, output_path: str, 
                            max_size_mb: float, platform: str = None,
@@ -51,21 +57,33 @@ class AdvancedGifOptimizer:
         logger.info("Starting advanced GIF optimization...")
         
         # 1. Intelligent Frame Analysis
+        if self._shutdown_checker():
+            return {'success': False, 'error': 'shutdown'}
         frame_analysis = self._perform_intelligent_frame_analysis(input_video, start_time, duration)
         
         # 2. Advanced Palette Optimization
+        if self._shutdown_checker():
+            return {'success': False, 'error': 'shutdown'}
         optimal_palette = self._generate_optimal_palette(input_video, frame_analysis, max_size_mb)
         
         # 3. Smart Frame Selection and Temporal Optimization
+        if self._shutdown_checker():
+            return {'success': False, 'error': 'shutdown'}
         optimized_frames = self._optimize_frame_sequence(input_video, frame_analysis, optimal_palette, max_size_mb)
         
         # 4. Multi-Strategy GIF Generation
+        if self._shutdown_checker():
+            return {'success': False, 'error': 'shutdown'}
         gif_candidates = self._generate_gif_candidates(optimized_frames, optimal_palette, max_size_mb, platform)
         
         # 5. Parallel Evaluation and Selection
+        if self._shutdown_checker():
+            return {'success': False, 'error': 'shutdown'}
         best_gif = self._evaluate_gif_candidates_parallel(gif_candidates, output_path, max_size_mb)
         
         # 6. Post-Processing Optimization
+        if self._shutdown_checker():
+            return {'success': False, 'error': 'shutdown'}
         final_result = self._apply_gif_post_processing(best_gif, max_size_mb)
         
         return final_result
@@ -79,6 +97,8 @@ class AdvancedGifOptimizer:
           4) Optional final gifsicle squeeze for small overage
         """
         try:
+            if self._shutdown_checker():
+                return False
             if not os.path.exists(gif_path):
                 logger.error(f"GIF file not found: {gif_path}")
                 return False
@@ -100,8 +120,14 @@ class AdvancedGifOptimizer:
 
             gifsicle_available = self._is_tool_available("gifsicle")
 
-            # Stage 1: Lossless gifsicle optimize (if available)
-            if gifsicle_available:
+            # Determine if we should skip gifsicle entirely due to being far over target
+            original_over_ratio = (original_bytes - target_bytes) / float(target_bytes) if target_bytes > 0 else 1.0
+            far_over_skip = gifsicle_available and (original_over_ratio >= self.skip_gifsicle_far_over_ratio)
+
+            # Stage 1: Lossless gifsicle optimize (if available and not far over target)
+            if self._shutdown_checker():
+                return False
+            if gifsicle_available and not far_over_skip:
                 temp_lossless = gif_path + ".lossless.tmp.gif"
                 if self._gifsicle_lossless_optimize(gif_path, temp_lossless) and os.path.exists(temp_lossless):
                     os.replace(temp_lossless, gif_path)
@@ -118,9 +144,11 @@ class AdvancedGifOptimizer:
 
             # Determine strategy threshold (15%)
             over_ratio = (current_bytes - target_bytes) / float(target_bytes)
-            near_target = over_ratio <= 0.15
+            near_target = (over_ratio <= 0.15) and (not far_over_skip)
 
             # Stage 2: Near-target bounded gifsicle search
+            if self._shutdown_checker():
+                return False
             if gifsicle_available and near_target:
                 temp_best = gif_path + ".near.tmp.gif"
                 if self._bounded_gifsicle_near_target(gif_path, temp_best, target_bytes):
@@ -142,6 +170,8 @@ class AdvancedGifOptimizer:
                     pass
 
             # Stage 3: ffmpeg palette re-encode with mpdecimate (robust fallback / far-over-target)
+            if self._shutdown_checker():
+                return False
             info = self._get_gif_basic_info(gif_path)
             temp_ffmpeg = gif_path + ".ffmpeg.tmp.gif"
 
@@ -153,12 +183,14 @@ class AdvancedGifOptimizer:
             new_width = max(2, int((info.get('width', 320) * scale_factor) // 2 * 2))
             fps = max(6, min(15, int(round(info.get('fps', 12)))))
 
+            if self._shutdown_checker():
+                return False
             if self._ffmpeg_palette_reencode(gif_path, temp_ffmpeg, new_width, fps):
                 os.replace(temp_ffmpeg, gif_path)
                 current_bytes = os.path.getsize(gif_path)
 
                 # Stage 4: If slightly over, try a tiny gifsicle squeeze
-                if current_bytes > target_bytes and gifsicle_available:
+                if current_bytes > target_bytes and gifsicle_available and not self._shutdown_checker():
                     if self._gifsicle_squeeze_small_overage(gif_path):
                         current_bytes = os.path.getsize(gif_path)
 
@@ -232,10 +264,15 @@ class AdvancedGifOptimizer:
         """Small, bounded search using gifsicle for near-target cases to avoid heavy compute."""
         try:
             candidates = []
-            # Conservative ladders
-            color_steps = [256, 224, 208, 192, 176, 160]
-            lossy_steps = [0, 10, 20, 30]
-            scale_steps = [1.0, 0.96, 0.92]
+            # Conservative ladders (shorter when fast_mode)
+            if self.fast_mode:
+                color_steps = [256, 192]
+                lossy_steps = [0, 20]
+                scale_steps = [1.0, 0.96]
+            else:
+                color_steps = [256, 224, 208, 192, 176, 160]
+                lossy_steps = [0, 10, 20, 30]
+                scale_steps = [1.0, 0.96, 0.92]
 
             original_size = os.path.getsize(input_path)
             best: Tuple[int, str] = (original_size, '')
@@ -260,7 +297,7 @@ class AdvancedGifOptimizer:
                         pass
 
             # Small grid over lossy and scale (hard-capped iterations)
-            max_runs = 24
+            max_runs = int(self.near_target_max_runs)
             runs = 0
             for scale in scale_steps:
                 for colors in color_steps:
@@ -318,6 +355,8 @@ class AdvancedGifOptimizer:
     def _ffmpeg_palette_reencode(self, input_path: str, output_path: str, new_width: int, fps: int) -> bool:
         """Re-encode GIF via ffmpeg using mpdecimate + palettegen/paletteuse preserving AR."""
         try:
+            if self._shutdown_checker():
+                return False
             palette_path = input_path + ".palette.png"
             # Build filters
             pre = [
@@ -331,6 +370,8 @@ class AdvancedGifOptimizer:
                 'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
                 '-i', input_path, '-vf', vf_palette, '-frames:v', '1', palette_path
             ]
+            if self._shutdown_checker():
+                return False
             r1 = subprocess.run(cmd1, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=180)
             if r1.returncode != 0 or not os.path.exists(palette_path):
                 try:
@@ -348,6 +389,8 @@ class AdvancedGifOptimizer:
                 '-lavfi', lavfi,
                 '-loop', '0', output_path
             ]
+            if self._shutdown_checker():
+                return False
             r2 = subprocess.run(cmd2, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
             try:
                 if os.path.exists(palette_path):
@@ -356,12 +399,17 @@ class AdvancedGifOptimizer:
                 pass
             return r2.returncode == 0 and os.path.exists(output_path)
         except Exception as e:
-            logger.debug(f"ffmpeg palette re-encode failed: {e}")
+            if self._shutdown_checker():
+                logger.info("ffmpeg palette re-encode interrupted by shutdown")
+            else:
+                logger.debug(f"ffmpeg palette re-encode failed: {e}")
             return False
 
     def _gifsicle_squeeze_small_overage(self, gif_path: str) -> bool:
         """Tiny gifsicle squeeze for <=15% overage without major quality loss."""
         try:
+            if self._shutdown_checker():
+                return False
             if not self._is_tool_available('gifsicle'):
                 return False
             temp = gif_path + '.squeeze.tmp.gif'
@@ -1470,7 +1518,7 @@ class AdvancedGifOptimizer:
                 prev_histogram = self._calculate_frame_histogram(frame_array)
                 
             except Exception as e:
-                logger.warning(f"Failed to analyze frame {frame_file}: {e}")
+                logger.debug(f"Failed to analyze frame {frame_file}: {e}")
                 # Add default values
                 analysis['motion_intensity'].append(0.5)
                 analysis['color_complexity'].append(5.0)
@@ -2031,6 +2079,8 @@ class AdvancedGifOptimizer:
         Evaluate GIF candidates in parallel and select the best one
         """
         
+        if self._shutdown_checker():
+            raise RuntimeError("Shutdown requested before candidate evaluation")
         logger.info(f"Evaluating {len(candidates)} GIF candidates in parallel...")
         
         successful_results = []
@@ -2049,6 +2099,8 @@ class AdvancedGifOptimizer:
             for future in as_completed(future_to_candidate):
                 candidate = future_to_candidate[future]
                 try:
+                    if self._shutdown_checker():
+                        break
                     result = future.result(timeout=180)  # 3 minute timeout per candidate
                     if result and result.get('success', False):
                         # Early-stop check
@@ -2063,7 +2115,10 @@ class AdvancedGifOptimizer:
                         logger.info(f"GIF candidate '{candidate['name']}' completed: "
                                   f"{result['size_mb']:.2f}MB, quality: {result['quality_score']:.1f}")
                 except Exception as e:
-                    logger.warning(f"GIF candidate '{candidate['name']}' failed: {e}")
+                    if self._shutdown_checker():
+                        logger.info(f"Candidate '{candidate['name']}' interrupted by shutdown")
+                        break
+                    logger.debug(f"GIF candidate '{candidate['name']}' failed: {e}")
         
         if early_pick:
             shutil.move(early_pick['temp_file'], output_path)

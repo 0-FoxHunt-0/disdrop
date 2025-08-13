@@ -1509,11 +1509,11 @@ class AutomatedWorkflow:
             max_seg = max(min_seg, float(seg_cfg.get('max_segment_duration', 35)))
             size_threshold_multiplier = float(seg_cfg.get('size_threshold_multiplier', 2.5))
 
-            # Heuristic: segment if file is over target (slightly), or duration is long
-            # Keep the 1.05 safety to trigger fallback after optimization failure,
-            # but we will decide the NUMBER of segments using the configured multiplier.
+            # Heuristic: segment if file is over target at all, or duration is long
+            # Note: We are in the optimization-fallback path when this is called.
+            # Use strict size comparison (no 5% cushion) to ensure segmentation triggers.
             should_segment = (
-                (max_size_mb is not None and original_size_mb > max_size_mb * 1.05)
+                (max_size_mb is not None and original_size_mb > max_size_mb)
                 or (duration > max_duration_cfg)
                 or (duration >= max_seg * 2)  # clearly benefits from splitting
             )
@@ -1581,126 +1581,122 @@ class AutomatedWorkflow:
             single_output_path = output_dir / f"{base_name}.gif"
             segments_dir_created = False
 
-            # Process each segment
+            # Process each segment (parallelized)
             successful = 0
             total_size_mb = 0.0
 
             # Read target fps from config; fallback to 20
             target_fps = int(self.config.get('gif_settings.fps', 20) or 20)
 
-            for i in range(num_segments):
-                if self.shutdown_requested:
-                    print("    🛑 Segmentation cancelled by user")
-                    break
-
-                seg_start = i * segment_duration
-                if duration > 0:
-                    seg_end = min(duration, seg_start + segment_duration)
-                    seg_len = max(0.0, seg_end - seg_start)
-                else:
-                    seg_len = segment_duration
-
-                if seg_len <= 0.1:
-                    continue
-
-                # Create temp segment GIF path
-                temp_seg = self.temp_dir / f"{base_name}.seg{i+1:02d}.gif"
+            # Determine parallelism
+            perf_cfg = self.config.get('gif_settings.performance', {}) or {}
+            segment_parallelism = perf_cfg.get('segment_parallelism', 'auto')
+            if str(segment_parallelism).lower() == 'auto':
                 try:
-                    if temp_seg.exists():
-                        try:
-                            temp_seg.unlink()
-                        except Exception:
-                            pass
+                    cpu = os.cpu_count() or 4
+                    max_workers = max(1, min(4, cpu // 2))
+                except Exception:
+                    max_workers = 2
+            else:
+                try:
+                    max_workers = max(1, min(8, int(segment_parallelism)))
+                except Exception:
+                    max_workers = 2
+
+            # Pre-create segments directory when using multi-segment mode to avoid race conditions
+            if use_segments_folder:
+                try:
+                    segments_dir.mkdir(parents=True, exist_ok=True)
                 except Exception:
                     pass
+                segments_dir_created = True
 
-                # Build ffmpeg command to slice GIF and lightly normalize frames
-                # Preserve aspect ratio and avoid stretching; drop dup frames to keep size down.
-                vf = f"mpdecimate=hi=768:lo=512:frac=0.5,fps={target_fps},scale=iw:ih:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1"
-                cmd = [
-                    'ffmpeg', '-y',
-                    '-ss', str(seg_start),
-                    '-t', str(seg_len),
-                    '-i', str(gif_file),
-                    '-vf', vf,
-                    '-loop', '0',
-                    str(temp_seg)
-                ]
-                FFmpegUtils.add_ffmpeg_perf_flags(cmd)
+            from .gif_optimizer_advanced import AdvancedGifOptimizer
+            optimizer = AdvancedGifOptimizer(self.config, shutdown_checker=lambda: self.shutdown_requested)
 
+            def _process_segment(index: int) -> Optional[Tuple[int, Path, float]]:
                 try:
+                    if self.shutdown_requested:
+                        return None
+                    seg_start = index * segment_duration
+                    if duration > 0:
+                        seg_end = min(duration, seg_start + segment_duration)
+                        seg_len = max(0.0, seg_end - seg_start)
+                    else:
+                        seg_len = segment_duration
+                    if seg_len <= 0.1:
+                        return None
+                    temp_seg = self.temp_dir / f"{base_name}.seg{index+1:02d}.gif"
+                    try:
+                        if temp_seg.exists():
+                            temp_seg.unlink()
+                    except Exception:
+                        pass
+                    vf = f"mpdecimate=hi=768:lo=512:frac=0.5,fps={target_fps},scale=iw:ih:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1"
+                    cmd = [
+                        'ffmpeg', '-y',
+                        '-ss', str(seg_start),
+                        '-t', str(seg_len),
+                        '-i', str(gif_file),
+                        '-vf', vf,
+                        '-loop', '0',
+                        str(temp_seg)
+                    ]
+                    FFmpegUtils.add_ffmpeg_perf_flags(cmd)
                     result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
                     if result.returncode != 0 or not temp_seg.exists():
-                        logger.warning(f"Failed to create segment {i+1}: {result.stderr[:200] if result.stderr else 'unknown error'}")
-                        continue
-                except Exception as e:
-                    logger.warning(f"Exception while creating GIF segment {i+1}: {e}")
-                    continue
-
-                # Optimize the segment with gifsicle-first strategy; fallback to ffmpeg, preserving aspect ratio
-                # Per workflow guidance, prefer gifsicle when close to target, ffmpeg re-encode with mpdecimate otherwise
-                from .gif_optimizer_advanced import AdvancedGifOptimizer
-                optimizer = AdvancedGifOptimizer(self.config)
-                optimized_ok = optimizer.optimize_gif(str(temp_seg), max_size_mb)
-                if not optimized_ok:
-                    try:
-                        if temp_seg.exists():
-                            temp_seg.unlink()
-                    except Exception:
-                        pass
-                    continue
-
-                # Validate and move to final location
-                if use_segments_folder:
-                    final_seg = segments_dir / f"{base_name}_segment_{i+1:02d}.gif"
-                else:
-                    # Single segment case → write as a single GIF at output root
-                    final_seg = single_output_path
-                is_valid, _ = self.file_validator.is_valid_gif_with_enhanced_checks(
-                    str(temp_seg), original_path=None, max_size_mb=max_size_mb
-                )
-                if not is_valid:
-                    try:
-                        if temp_seg.exists():
-                            temp_seg.unlink()
-                    except Exception:
-                        pass
-                    continue
-
-                # Create the segments directory only when we have the first valid segment
-                if use_segments_folder and not segments_dir_created:
-                    try:
-                        segments_dir.mkdir(parents=True, exist_ok=True)
-                    except Exception:
-                        pass
-                    segments_dir_created = True
-
-                try:
-                    # Replace existing file if needed in single-output case
-                    if not use_segments_folder and final_seg.exists():
+                        logger.warning(f"Failed to create segment {index+1}: {result.stderr[:200] if result.stderr else 'unknown error'}")
+                        return None
+                    # Optimize
+                    if not optimizer.optimize_gif(str(temp_seg), max_size_mb):
                         try:
+                            temp_seg.unlink()
+                        except Exception:
+                            pass
+                        return None
+                    # Validate and move
+                    final_seg = (segments_dir / f"{base_name}_segment_{index+1:02d}.gif") if use_segments_folder else single_output_path
+                    is_valid, _ = self.file_validator.is_valid_gif_with_enhanced_checks(str(temp_seg), original_path=None, max_size_mb=max_size_mb)
+                    if not is_valid:
+                        try:
+                            temp_seg.unlink()
+                        except Exception:
+                            pass
+                        return None
+                    try:
+                        if not use_segments_folder and final_seg.exists():
                             final_seg.unlink()
-                        except Exception:
-                            pass
-                    shutil.move(str(temp_seg), str(final_seg))
-                except Exception:
-                    try:
-                        shutil.copy2(str(temp_seg), str(final_seg))
-                        temp_seg.unlink(missing_ok=True)  # type: ignore[arg-type]
-                    except Exception as e:
-                        logger.warning(f"Failed to move/copy segment {i+1} to output: {e}")
+                        shutil.move(str(temp_seg), str(final_seg))
+                    except Exception:
                         try:
-                            if temp_seg.exists():
-                                temp_seg.unlink()
+                            shutil.copy2(str(temp_seg), str(final_seg))
+                            temp_seg.unlink(missing_ok=True)  # type: ignore[arg-type]
                         except Exception:
-                            pass
-                        continue
+                            return None
+                    sz = self.file_validator.get_file_size_mb(str(final_seg))
+                    print(f"    ✅ Created GIF segment {index+1}/{num_segments}: {final_seg.name} ({sz:.2f}MB)")
+                    logger.info(f"Created GIF segment {index+1}/{num_segments}: {final_seg} ({sz:.2f}MB)")
+                    return (index, final_seg, sz)
+                except Exception as e:
+                    logger.warning(f"Exception while processing GIF segment {index+1}: {e}")
+                    return None
 
-                seg_size = self.file_validator.get_file_size_mb(str(final_seg))
-                total_size_mb += seg_size
-                successful += 1
-                print(f"    ✅ Created GIF segment {i+1}/{num_segments}: {final_seg.name} ({seg_size:.2f}MB)")
-                logger.info(f"Created GIF segment {i+1}/{num_segments}: {final_seg} ({seg_size:.2f}MB)")
+            indices = list(range(num_segments))
+            results: List[Tuple[int, Path, float]] = []
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(_process_segment, idx) for idx in indices]
+                for fut in as_completed(futures):
+                    res = None
+                    try:
+                        res = fut.result()
+                    except Exception as e:
+                        logger.warning(f"Segment future failed: {e}")
+                    if res:
+                        results.append(res)
+
+            # Aggregate
+            successful = len(results)
+            total_size_mb = sum(r[2] for r in results)
 
             if successful > 0:
                 if use_segments_folder:
