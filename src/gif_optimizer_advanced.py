@@ -500,9 +500,9 @@ class AdvancedGifOptimizer:
             palette_path = input_path + ".palette.png"
             # Build filters
             pre = [
-                'mpdecimate=hi=768:lo=512:frac=0.5',
+                'mpdecimate=hi=512:lo=256:frac=0.3',
                 f'fps={fps}',
-                f'scale={new_width}:-2:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1'
+                f'scale={new_width}:-2:flags=lanczos'
             ]
             vf_palette = ','.join(pre + [f'palettegen=max_colors={int(max_colors)}:stats_mode=diff'])
             # Palette gen
@@ -788,7 +788,7 @@ class AdvancedGifOptimizer:
         try:
             cmd = [
                 'ffmpeg', '-y', '-i', input_path,
-                '-vf', f'mpdecimate=hi=768:lo=512:frac=0.5,fps={fps},scale=iw:ih:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1',
+                '-vf', f'mpdecimate=hi=512:lo=256:frac=0.3,fps={fps},scale=iw:ih:flags=lanczos',
                 '-loop', '0', output_path
             ]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
@@ -1191,7 +1191,7 @@ class AdvancedGifOptimizer:
         palette_path = output_path + '.palette.png'
         palette_cmd = [
             'ffmpeg', '-i', input_path,
-            '-vf', f'scale={params["width"]}:{params["height"]}:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1,fps={params["fps"]},palettegen=max_colors={params["colors"]}:stats_mode=diff',
+            '-vf', f'scale={params["width"]}:{params["height"]}:flags=lanczos,fps={params["fps"]},palettegen=max_colors={params["colors"]}:stats_mode=diff',
             '-frames:v', '1', '-y', palette_path
         ]
         
@@ -1202,7 +1202,7 @@ class AdvancedGifOptimizer:
         # Create optimized GIF using palette
         gif_cmd = [
             'ffmpeg', '-i', input_path, '-i', palette_path,
-            '-lavfi', f'scale={params["width"]}:{params["height"]}:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1,fps={params["fps"]},paletteuse=dither={params["dither"]}:diff_mode=rectangle',
+            '-lavfi', f'scale={params["width"]}:{params["height"]}:flags=lanczos,fps={params["fps"]},paletteuse=dither={params["dither"]}:diff_mode=rectangle',
             '-loop', '0', '-y', output_path
         ]
         
@@ -1225,7 +1225,7 @@ class AdvancedGifOptimizer:
         palette_path = output_path + '.palette.png'
         palette_cmd = [
             'ffmpeg', '-i', input_path,
-            '-vf', f'scale={scale_width}:{scale_height}:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1,fps={params["fps"]},palettegen=max_colors={params["colors"]}:stats_mode=diff',
+            '-vf', f'scale={scale_width}:{scale_height}:flags=lanczos,fps={params["fps"]},palettegen=max_colors={params["colors"]}:stats_mode=diff',
             '-frames:v', '1', '-y', palette_path
         ]
         
@@ -1236,7 +1236,7 @@ class AdvancedGifOptimizer:
         # Create optimized GIF using palette
         gif_cmd = [
             'ffmpeg', '-i', input_path, '-i', palette_path,
-            '-lavfi', f'scale={scale_width}:{scale_height}:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1,fps={params["fps"]},paletteuse=dither={params["dither"]}:diff_mode=rectangle',
+            '-lavfi', f'scale={scale_width}:{scale_height}:flags=lanczos,fps={params["fps"]},paletteuse=dither={params["dither"]}:diff_mode=rectangle',
             '-loop', '0', '-y', output_path
         ]
         
@@ -1260,7 +1260,7 @@ class AdvancedGifOptimizer:
         palette_path = output_path + '.palette.png'
         palette_cmd = [
             'ffmpeg', '-i', input_path,
-            '-vf', f'scale={new_width}:{new_height}:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1,fps={params["fps"]},palettegen=max_colors={params["colors"]}:stats_mode=diff',
+            '-vf', f'scale={new_width}:{new_height}:flags=lanczos,fps={params["fps"]},palettegen=max_colors={params["colors"]}:stats_mode=diff',
             '-frames:v', '1', '-y', palette_path
         ]
         
@@ -1271,7 +1271,7 @@ class AdvancedGifOptimizer:
         # Create upscaled GIF using palette
         gif_cmd = [
             'ffmpeg', '-i', input_path, '-i', palette_path,
-            '-lavfi', f'scale={new_width}:{new_height}:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1,fps={params["fps"]},paletteuse=dither={params["dither"]}:diff_mode=rectangle',
+            '-lavfi', f'scale={new_width}:{new_height}:flags=lanczos,fps={params["fps"]}:diff_mode=rectangle',
             '-loop', '0', '-y', output_path
         ]
         
@@ -1379,7 +1379,7 @@ class AdvancedGifOptimizer:
                     palette_path = temp_output + f".palette_{sw}x{sh}_{t['fps']}_{t['colors']}.png"
                     palette_cmd = [
                         'ffmpeg', '-y', '-i', gif_path,
-                        '-vf', f'mpdecimate=hi=768:lo=512:frac=0.5,fps={t["fps"]},scale={sw}:{sh}:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1,palettegen=max_colors={t["colors"]}:stats_mode=diff',
+                        '-vf', f'mpdecimate=hi=512:lo=256:frac=0.3,fps={t["fps"]},scale={sw}:{sh}:flags=lanczos,palettegen=max_colors={t["colors"]}:stats_mode=diff',
                         '-frames:v', '1', palette_path
                     ]
                     palette_result = subprocess.run(palette_cmd, capture_output=True, text=True, timeout=90)
@@ -1388,7 +1388,7 @@ class AdvancedGifOptimizer:
 
                     gif_cmd = [
                         'ffmpeg', '-y', '-i', gif_path, '-i', palette_path,
-                        '-lavfi', f'mpdecimate=hi=768:lo=512:frac=0.5,fps={t["fps"]},scale={sw}:{sh}:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1[p];[p][1:v]paletteuse=dither={t["dither"]}:diff_mode=rectangle',
+                        '-lavfi', f'mpdecimate=hi=512:lo=256:frac=0.3,fps={t["fps"]},scale={sw}:{sh}:flags=lanczos[p];[p][1:v]paletteuse=dither={t["dither"]}:diff_mode=rectangle',
                         '-loop', '0', temp_output
                     ]
                     gif_result = subprocess.run(gif_cmd, capture_output=True, text=True, timeout=180)
@@ -2641,7 +2641,7 @@ class AdvancedGifOptimizer:
                 '-t', str(duration),
                 '-i', input_video,
                 '-i', palette_file,
-                '-lavfi', f'fps={params["fps"]},scale={params["width"]}:{params["height"]}:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1[x];[x][1:v]paletteuse=dither={params["dither"]}:diff_mode=rectangle',
+                '-lavfi', f'fps={params["fps"]},scale={params["width"]}:{params["height"]}:flags=lanczos[x];[x][1:v]paletteuse=dither={params["dither"]}:diff_mode=rectangle',
                 '-loop', '0',
                 output_gif
             ]
@@ -2652,7 +2652,7 @@ class AdvancedGifOptimizer:
                 '-ss', str(start_time),
                 '-t', str(duration),
                 '-i', input_video,
-                '-vf', f'fps={params["fps"]},scale={params["width"]}:{params["height"]}:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1,palettegen=max_colors={params["colors"]}:stats_mode=diff,paletteuse=dither={params["dither"]}',
+                '-vf', f'fps={params["fps"]},scale={params["width"]}:{params["height"]}:flags=lanczos,palettegen=max_colors={params["colors"]}:stats_mode=diff,paletteuse=dither={params["dither"]}',
                 '-loop', '0',
                 output_gif
             ]

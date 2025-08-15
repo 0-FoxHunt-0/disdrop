@@ -390,7 +390,7 @@ class FFmpegUtils:
 
             vf_chain: List[str] = ['setsar=1']
             if width and width > 0:
-                vf_chain.insert(0, f"scale={width}:-1:flags=lanczos:force_original_aspect_ratio=decrease")
+                vf_chain.insert(0, f"scale={width}:-1:flags=lanczos")
             vf = ','.join(vf_chain)
 
             cmd: List[str] = [

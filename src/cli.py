@@ -12,8 +12,9 @@ import signal
 import traceback
 from typing import Dict, Any, Optional
 import logging
+import time
 
-from .logger_setup import setup_logging, get_logger
+from .logger_setup import setup_logging, get_logger, _cleanup_old_logs
 from .config_manager import ConfigManager
 from .hardware_detector import HardwareDetector
 from .video_compressor import DynamicVideoCompressor
@@ -37,6 +38,9 @@ class VideoCompressorCLI:
         try:
             # Parse arguments first to get log level
             args = self._parse_arguments()
+            
+            # Clean up old logs at startup (keep only last 5 executions)
+            _cleanup_old_logs("logs", keep_count=5)
             
             # Setup logging (quiet console by default; enable verbose console when --debug)
             global logger
@@ -253,6 +257,12 @@ class VideoCompressorCLI:
         auto_parser.add_argument('--no-cache', action='store_true',
                                 help='Do not use success cache in automated workflow')
         
+        # Cache management command
+        cache_parser = subparsers.add_parser('cache', help='Cache management operations')
+        cache_subparsers = cache_parser.add_subparsers(dest='cache_action', help='Cache operations')
+        cache_subparsers.add_parser('clear', help='Clear all cache entries')
+        cache_subparsers.add_parser('stats', help='Show cache statistics')
+        
         # Set default command if none provided
         args = parser.parse_args()
         if not args.command:
@@ -409,6 +419,9 @@ class VideoCompressorCLI:
         elif args.command == 'auto':
             self._run_automated_workflow(args)
         
+        elif args.command == 'cache':
+            self._handle_cache_command(args)
+        
         else:
             logger.error(f"Unknown command: {args.command}")
             sys.exit(1)
@@ -530,6 +543,27 @@ class VideoCompressorCLI:
                                 shutil.move(summary_file, final_summary)
                             except Exception as e:
                                 logger.warning(f"Failed to move summary file: {e}")
+                        
+                        # Ensure MP4 is moved to segments folder for user convenience
+                        try:
+                            # Find the source MP4 file
+                            source_mp4 = None
+                            for segment in segments:
+                                if segment.get('temp_path') and segment.get('temp_path').endswith('.mp4'):
+                                    source_mp4 = segment.get('temp_path')
+                                    break
+                            
+                            if source_mp4 and os.path.exists(source_mp4):
+                                # Check if there's an MP4 in the final segments folder
+                                mp4_files = [f for f in os.listdir(final_segments_folder) if f.endswith('.mp4')]
+                                if not mp4_files:
+                                    # Move the source MP4 to segments folder
+                                    mp4_name = os.path.basename(source_mp4)
+                                    final_mp4_path = os.path.join(final_segments_folder, mp4_name)
+                                    shutil.move(source_mp4, final_mp4_path)
+                                    logger.info(f"Moved source MP4 to segments folder: {mp4_name}")
+                        except Exception as e:
+                            logger.warning(f"Failed to move MP4 to segments folder: {e}")
                         
                         # Clean up temp folder
                         try:
@@ -770,6 +804,27 @@ class VideoCompressorCLI:
                                     shutil.move(summary_file, final_summary)
                                 except Exception as e:
                                     logger.warning(f"Failed to move summary file: {e}")
+                            
+                            # Ensure MP4 is moved to segments folder for user convenience
+                            try:
+                                # Find the source MP4 file
+                                source_mp4 = None
+                                for segment in segments:
+                                    if segment.get('temp_path') and segment.get('temp_path').endswith('.mp4'):
+                                        source_mp4 = segment.get('temp_path')
+                                        break
+                                
+                                if source_mp4 and os.path.exists(source_mp4):
+                                    # Check if there's an MP4 in the final segments folder
+                                    mp4_files = [f for f in os.listdir(final_segments_folder) if f.endswith('.mp4')]
+                                    if not mp4_files:
+                                        # Move the source MP4 to segments folder
+                                        mp4_name = os.path.basename(source_mp4)
+                                        final_mp4_path = os.path.join(final_segments_folder, mp4_name)
+                                        shutil.move(source_mp4, final_mp4_path)
+                                        logger.info(f"Moved source MP4 to segments folder: {mp4_name}")
+                            except Exception as e:
+                                logger.warning(f"Failed to move MP4 to segments folder: {e}")
                             
                             # Clean up temp folder
                             try:
@@ -1299,6 +1354,40 @@ class VideoCompressorCLI:
         except Exception as e:
             logger.error(f"Automated workflow error: {e}")
             raise
+
+    def _handle_cache_command(self, args: argparse.Namespace):
+        """Handle cache management commands"""
+        if args.cache_action == 'clear':
+            self._clear_cache()
+        elif args.cache_action == 'stats':
+            self._show_cache_stats()
+        else:
+            logger.error("Cache command requires an action (clear|stats)")
+
+    def _clear_cache(self):
+        """Clear all cache entries."""
+        try:
+            self.automated_workflow.clear_cache()
+            print("✅ Cache cleared successfully")
+        except Exception as e:
+            print(f"❌ Failed to clear cache: {e}")
+            logger.error(f"Failed to clear cache: {e}")
+
+    def _show_cache_stats(self):
+        """Show cache statistics."""
+        try:
+            stats = self.automated_workflow.get_cache_stats()
+            print("\n📊 Cache Statistics:")
+            print("=" * 50)
+            print(f"Total Entries:        {stats['total_entries']}")
+            print(f"Recent Entries:       {stats['current_session_entries']} (<1 hour)")
+            print(f"Older Entries:        {stats['old_entries']} (≥1 hour)")
+            print(f"Cache Age:            {stats['cache_age_info']}")
+            print(f"Session Start:        {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stats['session_start_time']))}")
+            print("=" * 50)
+        except Exception as e:
+            print(f"❌ Failed to get cache stats: {e}")
+            logger.error(f"Failed to get cache stats: {e}")
 
 def main():
     """Entry point for the CLI application"""

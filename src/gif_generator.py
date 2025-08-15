@@ -118,6 +118,49 @@ class GifGenerator:
             logger.error(f"Error creating GIF: {e}")
             return {'success': False, 'error': str(e)}
     
+    def _calculate_optimal_scale(self, video_info: Dict[str, Any], target_width: int, max_size_mb: float) -> Tuple[int, int]:
+        """
+        Calculate optimal scaling dimensions that preserve aspect ratio and quality
+        
+        Args:
+            video_info: Video information from FFmpeg
+            target_width: Target width in pixels
+            max_size_mb: Maximum file size in MB
+            
+        Returns:
+            Tuple of (width, height) for optimal scaling
+        """
+        try:
+            original_width = video_info.get('width', 1920)
+            original_height = video_info.get('height', 1080)
+            
+            if not original_width or not original_height:
+                return target_width, -2  # Fallback to original behavior
+            
+            # Calculate aspect ratio
+            aspect_ratio = original_width / original_height
+            
+            # Calculate height that maintains aspect ratio
+            calculated_height = int(target_width / aspect_ratio)
+            
+            # Ensure height is even (required for some codecs)
+            if calculated_height % 2 != 0:
+                calculated_height = calculated_height + 1
+            
+            # If the calculated dimensions would result in a very small file,
+            # we can afford to use higher quality
+            estimated_pixels = target_width * calculated_height
+            if estimated_pixels < 300000:  # Less than 300k pixels
+                # Use higher quality scaling
+                return target_width, calculated_height
+            
+            # For larger videos, use the calculated dimensions
+            return target_width, calculated_height
+            
+        except Exception as e:
+            logger.warning(f"Error calculating optimal scale, using fallback: {e}")
+            return target_width, -2  # Fallback to original behavior
+
     def _get_platform_settings(self, platform: str, max_size_mb: float) -> Dict[str, Any]:
         """Get platform-specific settings"""
         if platform and platform.lower() in self.platform_settings:
@@ -329,10 +372,16 @@ class GifGenerator:
             pre_chain = []
             if crop_filter:
                 pre_chain.append(crop_filter)
-            pre_chain.append('mpdecimate=hi=768:lo=512:frac=0.5')
+            pre_chain.append('mpdecimate=hi=512:lo=256:frac=0.3')
             pre_chain.append(f"fps={settings['fps']}")
-            pre_chain.append(f"scale={settings['scale']}:-1:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1")
-            vf = ','.join(pre_chain + ["palettegen=max_colors=256:stats_mode=diff"])  # diff by default
+            
+            # Get video info for optimal scaling
+            video_info = self.ffmpeg_utils.get_video_info(safe_input_path)
+            optimal_width, optimal_height = self._calculate_optimal_scale(video_info, settings['scale'], settings['max_size_mb'])
+            
+            # Improved scaling: preserve aspect ratio better and use higher quality
+            pre_chain.append(f"scale={optimal_width}:{optimal_height}:flags=lanczos")
+            vf = ','.join(pre_chain + ["palettegen=max_colors=256:stats_mode=diff:reserve_transparent=1"])  # Improved palette settings
 
             # Palette cache key
             cache_dir = os.path.join(self.config.get_temp_dir(), 'palette_cache')
@@ -412,10 +461,16 @@ class GifGenerator:
             pre_chain = []
             if crop_filter:
                 pre_chain.append(crop_filter)
-            pre_chain.append('mpdecimate=hi=768:lo=512:frac=0.5')
+            pre_chain.append('mpdecimate=hi=512:lo=256:frac=0.3')
             pre_chain.append(f"fps={settings['fps']}")
-            pre_chain.append(f"scale={settings['scale']}:-1:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1")
-            lavfi = ','.join(pre_chain) + " [x]; [x][1:v] paletteuse=dither=sierra2_4a:diff_mode=rectangle"
+            
+            # Get video info for optimal scaling
+            video_info = self.ffmpeg_utils.get_video_info(safe_input_path)
+            optimal_width, optimal_height = self._calculate_optimal_scale(video_info, settings['scale'], settings['max_size_mb'])
+            
+            # Improved scaling: preserve aspect ratio better and use higher quality
+            pre_chain.append(f"scale={optimal_width}:{optimal_height}:flags=lanczos")
+            lavfi = ','.join(pre_chain) + " [x]; [x][1:v] paletteuse=dither=sierra2_4a:diff_mode=rectangle:new=1"
 
             # Build FFmpeg command for GIF creation
             cmd = [
@@ -467,15 +522,21 @@ class GifGenerator:
             pre = []
             if crop_filter:
                 pre.append(crop_filter)
-            pre.append('mpdecimate=hi=768:lo=512:frac=0.5')
+            pre.append('mpdecimate=hi=512:lo=256:frac=0.3')
             pre.append(f"fps={settings['fps']}")
-            pre.append(f"scale={settings['scale']}:-1:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1")
+            
+            # Get video info for optimal scaling
+            video_info = self.ffmpeg_utils.get_video_info(safe_input_path)
+            optimal_width, optimal_height = self._calculate_optimal_scale(video_info, settings['scale'], settings['max_size_mb'])
+            
+            # Improved scaling: preserve aspect ratio better and use higher quality
+            pre.append(f"scale={optimal_width}:{optimal_height}:flags=lanczos")
             chain = ','.join(pre)
 
             filter_complex = (
                 f"{chain},split[a][b];" 
-                f"[a]palettegen=stats_mode=diff:reserve_transparent=1[p];"
-                f"[b][p]paletteuse=dither=sierra2_4a:diff_mode=rectangle"
+                f"[a]palettegen=stats_mode=diff:reserve_transparent=1:max_colors=256[p];"
+                f"[b][p]paletteuse=dither=sierra2_4a:diff_mode=rectangle:new=1"
             )
 
             cmd = [

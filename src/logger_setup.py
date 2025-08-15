@@ -13,6 +13,7 @@ from typing import Optional
 import codecs
 import atexit
 from datetime import datetime
+import glob
 
 # Initialize colorama for Windows compatibility
 init(autoreset=True)
@@ -159,6 +160,56 @@ def _enable_terminal_tee(logs_dir: str = "logs") -> str:
     _TEE_ENABLED = True
     return terminal_log_path
 
+def _cleanup_old_logs(logs_dir: str = "logs", keep_count: int = 5):
+    """
+    Clean up old log files, keeping only the last N executions
+    
+    Args:
+        logs_dir: Directory containing log files
+        keep_count: Number of most recent log files to keep
+    """
+    try:
+        # Find all terminal log files (timestamped)
+        terminal_logs = glob.glob(os.path.join(logs_dir, "terminal_*.log"))
+        
+        print(f"Log cleanup: Found {len(terminal_logs)} terminal log files")
+        
+        if len(terminal_logs) <= keep_count:
+            print(f"Log cleanup: No cleanup needed, only {len(terminal_logs)} files found")
+            return  # No cleanup needed
+        
+        # Sort by modification time (newest first)
+        terminal_logs.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+        
+        # Show what we're keeping and what we're removing
+        files_to_keep = terminal_logs[:keep_count]
+        files_to_remove = terminal_logs[keep_count:]
+        
+        print(f"Log cleanup: Keeping {len(files_to_keep)} most recent log files:")
+        for f in files_to_keep:
+            print(f"  - {os.path.basename(f)}")
+        
+        print(f"Log cleanup: Removing {len(files_to_remove)} old log files:")
+        for f in files_to_remove:
+            print(f"  - {os.path.basename(f)}")
+        
+        # Remove old files
+        removed_count = 0
+        for old_log in files_to_remove:
+            try:
+                os.remove(old_log)
+                print(f"Log cleanup: Successfully removed {os.path.basename(old_log)}")
+                removed_count += 1
+            except Exception as e:
+                print(f"Log cleanup warning: Could not remove {os.path.basename(old_log)}: {e}")
+        
+        print(f"Log cleanup: Completed. Removed {removed_count} old log files.")
+                
+    except Exception as e:
+        print(f"Log cleanup error: {e}")
+        import traceback
+        traceback.print_exc()
+
 def setup_logging(config_path: str = "config/logging.yaml", log_level: Optional[str] = None):
     """
     Setup logging configuration from YAML file
@@ -236,6 +287,9 @@ def setup_logging(config_path: str = "config/logging.yaml", log_level: Optional[
 
         # Enable terminal tee BEFORE applying logging config so console handler uses the tee stream
         terminal_log_path = _enable_terminal_tee(logs_dir)
+        
+        # Clean up old logs AFTER terminal tee is set up (keep only last 5 executions)
+        _cleanup_old_logs(logs_dir, keep_count=5)
 
         # Default: quieter console (WARNING) and DEBUG to file unless overridden
         try:

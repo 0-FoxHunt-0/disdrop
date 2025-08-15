@@ -729,28 +729,100 @@ class DynamicVideoCompressor:
         original_width, original_height = video_info['width'], video_info['height']
         original_pixels = original_width * original_height
         
-        # Estimate pixels we can afford based on target size
-        duration = video_info['duration']
-        complexity = video_info.get('complexity_score', 5.0)
+        logger.info(f"Calculating optimal resolution: original {original_width}x{original_height} "
+                   f"({original_pixels:,} pixels), target size {target_size_mb}MB")
         
-        # Rough calculation: bits per pixel per second
-        target_bits = target_size_mb * 8 * 1024 * 1024 * 0.85
-        bits_per_second = target_bits / duration
+        # Safety check: if the target size is much larger than what we need, 
+        # don't aggressively downscale. This prevents the 1.19MB issue.
+        original_size_mb = video_info.get('size_bytes', 0) / (1024 * 1024)
+        if original_size_mb > 0 and target_size_mb > original_size_mb * 2:
+            logger.info(f"Target size {target_size_mb}MB is much larger than original {original_size_mb:.1f}MB, "
+                       f"keeping original resolution to maintain quality")
+            return original_width, original_height
         
-        # Adjust for complexity
-        efficiency_factor = 0.15 - (complexity * 0.01)  # More complex = less efficient
-        affordable_pixels = int((bits_per_second * efficiency_factor) / 24)  # 24 bits per pixel estimate
-        
-        if affordable_pixels >= original_pixels:
-            # Can keep original resolution
-            optimal_width, optimal_height = original_width, original_height
+        # For high-resolution videos, be much more conservative about downscaling
+        # The goal is to maintain quality while meeting size constraints
+        if original_pixels > 1000000:  # Over 1M pixels (like your 1080x1440)
+            logger.info(f"High-resolution video detected ({original_pixels:,} pixels), using conservative scaling")
+            
+            # Start with a much more conservative approach
+            # Instead of aggressive downscaling, try to maintain resolution and adjust other parameters
+            if original_pixels <= 2000000:  # 1M-2M pixels (like 1080p, 1440p)
+                # For videos in this range, try to keep at least 80% of original resolution
+                min_scale_factor = 0.8
+            else:  # Over 2M pixels (4K+)
+                # For very high resolution, be more aggressive but still reasonable
+                min_scale_factor = 0.6
+            
+            # Calculate what we can afford based on target size
+            duration = video_info['duration']
+            complexity = video_info.get('complexity_score', 5.0)
+            
+            # Much more conservative bitrate calculation
+            target_bits = target_size_mb * 8 * 1024 * 1024 * 0.85
+            bits_per_second = target_bits / duration
+            
+            # For high-resolution videos, use a much higher efficiency factor
+            # This prevents the extreme downscaling that was happening
+            base_efficiency = 0.6  # Much higher than the previous 0.25
+            complexity_penalty = min(complexity * 0.002, 0.05)  # Much smaller penalty
+            efficiency_factor = base_efficiency - complexity_penalty
+            
+            affordable_pixels = int((bits_per_second * efficiency_factor) / 24)
+            
+            logger.info(f"High-res calculation: duration={duration:.1f}s, complexity={complexity:.1f}, "
+                       f"efficiency_factor={efficiency_factor:.3f}, affordable_pixels={affordable_pixels:,}")
+            
+            if affordable_pixels >= original_pixels:
+                # Can keep original resolution
+                optimal_width, optimal_height = original_width, original_height
+                logger.info(f"Keeping original resolution: {optimal_width}x{optimal_height}")
+            else:
+                # Need to scale down, but be conservative
+                scale_factor = math.sqrt(affordable_pixels / original_pixels)
+                
+                # Apply minimum scale factor to prevent extreme downscaling
+                scale_factor = max(scale_factor, min_scale_factor)
+                
+                optimal_width = int(original_width * scale_factor)
+                optimal_height = int(original_height * scale_factor)
+                
+                logger.info(f"Conservative scaling: factor={scale_factor:.3f}, new size={optimal_width}x{optimal_height}")
         else:
-            # Need to scale down
-            scale_factor = math.sqrt(affordable_pixels / original_pixels)
-            optimal_width = int(original_width * scale_factor)
-            optimal_height = int(original_height * scale_factor)
+            # For lower resolution videos, use the existing logic but with improvements
+            duration = video_info['duration']
+            complexity = video_info.get('complexity_score', 5.0)
+            
+            # Improved calculation for lower resolution videos
+            target_bits = target_size_mb * 8 * 1024 * 1024 * 0.85
+            bits_per_second = target_bits / duration
+            
+            # Better efficiency factors for lower resolution
+            base_efficiency = 0.35  # Increased from 0.25
+            complexity_penalty = min(complexity * 0.003, 0.08)  # Reduced penalty
+            efficiency_factor = base_efficiency - complexity_penalty
+            
+            affordable_pixels = int((bits_per_second * efficiency_factor) / 24)
+            
+            logger.info(f"Standard calculation: duration={duration:.1f}s, complexity={complexity:.1f}, "
+                       f"efficiency_factor={efficiency_factor:.3f}, affordable_pixels={affordable_pixels:,}")
+            
+            if affordable_pixels >= original_pixels:
+                optimal_width, optimal_height = original_width, original_height
+                logger.info(f"Keeping original resolution: {optimal_width}x{optimal_height}")
+            else:
+                scale_factor = math.sqrt(affordable_pixels / original_pixels)
+                
+                # Apply minimum scale factor
+                min_scale_factor = 0.6  # Never go below 60% of original
+                scale_factor = max(scale_factor, min_scale_factor)
+                
+                optimal_width = int(original_width * scale_factor)
+                optimal_height = int(original_height * scale_factor)
+                
+                logger.info(f"Standard scaling: factor={scale_factor:.3f}, new size={optimal_width}x{optimal_height}")
         
-        # Apply platform constraints
+        # Apply platform constraints if available
         if platform_config:
             max_width = platform_config.get('max_width', optimal_width)
             max_height = platform_config.get('max_height', optimal_height)
@@ -758,12 +830,45 @@ class DynamicVideoCompressor:
             scale_factor = min(max_width / optimal_width, max_height / optimal_height, 1.0)
             optimal_width = int(optimal_width * scale_factor)
             optimal_height = int(optimal_height * scale_factor)
+            
+            logger.info(f"Applied platform constraints: max {max_width}x{max_height}, "
+                       f"final size={optimal_width}x{optimal_height}")
+        else:
+            # When no platform constraints, apply intelligent defaults based on video characteristics
+            if original_height > original_width:  # Vertical video
+                # For vertical videos, maintain reasonable minimums
+                min_width = max(480, int(original_width * 0.7))   # At least 70% of original width
+                min_height = max(640, int(original_height * 0.7)) # At least 70% of original height
+            else:  # Horizontal video
+                min_width = max(640, int(original_width * 0.7))   # At least 70% of original width
+                min_height = max(480, int(original_height * 0.7)) # At least 70% of original height
+            
+            optimal_width = max(optimal_width, min_width)
+            optimal_height = max(optimal_height, min_height)
+            
+            logger.info(f"No platform constraints, applied intelligent defaults: min {min_width}x{min_height}, "
+                       f"adjusted size={optimal_width}x{optimal_height}")
         
         # Ensure even dimensions for H.264 compatibility
         optimal_width = optimal_width if optimal_width % 2 == 0 else optimal_width - 1
         optimal_height = optimal_height if optimal_height % 2 == 0 else optimal_height - 1
         
-        return max(optimal_width, 128), max(optimal_height, 96)  # Minimum reasonable resolution
+        # Final safety check - ensure reasonable minimum resolution
+        # These are much higher than the previous 128x96 to prevent extreme downscaling
+        if original_pixels > 1000000:  # High resolution videos
+            final_min_width = 720   # Much higher minimum for high-res videos
+            final_min_height = 540  # Much higher minimum for high-res videos
+        else:  # Lower resolution videos
+            final_min_width = 480   # Reasonable minimum for standard videos
+            final_min_height = 360  # Reasonable minimum for standard videos
+        
+        final_width = max(optimal_width, final_min_width)
+        final_height = max(optimal_height, final_min_height)
+        
+        logger.info(f"Final resolution: {final_width}x{final_height} "
+                   f"(min allowed: {final_min_width}x{final_min_height})")
+        
+        return final_width, final_height
     
     def _calculate_quality_score(self, params: Dict[str, Any], video_info: Dict[str, Any]) -> float:
         """Calculate estimated quality score for comparison"""
@@ -926,10 +1031,46 @@ class DynamicVideoCompressor:
         
         encoder, accel_type = self.hardware.get_best_encoder("h264")
         
-        # Aggressive resolution reduction
-        scale_factor = 0.7  # Reduce to 70% of original
+        original_pixels = video_info['width'] * video_info['height']
+        logger.info(f"Aggressive compression: original {video_info['width']}x{video_info['height']} "
+                   f"({original_pixels:,} pixels), target size {target_size_mb}MB")
+        
+        # Much less aggressive resolution reduction for high-resolution videos
+        if original_pixels > 1000000:  # High resolution (like your 1080x1440)
+            # For high-res videos, be very conservative about downscaling
+            scale_factor = 0.9  # Only reduce to 90% of original (was 0.8)
+            logger.info(f"High-resolution video detected, using conservative scale factor: {scale_factor}")
+        else:
+            # For lower resolution videos, use standard aggressive scaling
+            scale_factor = 0.8  # Standard aggressive scaling
+            logger.info(f"Standard resolution video, using aggressive scale factor: {scale_factor}")
+        
         aggressive_width = int(video_info['width'] * scale_factor)
         aggressive_height = int(video_info['height'] * scale_factor)
+        
+        logger.info(f"Initial aggressive scaling: factor={scale_factor}, size={aggressive_width}x{aggressive_height}")
+        
+        # Apply much better minimum resolution constraints to prevent extreme downscaling
+        if video_info['height'] > video_info['width']:  # Vertical video
+            if original_pixels > 1000000:  # High resolution
+                min_width = max(720, int(video_info['width'] * 0.8))   # At least 720px wide or 80% of original
+                min_height = max(960, int(video_info['height'] * 0.8)) # At least 960px tall or 80% of original
+            else:  # Standard resolution
+                min_width = max(640, int(video_info['width'] * 0.7))   # At least 640px wide or 70% of original
+                min_height = max(480, int(video_info['height'] * 0.7)) # At least 480px tall or 70% of original
+        else:  # Horizontal video
+            if original_pixels > 1000000:  # High resolution
+                min_width = max(960, int(video_info['width'] * 0.8))   # At least 960px wide or 80% of original
+                min_height = max(720, int(video_info['height'] * 0.8)) # At least 720px tall or 80% of original
+            else:  # Standard resolution
+                min_width = max(640, int(video_info['width'] * 0.7))   # At least 640px wide or 70% of original
+                min_height = max(480, int(video_info['height'] * 0.7)) # At least 480px tall or 70% of original
+        
+        aggressive_width = max(aggressive_width, min_width)
+        aggressive_height = max(aggressive_height, min_height)
+        
+        logger.info(f"Applied minimum constraints: min {min_width}x{min_height}, "
+                   f"adjusted size={aggressive_width}x{aggressive_height}")
         
         # Ensure even dimensions
         aggressive_width = aggressive_width if aggressive_width % 2 == 0 else aggressive_width - 1
@@ -953,6 +1094,9 @@ class DynamicVideoCompressor:
         if accel_type == 'software':
             params['crf'] = 35  # Very high CRF for maximum compression
         
+        logger.info(f"Final aggressive params: {aggressive_width}x{aggressive_height}, "
+                   f"bitrate={params['bitrate']}k, crf={params.get('crf', 'N/A')}")
+        
         return params
     
     def _build_intelligent_ffmpeg_command(self, input_path: str, output_path: str, 
@@ -975,8 +1119,8 @@ class DynamicVideoCompressor:
         params['maxrate_multiplier'] = 1.15
         cmd = FFmpegUtils.build_base_ffmpeg_command(input_path, output_path, params)
         
-        # Smart scaling with high-quality filter
-        scale_filter = f"scale={params['width']}:{params['height']}:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1"
+        # Smart scaling with high-quality filter - removed problematic parameters
+        scale_filter = f"scale={params['width']}:{params['height']}:flags=lanczos"
         cmd.extend(['-vf', scale_filter])
         
         # Add frame rate

@@ -63,15 +63,20 @@ class AutomatedWorkflow:
         self._cache_index: Dict[str, Any] = {}
         self._cache_dir: Path = Path("temp") / 'cache'
         self._cache_file: Path = self._cache_dir / 'workflow_success_index.json'
+        # Session timestamp to track current execution and clean up old cache entries
+        self._session_start_time = time.time()
+        # Cache persistence: track when cache was last used to allow persistence between executions
+        self._cache_last_used_file = self._cache_dir / 'last_used.txt'
         
         # Setup signal handlers for graceful shutdown
         self._setup_signal_handlers()
         
         # Ensure directories exist
         self._ensure_directories()
-        # Load cache index best-effort
+        # Load cache index best-effort and clean up old entries
         try:
             self._load_cache_index()
+            self._cleanup_old_cache_entries()
         except Exception:
             self._cache_index = {}
     
@@ -179,10 +184,11 @@ class AutomatedWorkflow:
         print(f"👀 File watching is active. Monitoring: {self.input_dir.absolute()} (Ctrl+C to stop)")
         
         processed_files = set()
-        processing_stats = {'successful': 0, 'skipped': 0, 'errors': 0}
+        processing_stats = {'successful': 0, 'skipped': 0, 'errors': 0, 'processed': 0}
         first_scan = True
         idle_announced = False
         processed_count = 0
+        start_time = time.time()
         
         try:
             while not self.shutdown_requested:
@@ -255,6 +261,7 @@ class AutomatedWorkflow:
 
                             # Increment processed counter for any attempted file (success/skip/error)
                             processed_count += 1
+                            processing_stats['processed'] = processed_count
 
                             # If processing failed, leave original input in place (do not move from input/)
                             if result == 'error':
@@ -271,7 +278,7 @@ class AutomatedWorkflow:
                                 more_files = self._find_new_files(processed_files, skip_stability_check=True)
                                 if not more_files and not idle_announced:
                                     print(f"✅ All caught up. Watching for new files in: {self.input_dir.absolute()}", flush=True)
-                                    logger.info("All caught up. Watching for new files")
+                                    logger.info("All caught up. Watching for files")
                                     idle_announced = True
                             except Exception:
                                 pass
@@ -284,7 +291,7 @@ class AutomatedWorkflow:
                             # In normal mode, show a one-time standby message when idle
                             if not idle_announced:
                                 print(f"✅ All caught up. Watching for new files in: {self.input_dir.absolute()}", flush=True)
-                                logger.info("All caught up. Watching for new files")
+                                logger.info("All caught up. Watching for files")
                                 idle_announced = True
                     
                     # Sleep before next check (with interrupt checking)
@@ -304,6 +311,10 @@ class AutomatedWorkflow:
             self._cleanup_temp_files()
             # Also clean nested temp artifacts created during GIF optimization
             self._cleanup_orphan_segments()
+            
+            # Print final workflow summary with cache statistics
+            self._print_workflow_summary(processing_stats, start_time)
+            
             self._vprint(f"✅ Automated workflow stopped gracefully")
             logger.info("Automated workflow stopped")
 
@@ -357,6 +368,39 @@ class AutomatedWorkflow:
         else:
             self._cache_index = {}
 
+    def _cleanup_old_cache_entries(self) -> None:
+        """Remove cache entries from previous executions to ensure only current session cache is used."""
+        if not self._cache_index:
+            return
+        
+        current_time = time.time()
+        cleaned_count = 0
+        keys_to_remove = []
+        
+        # Allow cache entries to persist between executions, but clean up very old ones (e.g., >24 hours)
+        max_cache_age_hours = 24
+        max_cache_age_seconds = max_cache_age_hours * 3600
+        
+        for key, record in self._cache_index.items():
+            if not isinstance(record, dict):
+                keys_to_remove.append(key)
+                continue
+                
+            # Check if this cache entry is very old (older than max_cache_age_hours)
+            entry_time = record.get('time', 0)
+            if current_time - entry_time > max_cache_age_seconds:
+                keys_to_remove.append(key)
+                cleaned_count += 1
+        
+        # Remove old entries
+        for key in keys_to_remove:
+            del self._cache_index[key]
+        
+        if cleaned_count > 0:
+            logger.info(f"Cleaned up {cleaned_count} very old cache entries (older than {max_cache_age_hours} hours)")
+            # Save the cleaned cache index
+            self._save_cache_index()
+
     def _save_cache_index(self) -> None:
         """Persist cache index to disk (best-effort)."""
         try:
@@ -383,36 +427,51 @@ class AutomatedWorkflow:
         """Return True if input was previously verified successful and outputs still exist.
 
         This performs minimal checks for speed: input signature matches and basic output existence.
+        Cache entries can persist between executions but are cleaned up if very old (>24 hours).
         """
         if not self.use_cache:
             return False
         key = self._make_cache_key(input_file)
         rec = self._cache_index.get(key)
         if not isinstance(rec, dict):
+            logger.debug(f"Cache miss for {input_file.name}: no valid record")
             return False
+        
         # Verify signature matches
         sig = self._get_input_signature(input_file)
         if not sig or rec.get('input_signature') != sig:
+            logger.debug(f"Cache miss for {input_file.name}: signature mismatch")
             return False
         # Quick output existence check
         out_type = rec.get('type')
         out_path = rec.get('output')
         if not out_type or not out_path:
+            logger.debug(f"Cache miss for {input_file.name}: missing output info")
             return False
         try:
             if out_type == 'single_gif':
-                return Path(out_path).exists()
+                exists = Path(out_path).exists()
+                if exists:
+                    logger.debug(f"Cache hit for {input_file.name}: single GIF exists")
+                return exists
             if out_type == 'segments':
                 seg_dir = Path(out_path)
                 if not seg_dir.exists() or not seg_dir.is_dir():
+                    logger.debug(f"Cache miss for {input_file.name}: segments directory missing")
                     return False
                 for p in seg_dir.iterdir():
                     if p.is_file() and p.suffix.lower() == '.gif':
+                        logger.debug(f"Cache hit for {input_file.name}: segments exist")
                         return True
+                logger.debug(f"Cache miss for {input_file.name}: no GIF segments found")
                 return False
             if out_type == 'gif_input':
-                return Path(out_path).exists()
-        except Exception:
+                exists = Path(out_path).exists()
+                if exists:
+                    logger.debug(f"Cache hit for {input_file.name}: GIF input exists")
+                return exists
+        except Exception as e:
+            logger.debug(f"Cache miss for {input_file.name}: error checking output: {e}")
             return False
         return False
 
@@ -427,8 +486,9 @@ class AutomatedWorkflow:
                 'time': time.time(),
             }
             self._save_cache_index()
-        except Exception:
-            pass
+            logger.debug(f"Cached success for {input_file.name}: {out_type} -> {output_path}")
+        except Exception as e:
+            logger.warning(f"Failed to cache success for {input_file.name}: {e}")
 
     def _move_input_to_failures(self, src_path: Path) -> None:
         """Move a failed input file from input/ to failures/ with safe unique naming.
@@ -910,6 +970,40 @@ class AutomatedWorkflow:
                     if invalid_segments:
                         print(f"  ⚠️  Found {len(invalid_segments)} invalid/corrupted GIFs in segments folder")
                         logger.warning(f"Found {len(invalid_segments)} invalid GIFs in segments folder: {invalid_segments}")
+                        
+                        # Automatically clean up invalid segments and regenerate
+                        print(f"  🧹 Cleaning up invalid segments and regenerating...")
+                        logger.info(f"Cleaning up {len(invalid_segments)} invalid segments and regenerating")
+                        
+                        # Remove invalid segments
+                        for invalid_seg in invalid_segments:
+                            try:
+                                invalid_seg.unlink()
+                                logger.debug(f"Removed invalid segment: {invalid_seg.name}")
+                            except Exception as e:
+                                logger.warning(f"Failed to remove invalid segment {invalid_seg.name}: {e}")
+                        
+                        # Ensure MP4 is in segments folder for regeneration
+                        try:
+                            self._ensure_mp4_in_segments(mp4_file, segments_folder)
+                            logger.debug(f"Ensured MP4 is in segments folder: {mp4_file.name}")
+                        except Exception as e:
+                            logger.warning(f"Failed to ensure MP4 in segments folder: {e}")
+                        
+                        # Regenerate the segments
+                        print(f"  🔄 Regenerating invalid segments...")
+                        regeneration_success = self._regenerate_invalid_segments(segments_folder, max_size_mb)
+                        
+                        if regeneration_success:
+                            print(f"  ✅ Successfully regenerated invalid segments")
+                            logger.info(f"Successfully regenerated invalid segments for {video_file.name}")
+                            # Cache success for regenerated segments
+                            self._record_success_cache(video_file, 'segments', segments_folder)
+                            return 'success'
+                        else:
+                            print(f"  ❌ Failed to regenerate invalid segments, will do full regeneration")
+                            logger.warning(f"Failed to regenerate invalid segments for {video_file.name}, will do full regeneration")
+                            # Fall through to full regeneration
                     
                     # Cache success for segments
                     self._record_success_cache(video_file, 'segments', segments_folder)
@@ -917,6 +1011,21 @@ class AutomatedWorkflow:
                 else:
                     print(f"  🔄 Segment GIFs invalid/corrupted, will regenerate")
                     logger.info(f"Segment GIFs invalid, will regenerate: {segments_folder.name}")
+                    
+                    # Clean up invalid segments and ensure MP4 is in folder for regeneration
+                    print(f"  🧹 Cleaning up invalid segments...")
+                    try:
+                        for gif_file in segments_folder.glob("*.gif"):
+                            try:
+                                gif_file.unlink()
+                                logger.debug(f"Removed invalid segment: {gif_file.name}")
+                            except Exception as e:
+                                logger.warning(f"Failed to remove invalid segment {gif_file.name}: {e}")
+                        
+                        # Ensure MP4 is in segments folder for regeneration
+                        self._ensure_mp4_in_segments(mp4_file, segments_folder)
+                    except Exception as e:
+                        logger.warning(f"Error cleaning up invalid segments: {e}")
             else:
                 print(f"  📁 No segments folder found: {segments_folder.name}")
             
@@ -1499,6 +1608,10 @@ class AutomatedWorkflow:
         try:
             if self.temp_dir.exists():
                 for temp_file in self.temp_dir.iterdir():
+                    # Skip the cache directory - it should be preserved
+                    if temp_file.name == 'cache':
+                        continue
+                        
                     if temp_file.is_file():
                         try:
                             temp_file.unlink()
@@ -1543,21 +1656,160 @@ class AutomatedWorkflow:
             segments_folder.mkdir(exist_ok=True)
             target = segments_folder / mp4_file.name
             if target.exists():
+                logger.debug(f"MP4 already exists in segments folder: {target.name}")
                 return
+            
             # If mp4 is in output dir, move it. Otherwise, copy it (e.g., original input still in input/).
             try:
                 if mp4_file.parent.resolve() == self.output_dir.resolve() and mp4_file.exists():
                     shutil.move(str(mp4_file), str(target))
+                    logger.info(f"Moved MP4 to segments folder: {mp4_file.name} -> {target}")
                 else:
                     shutil.copy2(str(mp4_file), str(target))
-            except Exception:
+                    logger.info(f"Copied MP4 to segments folder: {mp4_file.name} -> {target}")
+            except Exception as e:
+                logger.warning(f"Failed to move/copy MP4 to segments folder: {e}")
                 # As a last resort, try copying
                 try:
                     shutil.copy2(str(mp4_file), str(target))
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                    logger.info(f"Fallback copy MP4 to segments folder: {mp4_file.name} -> {target}")
+                except Exception as copy_e:
+                    logger.error(f"Failed to copy MP4 to segments folder: {copy_e}")
+        except Exception as e:
+            logger.error(f"Error ensuring MP4 in segments folder: {e}")
+    
+    def _regenerate_invalid_segments(self, segments_folder: Path, max_size_mb: float) -> bool:
+        """Regenerate invalid segments from the MP4 file in the segments folder"""
+        try:
+            # Find the MP4 file in the segments folder
+            mp4_files = list(segments_folder.glob("*.mp4"))
+            if not mp4_files:
+                logger.warning(f"No MP4 file found in segments folder for regeneration: {segments_folder}")
+                return False
+            
+            mp4_file = mp4_files[0]  # Use the first MP4 found
+            logger.info(f"Regenerating segments from MP4: {mp4_file.name}")
+            
+            # Use the existing GIF generation logic to recreate segments
+            gif_success = self._generate_and_optimize_gif(mp4_file, max_size_mb)
+            
+            if gif_success:
+                logger.info(f"Successfully regenerated segments for: {mp4_file.name}")
+                return True
+            else:
+                logger.error(f"Failed to regenerate segments for: {mp4_file.name}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error regenerating invalid segments: {e}")
+            return False
+    
+    def _attempt_gif_repair(self, gif_file: Path, max_size_mb: float) -> bool:
+        """Attempt to repair a corrupted GIF file using multiple strategies"""
+        try:
+            print(f"    🔧 Attempting to repair corrupted GIF: {gif_file.name}")
+            logger.info(f"Attempting to repair corrupted GIF: {gif_file.name}")
+            
+            # Strategy 1: Try to read and rewrite using PIL
+            try:
+                from PIL import Image
+                repaired_path = self.temp_dir / f"{gif_file.stem}.repaired.gif"
+                
+                with Image.open(gif_file) as img:
+                    # Save as new GIF to potentially fix corruption
+                    img.save(repaired_path, 'GIF', save_all=True, loop=0)
+                
+                # Validate the repaired file
+                is_valid, error_msg = self.file_validator.is_valid_gif_with_enhanced_checks(
+                    str(repaired_path),
+                    original_path=str(gif_file),
+                    max_size_mb=max_size_mb
+                )
+                
+                if is_valid:
+                    current_size = self.file_validator.get_file_size_mb(str(repaired_path))
+                    print(f"    ✅ Successfully repaired corrupted GIF ({current_size:.2f}MB)")
+                    logger.info(f"Successfully repaired corrupted GIF {gif_file.name}")
+                    
+                    # Move repaired file to output
+                    output_path = self.output_dir / gif_file.name
+                    if output_path.exists():
+                        output_path.unlink()
+                    shutil.move(str(repaired_path), str(output_path))
+                    print(f"    📁 Saved repaired GIF to output: {output_path.name}")
+                    logger.info(f"Saved repaired GIF to output: {output_path}")
+                    
+                    return True
+                else:
+                    logger.warning(f"PIL repair failed: {error_msg}")
+                    try:
+                        repaired_path.unlink()
+                    except Exception:
+                        pass
+                        
+            except Exception as repair_error:
+                logger.warning(f"PIL repair failed for {gif_file.name}: {repair_error}")
+            
+            # Strategy 2: Try FFmpeg repair
+            try:
+                repaired_path = self.temp_dir / f"{gif_file.stem}.ffmpeg_repaired.gif"
+                
+                cmd = [
+                    'ffmpeg', '-y',
+                    '-i', str(gif_file),
+                    '-vf', 'fps=15,scale=trunc(iw/2)*2:trunc(ih/2)*2:flags=lanczos',
+                    '-loop', '0',
+                    str(repaired_path)
+                ]
+                
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                
+                if result.returncode == 0 and repaired_path.exists():
+                    # Validate the repaired file
+                    is_valid, error_msg = self.file_validator.is_valid_gif_with_enhanced_checks(
+                        str(repaired_path),
+                        original_path=str(gif_file),
+                        max_size_mb=max_size_mb
+                    )
+                    
+                    if is_valid:
+                        current_size = self.file_validator.get_file_size_mb(str(repaired_path))
+                        print(f"    ✅ Successfully repaired corrupted GIF using FFmpeg ({current_size:.2f}MB)")
+                        logger.info(f"Successfully repaired corrupted GIF {gif_file.name} using FFmpeg")
+                        
+                        # Move repaired file to output
+                        output_path = self.output_dir / gif_file.name
+                        if output_path.exists():
+                            output_path.unlink()
+                        shutil.move(str(repaired_path), str(output_path))
+                        print(f"    📁 Saved repaired GIF to output: {output_path.name}")
+                        logger.info(f"Saved repaired GIF to output: {output_path}")
+                        
+                        return True
+                    else:
+                        logger.warning(f"FFmpeg repair failed: {error_msg}")
+                        try:
+                            repaired_path.unlink()
+                        except Exception:
+                            pass
+                else:
+                    logger.warning(f"FFmpeg repair command failed: {result.stderr}")
+                    try:
+                        repaired_path.unlink()
+                    except Exception:
+                        pass
+                        
+            except Exception as repair_error:
+                logger.warning(f"FFmpeg repair failed for {gif_file.name}: {repair_error}")
+            
+            # All repair strategies failed
+            print(f"    ❌ All repair strategies failed for {gif_file.name}")
+            logger.error(f"All repair strategies failed for {gif_file.name}")
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error in GIF repair process: {e}")
+            return False
     
     def stop_workflow(self):
         """Request workflow to stop gracefully"""
@@ -1584,7 +1836,7 @@ class AutomatedWorkflow:
             if self.shutdown_requested:
                 return 'cancelled'
 
-            # Short-circuit: if an output GIF already exists and is valid & under size, reuse it
+            # Check if an output GIF already exists and validate it
             existing_output = self.output_dir / gif_file.name
             if existing_output.exists():
                 is_valid_out, err_out = self.file_validator.is_valid_gif_with_enhanced_checks(
@@ -1599,9 +1851,17 @@ class AutomatedWorkflow:
                     self._record_success_cache(gif_file, 'gif_input', existing_output)
                     return 'success'
                 else:
-                    logger.info(f"Existing output invalid, will optimize anew: {err_out}")
+                    print(f"    ⚠️  Existing output invalid ({err_out}), will remove and regenerate")
+                    logger.info(f"Existing output invalid, removing and regenerating: {err_out}")
+                    # Remove the invalid existing output
+                    try:
+                        existing_output.unlink()
+                        print(f"    🗑️  Removed invalid existing output: {existing_output.name}")
+                        logger.info(f"Removed invalid existing output: {existing_output.name}")
+                    except Exception as e:
+                        logger.warning(f"Failed to remove invalid existing output: {e}")
             
-            # Validate the GIF file for integrity (not size)
+            # Validate the input GIF file for integrity (not size)
             is_valid, error_msg = self.file_validator.is_valid_gif_with_enhanced_checks(
                 str(gif_file),
                 original_path=str(gif_file),
@@ -1609,9 +1869,28 @@ class AutomatedWorkflow:
             )
             
             if not is_valid:
-                print(f"    ❌ Invalid GIF file: {error_msg}")
-                logger.warning(f"Invalid GIF file {gif_file.name}: {error_msg}")
-                return 'error'
+                print(f"    ❌ Input GIF file invalid: {error_msg}")
+                logger.warning(f"Input GIF file {gif_file.name}: {error_msg}")
+                
+                # Try to regenerate from existing output if it was removed above
+                if not existing_output.exists():
+                    print(f"    🔄 Attempting to regenerate from input despite validation failure...")
+                    logger.info(f"Attempting to regenerate from invalid input GIF: {gif_file.name}")
+                    # Continue with optimization attempt even if validation fails
+                    # This allows the optimizer to potentially fix corrupted files
+                else:
+                    # Try to repair the corrupted GIF
+                    print(f"    🔧 Attempting to repair corrupted input GIF...")
+                    repair_success = self._attempt_gif_repair(gif_file, max_size_mb)
+                    
+                    if repair_success:
+                        print(f"    ✅ Successfully repaired corrupted GIF: {gif_file.name}")
+                        logger.info(f"Successfully repaired corrupted GIF: {gif_file.name}")
+                        return 'success'
+                    else:
+                        print(f"    ❌ Failed to repair corrupted GIF: {gif_file.name}")
+                        logger.error(f"Failed to repair corrupted GIF: {gif_file.name}")
+                        return 'error'
             
             # If original is a GIF input, try to keep GIF under target with best-effort re-encode;
             # else (videos) are handled elsewhere. Proceed to optimization.
@@ -1645,7 +1924,23 @@ class AutomatedWorkflow:
                         working_path.unlink()
                     except Exception:
                         pass
-                shutil.copy2(gif_file, working_path)
+                
+                # Try to copy the file, but handle corruption gracefully
+                try:
+                    shutil.copy2(gif_file, working_path)
+                except Exception as copy_error:
+                    logger.warning(f"Failed to copy corrupted GIF {gif_file.name}: {copy_error}")
+                    # Try to read and rewrite the file to potentially fix corruption
+                    try:
+                        from PIL import Image
+                        with Image.open(gif_file) as img:
+                            # Save as new GIF to potentially fix corruption
+                            img.save(working_path, 'GIF', save_all=True, loop=0)
+                        logger.info(f"Successfully repaired corrupted GIF {gif_file.name} using PIL")
+                    except Exception as repair_error:
+                        logger.error(f"Failed to repair corrupted GIF {gif_file.name}: {repair_error}")
+                        return 'error'
+                        
             except Exception as e:
                 logger.error(f"Failed to prepare working copy for {gif_file.name}: {e}")
                 return 'error'
@@ -1703,7 +1998,56 @@ class AutomatedWorkflow:
 
                 return 'success'
             else:
-                # If optimization failed, but the original GIF is valid and within size, keep the original
+                # If optimization failed, try to handle the corrupted input file
+                print(f"    ⚠️  Optimization failed, attempting fallback strategies...")
+                logger.info(f"Optimization failed for {gif_file.name}, attempting fallback strategies")
+                
+                # Strategy 1: Try to repair the corrupted input file
+                try:
+                    from PIL import Image
+                    repaired_path = self.temp_dir / f"{gif_file.stem}.repaired.gif"
+                    
+                    with Image.open(gif_file) as img:
+                        # Save as new GIF to potentially fix corruption
+                        img.save(repaired_path, 'GIF', save_all=True, loop=0)
+                    
+                    # Validate the repaired file
+                    is_valid, error_msg = self.file_validator.is_valid_gif_with_enhanced_checks(
+                        str(repaired_path),
+                        original_path=str(gif_file),
+                        max_size_mb=max_size_mb
+                    )
+                    
+                    if is_valid:
+                        current_size = self.file_validator.get_file_size_mb(str(repaired_path))
+                        print(f"    ✅ Successfully repaired corrupted GIF ({current_size:.2f}MB)")
+                        logger.info(f"Successfully repaired corrupted GIF {gif_file.name}")
+                        
+                        # Copy repaired file to output
+                        if output_path.exists():
+                            output_path.unlink()
+                        shutil.copy2(repaired_path, output_path)
+                        print(f"    📁 Saved repaired GIF to output: {output_path.name}")
+                        logger.info(f"Saved repaired GIF to output: {output_path}")
+                        
+                        # Clean up
+                        try:
+                            repaired_path.unlink()
+                        except Exception:
+                            pass
+                        
+                        return 'success'
+                    else:
+                        logger.warning(f"Repaired GIF still invalid: {error_msg}")
+                        try:
+                            repaired_path.unlink()
+                        except Exception:
+                            pass
+                        
+                except Exception as repair_error:
+                    logger.warning(f"Failed to repair corrupted GIF {gif_file.name}: {repair_error}")
+                
+                # Strategy 2: Check if original is valid and within size
                 is_valid, error_msg = self.file_validator.is_valid_gif_with_enhanced_checks(
                     str(gif_file),
                     original_path=str(gif_file),
@@ -1711,7 +2055,7 @@ class AutomatedWorkflow:
                 )
                 if is_valid:
                     current_size = self.file_validator.get_file_size_mb(str(gif_file))
-                    print(f"    ⚠️  Optimization did not produce a better result; keeping original ({current_size:.2f}MB)")
+                    print(f"    ⚠️  Optimization failed but original is valid; keeping original ({current_size:.2f}MB)")
                     logger.info(f"Keeping original GIF for {gif_file.name}; optimization failed but original is valid under limit")
                     if not output_path.exists():
                         shutil.copy2(gif_file, output_path)
@@ -1720,18 +2064,11 @@ class AutomatedWorkflow:
                     else:
                         print(f"    📁 Already exists in output directory: {output_path.name}")
                     return 'success'
-                else:
-                    print(f"    ❌ GIF optimization failed and original is not within constraints: {error_msg}")
-                    logger.error(f"GIF optimization failed and original invalid: {gif_file.name} - {error_msg}")
-
-                    # Attempt segmentation fallback for oversized input GIFs
-                    try:
-                        seg_success = self._segment_input_gif(gif_file, max_size_mb)
-                        if seg_success:
-                            return 'success'
-                    except Exception as e:
-                        logger.error(f"Segmentation fallback failed: {e}")
-                    return 'error'
+                
+                # Strategy 3: All attempts failed
+                print(f"    ❌ All optimization and repair strategies failed for {gif_file.name}")
+                logger.error(f"All optimization and repair strategies failed for {gif_file.name}")
+                return 'error'
                 
         except Exception as e:
             print(f"    ❌ Error optimizing GIF {gif_file.name}: {e}")
@@ -1909,9 +2246,9 @@ class AutomatedWorkflow:
                     except Exception:
                         max_width = 360
                     vf = (
-                        f"mpdecimate=hi=768:lo=512:frac=0.5,"
+                        f"mpdecimate=hi=512:lo=256:frac=0.3,"
                         f"fps={target_fps},"
-                        f"scale={max_width}:-2:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1"
+                        f"scale={max_width}:-2:flags=lanczos"
                     )
                     cmd = [
                         'ffmpeg', '-y',
@@ -2103,3 +2440,91 @@ class AutomatedWorkflow:
             print(f"    ❌ Error processing existing GIF {gif_file.name}: {e}")
             logger.error(f"Error processing existing GIF {gif_file.name}: {e}")
             return 'error' 
+
+    def clear_cache(self) -> None:
+        """Clear the entire cache index."""
+        self._cache_index.clear()
+        try:
+            if self._cache_file.exists():
+                self._cache_file.unlink()
+            logger.info("Cache cleared successfully")
+        except Exception as e:
+            logger.warning(f"Failed to clear cache file: {e}")
+
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Get cache statistics for monitoring."""
+        if not self._cache_index:
+            return {
+                'total_entries': 0, 
+                'current_session_entries': 0, 
+                'old_entries': 0,
+                'session_start_time': self._session_start_time,
+                'cache_age_info': 'No cache entries'
+            }
+        
+        current_time = time.time()
+        current_session_entries = 0
+        old_entries = 0
+        oldest_entry_age = float('inf')
+        newest_entry_age = 0
+        
+        for record in self._cache_index.values():
+            if isinstance(record, dict):
+                entry_time = record.get('time', 0)
+                entry_age = current_time - entry_time
+                
+                if entry_age < 3600:  # Less than 1 hour
+                    current_session_entries += 1
+                else:
+                    old_entries += 1
+                
+                oldest_entry_age = min(oldest_entry_age, entry_age)
+                newest_entry_age = max(newest_entry_age, entry_age)
+        
+        # Format age information
+        if oldest_entry_age != float('inf'):
+            oldest_hours = oldest_entry_age / 3600
+            newest_hours = newest_entry_age / 3600
+            cache_age_info = f"Oldest: {oldest_hours:.1f}h, Newest: {newest_hours:.1f}h"
+        else:
+            cache_age_info = 'No valid entries'
+        
+        return {
+            'total_entries': len(self._cache_index),
+            'current_session_entries': current_session_entries,
+            'old_entries': old_entries,
+            'session_start_time': self._session_start_time,
+            'cache_age_info': cache_age_info
+        }
+
+    def _print_cache_stats(self) -> None:
+        """Print cache statistics for monitoring."""
+        if not self.use_cache:
+            return
+        
+        stats = self.get_cache_stats()
+        if stats['total_entries'] > 0:
+            print(f"\n📊 Cache Stats: {stats['current_session_entries']} current, {stats['old_entries']} old entries")
+            logger.info(f"Cache stats: {stats['current_session_entries']} current, {stats['old_entries']} old entries")
+
+    def _print_workflow_summary(self, processing_stats: Dict[str, int], start_time: float) -> None:
+        """Print workflow summary with cache information."""
+        elapsed = time.time() - start_time
+        print(f"\n{'='*60}")
+        print(f"🎬 Workflow Complete!")
+        print(f"⏱️  Total time: {elapsed:.1f} seconds")
+        print(f"📁 Files processed: {processing_stats.get('processed', 0)}")
+        print(f"✅ Successful: {processing_stats.get('successful', 0)}")
+        print(f"❌ Failed: {processing_stats.get('failed', 0)}")
+        print(f"⚡ Skipped (cached): {processing_stats.get('skipped', 0)}")
+        print(f"🔄 Retries: {processing_stats.get('retries', 0)}")
+        
+        # Print cache statistics
+        self._print_cache_stats()
+        
+        print(f"{'='*60}")
+        logger.info(f"Workflow completed in {elapsed:.1f}s. "
+                   f"Processed: {processing_stats.get('processed', 0)}, "
+                   f"Success: {processing_stats.get('successful', 0)}, "
+                   f"Failed: {processing_stats.get('failed', 0)}, "
+                   f"Skipped: {processing_stats.get('skipped', 0)}")
