@@ -4,6 +4,7 @@ Handles the automated processing of videos and GIF generation with graceful shut
 """
 
 import os
+import json
 import math
 import subprocess
 import signal
@@ -48,16 +49,31 @@ class AutomatedWorkflow:
         self.failures_dir = Path("failures")
         self.move_failures_to_folder = True
         
+        # User preference: prefer single output file (1 segment) when possible
+        self.prefer_single_segment = False
+        # Generalized preference: prefer exactly N segments when possible
+        self.preferred_segments: Optional[int] = None
         # Shutdown handling
         self.shutdown_requested = False
         self.current_task = None
         self.processing_lock = threading.Lock()
+
+        # Caching of previously successful inputs
+        self.use_cache: bool = True
+        self._cache_index: Dict[str, Any] = {}
+        self._cache_dir: Path = Path("temp") / 'cache'
+        self._cache_file: Path = self._cache_dir / 'workflow_success_index.json'
         
         # Setup signal handlers for graceful shutdown
         self._setup_signal_handlers()
         
         # Ensure directories exist
         self._ensure_directories()
+        # Load cache index best-effort
+        try:
+            self._load_cache_index()
+        except Exception:
+            self._cache_index = {}
     
     def _setup_signal_handlers(self):
         """Setup signal handlers for graceful shutdown"""
@@ -77,6 +93,10 @@ class AutomatedWorkflow:
                 # Request shutdown from GIF generator if it has the method
                 if hasattr(self.gif_generator, 'request_shutdown'):
                     self.gif_generator.request_shutdown()
+                
+                # Request shutdown from GIF optimizer if it exists
+                if hasattr(self.gif_generator, 'optimizer') and hasattr(self.gif_generator.optimizer, 'request_shutdown'):
+                    self.gif_generator.optimizer.request_shutdown()
                 # Attempt to cleanup temp immediately
                 try:
                     self._cleanup_temp_files()
@@ -92,6 +112,8 @@ class AutomatedWorkflow:
                     self.video_compressor._terminate_ffmpeg_process()
                 if hasattr(self.gif_generator, '_terminate_ffmpeg_process'):
                     self.gif_generator._terminate_ffmpeg_process()
+                if hasattr(self.gif_generator, 'optimizer') and hasattr(self.gif_generator.optimizer, '_terminate_ffmpeg_process'):
+                    self.gif_generator.optimizer._terminate_ffmpeg_process()
                 
                 os._exit(1)
         
@@ -122,7 +144,7 @@ class AutomatedWorkflow:
             time.sleep(sleep_time)
             elapsed += sleep_time
     
-    def run_automated_workflow(self, check_interval: int = 5, max_size_mb: float = 10.0, verbose: bool = False):
+    def run_automated_workflow(self, check_interval: int = 5, max_size_mb: float = 10.0, verbose: bool = False, max_files: Optional[int] = None, output_dir: Optional[str] = None, no_cache: bool = False):
         """
         Run the automated workflow
         
@@ -132,6 +154,16 @@ class AutomatedWorkflow:
         """
         # Set verbosity for this run
         self.verbose = bool(verbose)
+
+        # Allow overriding output directory via CLI
+        if output_dir:
+            try:
+                self.output_dir = Path(output_dir)
+                self.output_dir.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                logger.warning(f"Could not set output directory to '{output_dir}': {e}")
+        # Configure cache usage
+        self.use_cache = not bool(no_cache)
 
         logger.info("Starting automated workflow...")
         logger.info(f"Input directory: {self.input_dir.absolute()}")
@@ -144,11 +176,13 @@ class AutomatedWorkflow:
         self._vprint(f"📁 Input: {self.input_dir.absolute()}")
         self._vprint(f"📤 Output: {self.output_dir.absolute()}")
         self._vprint(f"⚙️  Every {check_interval}s, Max GIF {max_size_mb}MB")
+        print(f"👀 File watching is active. Monitoring: {self.input_dir.absolute()} (Ctrl+C to stop)")
         
         processed_files = set()
         processing_stats = {'successful': 0, 'skipped': 0, 'errors': 0}
         first_scan = True
         idle_announced = False
+        processed_count = 0
         
         try:
             while not self.shutdown_requested:
@@ -166,6 +200,24 @@ class AutomatedWorkflow:
                         for file_path in video_files:
                             if self.shutdown_requested:
                                 break
+                            # Respect max_files limiter if provided
+                            if max_files is not None and processed_count >= int(max_files):
+                                logger.info(f"Max files limit reached ({processed_count}/{max_files}). Stopping workflow.")
+                                self.shutdown_requested = True
+                                break
+
+                            # Fast-skip using cache if enabled and previously verified success exists
+                            if self._is_cached_success(file_path):
+                                print(f"\n⚡ Skipping (cached success): {file_path.name}")
+                                logger.info(f"Skipping (cached success): {file_path.name}")
+                                result = 'skipped'
+                                # After processing a single file, cleanup temp files immediately
+                                self._cleanup_temp_files()
+                                processed_files.add(file_path)
+                                # Update stats and counters
+                                processing_stats['skipped'] += 1
+                                processed_count += 1
+                                continue
                             
                             # Determine file type and process accordingly
                             if file_path.suffix.lower() == '.gif':
@@ -201,6 +253,9 @@ class AutomatedWorkflow:
                             else:
                                 processing_stats['errors'] += 1
 
+                            # Increment processed counter for any attempted file (success/skip/error)
+                            processed_count += 1
+
                             # If processing failed, leave original input in place (do not move from input/)
                             if result == 'error':
                                 logger.info(
@@ -214,9 +269,9 @@ class AutomatedWorkflow:
                             # Immediately announce standby if we are now idle (no more files ready)
                             try:
                                 more_files = self._find_new_files(processed_files, skip_stability_check=True)
-                                if not more_files and not self.verbose and not idle_announced:
-                                    print("✅ All caught up. Standing by for new files…", flush=True)
-                                    logger.info("All caught up. Standing by for new files")
+                                if not more_files and not idle_announced:
+                                    print(f"✅ All caught up. Watching for new files in: {self.input_dir.absolute()}", flush=True)
+                                    logger.info("All caught up. Watching for new files")
                                     idle_announced = True
                             except Exception:
                                 pass
@@ -228,8 +283,8 @@ class AutomatedWorkflow:
                         else:
                             # In normal mode, show a one-time standby message when idle
                             if not idle_announced:
-                                print("✅ All caught up. Standing by for new files…", flush=True)
-                                logger.info("All caught up. Standing by for new files")
+                                print(f"✅ All caught up. Watching for new files in: {self.input_dir.absolute()}", flush=True)
+                                logger.info("All caught up. Watching for new files")
                                 idle_announced = True
                     
                     # Sleep before next check (with interrupt checking)
@@ -256,6 +311,124 @@ class AutomatedWorkflow:
         """Verbose print controlled by self.verbose."""
         if self.verbose:
             print(message, end=end, flush=flush)
+
+    def _record_success_for_input(self, input_path: Path) -> None:
+        """Detect final outputs for the given input and record cache.
+
+        Works for both video and GIF inputs by using the stem to find either a
+        single GIF in `output/` or a `<stem>_segments` folder with GIFs.
+        """
+        try:
+            stem = input_path.stem
+            # Prefer segments when they exist and contain valid GIFs
+            segments_dir = self.output_dir / f"{stem}_segments"
+            if segments_dir.exists() and segments_dir.is_dir():
+                valid_segs, _ = self._validate_segment_folder_gifs(segments_dir, 10.0)
+                if valid_segs:
+                    self._record_success_cache(input_path, 'segments', segments_dir)
+                    return
+            # Otherwise, check for single GIF
+            single_gif = self.output_dir / f"{stem}.gif"
+            if single_gif.exists():
+                is_valid, _ = self.file_validator.is_valid_gif_with_enhanced_checks(
+                    str(single_gif), original_path=None, max_size_mb=10.0
+                )
+                if is_valid:
+                    self._record_success_cache(input_path, 'single_gif', single_gif)
+        except Exception:
+            pass
+
+    def _load_cache_index(self) -> None:
+        """Load cache index from disk."""
+        try:
+            self._cache_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        if self._cache_file.exists():
+            try:
+                with open(self._cache_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        self._cache_index = data
+                    else:
+                        self._cache_index = {}
+            except Exception:
+                self._cache_index = {}
+        else:
+            self._cache_index = {}
+
+    def _save_cache_index(self) -> None:
+        """Persist cache index to disk (best-effort)."""
+        try:
+            self._cache_dir.mkdir(parents=True, exist_ok=True)
+            with open(self._cache_file, 'w', encoding='utf-8') as f:
+                json.dump(self._cache_index, f, indent=2)
+        except Exception:
+            pass
+
+    def _make_cache_key(self, input_file: Path) -> str:
+        try:
+            return str(input_file.resolve())
+        except Exception:
+            return str(input_file)
+
+    def _get_input_signature(self, input_file: Path) -> Dict[str, Any]:
+        try:
+            st = input_file.stat()
+            return {'size': int(st.st_size), 'mtime': float(st.st_mtime)}
+        except Exception:
+            return {'size': None, 'mtime': None}
+
+    def _is_cached_success(self, input_file: Path) -> bool:
+        """Return True if input was previously verified successful and outputs still exist.
+
+        This performs minimal checks for speed: input signature matches and basic output existence.
+        """
+        if not self.use_cache:
+            return False
+        key = self._make_cache_key(input_file)
+        rec = self._cache_index.get(key)
+        if not isinstance(rec, dict):
+            return False
+        # Verify signature matches
+        sig = self._get_input_signature(input_file)
+        if not sig or rec.get('input_signature') != sig:
+            return False
+        # Quick output existence check
+        out_type = rec.get('type')
+        out_path = rec.get('output')
+        if not out_type or not out_path:
+            return False
+        try:
+            if out_type == 'single_gif':
+                return Path(out_path).exists()
+            if out_type == 'segments':
+                seg_dir = Path(out_path)
+                if not seg_dir.exists() or not seg_dir.is_dir():
+                    return False
+                for p in seg_dir.iterdir():
+                    if p.is_file() and p.suffix.lower() == '.gif':
+                        return True
+                return False
+            if out_type == 'gif_input':
+                return Path(out_path).exists()
+        except Exception:
+            return False
+        return False
+
+    def _record_success_cache(self, input_file: Path, out_type: str, output_path: Path) -> None:
+        """Record a successful processing outcome in the cache."""
+        try:
+            key = self._make_cache_key(input_file)
+            self._cache_index[key] = {
+                'type': out_type,
+                'output': str(output_path),
+                'input_signature': self._get_input_signature(input_file),
+                'time': time.time(),
+            }
+            self._save_cache_index()
+        except Exception:
+            pass
 
     def _move_input_to_failures(self, src_path: Path) -> None:
         """Move a failed input file from input/ to failures/ with safe unique naming.
@@ -713,6 +886,8 @@ class AutomatedWorkflow:
                 if is_valid:
                     print(f"  ✅ Valid GIF already exists: {gif_name}")
                     logger.info(f"Valid GIF already exists for {video_file.name}: {gif_name}")
+                    # Cache success for single gif
+                    self._record_success_cache(video_file, 'single_gif', gif_path)
                     return 'success'
                 else:
                     print(f"  🔄 GIF validation failed ({error_msg}), will regenerate")
@@ -736,6 +911,8 @@ class AutomatedWorkflow:
                         print(f"  ⚠️  Found {len(invalid_segments)} invalid/corrupted GIFs in segments folder")
                         logger.warning(f"Found {len(invalid_segments)} invalid GIFs in segments folder: {invalid_segments}")
                     
+                    # Cache success for segments
+                    self._record_success_cache(video_file, 'segments', segments_folder)
                     return 'success'
                 else:
                     print(f"  🔄 Segment GIFs invalid/corrupted, will regenerate")
@@ -847,6 +1024,27 @@ class AutomatedWorkflow:
                     if segments_folder.exists() and segments_folder.is_dir():
                         print(f"    ✅ Video segmentation successful: {segments_folder.name}")
                         logger.info(f"Video segmentation successful: {segments_folder.name}")
+                        # Best-effort: create a cover image in the segments folder too
+                        try:
+                            # Use the first segment as thumbnail source if exists, else the original input video
+                            first_seg = None
+                            try:
+                                mp4s = sorted(list(segments_folder.glob('*.mp4')))
+                                if mp4s:
+                                    first_seg = mp4s[0]
+                            except Exception:
+                                first_seg = None
+                            thumb_src = str(first_seg or output_path)
+                            cover_jpg = segments_folder / 'folder.jpg'
+                            if not cover_jpg.exists():
+                                FFmpegUtils.extract_thumbnail_image(
+                                    input_path=thumb_src,
+                                    output_image_path=str(cover_jpg),
+                                    time_position_seconds=1.0,
+                                    width=640
+                                )
+                        except Exception as e:
+                            logger.debug(f"Could not create segments folder cover image: {e}")
                         return segments_folder
                     else:
                         print(f"    ❌ Segmentation completed but segments folder not found")
@@ -873,6 +1071,22 @@ class AutomatedWorkflow:
                             logger.info(f"Final video file specifications - {specs_log}")
                         except Exception as e:
                             logger.warning(f"Could not log detailed video specifications: {e}")
+
+                        # Generate a folder.jpg thumbnail for Windows Explorer folder cover
+                        try:
+                            thumb_path = self.output_dir / 'folder.jpg'
+                            # If already present, keep existing; otherwise, create from new MP4
+                            if not thumb_path.exists():
+                                ok = FFmpegUtils.extract_thumbnail_image(
+                                    input_path=str(output_path),
+                                    output_image_path=str(thumb_path),
+                                    time_position_seconds=1.0,
+                                    width=640
+                                )
+                                if ok:
+                                    logger.info(f"Created folder cover image: {thumb_path}")
+                        except Exception as e:
+                            logger.debug(f"Could not create folder cover image: {e}")
                         
                         return output_path
                     else:
@@ -912,6 +1126,12 @@ class AutomatedWorkflow:
                     print(f"    ⚠️  Found {len(invalid_segments)} invalid/corrupted GIFs in segments folder")
                     logger.warning(f"Found {len(invalid_segments)} invalid GIFs in segments folder: {invalid_segments}")
                 
+                # Record cache for segments-based success
+                try:
+                    src = Path(self.output_dir / f"{base_name}.mp4") if base_name else mp4_file
+                except Exception:
+                    src = mp4_file
+                self._record_success_cache(src, 'segments', segments_folder)
                 return True
             else:
                 print(f"    🔄 Regenerating segment GIFs (invalid/corrupted): {segments_folder.name}")
@@ -962,6 +1182,8 @@ class AutomatedWorkflow:
                 if is_valid:
                     print(f"    ♻️  Using existing GIF: {gif_name}")
                     logger.debug(f"Valid optimized GIF already exists: {gif_name}")
+                    # Record cache for single GIF success
+                    self._record_success_cache(mp4_file, 'single_gif', final_gif_path)
                     return True
                 else:
                     print(f"    🔄 Regenerating GIF (validation failed): {gif_name}")
@@ -1041,6 +1263,8 @@ class AutomatedWorkflow:
                                     self._ensure_mp4_in_segments(mp4_file, final_segments_dir)
                                 except Exception as e:
                                     logger.debug(f"Could not move MP4 into segments folder: {e}")
+                                # Record cache for segments-based success
+                                self._record_success_cache(mp4_file, 'segments', final_segments_dir)
                                 return True
                             else:
                                 print(f"    ❌ No valid segment GIFs after generation")
@@ -1078,6 +1302,8 @@ class AutomatedWorkflow:
                         size_mb = result.get('size_mb', 0)
                         print(f"    ✨ GIF generation successful: {size_mb:.2f}MB")
                         logger.info(f"GIF generation successful: {gif_name} ({size_mb:.2f}MB)")
+                        # Record cache for single GIF success
+                        self._record_success_cache(mp4_file if mp4_file.exists() else final_gif_path, 'single_gif', final_gif_path)
                         return True
                     else:
                         print(f"    ❌ Final GIF validation failed: {error_msg}")
@@ -1119,83 +1345,101 @@ class AutomatedWorkflow:
             
             successful_gifs = 0
             skipped_segments = 0
-            
-            # Process each segment individually
-            for segment_file in segment_files:
-                print(f"    🎨 Processing segment: {segment_file.name}")
-                
-                # Pre-check: Get segment duration to see if it's reasonable for GIF creation
-                try:
-                    segment_duration = FFmpegUtils.get_video_duration(str(segment_file))
-                    print(f"    ⏱️  Segment duration: {segment_duration:.1f}s")
-                    
-                    # Skip segments that are too long for good GIF quality
-                    # Long segments will likely result in poor quality or too-short GIFs
-                    if segment_duration > 30.0:  # Skip segments longer than 30 seconds
-                        print(f"    ⏭️  Skipping segment {segment_file.name}: too long ({segment_duration:.1f}s > 30s)")
-                        logger.info(f"Skipping segment {segment_file.name}: too long ({segment_duration:.1f}s)")
-                        skipped_segments += 1
-                        continue
-                        
-                except Exception as e:
-                    print(f"    ⚠️  Could not get segment duration, proceeding with caution: {e}")
-                    logger.warning(f"Could not get segment duration for {segment_file.name}: {e}")
-                
-                # Generate GIF name for this segment
-                gif_name = segment_file.stem + ".gif"
-                gif_path = segments_folder / gif_name
-                
-                # Skip if GIF already exists and is valid
-                if gif_path.exists():
-                    is_valid, _ = self.file_validator.is_valid_gif_with_enhanced_checks(
-                        str(gif_path), 
-                        original_path=None, 
-                        max_size_mb=max_size_mb
-                    )
-                    if is_valid:
-                        print(f"    ♻️  Using existing GIF: {gif_name}")
-                        successful_gifs += 1
-                        continue
-                
-                # Force single-GIF-per-segment to avoid nested segmentation
-                test_result = self.gif_generator.create_gif(
-                    input_video=str(segment_file),
-                    output_path=str(gif_path),
-                    max_size_mb=max_size_mb,
-                    disable_segmentation=True
-                )
 
-                if test_result.get('success', False):
-                    # Validate the generated GIF
-                    is_valid, error_msg = self.file_validator.is_valid_gif_with_enhanced_checks(
-                        str(gif_path), 
-                        original_path=None, 
-                        max_size_mb=max_size_mb
+            # Determine parallelism similar to GIF input segmentation
+            try:
+                perf_cfg = self.config.get('gif_settings.performance', {}) or {}
+                segment_parallelism = perf_cfg.get('segment_parallelism', 'auto')
+                if str(segment_parallelism).lower() == 'auto':
+                    cpu = os.cpu_count() or 4
+                    max_workers = max(1, min(4, cpu // 2))
+                else:
+                    max_workers = max(1, min(8, int(segment_parallelism)))
+            except Exception:
+                max_workers = 2
+
+            # Worker per segment; use a fresh GifGenerator instance to avoid shared ffmpeg process state
+            def _process_segment(segment_file: Path) -> Tuple[bool, Optional[str]]:
+                try:
+                    if self.shutdown_requested:
+                        return (False, 'shutdown')
+                    # Duration pre-check
+                    try:
+                        segment_duration = FFmpegUtils.get_video_duration(str(segment_file))
+                        print(f"    ⏱️  Segment duration: {segment_duration:.1f}s")
+                        if segment_duration > 30.0:
+                            print(f"    ⏭️  Skipping segment {segment_file.name}: too long ({segment_duration:.1f}s > 30s)")
+                            logger.info(f"Skipping segment {segment_file.name}: too long ({segment_duration:.1f}s)")
+                            return (False, 'too_long')
+                    except Exception as e:
+                        print(f"    ⚠️  Could not get segment duration, proceeding with caution: {e}")
+                        logger.warning(f"Could not get segment duration for {segment_file.name}: {e}")
+
+                    gif_name = segment_file.stem + ".gif"
+                    gif_path = segments_folder / gif_name
+                    # Reuse if valid
+                    if gif_path.exists():
+                        is_valid, _ = self.file_validator.is_valid_gif_with_enhanced_checks(
+                            str(gif_path), original_path=None, max_size_mb=max_size_mb
+                        )
+                        if is_valid:
+                            print(f"    ♻️  Using existing GIF: {gif_name}")
+                            return (True, None)
+
+                    # Fresh generator instance for thread safety
+                    local_generator = GifGenerator(self.config)
+                    result = local_generator.create_gif(
+                        input_video=str(segment_file),
+                        output_path=str(gif_path),
+                        max_size_mb=max_size_mb,
+                        disable_segmentation=True
                     )
-                    
-                    if is_valid:
-                        size_mb = test_result.get('size_mb', 0)
-                        print(f"    ✅ Segment GIF successful: {size_mb:.2f}MB")
+                    if result.get('success', False):
+                        is_valid, error_msg = self.file_validator.is_valid_gif_with_enhanced_checks(
+                            str(gif_path), original_path=None, max_size_mb=max_size_mb
+                        )
+                        if is_valid:
+                            size_mb = result.get('size_mb', 0)
+                            print(f"    ✅ Segment GIF successful: {size_mb:.2f}MB")
+                            return (True, None)
+                        else:
+                            print(f"    ❌ Segment GIF validation failed: {error_msg}")
+                            try:
+                                if gif_path.exists():
+                                    gif_path.unlink()
+                            except Exception:
+                                pass
+                            return (False, 'invalid')
+                    else:
+                        # Cleanup accidental nested segments
+                        nested_segments = segments_folder / f"{segment_file.stem}_segments"
+                        if nested_segments.exists():
+                            try:
+                                for item in nested_segments.iterdir():
+                                    if item.is_file():
+                                        item.unlink()
+                                nested_segments.rmdir()
+                            except Exception:
+                                pass
+                        return (False, result.get('error', 'Unknown error'))
+                except Exception as e:
+                    logger.warning(f"Exception while processing segment {segment_file.name}: {e}")
+                    return (False, str(e))
+
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {executor.submit(_process_segment, seg): seg for seg in segment_files}
+                for fut in as_completed(future_map):
+                    ok, reason = False, None
+                    try:
+                        ok, reason = fut.result()
+                    except Exception as e:
+                        logger.warning(f"Segment future failed: {e}")
+                        ok = False
+                    if ok:
                         successful_gifs += 1
                     else:
-                        print(f"    ❌ Segment GIF validation failed: {error_msg}")
-                        if gif_path.exists():
-                            gif_path.unlink()
                         skipped_segments += 1
-                else:
-                    # If segmentation attempted, clean up any nested segment folders created accidentally
-                    nested_segments = segments_folder / f"{segment_file.stem}_segments"
-                    if nested_segments.exists():
-                        try:
-                            for item in nested_segments.iterdir():
-                                if item.is_file():
-                                    item.unlink()
-                            nested_segments.rmdir()
-                        except Exception:
-                            pass
-                    error_msg = test_result.get('error', 'Unknown error')
-                    print(f"    ❌ Segment GIF generation failed: {error_msg}")
-                    skipped_segments += 1
             
             # Report results
             if successful_gifs > 0:
@@ -1351,6 +1595,8 @@ class AutomatedWorkflow:
                 if is_valid_out:
                     print(f"    ♻️  Using existing optimized GIF: {existing_output.name}")
                     logger.info(f"Existing optimized GIF reused: {existing_output}")
+                    # Cache success for gif input
+                    self._record_success_cache(gif_file, 'gif_input', existing_output)
                     return 'success'
                 else:
                     logger.info(f"Existing output invalid, will optimize anew: {err_out}")
@@ -1404,7 +1650,7 @@ class AutomatedWorkflow:
                 logger.error(f"Failed to prepare working copy for {gif_file.name}: {e}")
                 return 'error'
 
-            # Use the advanced GIF optimizer on the working copy only
+            # Use the advanced GIF optimizer with quality targeting on the working copy
             from .gif_optimizer_advanced import AdvancedGifOptimizer
             optimizer = AdvancedGifOptimizer(self.config)
 
@@ -1415,16 +1661,30 @@ class AutomatedWorkflow:
 
             if result and working_path.exists():
                 optimized_size = self.file_validator.get_file_size_mb(str(working_path))
+                
+                # Validate size before copying to output
+                if optimized_size > max_size_mb:
+                    print(f"    ❌ Optimized GIF still exceeds size limit: {optimized_size:.2f}MB > {max_size_mb:.2f}MB")
+                    logger.warning(f"Optimized GIF exceeds size limit: {gif_file.name} ({optimized_size:.2f}MB > {max_size_mb:.2f}MB)")
+                    return 'error'
+                
                 print(f"    ✅ GIF optimized successfully: {optimized_size:.2f}MB")
                 logger.info(f"GIF optimized successfully (copy): {gif_file.name} -> {optimized_size:.2f}MB")
 
                 # Copy optimized working copy to output directory
                 try:
                     if output_path.exists():
-                        # Overwrite only if new file is valid and under size
-                        shutil.copy2(str(working_path), str(output_path))
-                    else:
-                        shutil.copy2(str(working_path), str(output_path))
+                        output_path.unlink()  # Remove existing file first
+                    shutil.copy2(str(working_path), str(output_path))
+                    
+                    # Final validation after copy
+                    final_size = self.file_validator.get_file_size_mb(str(output_path))
+                    if final_size > max_size_mb:
+                        print(f"    ❌ Final output exceeds size limit: {final_size:.2f}MB > {max_size_mb:.2f}MB")
+                        logger.error(f"Final output exceeds size limit: {output_path.name} ({final_size:.2f}MB)")
+                        output_path.unlink()  # Remove the invalid file
+                        return 'error'
+                    
                     print(f"    📁 Saved optimized GIF to output: {output_path.name}")
                     logger.info(f"Saved optimized GIF to output: {output_path}")
                 except Exception as e:
@@ -1478,7 +1738,7 @@ class AutomatedWorkflow:
             logger.error(f"Error optimizing GIF {gif_file.name}: {e}")
             return 'error' 
 
-    def _segment_input_gif(self, gif_file: Path, max_size_mb: float) -> bool:
+    def _segment_input_gif(self, gif_file: Path, max_size_mb: float, preferred_segments: Optional[int] = None) -> bool:
         """Segment an input GIF into smaller GIF parts and optimize each.
 
         This provides a resilience path for very large/long input GIFs by
@@ -1509,14 +1769,22 @@ class AutomatedWorkflow:
             max_seg = max(min_seg, float(seg_cfg.get('max_segment_duration', 35)))
             size_threshold_multiplier = float(seg_cfg.get('size_threshold_multiplier', 2.5))
 
-            # Heuristic: segment if file is over target at all, or duration is long
-            # Note: We are in the optimization-fallback path when this is called.
-            # Use strict size comparison (no 5% cushion) to ensure segmentation triggers.
-            should_segment = (
-                (max_size_mb is not None and original_size_mb > max_size_mb)
-                or (duration > max_duration_cfg)
-                or (duration >= max_seg * 2)  # clearly benefits from splitting
-            )
+            # Heuristic: segment if over target or duration is long, with optional single-file preference
+            # If user prefers 1 segment, attempt single-file path first by setting should_segment False here
+            if preferred_segments is None and getattr(self, 'preferred_segments', None) is not None:
+                preferred_segments = int(self.preferred_segments)
+            if preferred_segments is not None:
+                # Force segmentation attempt according to preference
+                should_segment = True
+            elif getattr(self, 'prefer_single_segment', False):
+                # Legacy single-file preference path
+                should_segment = False
+            else:
+                should_segment = (
+                    (max_size_mb is not None and original_size_mb > max_size_mb)
+                    or (duration > max_duration_cfg)
+                    or (duration >= max_seg * 2)
+                )
 
             if not should_segment:
                 print("    ℹ️  Segmentation not needed based on size/duration heuristics")
@@ -1546,25 +1814,26 @@ class AutomatedWorkflow:
             import math
             segment_duration = pick_segment_duration(duration if duration > 0 else max_seg)
 
-            # Size-aware segment count based on original file size and target per-file size
-            # Use the configured multiplier so small overages do not force multiple segments.
+            # Size-aware segment count based purely on size ratio
+            # Ensure at least ceil(original_size / target_size) segments when oversized
             size_segments = 1
             if max_size_mb and max_size_mb > 0:
                 try:
-                    if original_size_mb > max_size_mb * size_threshold_multiplier:
+                    if original_size_mb > max_size_mb:
                         size_segments = max(1, int(math.ceil(original_size_mb / max_size_mb)))
-                    else:
-                        size_segments = 1
                 except Exception:
                     size_segments = 1
 
             # Duration-based segment count
-            if duration and duration > 0:
-                dur_segments = max(1, int(math.ceil(duration / segment_duration)))
-                num_segments = max(size_segments, dur_segments)
+            if preferred_segments is not None:
+                num_segments = max(1, int(preferred_segments))
             else:
-                # If duration unknown, ensure at least two or size-based count
-                num_segments = max(2, size_segments)
+                if duration and duration > 0:
+                    dur_segments = max(1, int(math.ceil(duration / segment_duration)))
+                    num_segments = max(size_segments, dur_segments)
+                else:
+                    # If duration unknown, ensure at least two or size-based count
+                    num_segments = max(2, size_segments)
 
             # Recompute per-segment duration to evenly split total duration when known
             if duration and duration > 0 and num_segments > 0:
@@ -1573,10 +1842,12 @@ class AutomatedWorkflow:
             # Prepare output directory path per asset (defer creation of segments dir until first success)
             output_dir = self.output_dir
             base_name = gif_file.stem
-            # Decide if we truly need multiple segments. If only one is needed,
-            # we will output a single GIF directly to the output directory
-            # instead of creating a "_segments" folder.
-            use_segments_folder = num_segments > 1
+            # Decide if we truly need multiple segments. If forced preference = 1 or prefer_single_segment is set,
+            # write a single GIF directly to output. Otherwise, use a segments folder when num_segments > 1.
+            if preferred_segments is not None:
+                use_segments_folder = num_segments > 1 and preferred_segments != 1
+            else:
+                use_segments_folder = (num_segments > 1) and (not getattr(self, 'prefer_single_segment', False))
             segments_dir = output_dir / f"{base_name}_segments"
             single_output_path = output_dir / f"{base_name}.gif"
             segments_dir_created = False
@@ -1632,7 +1903,16 @@ class AutomatedWorkflow:
                             temp_seg.unlink()
                     except Exception:
                         pass
-                    vf = f"mpdecimate=hi=768:lo=512:frac=0.5,fps={target_fps},scale=iw:ih:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1"
+                    # Downscale segments to configured max width while preserving AR to keep sizes under target
+                    try:
+                        max_width = int(self.config.get('gif_settings.width', 360) or 360)
+                    except Exception:
+                        max_width = 360
+                    vf = (
+                        f"mpdecimate=hi=768:lo=512:frac=0.5,"
+                        f"fps={target_fps},"
+                        f"scale={max_width}:-2:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1"
+                    )
                     cmd = [
                         'ffmpeg', '-y',
                         '-ss', str(seg_start),
@@ -1647,8 +1927,12 @@ class AutomatedWorkflow:
                     if result.returncode != 0 or not temp_seg.exists():
                         logger.warning(f"Failed to create segment {index+1}: {result.stderr[:200] if result.stderr else 'unknown error'}")
                         return None
-                    # Optimize
-                    if not optimizer.optimize_gif(str(temp_seg), max_size_mb):
+                    # Optimize with quality target for stronger convergence
+                    opt_ok = optimizer.optimize_gif(
+                        gif_path=str(temp_seg),
+                        max_size_mb=max_size_mb
+                    )
+                    if not opt_ok:
                         try:
                             temp_seg.unlink()
                         except Exception:
@@ -1706,6 +1990,19 @@ class AutomatedWorkflow:
                             seg_files = list(segments_dir.glob(f"{base_name}_segment_*.gif"))
                             if seg_files:
                                 src = seg_files[0]
+                                
+                                # Validate size before moving to output
+                                src_size = self.file_validator.get_file_size_mb(str(src))
+                                if src_size > max_size_mb:
+                                    print(f"    ❌ Single segment exceeds size limit: {src_size:.2f}MB > {max_size_mb:.2f}MB")
+                                    logger.error(f"Single segment exceeds size limit: {src.name} ({src_size:.2f}MB)")
+                                    # Clean up the oversized segment
+                                    try:
+                                        src.unlink()
+                                    except Exception:
+                                        pass
+                                    return False
+                                
                                 # Replace existing file if present
                                 if single_output_path.exists():
                                     try:
@@ -1713,16 +2010,44 @@ class AutomatedWorkflow:
                                     except Exception:
                                         pass
                                 shutil.move(str(src), str(single_output_path))
+                                
+                                # Final validation after move
+                                final_size = self.file_validator.get_file_size_mb(str(single_output_path))
+                                if final_size > max_size_mb:
+                                    print(f"    ❌ Final single output exceeds size limit: {final_size:.2f}MB > {max_size_mb:.2f}MB")
+                                    logger.error(f"Final single output exceeds size limit: {single_output_path.name} ({final_size:.2f}MB)")
+                                    single_output_path.unlink()  # Remove the invalid file
+                                    return False
                                 # Attempt to clean up empty segments folder
                                 try:
-                                    for extra in segments_dir.iterdir():
+                                    # First, remove any remaining files
+                                    remaining_files = list(segments_dir.iterdir())
+                                    for extra in remaining_files:
                                         try:
-                                            extra.unlink()
-                                        except Exception:
-                                            pass
-                                    segments_dir.rmdir()
-                                except Exception:
-                                    pass
+                                            if extra.is_file():
+                                                extra.unlink()
+                                                logger.debug(f"Removed remaining file: {extra}")
+                                            elif extra.is_dir():
+                                                # Remove subdirectories recursively
+                                                import shutil
+                                                shutil.rmtree(extra)
+                                                logger.debug(f"Removed remaining directory: {extra}")
+                                        except Exception as e:
+                                            logger.warning(f"Failed to remove {extra}: {e}")
+                                    
+                                    # Now attempt to remove the segments folder
+                                    if segments_dir.exists():
+                                        segments_dir.rmdir()
+                                        logger.info(f"Successfully cleaned up segments folder: {segments_dir}")
+                                except Exception as e:
+                                    logger.warning(f"Failed to clean up segments folder {segments_dir}: {e}")
+                                    # List what's preventing cleanup
+                                    try:
+                                        if segments_dir.exists():
+                                            remaining = list(segments_dir.iterdir())
+                                            logger.warning(f"Segments folder not empty, remaining items: {[str(item) for item in remaining]}")
+                                    except Exception:
+                                        pass
                                 print(f"    📁 Saved optimized GIF to output: {single_output_path.name} ({total_size_mb:.2f}MB)")
                                 logger.info(f"Single-segment GIF moved to output: {single_output_path} ({total_size_mb:.2f}MB)")
                                 return True
@@ -1764,6 +2089,8 @@ class AutomatedWorkflow:
                 if is_valid_out:
                     print(f"    ♻️  Valid optimized GIF already exists in output: {existing_output.name}")
                     logger.info(f"Skipping optimization; existing optimized GIF present: {existing_output}")
+                    # Cache success for gif input
+                    self._record_success_cache(gif_file, 'gif_input', existing_output)
                     return 'success'
             
             # Otherwise, optimize

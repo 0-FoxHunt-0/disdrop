@@ -363,6 +363,57 @@ class FFmpegUtils:
         
         logger.debug(f"Two-pass FFmpeg command (pass {pass_num}): {' '.join(cmd)}")
         return cmd
+
+    @staticmethod
+    def extract_thumbnail_image(input_path: str, output_image_path: str,
+                                time_position_seconds: float = 1.0,
+                                width: Optional[int] = 640) -> bool:
+        """Extract a single JPEG thumbnail from a video.
+
+        Args:
+            input_path: Source video path.
+            output_image_path: Destination JPEG path.
+            time_position_seconds: Timestamp to grab the frame from.
+            width: Optional output width (maintains aspect ratio). If None, keep source size.
+
+        Returns:
+            True on success, False otherwise.
+        """
+        try:
+            safe_input = FFmpegUtils._safe_file_path(input_path)
+            output_dir = os.path.dirname(os.path.abspath(output_image_path))
+            if output_dir and not os.path.exists(output_dir):
+                try:
+                    os.makedirs(output_dir, exist_ok=True)
+                except Exception:
+                    pass
+
+            vf_chain: List[str] = ['setsar=1']
+            if width and width > 0:
+                vf_chain.insert(0, f"scale={width}:-1:flags=lanczos:force_original_aspect_ratio=decrease")
+            vf = ','.join(vf_chain)
+
+            cmd: List[str] = [
+                'ffmpeg', '-y',
+                '-ss', str(max(0.0, float(time_position_seconds))),
+                '-i', safe_input,
+                '-frames:v', '1',
+                '-q:v', '2',
+                '-vf', vf,
+                output_image_path
+            ]
+
+            # Add performance flags (best-effort; safe if no-op)
+            try:
+                FFmpegUtils.add_ffmpeg_perf_flags(cmd)
+            except Exception:
+                pass
+
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+            return result.returncode == 0 and os.path.exists(output_image_path) and os.path.getsize(output_image_path) > 0
+        except Exception as e:
+            logger.debug(f"extract_thumbnail_image failed: {e}")
+            return False
     
     @staticmethod
     def execute_ffmpeg_with_progress(cmd: List[str], duration: float = None, 

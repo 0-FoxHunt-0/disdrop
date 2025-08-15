@@ -319,6 +319,16 @@ class DynamicVideoCompressor:
             
             logger.info(f"Dynamic compression completed: {results.get('compression_ratio', 0):.1f}% reduction, "
                        f"strategy: {best_result.get('strategy', 'unknown')}")
+
+            # Best-effort: create a folder.jpg in the destination directory for Windows Explorer cover
+            try:
+                out_dir = os.path.dirname(os.path.abspath(output_path))
+                thumb_path = os.path.join(out_dir, 'folder.jpg')
+                if not os.path.exists(thumb_path):
+                    from .ffmpeg_utils import FFmpegUtils as _FFU
+                    _FFU.extract_thumbnail_image(output_path, thumb_path, time_position_seconds=1.0, width=640)
+            except Exception:
+                pass
             
             return results
             
@@ -966,7 +976,7 @@ class DynamicVideoCompressor:
         cmd = FFmpegUtils.build_base_ffmpeg_command(input_path, output_path, params)
         
         # Smart scaling with high-quality filter
-        scale_filter = f"scale={params['width']}:{params['height']}:flags=lanczos"
+        scale_filter = f"scale={params['width']}:{params['height']}:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1"
         cmd.extend(['-vf', scale_filter])
         
         # Add frame rate

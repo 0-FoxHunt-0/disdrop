@@ -8,6 +8,9 @@ import subprocess
 import json
 import math
 import time
+import random
+import threading
+import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any, List, Tuple, Optional, Callable
 import logging
@@ -15,7 +18,6 @@ from PIL import Image, ImageSequence, ImageOps, ImageEnhance, ImageFilter
 import numpy as np
 from collections import Counter
 import cv2
-import shutil
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +27,8 @@ class AdvancedGifOptimizer:
         self.temp_dir = self.config.get_temp_dir()
         # Shutdown checker provided by caller; if not provided, never indicates shutdown
         self._shutdown_checker: Callable[[], bool] = shutdown_checker or (lambda: False)
+        self.shutdown_requested = False
+        self.current_ffmpeg_process = None
         
         # Advanced optimization cache
         self.palette_cache = {}
@@ -46,6 +50,116 @@ class AdvancedGifOptimizer:
         self.skip_gifsicle_far_over_ratio: float = float(self.perf_cfg.get('skip_gifsicle_far_over_ratio', 0.35 if self.fast_mode else 0.5))
         # Limit for near-target bounded search iterations
         self.near_target_max_runs: int = int(self.perf_cfg.get('near_target_max_runs', 12 if self.fast_mode else 24))
+
+    def _create_unique_temp_filename(self, prefix: str, suffix: str) -> str:
+        """Create a unique temporary filename to avoid Windows file locking conflicts"""
+        thread_id = threading.get_ident()
+        random_suffix = random.randint(1000, 9999)
+        timestamp = int(time.time())
+        return os.path.join(self.temp_dir, f"{prefix}_{thread_id}_{timestamp}_{random_suffix}{suffix}")
+
+    def _safe_file_operation(self, operation, *args, max_retries: int = 3, **kwargs):
+        """Perform file operation with retry logic for Windows file locking"""
+        for retry in range(max_retries):
+            try:
+                return operation(*args, **kwargs)
+            except (PermissionError, OSError) as e:
+                if retry < max_retries - 1:
+                    logger.debug(f"File operation retry {retry + 1}/{max_retries}: {e}")
+                    time.sleep(0.1 * (retry + 1))  # Progressive backoff
+                else:
+                    logger.warning(f"File operation failed after {max_retries} retries: {e}")
+                    raise
+
+    def request_shutdown(self):
+        """Request graceful shutdown of the optimizer"""
+        logger.info("Shutdown requested for GIF optimizer")
+        self.shutdown_requested = True
+        self._terminate_ffmpeg_process()
+
+    def _terminate_ffmpeg_process(self):
+        """Terminate the current FFmpeg process gracefully"""
+        if self.current_ffmpeg_process and self.current_ffmpeg_process.poll() is None:
+            try:
+                logger.info("Terminating FFmpeg process in GIF optimizer...")
+                # Try graceful termination first
+                self.current_ffmpeg_process.terminate()
+                
+                # Wait a bit for graceful termination
+                try:
+                    self.current_ffmpeg_process.wait(timeout=5)
+                    logger.info("FFmpeg process terminated gracefully")
+                except subprocess.TimeoutExpired:
+                    # Force kill if graceful termination fails
+                    logger.warning("FFmpeg process did not terminate gracefully, forcing kill...")
+                    self.current_ffmpeg_process.kill()
+                    self.current_ffmpeg_process.wait()
+                    logger.info("FFmpeg process killed")
+                
+            except Exception as e:
+                logger.error(f"Error terminating FFmpeg process in GIF optimizer: {e}")
+            finally:
+                self.current_ffmpeg_process = None
+
+    def _run_subprocess_with_shutdown_check(self, cmd, timeout=120, **kwargs):
+        """Run subprocess with shutdown checking and process tracking"""
+        # Check if shutdown was requested before starting
+        if self.shutdown_requested or self._shutdown_checker():
+            class ShutdownResult:
+                returncode = 1
+                stdout = ''
+                stderr = 'Shutdown requested before execution'
+            return ShutdownResult()
+        
+        try:
+            self.current_ffmpeg_process = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, **kwargs
+            )
+            
+            # Poll periodically to check for shutdown requests
+            start_time = time.time()
+            while self.current_ffmpeg_process.poll() is None:
+                if self.shutdown_requested or self._shutdown_checker():
+                    logger.info("Shutdown requested during subprocess execution, terminating...")
+                    self._terminate_ffmpeg_process()
+                    class ShutdownResult:
+                        returncode = 1
+                        stdout = ''
+                        stderr = 'Shutdown requested during execution'
+                    return ShutdownResult()
+                
+                # Check timeout
+                if time.time() - start_time > timeout:
+                    logger.warning(f"Subprocess timeout after {timeout}s, terminating...")
+                    self._terminate_ffmpeg_process()
+                    class TimeoutResult:
+                        returncode = 1
+                        stdout = ''
+                        stderr = 'TimeoutExpired'
+                    return TimeoutResult()
+                
+                time.sleep(0.1)  # Short sleep to avoid busy waiting
+            
+            # Process completed normally
+            stdout, stderr = self.current_ffmpeg_process.communicate()
+            
+            class NormalResult:
+                def __init__(self, returncode, stdout, stderr):
+                    self.returncode = returncode
+                    self.stdout = stdout
+                    self.stderr = stderr
+            
+            return NormalResult(self.current_ffmpeg_process.returncode, stdout, stderr)
+            
+        except Exception as e:
+            logger.error(f"Error running subprocess: {e}")
+            class ErrorResult:
+                returncode = 1
+                stdout = ''
+                stderr = str(e)
+            return ErrorResult()
+        finally:
+            self.current_ffmpeg_process = None
         
     def create_optimized_gif(self, input_video: str, output_path: str, 
                            max_size_mb: float, platform: str = None,
@@ -185,7 +299,7 @@ class AdvancedGifOptimizer:
 
             if self._shutdown_checker():
                 return False
-            if self._ffmpeg_palette_reencode(gif_path, temp_ffmpeg, new_width, fps):
+            if self._ffmpeg_palette_reencode(gif_path, temp_ffmpeg, new_width, fps, max_colors=256):
                 os.replace(temp_ffmpeg, gif_path)
                 current_bytes = os.path.getsize(gif_path)
 
@@ -202,6 +316,32 @@ class AdvancedGifOptimizer:
                             pass
                     logger.info("GIF met target via ffmpeg re-encode")
                     return True
+
+            # Iterative tightening: if still over target, progressively reduce width/fps and colors
+            if current_bytes > target_bytes and not self._shutdown_checker():
+                attempt_width = max(2, int((new_width * 0.85) // 2 * 2))
+                attempt_fps = max(6, int(fps * 0.9))
+                for colors in [192, 160]:
+                    if self._shutdown_checker():
+                        return False
+                    temp_try = gif_path + f".tight_{attempt_width}w_{attempt_fps}fps_{colors}c.tmp.gif"
+                    if self._ffmpeg_palette_reencode(gif_path, temp_try, attempt_width, attempt_fps, max_colors=colors):
+                        os.replace(temp_try, gif_path)
+                        current_bytes = os.path.getsize(gif_path)
+                        if current_bytes > target_bytes and gifsicle_available and not self._shutdown_checker():
+                            if self._gifsicle_squeeze_small_overage(gif_path):
+                                current_bytes = os.path.getsize(gif_path)
+                        if current_bytes <= target_bytes:
+                            if backup_path and os.path.exists(backup_path):
+                                try:
+                                    os.remove(backup_path)
+                                except Exception:
+                                    pass
+                            logger.info("GIF met target via iterative ffmpeg re-encode")
+                            return True
+                    # Prepare even tighter next round
+                    attempt_width = max(2, int((attempt_width * 0.88) // 2 * 2))
+                    attempt_fps = max(6, int(attempt_fps * 0.9))
 
             # Restore original if all attempts failed but original already <= target
             if backup_path and os.path.exists(backup_path):
@@ -352,7 +492,7 @@ class AdvancedGifOptimizer:
             logger.debug(f"Bounded gifsicle search failed: {e}")
             return False
 
-    def _ffmpeg_palette_reencode(self, input_path: str, output_path: str, new_width: int, fps: int) -> bool:
+    def _ffmpeg_palette_reencode(self, input_path: str, output_path: str, new_width: int, fps: int, max_colors: int = 256) -> bool:
         """Re-encode GIF via ffmpeg using mpdecimate + palettegen/paletteuse preserving AR."""
         try:
             if self._shutdown_checker():
@@ -364,7 +504,7 @@ class AdvancedGifOptimizer:
                 f'fps={fps}',
                 f'scale={new_width}:-2:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1'
             ]
-            vf_palette = ','.join(pre + ['palettegen=max_colors=256:stats_mode=diff'])
+            vf_palette = ','.join(pre + [f'palettegen=max_colors={int(max_colors)}:stats_mode=diff'])
             # Palette gen
             cmd1 = [
                 'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
@@ -1679,10 +1819,13 @@ class AdvancedGifOptimizer:
     def _generate_palette_median_cut(self, input_video: str, colors: int) -> Optional[str]:
         """Generate palette using median cut algorithm"""
         
-        palette_file = os.path.join(self.temp_dir, f"mediancut_palette_{colors}_{int(time.time())}.png")
+        # Create unique filename with thread ID and random suffix to avoid conflicts
+        thread_id = threading.get_ident()
+        random_suffix = random.randint(1000, 9999)
+        palette_file = os.path.join(self.temp_dir, f"mediancut_palette_{colors}_{thread_id}_{random_suffix}.png")
         
-        # Extract sample frames
-        sample_frames_dir = os.path.join(self.temp_dir, f"palette_frames_{int(time.time())}")
+        # Extract sample frames with unique directory name
+        sample_frames_dir = os.path.join(self.temp_dir, f"palette_frames_{thread_id}_{random_suffix}")
         os.makedirs(sample_frames_dir, exist_ok=True)
         
         try:
@@ -1714,23 +1857,48 @@ class AdvancedGifOptimizer:
                         quantized = combined_img.quantize(colors=colors, method=Image.Quantize.MEDIANCUT)
                         palette_img = quantized.convert('RGB')
                         
-                        # Save palette
-                        palette_img.save(palette_file)
-                        
-                        if os.path.exists(palette_file):
-                            return palette_file
+                        # Save palette with retry logic for Windows file locking
+                        max_retries = 3
+                        for retry in range(max_retries):
+                            try:
+                                palette_img.save(palette_file)
+                                
+                                if os.path.exists(palette_file):
+                                    return palette_file
+                                break
+                            except (PermissionError, OSError) as e:
+                                if retry < max_retries - 1:
+                                    logger.debug(f"Palette save retry {retry + 1}/{max_retries}: {e}")
+                                    time.sleep(0.1 * (retry + 1))  # Progressive backoff
+                                else:
+                                    logger.warning(f"Failed to save palette after {max_retries} retries: {e}")
             
         except Exception as e:
             logger.warning(f"Median cut palette generation failed: {e}")
         finally:
-            shutil.rmtree(sample_frames_dir, ignore_errors=True)
+            # Clean up with retry logic for Windows file locking
+            max_retries = 3
+            for retry in range(max_retries):
+                try:
+                    if os.path.exists(sample_frames_dir):
+                        shutil.rmtree(sample_frames_dir)
+                    break
+                except (PermissionError, OSError) as e:
+                    if retry < max_retries - 1:
+                        logger.debug(f"Cleanup retry {retry + 1}/{max_retries} for {sample_frames_dir}: {e}")
+                        time.sleep(0.2 * (retry + 1))  # Progressive backoff
+                    else:
+                        logger.warning(f"Failed to cleanup {sample_frames_dir} after {max_retries} retries: {e}")
         
         return None
     
     def _generate_palette_octree(self, input_video: str, colors: int) -> Optional[str]:
         """Generate palette using octree algorithm"""
         
-        palette_file = os.path.join(self.temp_dir, f"octree_palette_{colors}_{int(time.time())}.png")
+        # Create unique filename with thread ID and random suffix to avoid conflicts
+        thread_id = threading.get_ident()
+        random_suffix = random.randint(1000, 9999)
+        palette_file = os.path.join(self.temp_dir, f"octree_palette_{colors}_{thread_id}_{random_suffix}.png")
         
         # This is a simplified version - in practice you'd implement full octree quantization
         cmd = [
@@ -1740,10 +1908,26 @@ class AdvancedGifOptimizer:
             '-y', palette_file
         ]
         
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        
-        if result.returncode == 0 and os.path.exists(palette_file):
-            return palette_file
+        # Run with retry logic for Windows file locking issues
+        max_retries = 3
+        for retry in range(max_retries):
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                
+                if result.returncode == 0 and os.path.exists(palette_file):
+                    return palette_file
+                elif retry < max_retries - 1:
+                    logger.debug(f"FFmpeg palette generation retry {retry + 1}/{max_retries}")
+                    time.sleep(0.1 * (retry + 1))
+                else:
+                    logger.warning(f"FFmpeg palette generation failed after {max_retries} retries")
+                    break
+            except (subprocess.TimeoutExpired, OSError) as e:
+                if retry < max_retries - 1:
+                    logger.debug(f"FFmpeg timeout/error retry {retry + 1}/{max_retries}: {e}")
+                    time.sleep(0.2 * (retry + 1))
+                else:
+                    logger.warning(f"FFmpeg failed after {max_retries} retries: {e}")
         
         return None
     
@@ -2343,7 +2527,10 @@ class AdvancedGifOptimizer:
                                duration: float, platform: str = None) -> Optional[Dict[str, Any]]:
         """Create GIF with specific optimization parameters"""
         
-        temp_gif = os.path.join(self.temp_dir, f"optimization_temp_{int(time.time())}.gif")
+        # Create unique temp file name with thread ID and random suffix to avoid conflicts
+        thread_id = threading.get_ident()
+        random_suffix = random.randint(1000, 9999)
+        temp_gif = os.path.join(self.temp_dir, f"optimization_temp_{thread_id}_{random_suffix}.gif")
         
         try:
             # Create optimized frames based on parameters
@@ -2379,8 +2566,19 @@ class AdvancedGifOptimizer:
         
         except Exception as e:
             logger.warning(f"GIF creation with params failed: {e}")
+            # Clean up with retry logic for Windows file locking
             if os.path.exists(temp_gif):
-                os.remove(temp_gif)
+                max_retries = 3
+                for retry in range(max_retries):
+                    try:
+                        os.remove(temp_gif)
+                        break
+                    except (PermissionError, OSError) as cleanup_error:
+                        if retry < max_retries - 1:
+                            logger.debug(f"Temp file cleanup retry {retry + 1}/{max_retries}: {cleanup_error}")
+                            time.sleep(0.1 * (retry + 1))
+                        else:
+                            logger.warning(f"Failed to cleanup temp file {temp_gif}: {cleanup_error}")
         
         return None
     

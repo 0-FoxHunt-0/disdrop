@@ -18,6 +18,7 @@ import time # Added for time.sleep
 import json
 import hashlib
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .config_manager import ConfigManager
 from .ffmpeg_utils import FFmpegUtils
@@ -275,7 +276,21 @@ class GifGenerator:
                                         # Fallback to copy
                                         shutil.copy2(opt_result['output_file'], output_path)
                                         os.remove(opt_result['output_file'])
+                                
+                                # Validate final size after move
                                 size_mb = os.path.getsize(output_path) / (1024 * 1024)
+                                if size_mb > settings['max_size_mb']:
+                                    logger.error(f"Final GIF after optimization still exceeds limit: {size_mb:.2f}MB > {settings['max_size_mb']:.2f}MB")
+                                    # Remove the oversized file
+                                    try:
+                                        os.remove(output_path)
+                                    except Exception:
+                                        pass
+                                    return {
+                                        'success': False,
+                                        'error': f"Final GIF size ({size_mb:.2f}MB) exceeds limit ({settings['max_size_mb']:.2f}MB)",
+                                        'size_mb': size_mb
+                                    }
                         except Exception as e:
                             logger.warning(f"Iterative optimization failed: {e}")
                     
@@ -454,7 +469,7 @@ class GifGenerator:
                 pre.append(crop_filter)
             pre.append('mpdecimate=hi=768:lo=512:frac=0.5')
             pre.append(f"fps={settings['fps']}")
-            pre.append(f"scale={settings['scale']}: -1:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1".replace(' :', ':'))
+            pre.append(f"scale={settings['scale']}:-1:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1")
             chain = ','.join(pre)
 
             filter_complex = (
@@ -516,36 +531,81 @@ class GifGenerator:
         self._terminate_ffmpeg_process()
 
     def _terminate_ffmpeg_process(self):
-        try:
-            if self.current_ffmpeg_process and self.current_ffmpeg_process.poll() is None:
+        """Terminate the current FFmpeg process gracefully"""
+        if self.current_ffmpeg_process and self.current_ffmpeg_process.poll() is None:
+            try:
+                logger.info("Terminating FFmpeg process in GIF generator...")
+                # Try graceful termination first
                 self.current_ffmpeg_process.terminate()
+                
+                # Wait a bit for graceful termination
                 try:
-                    self.current_ffmpeg_process.wait(timeout=3)
-                except Exception:
+                    self.current_ffmpeg_process.wait(timeout=5)
+                    logger.info("FFmpeg process terminated gracefully")
+                except subprocess.TimeoutExpired:
+                    # Force kill if graceful termination fails
+                    logger.warning("FFmpeg process did not terminate gracefully, forcing kill...")
                     self.current_ffmpeg_process.kill()
-        except Exception:
-            pass
-        finally:
-            self.current_ffmpeg_process = None
+                    self.current_ffmpeg_process.wait()
+                    logger.info("FFmpeg process killed")
+                
+            except Exception as e:
+                logger.error(f"Error terminating FFmpeg process in GIF generator: {e}")
+            finally:
+                self.current_ffmpeg_process = None
 
     def _run_ffmpeg(self, cmd: list, timeout: int = 120):
         """Run FFmpeg with the ability to terminate early on shutdown."""
         class FFResult:
             pass
+        
+        # Check if shutdown was requested before starting
+        if self.shutdown_requested:
+            r = FFResult()
+            r.stdout = ''
+            r.stderr = 'Shutdown requested before FFmpeg execution'
+            r.returncode = 1
+            return r
+        
         try:
             self.current_ffmpeg_process = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
             )
-            try:
-                stdout, stderr = self.current_ffmpeg_process.communicate(timeout=timeout)
-                rc = self.current_ffmpeg_process.returncode
-            except subprocess.TimeoutExpired:
-                self._terminate_ffmpeg_process()
-                stdout, stderr, rc = '', 'TimeoutExpired', 1
+            
+            # Poll periodically to check for shutdown requests
+            start_time = time.time()
+            while self.current_ffmpeg_process.poll() is None:
+                if self.shutdown_requested:
+                    logger.info("Shutdown requested during FFmpeg execution, terminating...")
+                    self._terminate_ffmpeg_process()
+                    r = FFResult()
+                    r.stdout = ''
+                    r.stderr = 'Shutdown requested during execution'
+                    r.returncode = 1
+                    return r
+                
+                # Check timeout
+                if time.time() - start_time > timeout:
+                    logger.warning(f"FFmpeg timeout after {timeout}s, terminating...")
+                    self._terminate_ffmpeg_process()
+                    r = FFResult()
+                    r.stdout = ''
+                    r.stderr = 'TimeoutExpired'
+                    r.returncode = 1
+                    return r
+                
+                time.sleep(0.1)  # Short sleep to avoid busy waiting
+            
+            # Process completed normally
+            stdout, stderr = self.current_ffmpeg_process.communicate()
+            rc = self.current_ffmpeg_process.returncode
+            
         except Exception as e:
+            logger.error(f"Error running FFmpeg: {e}")
             stdout, stderr, rc = '', str(e), 1
         finally:
             self.current_ffmpeg_process = None
+            
         r = FFResult()
         r.stdout = stdout
         r.stderr = stderr
@@ -576,34 +636,65 @@ class GifGenerator:
                 os.makedirs(segments_dir)
             
             successful_segments = 0
-            total_size = 0
-            
-            for i in range(num_segments):
-                segment_start = start_time + (i * segment_duration)
-                # Correct for any accumulated floating error and ensure last segment reaches exact end
-                raw_end = start_time + duration
-                segment_end = min(raw_end, segment_start + segment_duration)
-                # If this is the last planned segment, hard-clamp to raw_end
-                if i == num_segments - 1:
-                    segment_end = raw_end
-                segment_duration_actual = max(0.0, segment_end - segment_start)
-                
-                if segment_duration_actual <= 0:
-                    break
-                
-                # Create segment GIF
-                segment_name = f"{base_name}_segment_{i+1:02d}.gif"
-                segment_path = os.path.join(segments_dir, segment_name)
-                
-                # For each segment, force no further segmentation to avoid nested segmentation
-                result = self._create_single_gif(input_video, segment_path, settings, segment_start, segment_duration_actual)
-                
-                if result.get('success', False):
-                    successful_segments += 1
-                    total_size += result.get('size_mb', 0)
-                    logger.info(f"Created segment {i+1}/{num_segments}: {segment_name} ({result.get('size_mb', 0):.2f}MB)")
+            total_size = 0.0
+
+            # Determine parallelism from config (optional key); fall back to auto sizing
+            try:
+                perf_cfg = self.config.get('gif_settings.performance', {}) or {}
+                segment_parallelism = perf_cfg.get('segment_parallelism', 'auto')
+                if str(segment_parallelism).lower() == 'auto':
+                    cpu = os.cpu_count() or 4
+                    max_workers = max(1, min(4, cpu // 2))
                 else:
-                    logger.warning(f"Failed to create segment {i+1}/{num_segments}: {result.get('error', 'Unknown error')}")
+                    max_workers = max(1, min(8, int(segment_parallelism)))
+            except Exception:
+                max_workers = 2
+
+            # Process segments in parallel
+            def _process_segment(i: int) -> Tuple[bool, float, str]:
+                try:
+                    if self.shutdown_requested:
+                        return (False, 0.0, f"{base_name}_segment_{i+1:02d}.gif")
+                    segment_start = start_time + (i * segment_duration)
+                    raw_end = start_time + duration
+                    segment_end = min(raw_end, segment_start + segment_duration)
+                    if i == num_segments - 1:
+                        segment_end = raw_end
+                    segment_duration_actual = max(0.0, segment_end - segment_start)
+                    if segment_duration_actual <= 0:
+                        return (False, 0.0, f"zero-length segment {i+1}")
+
+                    segment_name = f"{base_name}_segment_{i+1:02d}.gif"
+                    segment_path = os.path.join(segments_dir, segment_name)
+
+                    # Use a fresh generator instance to avoid shared process state across threads
+                    local_generator = GifGenerator(self.config)
+                    # Force per-segment single-GIF path to avoid nested segmentation
+                    result = local_generator._create_single_gif(input_video, segment_path, settings, segment_start, segment_duration_actual)
+                    if result.get('success', False):
+                        sz = float(result.get('size_mb', 0.0) or 0.0)
+                        logger.info(f"Created segment {i+1}/{num_segments}: {segment_name} ({sz:.2f}MB)")
+                        return (True, sz, segment_name)
+                    else:
+                        err = result.get('error', 'Unknown error')
+                        logger.warning(f"Failed to create segment {i+1}/{num_segments}: {err}")
+                        return (False, 0.0, segment_name)
+                except Exception as e:
+                    logger.warning(f"Exception in segment {i+1}: {e}")
+                    return (False, 0.0, f"{base_name}_segment_{i+1:02d}.gif")
+
+            indices = list(range(num_segments))
+            results: List[Tuple[bool, float, str]] = []
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(_process_segment, i) for i in indices]
+                for fut in as_completed(futures):
+                    try:
+                        ok, size_mb, name = fut.result()
+                        if ok:
+                            successful_segments += 1
+                            total_size += size_mb
+                    except Exception as e:
+                        logger.warning(f"Segment future failed: {e}")
             
             if successful_segments > 0:
                 return {

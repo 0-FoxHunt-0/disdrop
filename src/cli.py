@@ -82,6 +82,9 @@ class VideoCompressorCLI:
             # Request shutdown for all components
             if hasattr(self, 'gif_generator') and self.gif_generator:
                 self.gif_generator.request_shutdown()
+                # Also shutdown the GIF optimizer
+                if hasattr(self.gif_generator, 'optimizer') and hasattr(self.gif_generator.optimizer, 'request_shutdown'):
+                    self.gif_generator.optimizer.request_shutdown()
             if hasattr(self, 'video_compressor') and self.video_compressor:
                 self.video_compressor.request_shutdown()
             if hasattr(self, 'automated_workflow') and self.automated_workflow:
@@ -150,8 +153,16 @@ class VideoCompressorCLI:
         parser.add_argument('--temp-dir', help='Temporary directory for processing')
         parser.add_argument('--max-size', type=float, metavar='MB',
                           help='Maximum output file size in MB (overrides platform defaults)')
+        parser.add_argument('--max-files', type=int, metavar='N',
+                          help='Maximum number of files to process before exiting')
+        parser.add_argument('--output-dir', help='Output directory for generated files (default varies by mode, typically ./output)')
         parser.add_argument('--force-software', action='store_true',
                           help='Force software encoding (bypass hardware acceleration)')
+        parser.add_argument('--no-cache', action='store_true',
+                          help='Do not use success cache; verify and process all files even if previously successful')
+        # Segmentation preference: prefer a fixed number of segments (1-10)
+        parser.add_argument('--prefer-segments', type=int, choices=list(range(1, 11)), metavar='N',
+                          help='Prefer N segments (1-10). If impossible, fall back to normal operations')
         
         # Create subcommands
         subparsers = parser.add_subparsers(dest='command', help='Available commands')
@@ -188,7 +199,7 @@ class VideoCompressorCLI:
         # Batch compress command
         batch_parser = subparsers.add_parser('batch-compress', help='Compress multiple video files')
         batch_parser.add_argument('input_pattern', help='Input files pattern (e.g., *.mp4)')
-        batch_parser.add_argument('--output-dir', required=True, help='Output directory')
+        batch_parser.add_argument('--output-dir', help='Output directory (overrides global)')
         batch_parser.add_argument('--platform', choices=['instagram', 'twitter', 'tiktok', 'youtube_shorts', 'facebook'],
                                  help='Target social media platform')
         batch_parser.add_argument('--suffix', default='_compressed', help='Suffix for output files')
@@ -197,7 +208,7 @@ class VideoCompressorCLI:
         # Batch GIF command
         batch_gif_parser = subparsers.add_parser('batch-gif', help='Create GIFs from multiple videos')
         batch_gif_parser.add_argument('input_pattern', help='Input files pattern (e.g., *.mp4)')
-        batch_gif_parser.add_argument('--output-dir', required=True, help='Output directory')
+        batch_gif_parser.add_argument('--output-dir', help='Output directory (overrides global)')
         batch_gif_parser.add_argument('--platform', choices=['twitter', 'discord', 'slack'],
                                      help='Target platform for GIF optimization')
         batch_gif_parser.add_argument('--duration', type=float, metavar='SECONDS',
@@ -239,6 +250,8 @@ class VideoCompressorCLI:
                                 help='How often to check for new files (default: 5 seconds)')
         auto_parser.add_argument('--max-size', type=float, default=10.0, metavar='MB',
                                 help='Maximum output file size in MB (default: 10.0)')
+        auto_parser.add_argument('--no-cache', action='store_true',
+                                help='Do not use success cache in automated workflow')
         
         # Set default command if none provided
         args = parser.parse_args()
@@ -310,6 +323,15 @@ class VideoCompressorCLI:
             self.advanced_optimizer = AdvancedGifOptimizer(self.config)
             self.file_validator = FileValidator()
             self.automated_workflow = AutomatedWorkflow(self.config, self.hardware)
+            # Propagate preferred segments (legacy single-segment retained via value 1)
+            try:
+                preferred = getattr(args, 'prefer_segments', None)
+                if preferred is not None:
+                    self.automated_workflow.preferred_segments = int(preferred)
+                else:
+                    self.automated_workflow.preferred_segments = None
+            except Exception:
+                self.automated_workflow.preferred_segments = None
             
             logger.info("All components initialized successfully")
             
@@ -472,9 +494,29 @@ class VideoCompressorCLI:
                             segment_name = segment.get('name')
                             
                             if temp_path and segment_name and os.path.exists(temp_path):
+                                # Validate size before moving to final output
+                                temp_size_mb = os.path.getsize(temp_path) / (1024 * 1024)
+                                if temp_size_mb > args.max_size:
+                                    logger.error(f"Segment {segment_name} exceeds size limit: {temp_size_mb:.2f}MB > {args.max_size:.2f}MB")
+                                    # Remove the oversized temp file instead of moving it
+                                    try:
+                                        os.remove(temp_path)
+                                        logger.debug(f"Removed oversized segment: {segment_name}")
+                                    except Exception:
+                                        pass
+                                    continue
+                                
                                 final_path = os.path.join(final_segments_folder, segment_name)
                                 try:
                                     shutil.move(temp_path, final_path)
+                                    
+                                    # Final validation after move
+                                    final_size_mb = os.path.getsize(final_path) / (1024 * 1024)
+                                    if final_size_mb > args.max_size:
+                                        logger.error(f"Final segment {segment_name} exceeds size limit: {final_size_mb:.2f}MB > {args.max_size:.2f}MB")
+                                        os.remove(final_path)  # Remove the invalid file
+                                        continue
+                                    
                                     moved_segments += 1
                                     logger.debug(f"Moved segment: {segment_name} -> {final_path}")
                                 except Exception as e:
@@ -563,11 +605,16 @@ class VideoCompressorCLI:
         if not input_files:
             logger.error(f"No files found matching pattern: {args.input_pattern}")
             return
+
+        # Apply processing limit if specified
+        if getattr(args, 'max_files', None):
+            input_files = input_files[: int(args.max_files)]
         
         logger.info(f"Found {len(input_files)} files to compress")
         
-        # Create output directory
-        os.makedirs(args.output_dir, exist_ok=True)
+        # Resolve output directory: prefer provided --output-dir, else default to ./output
+        effective_output_dir = args.output_dir if getattr(args, 'output_dir', None) else os.path.join(os.getcwd(), 'output')
+        os.makedirs(effective_output_dir, exist_ok=True)
         
         # Determine number of parallel processes
         max_workers = args.parallel or min(4, len(input_files))
@@ -576,7 +623,7 @@ class VideoCompressorCLI:
             try:
                 # Generate output filename
                 basename = os.path.splitext(os.path.basename(input_file))[0]
-                output_file = os.path.join(args.output_dir, f"{basename}{args.suffix}.mp4")
+                output_file = os.path.join(effective_output_dir, f"{basename}{args.suffix}.mp4")
                 
                 # NEW: Check if output already exists and is valid
                 if os.path.exists(output_file):
@@ -627,6 +674,10 @@ class VideoCompressorCLI:
         if not input_files:
             logger.error(f"No files found matching pattern: {args.input_pattern}")
             return
+
+        # Apply processing limit if specified
+        if getattr(args, 'max_files', None):
+            input_files = input_files[: int(args.max_files)]
         
         logger.info(f"Found {len(input_files)} files for GIF creation")
         
@@ -643,7 +694,7 @@ class VideoCompressorCLI:
                 output_file = os.path.join(args.output_dir, f"{basename}.gif")
                 
                 # NEW: Comprehensive check for existing outputs before processing
-                if self._has_existing_output_cli(input_file, args.output_dir):
+                if self._has_existing_output_cli(input_file, effective_output_dir):
                     logger.info(f"Skipping {basename} - output already exists")
                     return {
                         'success': True,
@@ -683,9 +734,29 @@ class VideoCompressorCLI:
                                 segment_name = segment.get('name')
                                 
                                 if temp_path and segment_name and os.path.exists(temp_path):
+                                    # Validate size before moving to final output
+                                    temp_size_mb = os.path.getsize(temp_path) / (1024 * 1024)
+                                    if temp_size_mb > args.max_size:
+                                        logger.error(f"Batch segment {segment_name} exceeds size limit: {temp_size_mb:.2f}MB > {args.max_size:.2f}MB")
+                                        # Remove the oversized temp file instead of moving it
+                                        try:
+                                            os.remove(temp_path)
+                                            logger.debug(f"Removed oversized batch segment: {segment_name}")
+                                        except Exception:
+                                            pass
+                                        continue
+                                    
                                     final_path = os.path.join(final_segments_folder, segment_name)
                                     try:
                                         shutil.move(temp_path, final_path)
+                                        
+                                        # Final validation after move
+                                        final_size_mb = os.path.getsize(final_path) / (1024 * 1024)
+                                        if final_size_mb > args.max_size:
+                                            logger.error(f"Final batch segment {segment_name} exceeds size limit: {final_size_mb:.2f}MB > {args.max_size:.2f}MB")
+                                            os.remove(final_path)  # Remove the invalid file
+                                            continue
+                                        
                                         moved_segments += 1
                                         logger.debug(f"Moved segment: {segment_name} -> {final_path}")
                                     except Exception as e:
@@ -1201,7 +1272,9 @@ class VideoCompressorCLI:
             print("AUTOMATED VIDEO PROCESSING WORKFLOW")
             print("="*60)
             print(f"Input directory:    {os.path.abspath('input')}")
-            print(f"Output directory:   {os.path.abspath('output')}")
+            # Respect global --output-dir if provided
+            out_dir_display = os.path.abspath(args.output_dir) if getattr(args, 'output_dir', None) else os.path.abspath('output')
+            print(f"Output directory:   {out_dir_display}")
             print(f"Temp directory:     {os.path.abspath('temp')}")
             print(f"Check interval:     {args.check_interval} seconds")
             print(f"Max file size:      {args.max_size} MB")
@@ -1209,13 +1282,17 @@ class VideoCompressorCLI:
             print("\nPlace video files in the 'input' directory to process them automatically.")
             print("Press Ctrl+C to stop the workflow gracefully.\n")
         else:
-            print(f"Watching '{os.path.abspath('input')}' → '{os.path.abspath('output')}' every {args.check_interval}s (max {args.max_size}MB). Ctrl+C to stop.")
+            out_dir_display = os.path.abspath(args.output_dir) if getattr(args, 'output_dir', None) else os.path.abspath('output')
+            print(f"Watching '{os.path.abspath('input')}' → '{out_dir_display}' every {args.check_interval}s (max {args.max_size}MB). Ctrl+C to stop.")
         
         try:
             self.automated_workflow.run_automated_workflow(
                 check_interval=args.check_interval,
                 max_size_mb=args.max_size,
-                verbose=getattr(args, 'debug', False)
+                verbose=getattr(args, 'debug', False),
+                max_files=getattr(args, 'max_files', None),
+                output_dir=getattr(args, 'output_dir', None),
+                no_cache=getattr(args, 'no_cache', False)
             )
         except KeyboardInterrupt:
             logger.info("Automated workflow stopped by user")

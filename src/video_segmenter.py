@@ -253,11 +253,17 @@ class VideoSegmenter:
         
         # Calculate optimal segment duration
         segment_duration = self._calculate_optimal_segment_duration(duration, video_info, target_size_mb)
-        
+
         # Calculate number of segments
         num_segments = math.ceil(duration / segment_duration)
-        
-        logger.info(f"Splitting {duration:.1f}s video into {num_segments} segments of ~{segment_duration:.1f}s each")
+        # Equalize per-segment duration so all segments are similar length
+        # This ensures the final segment isn't disproportionately short
+        if num_segments > 0:
+            equalized_duration = duration / num_segments
+            # Keep within the originally calculated duration bound just in case
+            segment_duration = min(segment_duration, equalized_duration)
+
+        logger.info(f"Splitting {duration:.1f}s video into {num_segments} segments of ~{segment_duration:.1f}s each (equalized)")
         
         segments = []
         temp_files = []
@@ -265,9 +271,13 @@ class VideoSegmenter:
         try:
             # Process each segment
             for i in range(num_segments):
+                # Use equalized boundaries; clamp the last segment to the exact end to avoid drift
                 segment_start = start_time + (i * segment_duration)
-                segment_end = min(start_time + ((i + 1) * segment_duration), start_time + duration)
-                segment_duration_actual = segment_end - segment_start
+                if i < num_segments - 1:
+                    segment_end = start_time + ((i + 1) * segment_duration)
+                else:
+                    segment_end = start_time + duration
+                segment_duration_actual = max(0.0, segment_end - segment_start)
                 
                 if segment_duration_actual <= 0:
                     continue
@@ -419,20 +429,20 @@ class VideoSegmenter:
             
             logger.info(f"Creating segment with optimization: {segment_params['width']}x{segment_params['height']}, "
                        f"{duration:.1f}s @ {segment_params['fps']}fps")
-            
-            # Build FFmpeg command for segment creation (always use software encoding for reliability)
+
+            # Build FFmpeg command for segment creation (accurate seek: place -ss after -i)
             cmd = [
                 'ffmpeg', '-y',
+                '-i', input_video,
                 '-ss', str(start_time),
                 '-t', str(duration),
-                '-i', input_video,
-                '-c:v', 'libx264',  # Force software encoding for segments
-                '-crf', str(segment_params.get('crf', 23)),  # Use CRF instead of bitrate for better quality
+                '-c:v', 'libx264',
+                '-crf', str(segment_params.get('crf', 23)),
                 '-preset', segment_params.get('preset', 'medium'),
                 '-s', f"{segment_params['width']}x{segment_params['height']}",
                 '-r', str(segment_params['fps']),
                 '-c:a', 'aac',
-                '-b:a', '128k',  # Increased audio bitrate
+                '-b:a', '128k',
                 '-ac', '2',
                 '-movflags', '+faststart',
                 '-pix_fmt', 'yuv420p',
@@ -1082,6 +1092,15 @@ class VideoSegmenter:
             
             if result.returncode == 0:
                 file_size = os.path.getsize(output_path) / (1024 * 1024)
+                # Best-effort: extract a folder cover image if missing
+                try:
+                    from .ffmpeg_utils import FFmpegUtils as _FFU
+                    out_dir = os.path.dirname(os.path.abspath(output_path))
+                    thumb_path = os.path.join(out_dir, 'folder.jpg')
+                    if not os.path.exists(thumb_path):
+                        _FFU.extract_thumbnail_image(output_path, thumb_path, time_position_seconds=1.0, width=640)
+                except Exception:
+                    pass
                 return {
                     'success': True,
                     'size_mb': file_size,
