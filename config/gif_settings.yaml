@@ -8,7 +8,8 @@ gif_settings:
   # Quality settings - Improved FPS
   fps: 20 # Increased from 15 for better motion quality
   width: 360 # Maximum width (aspect ratio will be preserved)
-  height: 360 # Maximum height (aspect ratio will be preserved)
+  height: -1 # Use -1 to preserve aspect ratio automatically (was 360 which forced square)
+  # Note: height: -1 allows FFmpeg to automatically calculate height based on width while preserving aspect ratio
 
   # Optimization settings - More balanced defaults
   palette_size: 256

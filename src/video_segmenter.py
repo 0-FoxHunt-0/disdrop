@@ -206,6 +206,7 @@ class VideoSegmenter:
         if self.should_segment_video(actual_duration, video_info, target_size_mb):
             logger.info("Video will be split into high-quality segments")
             print("🎬 Video will be split into high-quality segments")
+            print(f"    📊 Processing {actual_duration:.1f}s video with target size {target_size_mb}MB per segment")
             results = self._split_video_into_segments(
                 input_video, output_base_path, start_time, actual_duration, 
                 video_info, platform_config, target_size_mb
@@ -263,6 +264,7 @@ class VideoSegmenter:
             # Keep within the originally calculated duration bound just in case
             segment_duration = min(segment_duration, equalized_duration)
 
+        print(f"    🔄 Starting video segmentation: {duration:.1f}s video -> {num_segments} segments of ~{segment_duration:.1f}s each")
         logger.info(f"Splitting {duration:.1f}s video into {num_segments} segments of ~{segment_duration:.1f}s each (equalized)")
         
         segments = []
@@ -286,6 +288,8 @@ class VideoSegmenter:
                 segment_filename = f"{base_name}_segment_{i+1:03d}.mp4"
                 segment_path = os.path.join(temp_segments_folder, segment_filename)
                 
+                print(f"    🔄 Processing segment {i+1}/{num_segments}: {segment_duration_actual:.1f}s "
+                      f"({segment_start:.1f}s - {segment_end:.1f}s)")
                 logger.info(f"Processing segment {i+1}/{num_segments}: {segment_duration_actual:.1f}s "
                            f"({segment_start:.1f}s - {segment_end:.1f}s)")
                 
@@ -332,6 +336,8 @@ class VideoSegmenter:
                     })
                     temp_files.append(segment_path)
                     
+                    print(f"    ✅ Segment {i+1}/{num_segments} completed: {segment_size_mb:.2f}MB "
+                          f"using {segment_result.get('method', 'unknown')} method")
                     logger.info(f"Segment {i+1} completed: {segment_size_mb:.2f}MB "
                                f"using {segment_result.get('method', 'unknown')} method")
                 else:
@@ -344,6 +350,9 @@ class VideoSegmenter:
             
             # Create segments summary
             self._create_segments_summary(temp_segments_folder, segments, base_name, duration)
+            
+            print(f"    🎉 All {len(segments)} segments completed successfully!")
+            logger.info(f"All {len(segments)} segments completed successfully")
             
             return {
                 'success': True,
@@ -439,7 +448,7 @@ class VideoSegmenter:
                 '-c:v', 'libx264',
                 '-crf', str(segment_params.get('crf', 23)),
                 '-preset', segment_params.get('preset', 'medium'),
-                '-s', f"{segment_params['width']}x{segment_params['height']}",
+                '-vf', f"scale={segment_params['width']}:{segment_params['height']}:flags=lanczos",
                 '-r', str(segment_params['fps']),
                 '-c:a', 'aac',
                 '-b:a', '128k',
@@ -1075,7 +1084,7 @@ class VideoSegmenter:
                 'ffmpeg', '-y',
                 '-i', input_video,
                 '-c:v', params['encoder'],
-                '-s', f"{params['width']}x{params['height']}",
+                '-vf', f"scale={params['width']}:{params['height']}:flags=lanczos",
                 '-r', str(params['fps']),
                 '-b:v', params['bitrate'],
                 '-c:a', 'aac',

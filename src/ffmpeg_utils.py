@@ -239,9 +239,15 @@ class FFmpegUtils:
     @staticmethod
     def add_video_settings(cmd: List[str], params: Dict[str, Any]) -> List[str]:
         """Add video encoding settings to FFmpeg command"""
-        # Resolution
+        # Resolution - only add -s if no scale filter is being used
+        # This prevents double scaling that can corrupt aspect ratios
         if 'width' in params and 'height' in params:
-            cmd.extend(['-s', f"{params['width']}x{params['height']}"])
+            # Check if a scale filter is already in the command
+            has_scale_filter = any('scale=' in arg for arg in cmd)
+            if not has_scale_filter:
+                cmd.extend(['-s', f"{params['width']}x{params['height']}"])
+            else:
+                logger.debug("Skipping -s parameter due to existing scale filter to prevent double scaling")
         
         # Frame rate
         if 'fps' in params:

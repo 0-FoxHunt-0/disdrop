@@ -135,6 +135,7 @@ class GifGenerator:
             original_height = video_info.get('height', 1080)
             
             if not original_width or not original_height:
+                logger.warning(f"Invalid video dimensions: {original_width}x{original_height}, using fallback")
                 return target_width, -2  # Fallback to original behavior
             
             # Calculate aspect ratio
@@ -147,14 +148,19 @@ class GifGenerator:
             if calculated_height % 2 != 0:
                 calculated_height = calculated_height + 1
             
+            # Log the scaling calculation for debugging
+            logger.info(f"GIF scaling calculation: original {original_width}x{original_height} (AR: {aspect_ratio:.3f}) -> target {target_width}x{calculated_height}")
+            
             # If the calculated dimensions would result in a very small file,
             # we can afford to use higher quality
             estimated_pixels = target_width * calculated_height
             if estimated_pixels < 300000:  # Less than 300k pixels
                 # Use higher quality scaling
+                logger.info(f"Small estimated file size ({estimated_pixels:,} pixels), using calculated dimensions")
                 return target_width, calculated_height
             
             # For larger videos, use the calculated dimensions
+            logger.info(f"Standard estimated file size ({estimated_pixels:,} pixels), using calculated dimensions")
             return target_width, calculated_height
             
         except Exception as e:
@@ -177,6 +183,14 @@ class GifGenerator:
         # Override with provided max_size_mb if specified
         if max_size_mb is not None:
             settings['max_size_mb'] = max_size_mb
+        
+        # Get GIF-specific settings from config
+        gif_config = self.config.get('gif_settings', {})
+        if gif_config:
+            # Use configured width/height for better aspect ratio preservation
+            settings['width'] = gif_config.get('width', settings.get('scale', 480))
+            settings['height'] = gif_config.get('height', -1)  # -1 means preserve aspect ratio
+            settings['fps'] = gif_config.get('fps', settings['fps'])
         
         return settings
     
@@ -466,10 +480,21 @@ class GifGenerator:
             
             # Get video info for optimal scaling
             video_info = self.ffmpeg_utils.get_video_info(safe_input_path)
-            optimal_width, optimal_height = self._calculate_optimal_scale(video_info, settings['scale'], settings['max_size_mb'])
             
-            # Improved scaling: preserve aspect ratio better and use higher quality
-            pre_chain.append(f"scale={optimal_width}:{optimal_height}:flags=lanczos")
+            # Use configured width/height for proper aspect ratio preservation
+            target_width = settings.get('width', 360)
+            target_height = settings.get('height', -1)
+            
+            if target_height == -1:
+                # Preserve aspect ratio by only specifying width
+                scale_filter = f"scale={target_width}:-2:flags=lanczos"
+                logger.info(f"GIF scaling: preserving aspect ratio with width={target_width}, height=auto")
+            else:
+                # Use both dimensions if explicitly specified
+                scale_filter = f"scale={target_width}:{target_height}:flags=lanczos"
+                logger.info(f"GIF scaling: using specified dimensions {target_width}x{target_height}")
+            
+            pre_chain.append(scale_filter)
             lavfi = ','.join(pre_chain) + " [x]; [x][1:v] paletteuse=dither=sierra2_4a:diff_mode=rectangle:new=1"
 
             # Build FFmpeg command for GIF creation
@@ -527,10 +552,21 @@ class GifGenerator:
             
             # Get video info for optimal scaling
             video_info = self.ffmpeg_utils.get_video_info(safe_input_path)
-            optimal_width, optimal_height = self._calculate_optimal_scale(video_info, settings['scale'], settings['max_size_mb'])
             
-            # Improved scaling: preserve aspect ratio better and use higher quality
-            pre.append(f"scale={optimal_width}:{optimal_height}:flags=lanczos")
+            # Use configured width/height for proper aspect ratio preservation
+            target_width = settings.get('width', 360)
+            target_height = settings.get('height', -1)
+            
+            if target_height == -1:
+                # Preserve aspect ratio by only specifying width
+                scale_filter = f"scale={target_width}:-2:flags=lanczos"
+                logger.info(f"GIF scaling: preserving aspect ratio with width={target_width}, height=auto")
+            else:
+                # Use both dimensions if explicitly specified
+                scale_filter = f"scale={target_width}:{target_height}:flags=lanczos"
+                logger.info(f"GIF scaling: using specified dimensions {target_width}x{target_height}")
+            
+            pre.append(scale_filter)
             chain = ','.join(pre)
 
             filter_complex = (
@@ -711,6 +747,9 @@ class GifGenerator:
             except Exception:
                 max_workers = 2
 
+            print(f"    🔄 Starting GIF segmentation: {num_segments} segments to create...")
+            logger.info(f"Starting GIF segmentation: {num_segments} segments to create")
+            
             # Process segments in parallel
             def _process_segment(i: int) -> Tuple[bool, float, str]:
                 try:
@@ -734,10 +773,12 @@ class GifGenerator:
                     result = local_generator._create_single_gif(input_video, segment_path, settings, segment_start, segment_duration_actual)
                     if result.get('success', False):
                         sz = float(result.get('size_mb', 0.0) or 0.0)
+                        print(f"    ✅ GIF segment {i+1}/{num_segments} completed: {segment_name} ({sz:.2f}MB)")
                         logger.info(f"Created segment {i+1}/{num_segments}: {segment_name} ({sz:.2f}MB)")
                         return (True, sz, segment_name)
                     else:
                         err = result.get('error', 'Unknown error')
+                        print(f"    ❌ GIF segment {i+1}/{num_segments} failed: {err}")
                         logger.warning(f"Failed to create segment {i+1}/{num_segments}: {err}")
                         return (False, 0.0, segment_name)
                 except Exception as e:
@@ -758,6 +799,8 @@ class GifGenerator:
                         logger.warning(f"Segment future failed: {e}")
             
             if successful_segments > 0:
+                print(f"    🎉 All {successful_segments} GIF segments completed successfully! Total size: {total_size:.2f}MB")
+                logger.info(f"All {successful_segments} GIF segments completed successfully")
                 return {
                     'success': True,
                     'segments_created': successful_segments,
@@ -766,6 +809,7 @@ class GifGenerator:
                     'method': 'segmentation'
                 }
             else:
+                print(f"    ❌ Failed to create any GIF segments")
                 return {'success': False, 'error': 'Failed to create any segments'}
                 
         except Exception as e:

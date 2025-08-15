@@ -827,12 +827,20 @@ class DynamicVideoCompressor:
             max_width = platform_config.get('max_width', optimal_width)
             max_height = platform_config.get('max_height', optimal_height)
             
-            scale_factor = min(max_width / optimal_width, max_height / optimal_height, 1.0)
+            # Calculate how much we need to scale to fit within platform constraints
+            # while preserving aspect ratio
+            width_scale = max_width / optimal_width if optimal_width > max_width else 1.0
+            height_scale = max_height / optimal_height if optimal_height > max_height else 1.0
+            
+            # Use the more restrictive scale factor to ensure we fit within both constraints
+            scale_factor = min(width_scale, height_scale)
+            
+            # Apply the scale factor to maintain aspect ratio
             optimal_width = int(optimal_width * scale_factor)
             optimal_height = int(optimal_height * scale_factor)
             
             logger.info(f"Applied platform constraints: max {max_width}x{max_height}, "
-                       f"final size={optimal_width}x{optimal_height}")
+                       f"scale factor: {scale_factor:.3f}, final size: {optimal_width}x{optimal_height}")
         else:
             # When no platform constraints, apply intelligent defaults based on video characteristics
             if original_height > original_width:  # Vertical video

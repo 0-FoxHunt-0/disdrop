@@ -262,6 +262,7 @@ class VideoCompressorCLI:
         cache_subparsers = cache_parser.add_subparsers(dest='cache_action', help='Cache operations')
         cache_subparsers.add_parser('clear', help='Clear all cache entries')
         cache_subparsers.add_parser('stats', help='Show cache statistics')
+        cache_subparsers.add_parser('validate', help='Validate cache entries and remove invalid ones')
         
         # Set default command if none provided
         args = parser.parse_args()
@@ -1361,8 +1362,10 @@ class VideoCompressorCLI:
             self._clear_cache()
         elif args.cache_action == 'stats':
             self._show_cache_stats()
+        elif args.cache_action == 'validate':
+            self._validate_cache()
         else:
-            logger.error("Cache command requires an action (clear|stats)")
+            logger.error("Cache command requires an action (clear|stats|validate)")
 
     def _clear_cache(self):
         """Clear all cache entries."""
@@ -1388,6 +1391,27 @@ class VideoCompressorCLI:
         except Exception as e:
             print(f"❌ Failed to get cache stats: {e}")
             logger.error(f"Failed to get cache stats: {e}")
+
+    def _validate_cache(self):
+        """Validate cache entries and remove invalid ones."""
+        try:
+            result = self.automated_workflow.validate_and_clean_cache()
+            print(f"\n🔍 Cache Validation Results:")
+            print("=" * 50)
+            print(f"Total Entries:     {result['total']}")
+            print(f"Valid Entries:     {result['valid']}")
+            print(f"Invalid Entries:   {result['invalid']}")
+            print(f"Cleaned Entries:   {result['cleaned']}")
+            print("=" * 50)
+            
+            if result['cleaned'] > 0:
+                print(f"✅ Successfully cleaned {result['cleaned']} invalid cache entries")
+            else:
+                print("✅ All cache entries are valid")
+                
+        except Exception as e:
+            print(f"❌ Failed to validate cache: {e}")
+            logger.error(f"Failed to validate cache: {e}")
 
 def main():
     """Entry point for the CLI application"""

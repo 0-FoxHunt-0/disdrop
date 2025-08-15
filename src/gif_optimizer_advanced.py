@@ -502,7 +502,7 @@ class AdvancedGifOptimizer:
             pre = [
                 'mpdecimate=hi=512:lo=256:frac=0.3',
                 f'fps={fps}',
-                f'scale={new_width}:-2:flags=lanczos'
+                self._build_scale_filter(new_width, -1)
             ]
             vf_palette = ','.join(pre + [f'palettegen=max_colors={int(max_colors)}:stats_mode=diff'])
             # Palette gen
@@ -788,7 +788,7 @@ class AdvancedGifOptimizer:
         try:
             cmd = [
                 'ffmpeg', '-y', '-i', input_path,
-                '-vf', f'mpdecimate=hi=512:lo=256:frac=0.3,fps={fps},scale=iw:ih:flags=lanczos',
+                '-vf', f'mpdecimate=hi=512:lo=256:frac=0.3,fps={fps},{self._build_scale_filter(-1, -1)}',
                 '-loop', '0', output_path
             ]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
@@ -1184,14 +1184,29 @@ class AdvancedGifOptimizer:
         
         return gif_result.returncode == 0
     
+    def _build_scale_filter(self, width: int, height: int) -> str:
+        """Build scale filter with proper aspect ratio preservation"""
+        if width == -1 and height == -1:
+            # Preserve original dimensions
+            return "scale=iw:ih:flags=lanczos"
+        elif height == -1:
+            # Preserve aspect ratio by only specifying width
+            return f"scale={width}:-2:flags=lanczos"
+        else:
+            # Use both dimensions if explicitly specified
+            return f"scale={width}:{height}:flags=lanczos"
+    
     def _apply_ffmpeg_resize_strategy(self, input_path: str, output_path: str, params: Dict[str, Any]) -> bool:
         """Apply FFmpeg-based resize optimization strategy"""
+        
+        # Build proper scale filter
+        scale_filter = self._build_scale_filter(params["width"], params["height"])
         
         # Generate palette first
         palette_path = output_path + '.palette.png'
         palette_cmd = [
             'ffmpeg', '-i', input_path,
-            '-vf', f'scale={params["width"]}:{params["height"]}:flags=lanczos,fps={params["fps"]},palettegen=max_colors={params["colors"]}:stats_mode=diff',
+            '-vf', f'{scale_filter},fps={params["fps"]},palettegen=max_colors={params["colors"]}:stats_mode=diff',
             '-frames:v', '1', '-y', palette_path
         ]
         
@@ -1202,7 +1217,7 @@ class AdvancedGifOptimizer:
         # Create optimized GIF using palette
         gif_cmd = [
             'ffmpeg', '-i', input_path, '-i', palette_path,
-            '-lavfi', f'scale={params["width"]}:{params["height"]}:flags=lanczos,fps={params["fps"]},paletteuse=dither={params["dither"]}:diff_mode=rectangle',
+            '-lavfi', f'{scale_filter},fps={params["fps"]},paletteuse=dither={params["dither"]}:diff_mode=rectangle',
             '-loop', '0', '-y', output_path
         ]
         
@@ -1221,11 +1236,14 @@ class AdvancedGifOptimizer:
         scale_width = int(params.get('width', 480) * params['scale_factor'])
         scale_height = int(params.get('height', 360) * params['scale_factor'])
         
+        # Build proper scale filter
+        scale_filter = self._build_scale_filter(scale_width, scale_height)
+        
         # Generate palette first
         palette_path = output_path + '.palette.png'
         palette_cmd = [
             'ffmpeg', '-i', input_path,
-            '-vf', f'scale={scale_width}:{scale_height}:flags=lanczos,fps={params["fps"]},palettegen=max_colors={params["colors"]}:stats_mode=diff',
+            '-vf', f'{scale_filter},fps={params["fps"]},palettegen=max_colors={params["colors"]}:stats_mode=diff',
             '-frames:v', '1', '-y', palette_path
         ]
         
@@ -1236,7 +1254,7 @@ class AdvancedGifOptimizer:
         # Create optimized GIF using palette
         gif_cmd = [
             'ffmpeg', '-i', input_path, '-i', palette_path,
-            '-lavfi', f'scale={scale_width}:{scale_height}:flags=lanczos,fps={params["fps"]},paletteuse=dither={params["dither"]}:diff_mode=rectangle',
+            '-lavfi', f'{scale_filter},fps={params["fps"]},paletteuse=dither={params["dither"]}:diff_mode=rectangle',
             '-loop', '0', '-y', output_path
         ]
         
@@ -1256,11 +1274,14 @@ class AdvancedGifOptimizer:
         new_width = int(params.get('width', 480) * scale_factor)
         new_height = int(params.get('height', 360) * scale_factor)
         
+        # Build proper scale filter
+        scale_filter = self._build_scale_filter(new_width, new_height)
+        
         # Generate palette first
         palette_path = output_path + '.palette.png'
         palette_cmd = [
             'ffmpeg', '-i', input_path,
-            '-vf', f'scale={new_width}:{new_height}:flags=lanczos,fps={params["fps"]},palettegen=max_colors={params["colors"]}:stats_mode=diff',
+            '-vf', f'{scale_filter},fps={params["fps"]},palettegen=max_colors={params["colors"]}:stats_mode=diff',
             '-frames:v', '1', '-y', palette_path
         ]
         
@@ -1271,7 +1292,7 @@ class AdvancedGifOptimizer:
         # Create upscaled GIF using palette
         gif_cmd = [
             'ffmpeg', '-i', input_path, '-i', palette_path,
-            '-lavfi', f'scale={new_width}:{new_height}:flags=lanczos,fps={params["fps"]}:diff_mode=rectangle',
+            '-lavfi', f'{scale_filter},fps={params["fps"]}:diff_mode=rectangle',
             '-loop', '0', '-y', output_path
         ]
         
@@ -1379,7 +1400,7 @@ class AdvancedGifOptimizer:
                     palette_path = temp_output + f".palette_{sw}x{sh}_{t['fps']}_{t['colors']}.png"
                     palette_cmd = [
                         'ffmpeg', '-y', '-i', gif_path,
-                        '-vf', f'mpdecimate=hi=512:lo=256:frac=0.3,fps={t["fps"]},scale={sw}:{sh}:flags=lanczos,palettegen=max_colors={t["colors"]}:stats_mode=diff',
+                        '-vf', f'mpdecimate=hi=512:lo=256:frac=0.3,fps={t["fps"]},{self._build_scale_filter(sw, sh)},palettegen=max_colors={t["colors"]}:stats_mode=diff',
                         '-frames:v', '1', palette_path
                     ]
                     palette_result = subprocess.run(palette_cmd, capture_output=True, text=True, timeout=90)
@@ -1388,7 +1409,7 @@ class AdvancedGifOptimizer:
 
                     gif_cmd = [
                         'ffmpeg', '-y', '-i', gif_path, '-i', palette_path,
-                        '-lavfi', f'mpdecimate=hi=512:lo=256:frac=0.3,fps={t["fps"]},scale={sw}:{sh}:flags=lanczos[p];[p][1:v]paletteuse=dither={t["dither"]}:diff_mode=rectangle',
+                        '-lavfi', f'mpdecimate=hi=512:lo=256:frac=0.3,fps={t["fps"]},{self._build_scale_filter(sw, sh)}[p];[p][1:v]paletteuse=dither={t["dither"]}:diff_mode=rectangle',
                         '-loop', '0', temp_output
                     ]
                     gif_result = subprocess.run(gif_cmd, capture_output=True, text=True, timeout=180)
@@ -1804,7 +1825,7 @@ class AdvancedGifOptimizer:
         
         cmd = [
             'ffmpeg', '-i', input_video, '-vf',
-            f'fps=2,scale=320:240,palettegen=max_colors={colors}:stats_mode=diff',
+            f'fps=2,{self._build_scale_filter(320, 240)},palettegen=max_colors={colors}:stats_mode=diff',
             '-frames:v', '1',
             '-y', palette_file
         ]
@@ -1831,7 +1852,7 @@ class AdvancedGifOptimizer:
         try:
             # Extract frames for palette generation
             cmd = [
-                'ffmpeg', '-i', input_video, '-vf', 'fps=1,scale=160:120',
+                'ffmpeg', '-i', input_video, '-vf', f'fps=1,{self._build_scale_filter(160, -1)}',
                 '-frames:v', '10', f'{sample_frames_dir}/sample_%03d.png'
             ]
             
@@ -1903,7 +1924,7 @@ class AdvancedGifOptimizer:
         # This is a simplified version - in practice you'd implement full octree quantization
         cmd = [
             'ffmpeg', '-i', input_video, '-vf',
-            f'fps=1,scale=240:180,palettegen=max_colors={colors}:stats_mode=full',
+            f'fps=1,{self._build_scale_filter(240, -1)},palettegen=max_colors={colors}:stats_mode=full',
             '-frames:v', '1',
             '-y', palette_file
         ]
@@ -2467,10 +2488,15 @@ class AdvancedGifOptimizer:
     def _initialize_optimization_params(self, max_size_mb: float, quality_preference: str) -> Dict[str, Any]:
         """Initialize optimization parameters based on target size and quality preference"""
         
-        # Base parameters
+        # Get GIF-specific settings from config to respect aspect ratio
+        gif_config = self.config.get('gif_settings', {})
+        config_width = gif_config.get('width', 480)
+        config_height = gif_config.get('height', -1)  # -1 means preserve aspect ratio
+        
+        # Base parameters - respect configuration settings
         params = {
-            'width': 480,
-            'height': 480,
+            'width': config_width,
+            'height': config_height,  # Use config height instead of forcing square
             'fps': 15,
             'colors': 256,
             'dither': 'floyd_steinberg',
@@ -2485,8 +2511,8 @@ class AdvancedGifOptimizer:
         if max_size_mb <= 2:
             # Very tight constraint
             params.update({
-                'width': 320,
-                'height': 320,
+                'width': min(320, config_width),  # Don't exceed config width
+                'height': -1 if config_height == -1 else min(320, config_height),  # Preserve aspect ratio if config says so
                 'fps': 10,
                 'colors': 64,
                 'dither': 'none',
@@ -2496,8 +2522,8 @@ class AdvancedGifOptimizer:
         elif max_size_mb <= 5:
             # Moderate constraint
             params.update({
-                'width': 400,
-                'height': 400,
+                'width': min(400, config_width),  # Don't exceed config width
+                'height': -1 if config_height == -1 else min(400, config_height),  # Preserve aspect ratio if config says so
                 'fps': 12,
                 'colors': 128,
                 'dither': 'bayer',
@@ -2633,6 +2659,11 @@ class AdvancedGifOptimizer:
         """Create GIF using FFmpeg with optimized parameters"""
         
         from .ffmpeg_utils import FFmpegUtils
+        
+        # Build scale filter with proper aspect ratio preservation
+        scale_filter = self._build_scale_filter(params['width'], params['height'])
+        logger.info(f"Advanced optimizer scaling: using scale filter: {scale_filter}")
+        
         if palette_file and os.path.exists(palette_file):
             # Use custom palette
             cmd = [
@@ -2641,7 +2672,7 @@ class AdvancedGifOptimizer:
                 '-t', str(duration),
                 '-i', input_video,
                 '-i', palette_file,
-                '-lavfi', f'fps={params["fps"]},scale={params["width"]}:{params["height"]}:flags=lanczos[x];[x][1:v]paletteuse=dither={params["dither"]}:diff_mode=rectangle',
+                '-lavfi', f'fps={params["fps"]},{scale_filter}[x];[x][1:v]paletteuse=dither={params["dither"]}:diff_mode=rectangle',
                 '-loop', '0',
                 output_gif
             ]
@@ -2652,7 +2683,7 @@ class AdvancedGifOptimizer:
                 '-ss', str(start_time),
                 '-t', str(duration),
                 '-i', input_video,
-                '-vf', f'fps={params["fps"]},scale={params["width"]}:{params["height"]}:flags=lanczos,palettegen=max_colors={params["colors"]}:stats_mode=diff,paletteuse=dither={params["dither"]}',
+                '-vf', f'fps={params["fps"]},{scale_filter},palettegen=max_colors={params["colors"]}:stats_mode=diff,paletteuse=dither={params["dither"]}',
                 '-loop', '0',
                 output_gif
             ]
@@ -2731,7 +2762,9 @@ class AdvancedGifOptimizer:
         if available_space > 0.15:
             size_increase = int(aggressiveness * 40)
             new_params['width'] = min(640, new_params['width'] + size_increase)
-            new_params['height'] = min(640, new_params['height'] + size_increase)
+            # Only increase height if it's not set to preserve aspect ratio
+            if new_params['height'] != -1:
+                new_params['height'] = min(640, new_params['height'] + size_increase)
         
         # Increase FPS if there's room
         if available_space > 0.2 and new_params['fps'] < 20:
@@ -2777,7 +2810,9 @@ class AdvancedGifOptimizer:
         if new_params['width'] > 160:
             size_reduction = int(reduction_factor * 40)
             new_params['width'] = max(160, new_params['width'] - size_reduction)
-            new_params['height'] = max(160, new_params['height'] - size_reduction)
+            # Only reduce height if it's not set to preserve aspect ratio
+            if new_params['height'] != -1:
+                new_params['height'] = max(160, new_params['height'] - size_reduction)
         
         # Reduce FPS
         if new_params['fps'] > 6:
@@ -2811,7 +2846,9 @@ class AdvancedGifOptimizer:
         # Tiny downscale
         if new_params['width'] > 200 and new_params['height'] > 200:
             new_params['width'] = max(200, new_params['width'] - 8)
-            new_params['height'] = max(200, new_params['height'] - 8)
+            # Only reduce height if it's not set to preserve aspect ratio
+            if new_params['height'] != -1:
+                new_params['height'] = max(200, new_params['height'] - 8)
         # Slight lossy bump
         new_params['lossy'] = min(150, new_params.get('lossy', 0) + 5)
         return new_params
@@ -2824,7 +2861,9 @@ class AdvancedGifOptimizer:
         # Reduce complexity to increase success rate
         new_params['colors'] = max(64, new_params['colors'] - 32)
         new_params['width'] = max(160, new_params['width'] - 40)
-        new_params['height'] = max(160, new_params['height'] - 40)
+        # Only reduce height if it's not set to preserve aspect ratio
+        if new_params['height'] != -1:
+            new_params['height'] = max(160, new_params['height'] - 40)
         new_params['fps'] = max(6, new_params['fps'] - 2)
         new_params['lossy'] = min(150, new_params['lossy'] + 20)
         

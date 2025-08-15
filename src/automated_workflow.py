@@ -77,6 +77,10 @@ class AutomatedWorkflow:
         try:
             self._load_cache_index()
             self._cleanup_old_cache_entries()
+            # Validate cache entries to remove any with missing outputs
+            validation_result = self.validate_and_clean_cache()
+            if validation_result['cleaned'] > 0:
+                logger.info(f"Workflow startup: cleaned {validation_result['cleaned']} invalid cache entries")
         except Exception:
             self._cache_index = {}
     
@@ -453,23 +457,39 @@ class AutomatedWorkflow:
                 exists = Path(out_path).exists()
                 if exists:
                     logger.debug(f"Cache hit for {input_file.name}: single GIF exists")
+                else:
+                    logger.debug(f"Cache miss for {input_file.name}: single GIF missing - {out_path}")
                 return exists
-            if out_type == 'segments':
+            elif out_type == 'segments':
                 seg_dir = Path(out_path)
                 if not seg_dir.exists() or not seg_dir.is_dir():
-                    logger.debug(f"Cache miss for {input_file.name}: segments directory missing")
+                    logger.debug(f"Cache miss for {input_file.name}: segments directory missing - {out_path}")
                     return False
-                for p in seg_dir.iterdir():
-                    if p.is_file() and p.suffix.lower() == '.gif':
-                        logger.debug(f"Cache hit for {input_file.name}: segments exist")
-                        return True
-                logger.debug(f"Cache miss for {input_file.name}: no GIF segments found")
-                return False
-            if out_type == 'gif_input':
+                # Check if at least one GIF segment exists
+                gif_segments = list(seg_dir.glob("*.gif"))
+                if gif_segments:
+                    logger.debug(f"Cache hit for {input_file.name}: {len(gif_segments)} GIF segments exist")
+                    return True
+                else:
+                    logger.debug(f"Cache miss for {input_file.name}: no GIF segments found in {out_path}")
+                    return False
+            elif out_type == 'gif_input':
                 exists = Path(out_path).exists()
                 if exists:
                     logger.debug(f"Cache hit for {input_file.name}: GIF input exists")
+                else:
+                    logger.debug(f"Cache miss for {input_file.name}: GIF input missing - {out_path}")
                 return exists
+            elif out_type == 'single_mp4':
+                exists = Path(out_path).exists()
+                if exists:
+                    logger.debug(f"Cache hit for {input_file.name}: single MP4 exists")
+                else:
+                    logger.debug(f"Cache miss for {input_file.name}: single MP4 missing - {out_path}")
+                return exists
+            else:
+                logger.debug(f"Cache miss for {input_file.name}: unknown output type '{out_type}'")
+                return False
         except Exception as e:
             logger.debug(f"Cache miss for {input_file.name}: error checking output: {e}")
             return False
@@ -964,56 +984,27 @@ class AutomatedWorkflow:
                 valid_segments, invalid_segments = self._validate_segment_folder_gifs(segments_folder, max_size_mb)
                 
                 if valid_segments:
-                    print(f"  ✅ Valid segment GIFs exist: {segments_folder.name}")
-                    logger.info(f"Valid segment GIFs already exist for {video_file.name}: {segments_folder.name}")
+                    print(f"    ♻️  Using existing segment GIFs: {segments_folder.name}")
+                    logger.debug(f"Valid segment GIFs already exist: {segments_folder.name}")
                     
                     if invalid_segments:
-                        print(f"  ⚠️  Found {len(invalid_segments)} invalid/corrupted GIFs in segments folder")
+                        print(f"    ⚠️  Found {len(invalid_segments)} invalid/corrupted GIFs in segments folder")
                         logger.warning(f"Found {len(invalid_segments)} invalid GIFs in segments folder: {invalid_segments}")
-                        
-                        # Automatically clean up invalid segments and regenerate
-                        print(f"  🧹 Cleaning up invalid segments and regenerating...")
-                        logger.info(f"Cleaning up {len(invalid_segments)} invalid segments and regenerating")
-                        
-                        # Remove invalid segments
-                        for invalid_seg in invalid_segments:
-                            try:
-                                invalid_seg.unlink()
-                                logger.debug(f"Removed invalid segment: {invalid_seg.name}")
-                            except Exception as e:
-                                logger.warning(f"Failed to remove invalid segment {invalid_seg.name}: {e}")
-                        
-                        # Ensure MP4 is in segments folder for regeneration
-                        try:
-                            self._ensure_mp4_in_segments(mp4_file, segments_folder)
-                            logger.debug(f"Ensured MP4 is in segments folder: {mp4_file.name}")
-                        except Exception as e:
-                            logger.warning(f"Failed to ensure MP4 in segments folder: {e}")
-                        
-                        # Regenerate the segments
-                        print(f"  🔄 Regenerating invalid segments...")
-                        regeneration_success = self._regenerate_invalid_segments(segments_folder, max_size_mb)
-                        
-                        if regeneration_success:
-                            print(f"  ✅ Successfully regenerated invalid segments")
-                            logger.info(f"Successfully regenerated invalid segments for {video_file.name}")
-                            # Cache success for regenerated segments
-                            self._record_success_cache(video_file, 'segments', segments_folder)
-                            return 'success'
-                        else:
-                            print(f"  ❌ Failed to regenerate invalid segments, will do full regeneration")
-                            logger.warning(f"Failed to regenerate invalid segments for {video_file.name}, will do full regeneration")
-                            # Fall through to full regeneration
                     
-                    # Cache success for segments
-                    self._record_success_cache(video_file, 'segments', segments_folder)
-                    return 'success'
+                    # Only move MP4 to segments folder AFTER we're sure we have valid segments
+                    # and we're not going to regenerate them
+                    try:
+                        self._ensure_mp4_in_segments(mp4_file, segments_folder)
+                    except Exception as e:
+                        logger.debug(f"Could not ensure MP4 in segments folder: {e}")
+                    
+                    return True
                 else:
-                    print(f"  🔄 Segment GIFs invalid/corrupted, will regenerate")
+                    print(f"    🔄 Regenerating segment GIFs (invalid/corrupted): {segments_folder.name}")
                     logger.info(f"Segment GIFs invalid, will regenerate: {segments_folder.name}")
-                    
-                    # Clean up invalid segments and ensure MP4 is in folder for regeneration
-                    print(f"  🧹 Cleaning up invalid segments...")
+                    # Clean up invalid segments and continue to main GIF generation
+                    # DO NOT move MP4 to segments folder yet - wait until after successful generation
+                    print(f"    🧹 Cleaning up invalid segments...")
                     try:
                         for gif_file in segments_folder.glob("*.gif"):
                             try:
@@ -1021,11 +1012,13 @@ class AutomatedWorkflow:
                                 logger.debug(f"Removed invalid segment: {gif_file.name}")
                             except Exception as e:
                                 logger.warning(f"Failed to remove invalid segment {gif_file.name}: {e}")
-                        
-                        # Ensure MP4 is in segments folder for regeneration
-                        self._ensure_mp4_in_segments(mp4_file, segments_folder)
                     except Exception as e:
                         logger.warning(f"Error cleaning up invalid segments: {e}")
+                    
+                    # Continue to main GIF generation instead of trying to regenerate from invalid segments
+                    print(f"    🎨 Continuing to main GIF generation...")
+                    # Continue to generate new segment GIFs
+                    # DO NOT move MP4 to segments folder yet - wait until after successful generation
             else:
                 print(f"  📁 No segments folder found: {segments_folder.name}")
             
@@ -1090,6 +1083,8 @@ class AutomatedWorkflow:
             if is_valid:
                 print(f"    ♻️  Using existing MP4: {output_name}")
                 logger.debug(f"Valid optimized MP4 already exists: {output_name}")
+                # Cache successful existing MP4 output
+                self._record_success_cache(video_file, 'single_mp4', output_path)
                 return output_path
             else:
                 print(f"    🔄 Reprocessing MP4 (validation failed): {output_name}")
@@ -1173,6 +1168,9 @@ class AutomatedWorkflow:
                         print(f"    ✨ Video optimization successful: {size_mb:.2f}MB")
                         logger.info(f"Video optimization successful: {output_name} ({size_mb:.2f}MB)")
                         
+                        # Cache successful MP4 output
+                        self._record_success_cache(video_file, 'single_mp4', output_path)
+                        
                         # Log detailed file specifications
                         try:
                             specs = FFmpegUtils.get_detailed_file_specifications(str(output_path))
@@ -1245,7 +1243,23 @@ class AutomatedWorkflow:
             else:
                 print(f"    🔄 Regenerating segment GIFs (invalid/corrupted): {segments_folder.name}")
                 logger.info(f"Segment GIFs invalid, will regenerate: {segments_folder.name}")
+                # Clean up invalid segments and continue to main GIF generation
+                # DO NOT move MP4 to segments folder yet - wait until after successful generation
+                print(f"    🧹 Cleaning up invalid segments...")
+                try:
+                    for gif_file in segments_folder.glob("*.gif"):
+                        try:
+                            gif_file.unlink()
+                            logger.debug(f"Removed invalid segment: {gif_file.name}")
+                        except Exception as e:
+                            logger.warning(f"Failed to remove invalid segment {gif_file.name}: {e}")
+                except Exception as e:
+                    logger.warning(f"Error cleaning up invalid segments: {e}")
+                
+                # Continue to main GIF generation instead of trying to regenerate from invalid segments
+                print(f"    🎨 Continuing to main GIF generation...")
                 # Continue to generate new segment GIFs
+                # DO NOT move MP4 to segments folder yet - wait until after successful generation
                 return self._generate_gifs_from_segments(segments_folder, max_size_mb)
         else:
             # This is a single MP4 file, handle as before
@@ -1269,7 +1283,8 @@ class AutomatedWorkflow:
                         print(f"    ⚠️  Found {len(invalid_segments)} invalid/corrupted GIFs in segments folder")
                         logger.warning(f"Found {len(invalid_segments)} invalid GIFs in segments folder: {invalid_segments}")
                     
-                    # Ensure the source MP4 is placed in the segments folder for easy access
+                    # Only move MP4 to segments folder AFTER we're sure we have valid segments
+                    # and we're not going to regenerate them
                     try:
                         self._ensure_mp4_in_segments(mp4_file, segments_folder)
                     except Exception as e:
@@ -1279,7 +1294,23 @@ class AutomatedWorkflow:
                 else:
                     print(f"    🔄 Regenerating segment GIFs (invalid/corrupted): {segments_folder.name}")
                     logger.info(f"Segment GIFs invalid, will regenerate: {segments_folder.name}")
+                    # Clean up invalid segments and continue to main GIF generation
+                    # DO NOT move MP4 to segments folder yet - wait until after successful generation
+                    print(f"    🧹 Cleaning up invalid segments...")
+                    try:
+                        for gif_file in segments_folder.glob("*.gif"):
+                            try:
+                                gif_file.unlink()
+                                logger.debug(f"Removed invalid segment: {gif_file.name}")
+                            except Exception as e:
+                                logger.warning(f"Failed to remove invalid segment {gif_file.name}: {e}")
+                    except Exception as e:
+                        logger.warning(f"Error cleaning up invalid segments: {e}")
+                    
+                    # Continue to main GIF generation instead of trying to regenerate from invalid segments
+                    print(f"    🎨 Continuing to main GIF generation...")
                     # Continue to generate new segment GIFs
+                    # DO NOT move MP4 to segments folder yet - wait until after successful generation
         
             # Check if optimized GIF already exists and is valid with enhanced checks
             if final_gif_path.exists():
@@ -1451,6 +1482,7 @@ class AutomatedWorkflow:
                 return False
             
             print(f"    📁 Found {len(segment_files)} video segments")
+            print(f"    🔄 Starting GIF generation for {len(segment_files)} segments...")
             
             successful_gifs = 0
             skipped_segments = 0
@@ -1552,7 +1584,7 @@ class AutomatedWorkflow:
             
             # Report results
             if successful_gifs > 0:
-                print(f"    ✅ Successfully created {successful_gifs} GIFs from segments")
+                print(f"    🎉 GIF generation completed: {successful_gifs} GIFs created successfully!")
                 if skipped_segments > 0:
                     print(f"    ⏭️  Skipped {skipped_segments} segments (too long or would create multiple GIFs)")
                 return True
@@ -1757,7 +1789,7 @@ class AutomatedWorkflow:
                 cmd = [
                     'ffmpeg', '-y',
                     '-i', str(gif_file),
-                    '-vf', 'fps=15,scale=trunc(iw/2)*2:trunc(ih/2)*2:flags=lanczos',
+                    '-vf', 'fps=15,scale=iw:ih:flags=lanczos',
                     '-loop', '0',
                     str(repaired_path)
                 ]
@@ -2243,12 +2275,44 @@ class AutomatedWorkflow:
                     # Downscale segments to configured max width while preserving AR to keep sizes under target
                     try:
                         max_width = int(self.config.get('gif_settings.width', 360) or 360)
+                        # Get height setting - if -1, we'll calculate it to preserve aspect ratio
+                        height_setting = self.config.get('gif_settings.height', -1)
                     except Exception:
                         max_width = 360
+                        height_setting = -1
+                    
+                    # Get video info to calculate proper scaling that preserves aspect ratio
+                    try:
+                        from .ffmpeg_utils import FFmpegUtils
+                        video_info = FFmpegUtils.get_video_info(str(gif_file))
+                        if video_info and 'width' in video_info and 'height' in video_info:
+                            original_width = video_info['width']
+                            original_height = video_info['height']
+                            aspect_ratio = original_width / original_height
+                            
+                            # Calculate height that maintains aspect ratio
+                            calculated_height = int(max_width / aspect_ratio)
+                            
+                            # Ensure height is even (required for some codecs)
+                            if calculated_height % 2 != 0:
+                                calculated_height = calculated_height + 1
+                            
+                            # Use calculated dimensions to preserve aspect ratio
+                            scale_filter = f"scale={max_width}:{calculated_height}:flags=lanczos"
+                            logger.info(f"GIF segment scaling: original {original_width}x{original_height} -> {max_width}x{calculated_height} (AR: {aspect_ratio:.3f})")
+                        else:
+                            # Fallback to aspect ratio preservation
+                            scale_filter = f"scale={max_width}:-2:flags=lanczos"
+                            logger.info(f"GIF segment scaling: using fallback AR preservation {max_width}:-2")
+                    except Exception as e:
+                        logger.warning(f"Could not calculate proper scaling, using fallback: {e}")
+                        # Fallback to aspect ratio preservation
+                        scale_filter = f"scale={max_width}:-2:flags=lanczos"
+                    
                     vf = (
                         f"mpdecimate=hi=512:lo=256:frac=0.3,"
                         f"fps={target_fps},"
-                        f"scale={max_width}:-2:flags=lanczos"
+                        f"{scale_filter}"
                     )
                     cmd = [
                         'ffmpeg', '-y',
@@ -2450,6 +2514,69 @@ class AutomatedWorkflow:
             logger.info("Cache cleared successfully")
         except Exception as e:
             logger.warning(f"Failed to clear cache file: {e}")
+
+    def validate_and_clean_cache(self) -> Dict[str, int]:
+        """Validate all cache entries and remove invalid ones (missing outputs, etc.)."""
+        if not self._cache_index:
+            return {'total': 0, 'valid': 0, 'invalid': 0, 'cleaned': 0}
+        
+        total_entries = len(self._cache_index)
+        valid_entries = 0
+        invalid_entries = 0
+        keys_to_remove = []
+        
+        for key, record in self._cache_index.items():
+            if not isinstance(record, dict):
+                keys_to_remove.append(key)
+                invalid_entries += 1
+                continue
+            
+            # Check if output still exists
+            out_type = record.get('type')
+            out_path = record.get('output')
+            
+            if not out_type or not out_path:
+                keys_to_remove.append(key)
+                invalid_entries += 1
+                continue
+            
+            # Validate output existence based on type
+            is_valid = False
+            try:
+                if out_type == 'single_gif':
+                    is_valid = Path(out_path).exists()
+                elif out_type == 'segments':
+                    seg_dir = Path(out_path)
+                    is_valid = seg_dir.exists() and seg_dir.is_dir() and list(seg_dir.glob("*.gif"))
+                elif out_type == 'gif_input':
+                    is_valid = Path(out_path).exists()
+                elif out_type == 'single_mp4':
+                    is_valid = Path(out_path).exists()
+                else:
+                    is_valid = False
+            except Exception:
+                is_valid = False
+            
+            if is_valid:
+                valid_entries += 1
+            else:
+                keys_to_remove.append(key)
+                invalid_entries += 1
+        
+        # Remove invalid entries
+        for key in keys_to_remove:
+            del self._cache_index[key]
+        
+        if keys_to_remove:
+            logger.info(f"Cleaned up {len(keys_to_remove)} invalid cache entries")
+            self._save_cache_index()
+        
+        return {
+            'total': total_entries,
+            'valid': valid_entries,
+            'invalid': invalid_entries,
+            'cleaned': len(keys_to_remove)
+        }
 
     def get_cache_stats(self) -> Dict[str, Any]:
         """Get cache statistics for monitoring."""
