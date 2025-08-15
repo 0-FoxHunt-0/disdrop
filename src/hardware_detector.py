@@ -7,7 +7,7 @@ import subprocess
 import psutil
 import platform
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 from enum import Enum
 
 logger = logging.getLogger(__name__)
@@ -609,4 +609,131 @@ class HardwareDetector:
         else:
             report.append("⚠️  Hardware Acceleration: NOT AVAILABLE")
         
-        return "\n".join(report) 
+        # Add optimal worker analysis
+        report.append("")
+        report.append("=== Optimal Worker Analysis ===")
+        optimal_workers = self.analyze_optimal_segmentation_workers()
+        report.append(f"Recommended concurrent workers: {optimal_workers['recommended']}")
+        report.append(f"Maximum safe workers: {optimal_workers['maximum_safe']}")
+        report.append(f"Conservative workers: {optimal_workers['conservative']}")
+        report.append(f"Reasoning: {optimal_workers['reasoning']}")
+        
+        return "\n".join(report)
+    
+    def analyze_optimal_segmentation_workers(self) -> Dict[str, Any]:
+        """
+        Analyze system capabilities to determine optimal number of concurrent workers for segmentation
+        
+        Returns:
+            Dictionary with worker recommendations and reasoning
+        """
+        import psutil
+        
+        # Get current system load
+        cpu_percent = psutil.cpu_percent(interval=1)
+        memory = psutil.virtual_memory()
+        memory_percent = memory.percent
+        memory_available_gb = memory.available / (1024**3)
+        
+        # Get CPU information
+        cpu_count = psutil.cpu_count(logical=False)  # Physical cores
+        logical_cpu_count = psutil.cpu_count(logical=True)  # Logical cores
+        
+        # Get disk I/O information
+        try:
+            disk_io = psutil.disk_io_counters()
+            disk_busy = disk_io.read_bytes + disk_io.write_bytes > 0
+        except:
+            disk_busy = False
+        
+        # Base calculation
+        base_workers = max(1, cpu_count)
+        
+        # Memory factor (segmentation can be memory-intensive)
+        memory_factor = 1.0
+        if memory_available_gb >= 8:
+            memory_factor = 1.5  # Plenty of RAM
+        elif memory_available_gb >= 4:
+            memory_factor = 1.2  # Adequate RAM
+        elif memory_available_gb < 2:
+            memory_factor = 0.5  # Limited RAM
+        
+        # System load factor
+        load_factor = 1.0
+        if cpu_percent < 30:
+            load_factor = 1.2  # Low system load
+        elif cpu_percent > 70:
+            load_factor = 0.7  # High system load
+        elif cpu_percent > 90:
+            load_factor = 0.5  # Very high system load
+        
+        # Hardware acceleration factor
+        hw_factor = 1.0
+        if self.has_hardware_acceleration():
+            hw_factor = 1.3  # Hardware acceleration available
+        else:
+            hw_factor = 0.8  # Software encoding only
+        
+        # Platform-specific adjustments
+        platform_factor = 1.0
+        if self.system_info['platform'] == 'Windows':
+            # Windows can handle more concurrent processes
+            platform_factor = 1.1
+        elif self.system_info['platform'] == 'Linux':
+            # Linux is generally more efficient for concurrent processing
+            platform_factor = 1.2
+        elif self.system_info['platform'] == 'Darwin':  # macOS
+            # macOS can be more conservative
+            platform_factor = 0.9
+        
+        # Calculate recommended workers
+        recommended = int(base_workers * memory_factor * load_factor * hw_factor * platform_factor)
+        
+        # Apply safety limits
+        recommended = max(1, min(recommended, 4))  # Between 1 and 4
+        
+        # Calculate maximum safe workers (more aggressive)
+        maximum_safe = min(recommended + 1, 6, logical_cpu_count // 2)
+        
+        # Calculate conservative workers (safer)
+        conservative = max(1, recommended - 1)
+        
+        # Generate reasoning
+        reasoning_parts = []
+        
+        if memory_available_gb < 4:
+            reasoning_parts.append("Limited RAM available")
+        
+        if cpu_percent > 70:
+            reasoning_parts.append("High system load")
+        
+        if not self.has_hardware_acceleration():
+            reasoning_parts.append("Software encoding only")
+        
+        if disk_busy:
+            reasoning_parts.append("High disk I/O activity")
+        
+        if self.system_info['platform'] == 'Darwin':
+            reasoning_parts.append("macOS platform considerations")
+        
+        reasoning = "; ".join(reasoning_parts) if reasoning_parts else "System resources adequate"
+        
+        # Log the analysis
+        logger.info(f"Worker analysis: CPU={cpu_count} cores, RAM={memory_available_gb:.1f}GB available, "
+                   f"Load={cpu_percent:.1f}%, HW={self.has_hardware_acceleration()}, "
+                   f"Recommended={recommended}, Max={maximum_safe}, Conservative={conservative}")
+        
+        return {
+            'recommended': recommended,
+            'maximum_safe': maximum_safe,
+            'conservative': conservative,
+            'reasoning': reasoning,
+            'factors': {
+                'cpu_count': cpu_count,
+                'memory_available_gb': memory_available_gb,
+                'cpu_percent': cpu_percent,
+                'memory_percent': memory_percent,
+                'has_hardware_acceleration': self.has_hardware_acceleration(),
+                'platform': self.system_info['platform']
+            }
+        } 

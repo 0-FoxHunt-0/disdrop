@@ -21,6 +21,13 @@ gif_settings:
     threads: auto # auto or integer
     filter_threads: auto # auto or integer
 
+  # Multiprocessing configuration
+  multiprocessing:
+    max_concurrent_segments: 4 # Maximum concurrent processes for segmentation (MP4 and GIF)
+    enabled: true # Enable multiprocessing for segmentation
+    use_dynamic_analysis: true # Enable dynamic worker analysis based on system capabilities
+    analysis_mode: "recommended" # Analysis mode: "conservative", "recommended", or "maximum_safe"
+
   # Gifsicle performance controls
   performance:
     fast_mode: true # When true, use faster gifsicle settings and limit search

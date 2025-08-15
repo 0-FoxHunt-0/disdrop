@@ -15,6 +15,7 @@ from tqdm import tqdm
 import json
 import math
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .config_manager import ConfigManager
 from .hardware_detector import HardwareDetector
@@ -31,6 +32,54 @@ class VideoSegmenter:
         # Shutdown handling
         self.shutdown_requested = False
         self.current_ffmpeg_process = None
+        
+        # Multiprocessing configuration - dynamic analysis with fallback
+        self.max_workers = self._calculate_optimal_workers()
+        
+        logger.info(f"Video segmenter initialized with {self.max_workers} concurrent workers")
+    
+    def _calculate_optimal_workers(self) -> int:
+        """
+        Calculate optimal number of workers based on configuration and system analysis
+        """
+        # Check if multiprocessing is enabled
+        if not self.config.get('gif_settings.multiprocessing.enabled', True):
+            return 1  # Disable multiprocessing if configured
+        
+        # Check if we should use dynamic analysis
+        use_dynamic = self.config.get('gif_settings.multiprocessing.use_dynamic_analysis', True)
+        
+        if use_dynamic:
+            try:
+                # Use hardware detector to analyze optimal workers
+                worker_analysis = self.hardware.analyze_optimal_segmentation_workers()
+                
+                # Get the analysis mode from config
+                analysis_mode = self.config.get('gif_settings.multiprocessing.analysis_mode', 'recommended')
+                
+                if analysis_mode == 'conservative':
+                    dynamic_workers = worker_analysis['conservative']
+                elif analysis_mode == 'maximum_safe':
+                    dynamic_workers = worker_analysis['maximum_safe']
+                else:  # 'recommended' or default
+                    dynamic_workers = worker_analysis['recommended']
+                
+                # Apply configurable limits
+                config_max = self.config.get('gif_settings.multiprocessing.max_concurrent_segments', 4)
+                final_workers = min(dynamic_workers, config_max)
+                
+                logger.info(f"Dynamic analysis: {analysis_mode} mode suggests {dynamic_workers} workers, "
+                           f"limited to {final_workers} by config")
+                
+                return final_workers
+                
+            except Exception as e:
+                logger.warning(f"Dynamic worker analysis failed: {e}, falling back to static config")
+                # Fall back to static configuration
+                pass
+        
+        # Static configuration fallback
+        return self.config.get('gif_settings.multiprocessing.max_concurrent_segments', 2)
         
     def should_segment_video(self, duration: float, video_info: Dict[str, Any], max_size_mb: float) -> bool:
         """
@@ -271,82 +320,117 @@ class VideoSegmenter:
         temp_files = []
         
         try:
-            # Process each segment
-            for i in range(num_segments):
-                # Use equalized boundaries; clamp the last segment to the exact end to avoid drift
-                segment_start = start_time + (i * segment_duration)
-                if i < num_segments - 1:
-                    segment_end = start_time + ((i + 1) * segment_duration)
-                else:
-                    segment_end = start_time + duration
-                segment_duration_actual = max(0.0, segment_end - segment_start)
-                
-                if segment_duration_actual <= 0:
-                    continue
-                
-                # Create segment filename
-                segment_filename = f"{base_name}_segment_{i+1:03d}.mp4"
-                segment_path = os.path.join(temp_segments_folder, segment_filename)
-                
-                print(f"    🔄 Processing segment {i+1}/{num_segments}: {segment_duration_actual:.1f}s "
-                      f"({segment_start:.1f}s - {segment_end:.1f}s)")
-                logger.info(f"Processing segment {i+1}/{num_segments}: {segment_duration_actual:.1f}s "
-                           f"({segment_start:.1f}s - {segment_end:.1f}s)")
-                
-                # Create high-quality segment
-                segment_result = self._create_high_quality_segment(
-                    input_video, segment_path, segment_start, segment_duration_actual,
-                    video_info, platform_config, target_size_mb
-                )
-                
-                if segment_result.get('success', False):
-                    segment_size_mb = segment_result.get('size_mb', 0)
-                    
-                    # Check if segment is too large and needs optimization
-                    if segment_size_mb > target_size_mb:
-                        logger.warning(f"Segment {i+1} is {segment_size_mb:.2f}MB (exceeds target {target_size_mb}MB), applying optimization...")
+            # Process segments in parallel with limited concurrency
+            def _process_segment(i: int) -> Optional[Dict[str, Any]]:
+                try:
+                    if self.shutdown_requested:
+                        return None
                         
-                        # Apply post-segment optimization
-                        optimized_result = self._optimize_oversized_segment(
-                            segment_path, segment_duration_actual, video_info, 
-                            platform_config, target_size_mb
-                        )
-                        
-                        if optimized_result.get('success', False):
-                            segment_size_mb = optimized_result.get('size_mb', segment_size_mb)
-                            segment_result['method'] = f"{segment_result.get('method', 'unknown')}_optimized"
-                            segment_result['size_mb'] = segment_size_mb
-                            segment_result['optimization_applied'] = True
-                            logger.info(f"Segment {i+1} optimized to {segment_size_mb:.2f}MB")
-                        else:
-                            logger.warning(f"Failed to optimize segment {i+1}: {optimized_result.get('error', 'Unknown error')}")
-                            segment_result['optimization_applied'] = False
+                    # Use equalized boundaries; clamp the last segment to the exact end to avoid drift
+                    segment_start = start_time + (i * segment_duration)
+                    if i < num_segments - 1:
+                        segment_end = start_time + ((i + 1) * segment_duration)
                     else:
-                        segment_result['optimization_applied'] = False
+                        segment_end = start_time + duration
+                    segment_duration_actual = max(0.0, segment_end - segment_start)
                     
-                    segments.append({
-                        'index': i + 1,
-                        'path': segment_path,
-                        'start_time': segment_start,
-                        'duration': segment_duration_actual,
-                        'size_mb': segment_size_mb,
-                        'method': segment_result.get('method', 'unknown'),
-                        'quality_score': segment_result.get('quality_score', 0),
-                        'optimization_applied': segment_result.get('optimization_applied', False)
-                    })
-                    temp_files.append(segment_path)
+                    if segment_duration_actual <= 0:
+                        return None
                     
-                    print(f"    ✅ Segment {i+1}/{num_segments} completed: {segment_size_mb:.2f}MB "
-                          f"using {segment_result.get('method', 'unknown')} method")
-                    logger.info(f"Segment {i+1} completed: {segment_size_mb:.2f}MB "
-                               f"using {segment_result.get('method', 'unknown')} method")
-                else:
-                    logger.error(f"Failed to create segment {i+1}: {segment_result.get('error', 'Unknown error')}")
-                    return {
-                        'success': False,
-                        'error': f"Failed to create segment {i+1}: {segment_result.get('error', 'Unknown error')}",
-                        'temp_files': temp_files
-                    }
+                    # Create segment filename
+                    segment_filename = f"{base_name}_segment_{i+1:03d}.mp4"
+                    segment_path = os.path.join(temp_segments_folder, segment_filename)
+                    
+                    print(f"    🔄 Processing segment {i+1}/{num_segments}: {segment_duration_actual:.1f}s "
+                          f"({segment_start:.1f}s - {segment_end:.1f}s)")
+                    logger.info(f"Processing segment {i+1}/{num_segments}: {segment_duration_actual:.1f}s "
+                               f"({segment_start:.1f}s - {segment_end:.1f}s)")
+                    
+                    # Create high-quality segment
+                    segment_result = self._create_high_quality_segment(
+                        input_video, segment_path, segment_start, segment_duration_actual,
+                        video_info, platform_config, target_size_mb
+                    )
+                    
+                    if segment_result.get('success', False):
+                        segment_size_mb = segment_result.get('size_mb', 0)
+                        
+                        # Check if segment is too large and needs optimization
+                        if segment_size_mb > target_size_mb:
+                            logger.warning(f"Segment {i+1} is {segment_size_mb:.2f}MB (exceeds target {target_size_mb}MB), applying optimization...")
+                            
+                            # Apply post-segment optimization
+                            optimized_result = self._optimize_oversized_segment(
+                                segment_path, segment_duration_actual, video_info, 
+                                platform_config, target_size_mb
+                            )
+                            
+                            if optimized_result.get('success', False):
+                                segment_size_mb = optimized_result.get('size_mb', segment_size_mb)
+                                segment_result['method'] = f"{segment_result.get('method', 'unknown')}_optimized"
+                                segment_result['size_mb'] = segment_size_mb
+                                segment_result['optimization_applied'] = True
+                                logger.info(f"Segment {i+1} optimized to {segment_size_mb:.2f}MB")
+                            else:
+                                logger.warning(f"Failed to optimize segment {i+1}: {optimized_result.get('error', 'Unknown error')}")
+                                segment_result['optimization_applied'] = False
+                        else:
+                            segment_result['optimization_applied'] = False
+                        
+                        segment_info = {
+                            'index': i + 1,
+                            'path': segment_path,
+                            'start_time': segment_start,
+                            'duration': segment_duration_actual,
+                            'size_mb': segment_size_mb,
+                            'method': segment_result.get('method', 'unknown'),
+                            'quality_score': segment_result.get('quality_score', 0),
+                            'optimization_applied': segment_result.get('optimization_applied', False)
+                        }
+                        
+                        logger.info(f"Segment {i+1} completed: {segment_size_mb:.2f}MB "
+                                   f"using {segment_result.get('method', 'unknown')} method")
+                        
+                        return segment_info
+                    else:
+                        logger.error(f"Failed to create segment {i+1}: {segment_result.get('error', 'Unknown error')}")
+                        return None
+                        
+                except Exception as e:
+                    logger.error(f"Exception while processing segment {i+1}: {e}")
+                    return None
+            
+            # Process segments in parallel with limited concurrency
+            indices = list(range(num_segments))
+            results: List[Dict[str, Any]] = []
+            completed_count = 0
+            
+            logger.info(f"Starting parallel video segmentation with {self.max_workers} workers for {num_segments} segments")
+            print(f"    🔄 Processing {num_segments} segments with {self.max_workers} concurrent workers...")
+            
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                futures = [executor.submit(_process_segment, i) for i in indices]
+                for future in as_completed(futures):
+                    try:
+                        segment_info = future.result()
+                        if segment_info:
+                            segments.append(segment_info)
+                            temp_files.append(segment_info['path'])
+                            completed_count += 1
+                            # Show progress with actual completion count, not segment index
+                            print(f"    ✅ Segment {completed_count}/{num_segments} completed: {segment_info['size_mb']:.2f}MB "
+                                  f"using {segment_info.get('method', 'unknown')} method")
+                    except Exception as e:
+                        logger.warning(f"Segment future failed: {e}")
+            
+            # Check if all segments were created successfully
+            if len(segments) != num_segments:
+                logger.error(f"Only {len(segments)}/{num_segments} segments were created successfully")
+                return {
+                    'success': False,
+                    'error': f"Only {len(segments)}/{num_segments} segments were created successfully",
+                    'temp_files': temp_files
+                }
             
             # Create segments summary
             self._create_segments_summary(temp_segments_folder, segments, base_name, duration)

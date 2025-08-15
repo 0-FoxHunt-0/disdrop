@@ -735,19 +735,11 @@ class GifGenerator:
             successful_segments = 0
             total_size = 0.0
 
-            # Determine parallelism from config (optional key); fall back to auto sizing
-            try:
-                perf_cfg = self.config.get('gif_settings.performance', {}) or {}
-                segment_parallelism = perf_cfg.get('segment_parallelism', 'auto')
-                if str(segment_parallelism).lower() == 'auto':
-                    cpu = os.cpu_count() or 4
-                    max_workers = max(1, min(4, cpu // 2))
-                else:
-                    max_workers = max(1, min(8, int(segment_parallelism)))
-            except Exception:
-                max_workers = 2
+            # Limit parallelism based on configuration and system analysis
+            max_workers = self._calculate_optimal_segmentation_workers()
 
-            print(f"    🔄 Starting GIF segmentation: {num_segments} segments to create...")
+            logger.info(f"Starting parallel GIF segmentation with {max_workers} workers for {num_segments} segments")
+            print(f"    🔄 Starting GIF segmentation: {num_segments} segments to create with {max_workers} concurrent workers...")
             logger.info(f"Starting GIF segmentation: {num_segments} segments to create")
             
             # Process segments in parallel
@@ -773,7 +765,6 @@ class GifGenerator:
                     result = local_generator._create_single_gif(input_video, segment_path, settings, segment_start, segment_duration_actual)
                     if result.get('success', False):
                         sz = float(result.get('size_mb', 0.0) or 0.0)
-                        print(f"    ✅ GIF segment {i+1}/{num_segments} completed: {segment_name} ({sz:.2f}MB)")
                         logger.info(f"Created segment {i+1}/{num_segments}: {segment_name} ({sz:.2f}MB)")
                         return (True, sz, segment_name)
                     else:
@@ -787,6 +778,8 @@ class GifGenerator:
 
             indices = list(range(num_segments))
             results: List[Tuple[bool, float, str]] = []
+            completed_count = 0
+            
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = [executor.submit(_process_segment, i) for i in indices]
                 for fut in as_completed(futures):
@@ -795,6 +788,9 @@ class GifGenerator:
                         if ok:
                             successful_segments += 1
                             total_size += size_mb
+                            completed_count += 1
+                            # Show progress with actual completion count, not segment index
+                            print(f"    ✅ GIF segment {completed_count}/{num_segments} completed: {name} ({size_mb:.2f}MB)")
                     except Exception as e:
                         logger.warning(f"Segment future failed: {e}")
             
@@ -886,6 +882,51 @@ class GifGenerator:
         except Exception as e:
             logger.error(f"Error getting GIF info: {e}")
             return {'error': str(e)}
+    
+    def _calculate_optimal_segmentation_workers(self) -> int:
+        """
+        Calculate optimal number of workers based on configuration and system analysis
+        """
+        # Check if multiprocessing is enabled
+        if not self.config.get('gif_settings.multiprocessing.enabled', True):
+            return 1  # Disable multiprocessing if configured
+        
+        # Check if we should use dynamic analysis
+        use_dynamic = self.config.get('gif_settings.multiprocessing.use_dynamic_analysis', True)
+        
+        if use_dynamic:
+            try:
+                # Import hardware detector to analyze optimal workers
+                from .hardware_detector import HardwareDetector
+                hardware = HardwareDetector()
+                worker_analysis = hardware.analyze_optimal_segmentation_workers()
+                
+                # Get the analysis mode from config
+                analysis_mode = self.config.get('gif_settings.multiprocessing.analysis_mode', 'recommended')
+                
+                if analysis_mode == 'conservative':
+                    dynamic_workers = worker_analysis['conservative']
+                elif analysis_mode == 'maximum_safe':
+                    dynamic_workers = worker_analysis['maximum_safe']
+                else:  # 'recommended' or default
+                    dynamic_workers = worker_analysis['recommended']
+                
+                # Apply configurable limits
+                config_max = self.config.get('gif_settings.multiprocessing.max_concurrent_segments', 4)
+                final_workers = min(dynamic_workers, config_max)
+                
+                logger.info(f"Dynamic analysis: {analysis_mode} mode suggests {dynamic_workers} workers, "
+                           f"limited to {final_workers} by config")
+                
+                return final_workers
+                
+            except Exception as e:
+                logger.warning(f"Dynamic worker analysis failed: {e}, falling back to static config")
+                # Fall back to static configuration
+                pass
+        
+        # Static configuration fallback
+        return self.config.get('gif_settings.multiprocessing.max_concurrent_segments', 2)
     
     def _set_windows_thumbnail_attributes(self, gif_path: str) -> bool:
         """Set Windows thumbnail attributes for GIF file"""

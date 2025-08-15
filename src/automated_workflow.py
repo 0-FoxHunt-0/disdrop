@@ -1487,17 +1487,11 @@ class AutomatedWorkflow:
             successful_gifs = 0
             skipped_segments = 0
 
-            # Determine parallelism similar to GIF input segmentation
-            try:
-                perf_cfg = self.config.get('gif_settings.performance', {}) or {}
-                segment_parallelism = perf_cfg.get('segment_parallelism', 'auto')
-                if str(segment_parallelism).lower() == 'auto':
-                    cpu = os.cpu_count() or 4
-                    max_workers = max(1, min(4, cpu // 2))
-                else:
-                    max_workers = max(1, min(8, int(segment_parallelism)))
-            except Exception:
-                max_workers = 2
+            # Limit parallelism based on configuration and system analysis
+            max_workers = self._calculate_optimal_segmentation_workers()
+
+            logger.info(f"Starting parallel GIF generation with {max_workers} workers for {len(segment_files)} segments")
+            print(f"    🔄 Processing {len(segment_files)} segments with {max_workers} concurrent workers...")
 
             # Worker per segment; use a fresh GifGenerator instance to avoid shared ffmpeg process state
             def _process_segment(segment_file: Path) -> Tuple[bool, Optional[str]]:
@@ -1568,6 +1562,8 @@ class AutomatedWorkflow:
                     return (False, str(e))
 
             from concurrent.futures import ThreadPoolExecutor, as_completed
+            completed_count = 0
+            
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_map = {executor.submit(_process_segment, seg): seg for seg in segment_files}
                 for fut in as_completed(future_map):
@@ -1579,6 +1575,9 @@ class AutomatedWorkflow:
                         ok = False
                     if ok:
                         successful_gifs += 1
+                        completed_count += 1
+                        # Show progress with actual completion count
+                        print(f"    ✅ GIF {completed_count}/{len(segment_files)} completed successfully")
                     else:
                         skipped_segments += 1
             
@@ -1633,6 +1632,51 @@ class AutomatedWorkflow:
                     invalid_gifs.append(gif_file)
         
         return valid_gifs, invalid_gifs
+    
+    def _calculate_optimal_segmentation_workers(self) -> int:
+        """
+        Calculate optimal number of workers based on configuration and system analysis
+        """
+        # Check if multiprocessing is enabled
+        if not self.config.get('gif_settings.multiprocessing.enabled', True):
+            return 1  # Disable multiprocessing if configured
+        
+        # Check if we should use dynamic analysis
+        use_dynamic = self.config.get('gif_settings.multiprocessing.use_dynamic_analysis', True)
+        
+        if use_dynamic:
+            try:
+                # Import hardware detector to analyze optimal workers
+                from .hardware_detector import HardwareDetector
+                hardware = HardwareDetector()
+                worker_analysis = hardware.analyze_optimal_segmentation_workers()
+                
+                # Get the analysis mode from config
+                analysis_mode = self.config.get('gif_settings.multiprocessing.analysis_mode', 'recommended')
+                
+                if analysis_mode == 'conservative':
+                    dynamic_workers = worker_analysis['conservative']
+                elif analysis_mode == 'maximum_safe':
+                    dynamic_workers = worker_analysis['maximum_safe']
+                else:  # 'recommended' or default
+                    dynamic_workers = worker_analysis['recommended']
+                
+                # Apply configurable limits
+                config_max = self.config.get('gif_settings.multiprocessing.max_concurrent_segments', 4)
+                final_workers = min(dynamic_workers, config_max)
+                
+                logger.info(f"Dynamic analysis: {analysis_mode} mode suggests {dynamic_workers} workers, "
+                           f"limited to {final_workers} by config")
+                
+                return final_workers
+                
+            except Exception as e:
+                logger.warning(f"Dynamic worker analysis failed: {e}, falling back to static config")
+                # Fall back to static configuration
+                pass
+        
+        # Static configuration fallback
+        return self.config.get('gif_settings.multiprocessing.max_concurrent_segments', 2)
     
     def _cleanup_temp_files(self):
         """Clean up temporary files"""
@@ -2228,20 +2272,11 @@ class AutomatedWorkflow:
             # Read target fps from config; fallback to 20
             target_fps = int(self.config.get('gif_settings.fps', 20) or 20)
 
-            # Determine parallelism
-            perf_cfg = self.config.get('gif_settings.performance', {}) or {}
-            segment_parallelism = perf_cfg.get('segment_parallelism', 'auto')
-            if str(segment_parallelism).lower() == 'auto':
-                try:
-                    cpu = os.cpu_count() or 4
-                    max_workers = max(1, min(4, cpu // 2))
-                except Exception:
-                    max_workers = 2
-            else:
-                try:
-                    max_workers = max(1, min(8, int(segment_parallelism)))
-                except Exception:
-                    max_workers = 2
+            # Limit parallelism based on configuration and system analysis
+            max_workers = self._calculate_optimal_segmentation_workers()
+
+            logger.info(f"Starting parallel GIF segmentation with {max_workers} workers for {num_segments} segments")
+            print(f"    🔄 Processing {num_segments} segments with {max_workers} concurrent workers...")
 
             # Pre-create segments directory when using multi-segment mode to avoid race conditions
             if use_segments_folder:
@@ -2359,7 +2394,6 @@ class AutomatedWorkflow:
                         except Exception:
                             return None
                     sz = self.file_validator.get_file_size_mb(str(final_seg))
-                    print(f"    ✅ Created GIF segment {index+1}/{num_segments}: {final_seg.name} ({sz:.2f}MB)")
                     logger.info(f"Created GIF segment {index+1}/{num_segments}: {final_seg} ({sz:.2f}MB)")
                     return (index, final_seg, sz)
                 except Exception as e:
@@ -2368,6 +2402,8 @@ class AutomatedWorkflow:
 
             indices = list(range(num_segments))
             results: List[Tuple[int, Path, float]] = []
+            completed_count = 0
+            
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = [executor.submit(_process_segment, idx) for idx in indices]
                 for fut in as_completed(futures):
@@ -2378,6 +2414,9 @@ class AutomatedWorkflow:
                         logger.warning(f"Segment future failed: {e}")
                     if res:
                         results.append(res)
+                        completed_count += 1
+                        # Show progress with actual completion count
+                        print(f"    ✅ GIF segment {completed_count}/{num_segments} completed: {res[1].name} ({res[2]:.2f}MB)")
 
             # Aggregate
             successful = len(results)
