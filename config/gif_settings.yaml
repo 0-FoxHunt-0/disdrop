@@ -39,6 +39,13 @@ gif_settings:
   colors: 256
   stats_mode: "diff" # full, diff
 
+  # Crop detection (disabled by default to avoid slight unintended crops)
+  crop_detection:
+    enabled: false
+    # Only apply crop if borders exceed BOTH of these loosened thresholds
+    min_border_px: 12 # Require at least 12px on one side
+    min_border_ratio: 0.04 # Or at least 4% of dimension combined per axis
+
   # Segmentation settings - DISABLED for segmented videos
   segmentation:
     # Size-based thresholds (primary decision factors) - More conservative

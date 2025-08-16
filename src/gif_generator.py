@@ -604,6 +604,11 @@ class GifGenerator:
     def _detect_crop_filter(self, input_video: str, start_time: float, duration: float) -> str:
         """Detect crop suggestion using ffmpeg cropdetect and return crop filter string or empty"""
         try:
+            # Respect configuration: crop detection disabled by default to avoid unintended cropping
+            crop_enabled = bool(self.config.get('gif_settings.crop_detection.enabled', False))
+            if not crop_enabled:
+                return ''
+
             cmd = [
                 'ffmpeg', '-v', 'error',
                 '-ss', str(start_time),
@@ -624,7 +629,33 @@ class GifGenerator:
                     except Exception:
                         continue
             if crop and 'x' in crop and ':' in crop:
-                return f"crop={crop}"
+                # Validate that suggested crop meaningfully removes borders (avoid slight crops)
+                try:
+                    # Example format: crop=width:height:x:y
+                    parts = crop.replace('crop=', '').split(':')
+                    cw, ch, cx, cy = [int(float(p)) for p in parts[:4]]
+                    info = self.ffmpeg_utils.get_video_info(input_video) or {}
+                    iw = int(info.get('width') or 0)
+                    ih = int(info.get('height') or 0)
+                    if iw > 0 and ih > 0 and cw > 0 and ch > 0:
+                        left = max(0, cx)
+                        top = max(0, cy)
+                        right = max(0, iw - (cx + cw))
+                        bottom = max(0, ih - (cy + ch))
+                        # Thresholds from config (defaults chosen to prevent minor crops)
+                        min_border_px = int(self.config.get('gif_settings.crop_detection.min_border_px', 12))
+                        min_border_ratio = float(self.config.get('gif_settings.crop_detection.min_border_ratio', 0.04))
+                        hori_ratio = (left + right) / max(1, iw)
+                        vert_ratio = (top + bottom) / max(1, ih)
+                        significant_hori = (left >= min_border_px or right >= min_border_px or hori_ratio >= min_border_ratio)
+                        significant_vert = (top >= min_border_px or bottom >= min_border_px or vert_ratio >= min_border_ratio)
+                        if significant_hori or significant_vert:
+                            return f"crop={cw}:{ch}:{cx}:{cy}"
+                        else:
+                            logger.debug("Crop detection ignored: borders below significance thresholds")
+                except Exception:
+                    # If we cannot validate, err on side of not cropping
+                    pass
         except Exception:
             pass
         return ''
