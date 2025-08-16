@@ -106,9 +106,10 @@ class AdvancedGifOptimizer:
         # Check if shutdown was requested before starting
         if self.shutdown_requested or self._shutdown_checker():
             class ShutdownResult:
-                returncode = 1
-                stdout = ''
-                stderr = 'Shutdown requested before execution'
+                def __init__(self):
+                    self.returncode = 1
+                    self.stdout = ''
+                    self.stderr = 'Shutdown requested before execution'
             return ShutdownResult()
         
         try:
@@ -123,9 +124,10 @@ class AdvancedGifOptimizer:
                     logger.info("Shutdown requested during subprocess execution, terminating...")
                     self._terminate_ffmpeg_process()
                     class ShutdownResult:
-                        returncode = 1
-                        stdout = ''
-                        stderr = 'Shutdown requested during execution'
+                        def __init__(self):
+                            self.returncode = 1
+                            self.stdout = ''
+                            self.stderr = 'Shutdown requested during execution'
                     return ShutdownResult()
                 
                 # Check timeout
@@ -133,9 +135,10 @@ class AdvancedGifOptimizer:
                     logger.warning(f"Subprocess timeout after {timeout}s, terminating...")
                     self._terminate_ffmpeg_process()
                     class TimeoutResult:
-                        returncode = 1
-                        stdout = ''
-                        stderr = 'TimeoutExpired'
+                        def __init__(self):
+                            self.returncode = 1
+                            self.stdout = ''
+                            self.stderr = 'TimeoutExpired'
                     return TimeoutResult()
                 
                 time.sleep(0.1)  # Short sleep to avoid busy waiting
@@ -1165,8 +1168,8 @@ class AdvancedGifOptimizer:
             '-frames:v', '1', '-y', palette_path
         ]
         
-        palette_result = subprocess.run(palette_cmd, capture_output=True, text=True, timeout=60)
-        if palette_result.returncode != 0:
+        palette_result = self._run_subprocess_with_shutdown_check(palette_cmd, timeout=60)
+        if (self.shutdown_requested or self._shutdown_checker()) or palette_result.returncode != 0:
             return False
         
         # Create optimized GIF using palette
@@ -1176,13 +1179,16 @@ class AdvancedGifOptimizer:
             '-loop', '0', '-y', output_path
         ]
         
-        gif_result = subprocess.run(gif_cmd, capture_output=True, text=True, timeout=120)
+        gif_result = self._run_subprocess_with_shutdown_check(gif_cmd, timeout=120)
         
         # Clean up palette file
         if os.path.exists(palette_path):
-            os.remove(palette_path)
+            try:
+                os.remove(palette_path)
+            except Exception:
+                pass
         
-        return gif_result.returncode == 0
+        return (not (self.shutdown_requested or self._shutdown_checker())) and gif_result.returncode == 0
     
     def _build_scale_filter(self, width: int, height: int) -> str:
         """Build scale filter with proper aspect ratio preservation"""
@@ -1210,8 +1216,8 @@ class AdvancedGifOptimizer:
             '-frames:v', '1', '-y', palette_path
         ]
         
-        palette_result = subprocess.run(palette_cmd, capture_output=True, text=True, timeout=60)
-        if palette_result.returncode != 0:
+        palette_result = self._run_subprocess_with_shutdown_check(palette_cmd, timeout=60)
+        if (self.shutdown_requested or self._shutdown_checker()) or palette_result.returncode != 0:
             return False
         
         # Create optimized GIF using palette
@@ -1221,13 +1227,16 @@ class AdvancedGifOptimizer:
             '-loop', '0', '-y', output_path
         ]
         
-        gif_result = subprocess.run(gif_cmd, capture_output=True, text=True, timeout=120)
+        gif_result = self._run_subprocess_with_shutdown_check(gif_cmd, timeout=120)
         
         # Clean up palette file
         if os.path.exists(palette_path):
-            os.remove(palette_path)
+            try:
+                os.remove(palette_path)
+            except Exception:
+                pass
         
-        return gif_result.returncode == 0
+        return (not (self.shutdown_requested or self._shutdown_checker())) and gif_result.returncode == 0
     
     def _apply_ffmpeg_adaptive_strategy(self, input_path: str, output_path: str, params: Dict[str, Any]) -> bool:
         """Apply adaptive FFmpeg-based optimization strategy"""
@@ -1247,8 +1256,8 @@ class AdvancedGifOptimizer:
             '-frames:v', '1', '-y', palette_path
         ]
         
-        palette_result = subprocess.run(palette_cmd, capture_output=True, text=True, timeout=60)
-        if palette_result.returncode != 0:
+        palette_result = self._run_subprocess_with_shutdown_check(palette_cmd, timeout=60)
+        if (self.shutdown_requested or self._shutdown_checker()) or palette_result.returncode != 0:
             return False
         
         # Create optimized GIF using palette
@@ -1258,13 +1267,16 @@ class AdvancedGifOptimizer:
             '-loop', '0', '-y', output_path
         ]
         
-        gif_result = subprocess.run(gif_cmd, capture_output=True, text=True, timeout=120)
+        gif_result = self._run_subprocess_with_shutdown_check(gif_cmd, timeout=120)
         
         # Clean up palette file
         if os.path.exists(palette_path):
-            os.remove(palette_path)
+            try:
+                os.remove(palette_path)
+            except Exception:
+                pass
         
-        return gif_result.returncode == 0
+        return (not (self.shutdown_requested or self._shutdown_checker())) and gif_result.returncode == 0
     
     def _apply_ffmpeg_upscale_strategy(self, input_path: str, output_path: str, params: Dict[str, Any]) -> bool:
         """Apply FFmpeg-based upscaling optimization strategy"""
@@ -1285,8 +1297,8 @@ class AdvancedGifOptimizer:
             '-frames:v', '1', '-y', palette_path
         ]
         
-        palette_result = subprocess.run(palette_cmd, capture_output=True, text=True, timeout=60)
-        if palette_result.returncode != 0:
+        palette_result = self._run_subprocess_with_shutdown_check(palette_cmd, timeout=60)
+        if (self.shutdown_requested or self._shutdown_checker()) or palette_result.returncode != 0:
             return False
         
         # Create upscaled GIF using palette
@@ -1296,13 +1308,16 @@ class AdvancedGifOptimizer:
             '-loop', '0', '-y', output_path
         ]
         
-        gif_result = subprocess.run(gif_cmd, capture_output=True, text=True, timeout=120)
+        gif_result = self._run_subprocess_with_shutdown_check(gif_cmd, timeout=120)
         
         # Clean up palette file
         if os.path.exists(palette_path):
-            os.remove(palette_path)
+            try:
+                os.remove(palette_path)
+            except Exception:
+                pass
         
-        return gif_result.returncode == 0
+        return (not (self.shutdown_requested or self._shutdown_checker())) and gif_result.returncode == 0
     
     def _evaluate_gif_quality(self, gif_path: str, original_analysis: Dict[str, Any]) -> float:
         """Evaluate the quality of an optimized GIF"""
@@ -1499,6 +1514,9 @@ class AdvancedGifOptimizer:
             logger.info(f"Optimization iteration {iteration}/{max_iterations}")
             
             try:
+                # Exit promptly if shutdown requested
+                if self.shutdown_requested or self._shutdown_checker():
+                    raise RuntimeError("shutdown")
                 # Create GIF with current parameters
                 current_result = self._create_gif_with_params(
                     input_video, output_path, optimization_params, 
@@ -1506,6 +1524,8 @@ class AdvancedGifOptimizer:
                 )
                 
                 if not current_result or not current_result.get('success', False):
+                    if self.shutdown_requested or self._shutdown_checker():
+                        raise RuntimeError("shutdown")
                     logger.warning(f"Iteration {iteration}: GIF creation failed")
                     optimization_params = self._adjust_params_for_failure(optimization_params)
                     continue
@@ -1554,8 +1574,13 @@ class AdvancedGifOptimizer:
                 
             except Exception as e:
                 logger.warning(f"Iteration {iteration} failed: {e}")
+                if str(e) == "shutdown" or self.shutdown_requested or self._shutdown_checker():
+                    # Break out immediately on shutdown
+                    break
                 optimization_params = self._adjust_params_for_failure(optimization_params)
         
+        if (self.shutdown_requested or self._shutdown_checker()):
+            raise RuntimeError("shutdown")
         if not best_result:
             raise RuntimeError("Failed to create GIF under target size limit")
         
@@ -1819,22 +1844,30 @@ class AdvancedGifOptimizer:
         return palette_data
     
     def _generate_palette_neuquant(self, input_video: str, colors: int) -> Optional[str]:
-        """Generate palette using NeuQuant algorithm (via FFmpeg)"""
-        
-        palette_file = os.path.join(self.temp_dir, f"neuquant_palette_{colors}_{int(time.time())}.png")
-        
+        """Generate palette using NeuQuant algorithm (via FFmpeg) with unique filenames to avoid collisions."""
+        # Create unique filename with thread id and random suffix to avoid cross-thread collisions on Windows
+        thread_id = threading.get_ident()
+        random_suffix = random.randint(1000, 9999)
+        palette_file = os.path.join(self.temp_dir, f"neuquant_palette_{colors}_{thread_id}_{int(time.time())}_{random_suffix}.png")
+
+        # Ensure temp dir exists
+        os.makedirs(self.temp_dir, exist_ok=True)
+
         cmd = [
-            'ffmpeg', '-i', input_video, '-vf',
+            'ffmpeg', '-v', 'error',
+            '-i', input_video, '-vf',
             f'fps=2,{self._build_scale_filter(320, 240)},palettegen=max_colors={colors}:stats_mode=diff',
             '-frames:v', '1',
             '-y', palette_file
         ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        
-        if result.returncode == 0 and os.path.exists(palette_file):
-            return palette_file
-        
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            if result.returncode == 0 and os.path.exists(palette_file):
+                return palette_file
+        except Exception:
+            pass
+
         return None
     
     def _generate_palette_median_cut(self, input_video: str, colors: int) -> Optional[str]:
@@ -2570,6 +2603,9 @@ class AdvancedGifOptimizer:
             )
             
             # Create GIF using FFmpeg with current parameters
+            # Respect shutdown requests before heavy ffmpeg call
+            if self.shutdown_requested or self._shutdown_checker():
+                return None
             self._create_gif_ffmpeg_optimized(
                 input_video, temp_gif, params, current_palette, 
                 optimized_frames, start_time, duration
@@ -2591,7 +2627,11 @@ class AdvancedGifOptimizer:
                 }
         
         except Exception as e:
-            logger.warning(f"GIF creation with params failed: {e}")
+            if self.shutdown_requested or self._shutdown_checker():
+                # Suppress noisy warnings on shutdown
+                logger.info("GIF creation interrupted by shutdown request")
+            else:
+                logger.warning(f"GIF creation with params failed: {e}")
             # Clean up with retry logic for Windows file locking
             if os.path.exists(temp_gif):
                 max_retries = 3

@@ -7,7 +7,7 @@ import os
 import subprocess
 import tempfile
 import shutil
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Dict, Any, Optional, Tuple, List, Callable
 import math
 import logging
 from pathlib import Path
@@ -18,7 +18,7 @@ import time # Added for time.sleep
 import json
 import hashlib
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 
 from .config_manager import ConfigManager
 from .ffmpeg_utils import FFmpegUtils
@@ -29,10 +29,11 @@ logger = logging.getLogger(__name__)
 class GifGenerator:
     """Advanced GIF generator with optimization and platform-specific settings"""
     
-    def __init__(self, config_manager: ConfigManager):
+    def __init__(self, config_manager: ConfigManager, shutdown_checker: Optional[Callable[[], bool]] = None):
         self.config = config_manager
         self.ffmpeg_utils = FFmpegUtils()
-        self.optimizer = AdvancedGifOptimizer(config_manager)
+        self._shutdown_checker: Callable[[], bool] = shutdown_checker or (lambda: False)
+        self.optimizer = AdvancedGifOptimizer(config_manager, shutdown_checker=self._is_shutdown_requested)
         self.shutdown_requested = False
         self.current_ffmpeg_process = None
         
@@ -70,6 +71,13 @@ class GifGenerator:
             }
         }
     
+    def _is_shutdown_requested(self) -> bool:
+        """Return True if shutdown was requested locally or by external checker."""
+        try:
+            return bool(self.shutdown_requested or (self._shutdown_checker() if self._shutdown_checker else False))
+        except Exception:
+            return bool(self.shutdown_requested)
+
     def create_gif(self, input_video: str, output_path: str, platform: str = None,
                   max_size_mb: int = None, start_time: float = 0, 
                   duration: float = None, disable_segmentation: bool = False) -> Dict[str, Any]:
@@ -606,10 +614,10 @@ class GifGenerator:
                 '-f', 'null', '-'
             ]
             FFmpegUtils.add_ffmpeg_perf_flags(cmd)
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=20)
+            result = self._run_ffmpeg(cmd, timeout=20)
             # Parse stderr for last crop=
             crop = None
-            for line in result.stderr.splitlines():
+            for line in (result.stderr or '').splitlines():
                 if 'crop=' in line:
                     try:
                         crop = line.split('crop=')[-1].split()[0]
@@ -625,6 +633,11 @@ class GifGenerator:
     def request_shutdown(self):
         """Request generator to stop and terminate any running FFmpeg process."""
         self.shutdown_requested = True
+        try:
+            if hasattr(self, 'optimizer') and hasattr(self.optimizer, 'request_shutdown'):
+                self.optimizer.request_shutdown()
+        except Exception:
+            pass
         self._terminate_ffmpeg_process()
 
     def _terminate_ffmpeg_process(self):
@@ -657,7 +670,7 @@ class GifGenerator:
             pass
         
         # Check if shutdown was requested before starting
-        if self.shutdown_requested:
+        if self._is_shutdown_requested():
             r = FFResult()
             r.stdout = ''
             r.stderr = 'Shutdown requested before FFmpeg execution'
@@ -672,7 +685,7 @@ class GifGenerator:
             # Poll periodically to check for shutdown requests
             start_time = time.time()
             while self.current_ffmpeg_process.poll() is None:
-                if self.shutdown_requested:
+                if self._is_shutdown_requested():
                     logger.info("Shutdown requested during FFmpeg execution, terminating...")
                     self._terminate_ffmpeg_process()
                     r = FFResult()
@@ -713,6 +726,10 @@ class GifGenerator:
                               start_time: float, duration: float) -> Dict[str, Any]:
         """Create multiple GIF segments from long video"""
         try:
+            # Abort early if shutdown has been requested
+            if self._is_shutdown_requested():
+                return {'success': False, 'error': 'Shutdown requested before starting segmentation'}
+
             # Calculate segment duration
             segment_duration = min(settings['max_duration'], duration / 2)
             # Use ceiling to ensure the tail remainder is included
@@ -745,7 +762,7 @@ class GifGenerator:
             # Process segments in parallel
             def _process_segment(i: int) -> Tuple[bool, float, str]:
                 try:
-                    if self.shutdown_requested:
+                    if self._is_shutdown_requested():
                         return (False, 0.0, f"{base_name}_segment_{i+1:02d}.gif")
                     segment_start = start_time + (i * segment_duration)
                     raw_end = start_time + duration
@@ -760,7 +777,7 @@ class GifGenerator:
                     segment_path = os.path.join(segments_dir, segment_name)
 
                     # Use a fresh generator instance to avoid shared process state across threads
-                    local_generator = GifGenerator(self.config)
+                    local_generator = GifGenerator(self.config, shutdown_checker=self._is_shutdown_requested)
                     # Force per-segment single-GIF path to avoid nested segmentation
                     result = local_generator._create_single_gif(input_video, segment_path, settings, segment_start, segment_duration_actual)
                     if result.get('success', False):
@@ -782,21 +799,56 @@ class GifGenerator:
             
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = [executor.submit(_process_segment, i) for i in indices]
-                for fut in as_completed(futures):
-                    try:
-                        ok, size_mb, name = fut.result()
-                        if ok:
-                            successful_segments += 1
-                            total_size += size_mb
-                            completed_count += 1
-                            # Show progress with actual completion count, not segment index
-                            print(f"    ✅ GIF segment {completed_count}/{num_segments} completed: {name} ({size_mb:.2f}MB)")
-                    except Exception as e:
-                        logger.warning(f"Segment future failed: {e}")
+                pending = set(futures)
+                try:
+                    while pending:
+                        # Periodically check for shutdown to cancel promptly
+                        if self._is_shutdown_requested():
+                            for f in list(pending):
+                                f.cancel()
+                            # Attempt to stop executor quickly and cancel futures (Py 3.9+)
+                            try:
+                                executor.shutdown(wait=False, cancel_futures=True)
+                            except TypeError:
+                                # Fallback for older Python versions
+                                executor.shutdown(wait=False)
+                            break
+
+                        # Wait briefly for any future to complete
+                        done, pending = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
+                        for fut in done:
+                            try:
+                                ok, size_mb, name = fut.result()
+                                if ok:
+                                    successful_segments += 1
+                                    total_size += size_mb
+                                    completed_count += 1
+                                    # Show progress with actual completion count, not segment index
+                                    print(f"    ✅ GIF segment {completed_count}/{num_segments} completed: {name} ({size_mb:.2f}MB)")
+                            except Exception as e:
+                                logger.warning(f"Segment future failed: {e}")
+                finally:
+                    # Ensure executor stops promptly if shutdown was requested
+                    if self._is_shutdown_requested():
+                        try:
+                            executor.shutdown(wait=False, cancel_futures=True)
+                        except TypeError:
+                            executor.shutdown(wait=False)
             
+            # If shutdown was requested, return early with partial progress info
+            if self._is_shutdown_requested():
+                return {'success': False, 'error': 'Shutdown requested during GIF segmentation', 'segments_created': successful_segments}
+
             if successful_segments > 0:
                 print(f"    🎉 All {successful_segments} GIF segments completed successfully! Total size: {total_size:.2f}MB")
                 logger.info(f"All {successful_segments} GIF segments completed successfully")
+                
+                # Create comprehensive summary for the segments folder
+                try:
+                    self._create_comprehensive_segments_summary(segments_dir, base_name)
+                except Exception as e:
+                    logger.warning(f"Could not create comprehensive summary: {e}")
+                
                 return {
                     'success': True,
                     'segments_created': successful_segments,
@@ -811,6 +863,163 @@ class GifGenerator:
         except Exception as e:
             logger.error(f"Error creating segmented GIFs: {e}")
             return {'success': False, 'error': str(e)}
+
+    def _create_comprehensive_segments_summary(self, segments_dir: str, base_name: str) -> None:
+        """Create a comprehensive summary across all files in a segments folder.
+
+        - Includes both MP4 and GIF files if present
+        - Writes FPS, Duration, Frame Count (estimated for GIF), Resolution, Codec/Bitrate (for MP4), and Size
+        - Prefixed with '~' so it's listed last and avoided as a thumbnail
+        """
+        try:
+            summary_path = os.path.join(segments_dir, f"~{base_name}_comprehensive_summary.txt")
+            temp_path = os.path.join(segments_dir, f"~{base_name}_comprehensive_summary.txt.tmp")
+
+            # Collect files
+            entries = [e for e in os.listdir(segments_dir) if os.path.isfile(os.path.join(segments_dir, e))]
+            mp4_files = sorted([e for e in entries if e.lower().endswith('.mp4')])
+            gif_files = sorted([e for e in entries if e.lower().endswith('.gif')])
+
+            if not mp4_files and not gif_files:
+                return
+
+            import time as _time
+
+            total_mp4_size = 0.0
+            total_mp4_duration = 0.0
+            total_mp4_frames = 0
+
+            total_gif_size = 0.0
+            total_gif_duration = 0.0
+            total_gif_frames = 0
+
+            # Best-effort clear attributes on existing file
+            try:
+                if os.path.exists(summary_path):
+                    subprocess.run(['attrib', '-R', '-S', '-H', summary_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+            except Exception:
+                pass
+
+            # Write to temp file first
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
+
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                f.write("Comprehensive Segments Summary\n")
+                f.write("=============================\n\n")
+                f.write(f"Base Name: {base_name}\n")
+                f.write(f"Created: {_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Total MP4 Segments: {len(mp4_files)}\n")
+                f.write(f"Total GIF Segments: {len(gif_files)}\n")
+                f.write(f"Total Files: {len(mp4_files) + len(gif_files)}\n\n")
+
+                # MP4 details
+                if mp4_files:
+                    f.write("MP4 Segments Details:\n")
+                    f.write("--------------------\n")
+                    for idx, name in enumerate(mp4_files, 1):
+                        path = os.path.join(segments_dir, name)
+                        try:
+                            info = FFmpegUtils.get_video_info(path)
+                            size_mb = os.path.getsize(path) / (1024 * 1024)
+                            f.write(f"MP4 Segment {idx:03d}: {name}\n")
+                            f.write(f"  Duration: {info.get('duration', 0.0):.2f}s\n")
+                            f.write(f"  FPS: {info.get('fps', 0.0):.2f}\n")
+                            f.write(f"  Frame Count: {info.get('frame_count', 0)}\n")
+                            f.write(f"  Resolution: {info.get('width', 0)}x{info.get('height', 0)}\n")
+                            f.write(f"  Codec: {info.get('codec', 'unknown')}\n")
+                            f.write(f"  Bitrate: {info.get('bitrate', 0)} kbps\n")
+                            f.write(f"  Size: {size_mb:.2f}MB\n\n")
+                            total_mp4_size += size_mb
+                            total_mp4_duration += float(info.get('duration', 0.0) or 0.0)
+                            total_mp4_frames += int(info.get('frame_count', 0) or 0)
+                        except Exception as e:
+                            f.write(f"MP4 Segment {idx:03d}: {name}\n")
+                            f.write(f"  Error reading info: {e}\n\n")
+
+                    f.write("MP4 Summary:\n")
+                    f.write(f"  Total Size: {total_mp4_size:.2f}MB\n")
+                    f.write(f"  Total Duration: {total_mp4_duration:.2f}s\n")
+                    f.write(f"  Total Frames: {total_mp4_frames}\n")
+                    if len(mp4_files) > 0:
+                        f.write(f"  Average Size: {total_mp4_size/len(mp4_files):.2f}MB\n")
+                        f.write(f"  Average Duration: {total_mp4_duration/len(mp4_files):.2f}s\n")
+                        f.write(f"  Average FPS: {total_mp4_frames/total_mp4_duration if total_mp4_duration>0 else 0:.2f}\n\n")
+
+                # GIF details
+                if gif_files:
+                    f.write("GIF Segments Details:\n")
+                    f.write("--------------------\n")
+                    for idx, name in enumerate(gif_files, 1):
+                        path = os.path.join(segments_dir, name)
+                        try:
+                            g = self.get_gif_info(path)
+                            size_mb = os.path.getsize(path) / (1024 * 1024)
+                            duration = float(g.get('duration') or 0.0)
+                            fps = float(g.get('fps') or 0.0)
+                            est_frames = int(round(duration * fps)) if duration > 0 and fps > 0 else 0
+                            width = height = 0
+                            if isinstance(g.get('resolution'), (list, tuple)) and len(g['resolution']) == 2:
+                                width, height = g['resolution']
+                            f.write(f"GIF Segment {idx:03d}: {name}\n")
+                            f.write(f"  Duration: {duration:.2f}s\n")
+                            f.write(f"  FPS: {fps:.2f}\n")
+                            f.write(f"  Estimated Frame Count: {est_frames}\n")
+                            f.write(f"  Resolution: {width}x{height}\n")
+                            f.write(f"  Size: {size_mb:.2f}MB\n\n")
+                            total_gif_size += size_mb
+                            total_gif_duration += duration
+                            total_gif_frames += est_frames
+                        except Exception as e:
+                            f.write(f"GIF Segment {idx:03d}: {name}\n")
+                            f.write(f"  Error reading info: {e}\n\n")
+
+                    f.write("GIF Summary:\n")
+                    f.write(f"  Total Size: {total_gif_size:.2f}MB\n")
+                    f.write(f"  Total Duration: {total_gif_duration:.2f}s\n")
+                    f.write(f"  Estimated Total Frames: {total_gif_frames}\n")
+                    if len(gif_files) > 0:
+                        f.write(f"  Average Size: {total_gif_size/len(gif_files):.2f}MB\n")
+                        f.write(f"  Average Duration: {total_gif_duration/len(gif_files):.2f}s\n")
+                        f.write(f"  Average FPS: {total_gif_frames/total_gif_duration if total_gif_duration>0 else 0:.2f}\n\n")
+
+                # Overall
+                total_files = len(mp4_files) + len(gif_files)
+                f.write("Overall Summary:\n")
+                f.write("---------------\n")
+                f.write(f"Total Files: {total_files}\n")
+                total_size = total_mp4_size + total_gif_size
+                total_duration = total_mp4_duration + total_gif_duration
+                total_frames = total_mp4_frames + total_gif_frames
+                f.write(f"Total Size: {total_size:.2f}MB\n")
+                f.write(f"Total Duration: {total_duration:.2f}s\n")
+                f.write(f"Total Frames: {total_frames}\n")
+                if total_duration > 0:
+                    f.write(f"Overall Average FPS: {total_frames/total_duration:.2f}\n")
+                f.write(f"File Types: MP4 ({len(mp4_files)}), GIF ({len(gif_files)})\n")
+
+            # Atomic replace
+            try:
+                os.replace(temp_path, summary_path)
+            except Exception:
+                try:
+                    subprocess.run(['attrib', '-R', '-S', '-H', summary_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+                    os.replace(temp_path, summary_path)
+                except Exception:
+                    try:
+                        if os.path.exists(temp_path):
+                            os.remove(temp_path)
+                    except Exception:
+                        pass
+                    raise
+
+            # Do not hide the summary; folder.jpg controls thumbnail selection
+
+        except Exception as e:
+            logger.warning(f"Comprehensive summary creation failed for {segments_dir}: {e}")
     
     def optimize_existing_gif(self, gif_path: str, max_size_mb: float) -> bool:
         """Optimize an existing GIF file to meet size requirements"""

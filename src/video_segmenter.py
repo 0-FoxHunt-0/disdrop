@@ -16,6 +16,7 @@ import json
 import math
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 from .config_manager import ConfigManager
 from .hardware_detector import HardwareDetector
@@ -32,6 +33,8 @@ class VideoSegmenter:
         # Shutdown handling
         self.shutdown_requested = False
         self.current_ffmpeg_process = None
+        self._proc_lock = threading.Lock()
+        self._active_processes: set[subprocess.Popen] = set()
         
         # Multiprocessing configuration - dynamic analysis with fallback
         self.max_workers = self._calculate_optimal_workers()
@@ -98,16 +101,10 @@ class VideoSegmenter:
         # Get segmentation settings from config
         segmentation_config = self.config.get('video_compression.segmentation', {})
         
-        # Direct size check: if original video is already significantly larger than target, segment immediately
+        # Log original vs target size, but do not force segmentation solely on original size
         original_size_mb = video_info.get('size_bytes', 0) / (1024 * 1024)
         logger.info(f"Video segmentation check: original size {original_size_mb:.1f}MB, target {max_size_mb}MB, "
                    f"duration {duration:.1f}s, resolution {video_info.get('width', 0)}x{video_info.get('height', 0)}")
-        
-        # Only segment if original is extremely large (5x target size)
-        if original_size_mb > max_size_mb * 5.0:  # Increased from 3x to 5x
-            logger.info(f"Video segmentation recommended: original size {original_size_mb:.1f}MB > "
-                       f"{max_size_mb * 5.0:.1f}MB (5x target size)")
-            return True
         
         # Create optimal video parameters for size estimation
         estimation_params = {
@@ -432,9 +429,6 @@ class VideoSegmenter:
                     'temp_files': temp_files
                 }
             
-            # Create segments summary
-            self._create_segments_summary(temp_segments_folder, segments, base_name, duration)
-            
             print(f"    🎉 All {len(segments)} segments completed successfully!")
             logger.info(f"All {len(segments)} segments completed successfully")
             
@@ -524,14 +518,26 @@ class VideoSegmenter:
                        f"{duration:.1f}s @ {segment_params['fps']}fps")
 
             # Build FFmpeg command for segment creation (accurate seek: place -ss after -i)
+            encoder = segment_params.get('encoder', 'libx264')
+            accel_type = segment_params.get('acceleration_type', 'software')
             cmd = [
                 'ffmpeg', '-y',
                 '-i', input_video,
                 '-ss', str(start_time),
                 '-t', str(duration),
-                '-c:v', 'libx264',
-                '-crf', str(segment_params.get('crf', 23)),
-                '-preset', segment_params.get('preset', 'medium'),
+                '-c:v', encoder,
+            ]
+            # Quality/bitrate selection: use CRF only for software encoders; otherwise use bitrate
+            if accel_type == 'software' and 'crf' in segment_params:
+                cmd.extend(['-crf', str(segment_params.get('crf'))])
+                if 'preset' in segment_params:
+                    cmd.extend(['-preset', segment_params.get('preset', 'medium')])
+            else:
+                if 'bitrate' in segment_params:
+                    cmd.extend(['-b:v', str(segment_params['bitrate'])])
+                if 'preset' in segment_params:
+                    cmd.extend(['-preset', segment_params.get('preset', 'medium')])
+            cmd.extend([
                 '-vf', f"scale={segment_params['width']}:{segment_params['height']}:flags=lanczos",
                 '-r', str(segment_params['fps']),
                 '-c:a', 'aac',
@@ -540,13 +546,42 @@ class VideoSegmenter:
                 '-movflags', '+faststart',
                 '-pix_fmt', 'yuv420p',
                 output_path
-            ]
+            ])
             
             # Execute FFmpeg command
             try:
-                result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
+                # Use Popen + polling to support fast shutdown; track process per-thread
+                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                with self._proc_lock:
+                    self._active_processes.add(process)
+                start_time_poll = time.time()
+                # Dynamic timeout based on encoder type and segment duration
+                if accel_type == 'software':
+                    timeout_seconds = max(duration * 6.0, 480)
+                else:
+                    timeout_seconds = max(duration * 3.0, 240)
+                while process.poll() is None:
+                    if self.shutdown_requested:
+                        self._terminate_ffmpeg_process(process)
+                        return {
+                            'success': False,
+                            'error': 'Shutdown requested during segment creation'
+                        }
+                    if time.time() - start_time_poll > timeout_seconds:
+                        logger.warning("Segment creation timeout, terminating...")
+                        self._terminate_ffmpeg_process(process)
+                        return {
+                            'success': False,
+                            'error': 'Segment creation timed out'
+                        }
+                    time.sleep(0.1)
+                result_stdout, result_stderr = process.communicate()
+                rc = process.returncode
+                with self._proc_lock:
+                    if process in self._active_processes:
+                        self._active_processes.discard(process)
                 
-                if result.returncode == 0:
+                if rc == 0:
                     # Get segment info
                     segment_size = os.path.getsize(output_path) / (1024 * 1024)
                     result = {
@@ -562,10 +597,10 @@ class VideoSegmenter:
                     logger.info(f"Segment optimization successful: {segment_size:.2f}MB using direct FFmpeg method")
                     return result
                 else:
-                    logger.error(f"FFmpeg failed: {result.stderr}")
+                    logger.error(f"FFmpeg failed: {result_stderr}")
                     return {
                         'success': False,
-                        'error': f"FFmpeg failed: {result.stderr}"
+                        'error': f"FFmpeg failed: {result_stderr}"
                     }
                     
             except subprocess.TimeoutExpired:
@@ -1125,17 +1160,17 @@ class VideoSegmenter:
                 segment['filename'] = final_filename
                 final_segments.append(segment)
             
-            # Move summary file if it exists
-            summary_file = os.path.join(temp_folder, f"{base_name}_segments_summary.txt")
-            if os.path.exists(summary_file):
-                final_summary_path = os.path.join(final_segments_folder, f"{base_name}_segments_summary.txt")
-                shutil.move(summary_file, final_summary_path)
-            
             # Clean up temp folder
             try:
                 shutil.rmtree(temp_folder)
             except Exception as e:
                 logger.warning(f"Failed to clean up temp folder {temp_folder}: {e}")
+            
+            # Create comprehensive summary for the segments folder
+            try:
+                self._create_comprehensive_segments_summary(final_segments_folder, base_name)
+            except Exception as e:
+                logger.warning(f"Could not create comprehensive summary: {e}")
             
             return {
                 'success': True,
@@ -1228,28 +1263,208 @@ class VideoSegmenter:
         """Request graceful shutdown of the segmenter"""
         logger.info("Shutdown requested for video segmenter")
         self.shutdown_requested = True
-        if self.current_ffmpeg_process:
-            logger.info("Terminating current FFmpeg process...")
-            self._terminate_ffmpeg_process()
-    
-    def _terminate_ffmpeg_process(self):
-        """Terminate the current FFmpeg process gracefully"""
-        if self.current_ffmpeg_process and self.current_ffmpeg_process.poll() is None:
+        # Terminate all active FFmpeg processes
+        with self._proc_lock:
+            active = list(self._active_processes)
+        for proc in active:
             try:
-                # Try graceful termination first
-                self.current_ffmpeg_process.terminate()
-                
-                # Wait a bit for graceful termination
+                self._terminate_ffmpeg_process(proc)
+            except Exception:
+                pass
+    
+    def _terminate_ffmpeg_process(self, process: Optional[subprocess.Popen] = None):
+        """Terminate an FFmpeg process gracefully"""
+        target = process
+        # Backward-compatibility: if no process is passed, use current_ffmpeg_process if present
+        if target is None:
+            target = self.current_ffmpeg_process
+        if target and target.poll() is None:
+            try:
+                target.terminate()
                 try:
-                    self.current_ffmpeg_process.wait(timeout=5)
+                    target.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    # Force kill if graceful termination fails
                     logger.warning("FFmpeg process did not terminate gracefully, forcing kill...")
-                    self.current_ffmpeg_process.kill()
-                    self.current_ffmpeg_process.wait()
-                
+                    target.kill()
+                    target.wait()
                 logger.info("FFmpeg process terminated successfully")
             except Exception as e:
                 logger.error(f"Error terminating FFmpeg process: {e}")
             finally:
-                self.current_ffmpeg_process = None 
+                with self._proc_lock:
+                    if target in self._active_processes:
+                        self._active_processes.discard(target)
+                if target is self.current_ffmpeg_process:
+                    self.current_ffmpeg_process = None 
+
+    def _create_comprehensive_segments_summary(self, segments_folder: str, base_name: str) -> None:
+        """
+        Create a comprehensive summary file for both MP4 and GIF segments in a segments folder.
+        The summary will be prefixed with '~' to ensure it appears last in folder listings.
+        """
+        try:
+            import time
+            from .ffmpeg_utils import FFmpegUtils
+            
+            # Find all MP4 and GIF files in the segments folder
+            mp4_files = [f for f in os.listdir(segments_folder) if f.lower().endswith('.mp4')]
+            gif_files = [f for f in os.listdir(segments_folder) if f.lower().endswith('.gif')]
+            
+            if not mp4_files and not gif_files:
+                logger.info(f"No MP4 or GIF files found in segments folder: {segments_folder}")
+                return
+            
+            # Create summary filename with '~' prefix to ensure it appears last
+            summary_file = os.path.join(segments_folder, f"~{base_name}_comprehensive_summary.txt")
+            temp_file = os.path.join(segments_folder, f"~{base_name}_comprehensive_summary.txt.tmp")
+            # Best-effort clear attributes
+            try:
+                if os.path.exists(summary_file):
+                    subprocess.run(['attrib', '-R', '-S', '-H', summary_file], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+            except Exception:
+                pass
+            
+            # Write to temp file first
+            try:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+            except Exception:
+                pass
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                f.write("Comprehensive Segments Summary\n")
+                f.write("=============================\n\n")
+                f.write(f"Base Name: {base_name}\n")
+                f.write(f"Created: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Total MP4 Segments: {len(mp4_files)}\n")
+                f.write(f"Total GIF Segments: {len(gif_files)}\n")
+                f.write(f"Total Files: {len(mp4_files) + len(gif_files)}\n\n")
+
+                # MP4 details
+                if mp4_files:
+                    f.write("MP4 Segments Details:\n")
+                    f.write("--------------------\n")
+                    for idx, name in enumerate(mp4_files, 1):
+                        path = os.path.join(segments_folder, name)
+                        try:
+                            info = FFmpegUtils.get_video_info(path)
+                            size_mb = os.path.getsize(path) / (1024 * 1024)
+                            f.write(f"MP4 Segment {idx:03d}: {name}\n")
+                            f.write(f"  Duration: {info.get('duration', 0.0):.2f}s\n")
+                            f.write(f"  FPS: {info.get('fps', 0.0):.2f}\n")
+                            f.write(f"  Frame Count: {info.get('frame_count', 0)}\n")
+                            f.write(f"  Resolution: {info.get('width', 0)}x{info.get('height', 0)}\n")
+                            f.write(f"  Codec: {info.get('codec', 'unknown')}\n")
+                            f.write(f"  Bitrate: {info.get('bitrate', 0)} kbps\n")
+                            f.write(f"  Size: {size_mb:.2f}MB\n\n")
+                        except Exception as e:
+                            f.write(f"MP4 Segment {idx:03d}: {name}\n")
+                            f.write(f"  Error reading info: {e}\n\n")
+
+                    f.write("MP4 Summary:\n")
+                    f.write(f"  Total MP4 Segments: {len(mp4_files)}\n\n")
+
+                # GIF details
+                if gif_files:
+                    f.write("GIF Segments Details:\n")
+                    f.write("--------------------\n")
+                    for idx, name in enumerate(gif_files, 1):
+                        path = os.path.join(segments_folder, name)
+                        try:
+                            size_mb = os.path.getsize(path) / (1024 * 1024)
+                            f.write(f"GIF Segment {idx:03d}: {name}\n")
+                            f.write(f"  Size: {size_mb:.2f}MB\n\n")
+                        except Exception as e:
+                            f.write(f"GIF Segment {idx:03d}: {name}\n")
+                            f.write(f"  Error reading info: {e}\n\n")
+
+                    f.write("GIF Summary:\n")
+                    f.write(f"  Total GIF Segments: {len(gif_files)}\n\n")
+
+                # Overall
+                total_files = len(mp4_files) + len(gif_files)
+                f.write("Overall Summary:\n")
+                f.write("---------------\n")
+                f.write(f"Total Files: {total_files}\n")
+                f.write(f"File Types: MP4 ({len(mp4_files)}), GIF ({len(gif_files)})\n")
+
+            # Atomic replace
+            try:
+                os.replace(temp_file, summary_file)
+            except Exception:
+                try:
+                    subprocess.run(['attrib', '-R', '-S', '-H', summary_file], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+                    os.replace(temp_file, summary_file)
+                except Exception:
+                    try:
+                        if os.path.exists(temp_file):
+                            os.remove(temp_file)
+                    except Exception:
+                        pass
+                    raise
+
+            # Do not hide the summary; folder.jpg controls thumbnail selection
+
+        except Exception as e:
+            logger.warning(f"Failed to create segments summary: {e}")
+
+    def _get_gif_info_for_summary(self, gif_path: str) -> Dict[str, Any]:
+        """
+        Get GIF information for summary generation using FFmpeg.
+        This is a simplified version focused on summary needs.
+        """
+        try:
+            import subprocess
+            import re
+            
+            # Get basic file info
+            file_size = os.path.getsize(gif_path)
+            file_size_mb = file_size / (1024 * 1024)
+            
+            # Try to get GIF-specific info using FFmpeg
+            cmd = ['ffmpeg', '-i', gif_path]
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+            
+            duration = 0
+            fps = 12.0  # Default GIF FPS
+            width = 320
+            height = 240
+            
+            if result.stderr:
+                # Parse FFmpeg output for GIF info
+                lines = result.stderr.split('\n')
+                for line in lines:
+                    if 'Duration:' in line:
+                        # Extract duration
+                        duration_match = re.search(r'Duration: (\d{2}):(\d{2}):(\d{2})\.(\d{2})', line)
+                        if duration_match:
+                            h, m, s, cs = map(int, duration_match.groups())
+                            duration = h * 3600 + m * 60 + s + cs / 100
+                    
+                    elif 'Video:' in line:
+                        # Extract resolution
+                        res_match = re.search(r'(\d+)x(\d+)', line)
+                        if res_match:
+                            width, height = map(int, res_match.groups())
+                        
+                        # Extract FPS if available
+                        fps_match = re.search(r'(\d+(?:\.\d+)?) fps', line)
+                        if fps_match:
+                            fps = float(fps_match.group(1))
+            
+            return {
+                'duration': duration,
+                'fps': fps,
+                'width': width,
+                'height': height,
+                'file_size_mb': file_size_mb
+            }
+            
+        except Exception as e:
+            logger.warning(f"Error getting GIF info for summary: {e}")
+            return {
+                'duration': 0,
+                'fps': 12.0,
+                'width': 320,
+                'height': 240,
+                'file_size_mb': 0
+            } 

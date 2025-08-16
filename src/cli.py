@@ -1138,23 +1138,38 @@ class VideoCompressorCLI:
             logger.warning(f"Segments folder not found or not a directory: {segments_folder}")
             return [], []
         
-        for filename in os.listdir(segments_folder):
-            if filename.lower().endswith('.gif'):
-                gif_path = os.path.join(segments_folder, filename)
-                try:
-                    is_valid, error_msg = self.file_validator.is_valid_gif_with_enhanced_checks(
-                        gif_path,
-                        original_path=None,
-                        max_size_mb=max_size_mb
-                    )
-                    if is_valid:
-                        valid_gifs.append(gif_path)
-                    else:
-                        invalid_gifs.append(gif_path)
-                        logger.debug(f"Invalid GIF {filename}: {error_msg}")
-                except Exception as e:
-                    logger.warning(f"Error validating GIF {filename}: {e}")
-                    invalid_gifs.append(gif_path)
+        # Collect GIF files first
+        gif_files = [os.path.join(segments_folder, f) for f in os.listdir(segments_folder) if f.lower().endswith('.gif')]
+        if not gif_files:
+            return [], []
+        
+        # Determine reasonable parallelism using config if available
+        try:
+            # Access the same calculation as AutomatedWorkflow when possible
+            max_workers = getattr(self.automated_workflow, '_calculate_optimal_segmentation_workers')()
+            if not isinstance(max_workers, int) or max_workers < 1:
+                raise ValueError
+        except Exception:
+            max_workers = max(1, min(4, (os.cpu_count() or 2)))
+        
+        def _validate(gif_path: str):
+            try:
+                is_valid, error_msg = self.file_validator.is_valid_gif_with_enhanced_checks(
+                    gif_path, original_path=None, max_size_mb=max_size_mb
+                )
+                return gif_path, bool(is_valid)
+            except Exception:
+                return gif_path, False
+        
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_validate, p) for p in gif_files]
+            for fut in concurrent.futures.as_completed(futures):
+                path, ok = fut.result()
+                if ok:
+                    valid_gifs.append(path)
+                else:
+                    invalid_gifs.append(path)
         
         return valid_gifs, invalid_gifs
     
@@ -1242,8 +1257,8 @@ class VideoCompressorCLI:
                 basic_valid = is_valid
                 
             elif pattern_type.endswith('.gif'):
-                # Validate single GIF file
-                is_valid, _ = self.file_validator.is_valid_gif(output_path, max_size_mb=10.0)
+                # Fast validation for existing single GIF
+                is_valid, _ = self.file_validator.is_valid_gif_fast(output_path, max_size_mb=10.0)
                 basic_valid = is_valid
                 
             elif pattern_type.endswith('_segments'):

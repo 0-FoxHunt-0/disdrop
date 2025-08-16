@@ -143,6 +143,78 @@ class FileValidator:
                 
         except Exception as e:
             return False, f"GIF validation error: {str(e)}"
+
+    @staticmethod
+    def is_valid_gif_fast(gif_path: str, max_size_mb: float = 10.0) -> Tuple[bool, Optional[str]]:
+        """
+        Fast validation for GIFs avoiding full frame iteration.
+        Checks: existence, size (if provided), basic GIF header/trailer, PIL open, animated flag,
+        frame count via n_frames, and ability to seek a few key frames.
+        """
+        try:
+            if not os.path.exists(gif_path):
+                return False, "File does not exist"
+            file_size_mb = os.path.getsize(gif_path) / (1024 * 1024)
+            if file_size_mb == 0:
+                return False, "File is empty"
+            if max_size_mb is not None and file_size_mb > max_size_mb:
+                return False, f"File too large: {file_size_mb:.2f}MB > {max_size_mb}MB"
+
+            # Quick header/trailer check
+            try:
+                with open(gif_path, 'rb') as f:
+                    header = f.read(6)
+                    if header not in [b'GIF87a', b'GIF89a']:
+                        return False, "Invalid GIF header"
+                    f.seek(-1, 2)
+                    if f.read(1) != b';':
+                        return False, "Missing GIF trailer"
+            except Exception as e:
+                return False, f"Header/trailer check failed: {e}"
+
+            # PIL-based light checks
+            with Image.open(gif_path) as img:
+                if img.format != 'GIF':
+                    return False, "File is not a valid GIF format"
+                if not getattr(img, 'is_animated', False):
+                    return False, "File is not an animated GIF"
+
+                frame_count = getattr(img, 'n_frames', None)
+                if frame_count is None:
+                    # Fallback: try seeking a couple frames without full iteration
+                    try:
+                        img.seek(0)
+                    except Exception:
+                        return False, "Cannot read first frame"
+                    try:
+                        img.seek(1)
+                        frame_count = 2
+                    except EOFError:
+                        frame_count = 1
+                if frame_count <= 0:
+                    return False, "GIF has no frames"
+
+                # Probe a few positions to ensure seeking/decoding works
+                probes = {0, 1, max(0, (frame_count // 2)), max(0, frame_count - 1)}
+                for pos in probes:
+                    try:
+                        img.seek(pos)
+                        # Convert quickly to ensure decodability; avoid heavy getdata()
+                        frame = img.convert('P') if img.mode != 'P' else img
+                        w, h = frame.size
+                        if w <= 0 or h <= 0:
+                            return False, f"Invalid frame dimensions at {pos}"
+                    except EOFError:
+                        # If EOF on mid/last, still consider valid as long as first frames OK
+                        if pos in (0, 1):
+                            return False, f"Unexpected EOF at frame {pos}"
+                    except Exception as e:
+                        return False, f"Cannot decode frame {pos}: {e}"
+
+            return True, None
+
+        except Exception as e:
+            return False, f"Fast GIF validation error: {str(e)}"
     
     @staticmethod
     def is_video_under_size(video_path: str, max_size_mb: float) -> bool:
