@@ -147,7 +147,7 @@ gif_settings:
       max_height: 400
       max_duration: 15 # Increased from 10
       colors: 192
-      max_file_size_mb: 8 # Discord's actual 8MB limit for free users
+      max_file_size_mb: 10 # Discord's actual 10MB limit for free users
       dither: "floyd_steinberg"
       lossy: 40
 

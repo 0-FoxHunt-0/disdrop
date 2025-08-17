@@ -389,11 +389,8 @@ class GifGenerator:
                 logger.error(f"Input video not found for palette generation: {safe_input_path}")
                 return None
             
-            # Detect crop and build filter with mpdecimate + fps + scale
-            crop_filter = self._detect_crop_filter(safe_input_path, start_time, duration)
+            # Build filter with mpdecimate + fps + scale (no crop)
             pre_chain = []
-            if crop_filter:
-                pre_chain.append(crop_filter)
             pre_chain.append('mpdecimate=hi=512:lo=256:frac=0.3')
             pre_chain.append(f"fps={settings['fps']}")
             
@@ -478,11 +475,8 @@ class GifGenerator:
                 logger.error(f"Palette file not found for GIF creation: {palette_path}")
                 return False
             
-            # Build filter graph with optional crop, mpdecimate, fps, scale and paletteuse with high-quality dithering
-            crop_filter = self._detect_crop_filter(safe_input_path, start_time, duration)
+            # Build filter graph with mpdecimate, fps, scale and paletteuse (no crop)
             pre_chain = []
-            if crop_filter:
-                pre_chain.append(crop_filter)
             pre_chain.append('mpdecimate=hi=512:lo=256:frac=0.3')
             pre_chain.append(f"fps={settings['fps']}")
             
@@ -551,10 +545,8 @@ class GifGenerator:
                 logger.error(f"Input video not found for split-palette GIF: {safe_input_path}")
                 return False
 
-            crop_filter = self._detect_crop_filter(safe_input_path, start_time, duration)
+            # Build filter chain without crop
             pre = []
-            if crop_filter:
-                pre.append(crop_filter)
             pre.append('mpdecimate=hi=512:lo=256:frac=0.3')
             pre.append(f"fps={settings['fps']}")
             

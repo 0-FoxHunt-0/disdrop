@@ -225,7 +225,8 @@ class AutomatedWorkflow:
                             # Fast-skip using cache if enabled and previously verified success exists
                             if self._is_cached_success(file_path):
                                 print(f"\n⚡ Skipping (cached success): {file_path.name}")
-                                logger.info(f"Skipping (cached success): {file_path.name}")
+                                safe_name = self._safe_filename_for_logging(file_path.name)
+                                logger.info(f"Skipping (cached success): {safe_name}")
                                 result = 'skipped'
                                 # After processing a single file, cleanup temp files immediately
                                 self._cleanup_temp_files()
@@ -544,8 +545,17 @@ class AutomatedWorkflow:
         except Exception as e:
             logger.warning(f"Failed to move {src_path.name} to failures: {e}")
     
+    def _safe_filename_for_logging(self, filename: str) -> str:
+        """Convert filename to safe string for logging, handling Unicode characters."""
+        try:
+            # Try to encode as ASCII, replace problematic characters
+            return filename.encode('ascii', errors='replace').decode('ascii')
+        except Exception:
+            # Fallback: replace any non-ASCII characters with safe alternatives
+            return ''.join(c if ord(c) < 128 else '_' for c in filename)
+
     def _find_new_files(self, processed_files: set, skip_stability_check: bool = False) -> List[Path]:
-        """Find new files, prioritizing GIFs first, then videos."""
+        """Find new files, sorted by creation time (newest first)."""
         files = []
         
         if not self.input_dir.exists():
@@ -591,10 +601,22 @@ class AutomatedWorkflow:
         if len(potential_files) > 10:
             print(f"\r✅ File scan complete: {len(files)} files ready for processing" + " " * 20)
         
-        # Prioritize GIFs first, then videos (keep alphabetical order within each group)
-        gifs_first = sorted([f for f in files if f.suffix.lower() == '.gif'])
-        videos_next = sorted([f for f in files if f.suffix.lower() != '.gif'])
-        return gifs_first + videos_next
+        # Sort by creation time descending (Windows Date Created equivalent), fallback to mtime
+        def _creation_time_desc(path: Path) -> float:
+            try:
+                st = path.stat()
+                # On Windows, st_ctime is creation time; elsewhere it may be metadata change time
+                # This still provides a reasonable ordering, with mtime as a fallback
+                return float(getattr(st, 'st_ctime', st.st_mtime))
+            except Exception:
+                try:
+                    return float(path.stat().st_mtime)
+                except Exception:
+                    return 0.0
+
+        # Newest first
+        sorted_files = sorted(files, key=_creation_time_desc, reverse=True)
+        return sorted_files
     
     def _has_existing_output(self, input_file: Path) -> bool:
         """
@@ -886,7 +908,8 @@ class AutomatedWorkflow:
                 return 'cancelled'
             
             self.current_task = f"Processing {video_file.name}"
-            logger.info(f"Starting processing: {video_file.name}")
+            safe_name = self._safe_filename_for_logging(video_file.name)
+            logger.info(f"Starting processing: {safe_name}")
         
         print(f"\n📹 Processing: {video_file.name}")
         
@@ -907,8 +930,10 @@ class AutomatedWorkflow:
             # Step 2: Convert to MP4 if needed and optimize
             print("  🔄 Convert/optimize to MP4")
             mp4_file = self._ensure_mp4_format(video_file, max_size_mb)
-            if not mp4_file or self.shutdown_requested:
-                return 'error' if not self.shutdown_requested else 'cancelled'
+            if self.shutdown_requested:
+                return 'cancelled'
+            if not mp4_file:
+                return 'error'
             print(f"  ✅ MP4 optimization complete: {mp4_file.name}")
             
             # Check for shutdown before step 3
@@ -1148,6 +1173,8 @@ class AutomatedWorkflow:
                 print(f"    🛑 Processing cancelled after compression")
                 return None
             
+            if result.get('cancelled'):
+                return None
             if result.get('success', False):
                 # Check if segmentation was used
                 if result.get('method') == 'segmentation' or 'segments' in result:

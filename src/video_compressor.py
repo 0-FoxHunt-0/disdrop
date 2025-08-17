@@ -23,6 +23,11 @@ from .video_segmenter import VideoSegmenter
 
 logger = logging.getLogger(__name__)
 
+class GracefulCancellation(Exception):
+    """Raised to indicate a user-requested shutdown/cancellation."""
+    pass
+
+
 class DynamicVideoCompressor:
     def __init__(self, config_manager: ConfigManager, hardware_detector: HardwareDetector):
         self.config = config_manager
@@ -79,9 +84,16 @@ class DynamicVideoCompressor:
         def cached_analysis(file_path, file_size, target_size):
             return self._analyze_video_content(file_path)
         
-        # Get comprehensive video analysis (cached)
+        # Early-cancel before analysis if shutdown requested
+        if self.shutdown_requested:
+            return {'success': False, 'cancelled': True}
+
+        # Get comprehensive video analysis (cached), but handle graceful cancellation
         file_size = os.path.getsize(input_path)
-        video_info = cached_analysis(input_path, file_size, target_size_mb)
+        try:
+            video_info = cached_analysis(input_path, file_size, target_size_mb)
+        except GracefulCancellation:
+            return {'success': False, 'cancelled': True}
         original_size_mb = file_size / (1024 * 1024)
         
         logger.info(f"Original video: {video_info['width']}x{video_info['height']}, "
@@ -342,6 +354,9 @@ class DynamicVideoCompressor:
     def _analyze_video_content(self, video_path: str) -> Dict[str, Any]:
         """Analyze video content for intelligent compression decisions"""
         try:
+            # Respect shutdown requests: abort analysis without noisy errors
+            if self.shutdown_requested:
+                raise GracefulCancellation()
             # Get basic video info
             cmd = [
                 'ffprobe', '-v', 'quiet', '-print_format', 'json', 
@@ -353,6 +368,9 @@ class DynamicVideoCompressor:
             result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
             
             if result.returncode != 0:
+                # If shutdown occurred during probe, treat as graceful cancel
+                if self.shutdown_requested:
+                    raise GracefulCancellation()
                 raise subprocess.CalledProcessError(result.returncode, cmd, result.stderr)
             
             probe_data = json.loads(result.stdout)
@@ -398,10 +416,18 @@ class DynamicVideoCompressor:
                 'bitrate_per_pixel': bitrate / (width * height) if (width * height) > 0 else 0
             }
             
+        except GracefulCancellation:
+            # Propagate cancellation to caller to avoid further work/log noise
+            raise
         except Exception as e:
-            logger.error(f"Failed to analyze video content: {e}")
-            # Fallback to basic analysis
-            return self._get_basic_video_info(video_path)
+            if self.shutdown_requested:
+                # Avoid alarming error logs on shutdown; return minimal info to allow fast exit
+                logger.info("Video analysis aborted due to shutdown request")
+                raise GracefulCancellation()
+            else:
+                logger.error(f"Failed to analyze video content: {e}")
+                # Fallback to basic analysis
+                return self._get_basic_video_info(video_path)
     
     def _calculate_content_complexity(self, probe_data: Dict, width: int, height: int, duration: float) -> float:
         """Calculate content complexity score (0-10, higher = more complex)"""
