@@ -71,8 +71,18 @@ class TeeStream:
                 text = data.decode('utf-8', errors='replace')
             else:
                 text = data
-            # Write to console first
-            self._original_stream.write(text)
+            # Write to console first with encoding-safe fallback
+            try:
+                self._original_stream.write(text)
+            except Exception:
+                # Windows cp1252 console may fail on some Unicode (e.g., U+29F8). Fallback to replacement.
+                safe_text = text.encode(self.encoding or 'utf-8', errors='replace').decode(self.encoding or 'utf-8', errors='replace')
+                try:
+                    self._original_stream.write(safe_text)
+                except Exception:
+                    # As last resort, strip non-ASCII
+                    ascii_text = ''.join(ch if ord(ch) < 128 else '?' for ch in text)
+                    self._original_stream.write(ascii_text)
             # Then to file
             self._tee_file.write(text)
         except Exception:
@@ -300,7 +310,10 @@ def setup_logging(config_path: str = "config/logging.yaml", log_level: Optional[
                 # Force console to WARNING when no explicit log_level passed
                 if not log_level:
                     console_handler['level'] = 'WARNING'
-            # Ensure file handlers are DEBUG by default
+                # Force UTF-8 console handler to avoid cp1252 Unicode errors
+                console_handler['class'] = f"{__name__}.UTF8StreamHandler"
+                console_handler.pop('stream', None)
+            # Ensure file handlers are DEBUG by default and use UTF-8 encoding
             for hname in ('file', 'error_file'):
                 handler = logging_config.get('handlers', {}).get(hname)
                 if handler:
@@ -308,6 +321,7 @@ def setup_logging(config_path: str = "config/logging.yaml", log_level: Optional[
                         handler['level'] = 'DEBUG'
                     elif hname == 'error_file':
                         handler['level'] = 'ERROR'
+                    handler['encoding'] = 'utf-8'
             # Root level should be DEBUG to capture all into file handler
             if 'root' in logging_config:
                 logging_config['root']['level'] = 'DEBUG'

@@ -35,11 +35,23 @@ class VideoSegmenter:
         self.current_ffmpeg_process = None
         self._proc_lock = threading.Lock()
         self._active_processes: set[subprocess.Popen] = set()
+        self._print_lock = threading.Lock()
         
         # Multiprocessing configuration - dynamic analysis with fallback
         self.max_workers = self._calculate_optimal_workers()
         
         logger.info(f"Video segmenter initialized with {self.max_workers} concurrent workers")
+
+    def _threadsafe_print(self, message: str) -> None:
+        """Print from multiple worker threads without interleaving lines."""
+        try:
+            with self._print_lock:
+                print(message, flush=True)
+        except Exception:
+            try:
+                print(message)
+            except Exception:
+                pass
     
     def _calculate_optimal_workers(self) -> int:
         """
@@ -338,8 +350,10 @@ class VideoSegmenter:
                     segment_filename = f"{base_name}_segment_{i+1:03d}.mp4"
                     segment_path = os.path.join(temp_segments_folder, segment_filename)
                     
-                    print(f"    🔄 Processing segment {i+1}/{num_segments}: {segment_duration_actual:.1f}s "
-                          f"({segment_start:.1f}s - {segment_end:.1f}s)")
+                    self._threadsafe_print(
+                        f"    🔄 Processing segment {i+1}/{num_segments}: {segment_duration_actual:.1f}s "
+                        f"({segment_start:.1f}s - {segment_end:.1f}s)"
+                    )
                     logger.info(f"Processing segment {i+1}/{num_segments}: {segment_duration_actual:.1f}s "
                                f"({segment_start:.1f}s - {segment_end:.1f}s)")
                     
@@ -403,22 +417,49 @@ class VideoSegmenter:
             completed_count = 0
             
             logger.info(f"Starting parallel video segmentation with {self.max_workers} workers for {num_segments} segments")
-            print(f"    🔄 Processing {num_segments} segments with {self.max_workers} concurrent workers...")
+            self._threadsafe_print(f"    🔄 Processing {num_segments} segments with {self.max_workers} concurrent workers...")
             
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 futures = [executor.submit(_process_segment, i) for i in indices]
-                for future in as_completed(futures):
-                    try:
-                        segment_info = future.result()
-                        if segment_info:
-                            segments.append(segment_info)
-                            temp_files.append(segment_info['path'])
-                            completed_count += 1
-                            # Show progress with actual completion count, not segment index
-                            print(f"    ✅ Segment {completed_count}/{num_segments} completed: {segment_info['size_mb']:.2f}MB "
-                                  f"using {segment_info.get('method', 'unknown')} method")
-                    except Exception as e:
-                        logger.warning(f"Segment future failed: {e}")
+                pending = set(futures)
+                try:
+                    while pending:
+                        if self.shutdown_requested:
+                            for f in list(pending):
+                                f.cancel()
+                            try:
+                                executor.shutdown(wait=False, cancel_futures=True)
+                            except TypeError:
+                                executor.shutdown(wait=False)
+                            break
+                        # Poll for any completions
+                        done = []
+                        for f in list(pending):
+                            if f.done():
+                                done.append(f)
+                        if not done:
+                            time.sleep(0.1)
+                            continue
+                        for fut in done:
+                            pending.discard(fut)
+                            try:
+                                segment_info = fut.result()
+                            except Exception as e:
+                                logger.warning(f"Segment future failed: {e}")
+                                continue
+                            if segment_info:
+                                segments.append(segment_info)
+                                temp_files.append(segment_info['path'])
+                                completed_count += 1
+                                self._threadsafe_print(
+                                    f"    ✅ Segment {completed_count}/{num_segments} completed: {segment_info['size_mb']:.2f}MB "
+                                    f"using {segment_info.get('method', 'unknown')} method")
+                finally:
+                    if self.shutdown_requested:
+                        try:
+                            executor.shutdown(wait=False, cancel_futures=True)
+                        except TypeError:
+                            executor.shutdown(wait=False)
             
             # Check if all segments were created successfully
             if len(segments) != num_segments:
@@ -527,16 +568,18 @@ class VideoSegmenter:
                 '-t', str(duration),
                 '-c:v', encoder,
             ]
-            # Quality/bitrate selection: use CRF only for software encoders; otherwise use bitrate
-            if accel_type == 'software' and 'crf' in segment_params:
-                cmd.extend(['-crf', str(segment_params.get('crf'))])
+            # Quality/bitrate selection
+            if accel_type == 'software':
+                # Software: CRF and preset are valid
+                if 'crf' in segment_params:
+                    cmd.extend(['-crf', str(segment_params.get('crf'))])
                 if 'preset' in segment_params:
                     cmd.extend(['-preset', segment_params.get('preset', 'medium')])
             else:
+                # Hardware encoders (AMF/NVENC/QSV): avoid software-style preset strings
                 if 'bitrate' in segment_params:
                     cmd.extend(['-b:v', str(segment_params['bitrate'])])
-                if 'preset' in segment_params:
-                    cmd.extend(['-preset', segment_params.get('preset', 'medium')])
+                # Do not append -preset here; vendor presets differ and can break (e.g., AMF)
             cmd.extend([
                 '-vf', f"scale={segment_params['width']}:{segment_params['height']}:flags=lanczos",
                 '-r', str(segment_params['fps']),
@@ -555,11 +598,16 @@ class VideoSegmenter:
                 with self._proc_lock:
                     self._active_processes.add(process)
                 start_time_poll = time.time()
-                # Dynamic timeout based on encoder type and segment duration
-                if accel_type == 'software':
-                    timeout_seconds = max(duration * 6.0, 480)
-                else:
-                    timeout_seconds = max(duration * 3.0, 240)
+                # Dynamic timeout based on encoder type and segment duration (configurable; can be disabled)
+                try:
+                    enable_timeout = bool(self.config.get('video_compression.segmentation.enable_timeout', False))
+                except Exception:
+                    enable_timeout = False
+                if enable_timeout:
+                    if accel_type == 'software':
+                        timeout_seconds = max(duration * 6.0, 480)
+                    else:
+                        timeout_seconds = max(duration * 3.0, 240)
                 while process.poll() is None:
                     if self.shutdown_requested:
                         self._terminate_ffmpeg_process(process)
@@ -567,7 +615,7 @@ class VideoSegmenter:
                             'success': False,
                             'error': 'Shutdown requested during segment creation'
                         }
-                    if time.time() - start_time_poll > timeout_seconds:
+                    if enable_timeout and (time.time() - start_time_poll > timeout_seconds):
                         logger.warning("Segment creation timeout, terminating...")
                         self._terminate_ffmpeg_process(process)
                         return {

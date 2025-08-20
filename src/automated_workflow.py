@@ -444,63 +444,77 @@ class AutomatedWorkflow:
         key = self._make_cache_key(input_file)
         rec = self._cache_index.get(key)
         if not isinstance(rec, dict):
-            logger.debug(f"Cache miss for {input_file.name}: no valid record")
+            safe_name = self._safe_filename_for_logging(input_file.name)
+            logger.debug(f"Cache miss for {safe_name}: no valid record")
             return False
         
         # Verify signature matches
         sig = self._get_input_signature(input_file)
         if not sig or rec.get('input_signature') != sig:
-            logger.debug(f"Cache miss for {input_file.name}: signature mismatch")
+            safe_name = self._safe_filename_for_logging(input_file.name)
+            logger.debug(f"Cache miss for {safe_name}: signature mismatch")
             return False
         # Quick output existence check
         out_type = rec.get('type')
         out_path = rec.get('output')
         if not out_type or not out_path:
-            logger.debug(f"Cache miss for {input_file.name}: missing output info")
+            safe_name = self._safe_filename_for_logging(input_file.name)
+            logger.debug(f"Cache miss for {safe_name}: missing output info")
             return False
         try:
             if out_type == 'single_gif':
                 exists = Path(out_path).exists()
                 if exists:
-                    logger.debug(f"Cache hit for {input_file.name}: single GIF exists")
+                    safe_name = self._safe_filename_for_logging(input_file.name)
+                    logger.debug(f"Cache hit for {safe_name}: single GIF exists")
                 else:
-                    logger.debug(f"Cache miss for {input_file.name}: single GIF missing - {out_path}")
+                    safe_name = self._safe_filename_for_logging(input_file.name)
+                    logger.debug(f"Cache miss for {safe_name}: single GIF missing - {out_path}")
                 return exists
             elif out_type == 'segments':
                 seg_dir = Path(out_path)
                 if not seg_dir.exists() or not seg_dir.is_dir():
-                    logger.debug(f"Cache miss for {input_file.name}: segments directory missing - {out_path}")
+                    safe_name = self._safe_filename_for_logging(input_file.name)
+                    logger.debug(f"Cache miss for {safe_name}: segments directory missing - {out_path}")
                     return False
                 # Check if at least one GIF segment exists
                 gif_segments = list(seg_dir.glob("*.gif"))
                 if gif_segments:
-                    logger.debug(f"Cache hit for {input_file.name}: {len(gif_segments)} GIF segments exist")
+                    safe_name = self._safe_filename_for_logging(input_file.name)
+                    logger.debug(f"Cache hit for {safe_name}: {len(gif_segments)} GIF segments exist")
                     return True
                 else:
-                    logger.debug(f"Cache miss for {input_file.name}: no GIF segments found in {out_path}")
+                    safe_name = self._safe_filename_for_logging(input_file.name)
+                    logger.debug(f"Cache miss for {safe_name}: no GIF segments found in {out_path}")
                     return False
             elif out_type == 'gif_input':
                 exists = Path(out_path).exists()
                 if exists:
-                    logger.debug(f"Cache hit for {input_file.name}: GIF input exists")
+                    safe_name = self._safe_filename_for_logging(input_file.name)
+                    logger.debug(f"Cache hit for {safe_name}: GIF input exists")
                 else:
-                    logger.debug(f"Cache miss for {input_file.name}: GIF input missing - {out_path}")
+                    safe_name = self._safe_filename_for_logging(input_file.name)
+                    logger.debug(f"Cache miss for {safe_name}: GIF input missing - {out_path}")
                 return exists
             elif out_type == 'single_mp4':
                 # Do not treat MP4-only outputs as a final success for caching purposes.
                 # An MP4 may exist from a previous run, but GIFs might still need generation.
                 if Path(out_path).exists():
+                    safe_name = self._safe_filename_for_logging(input_file.name)
                     logger.debug(
-                        f"Cache record has MP4 for {input_file.name}, not skipping; GIFs may still be needed"
+                        f"Cache record has MP4 for {safe_name}, not skipping; GIFs may still be needed"
                     )
                 else:
-                    logger.debug(f"Cache miss for {input_file.name}: single MP4 missing - {out_path}")
+                    safe_name = self._safe_filename_for_logging(input_file.name)
+                    logger.debug(f"Cache miss for {safe_name}: single MP4 missing - {out_path}")
                 return False
             else:
-                logger.debug(f"Cache miss for {input_file.name}: unknown output type '{out_type}'")
+                safe_name = self._safe_filename_for_logging(input_file.name)
+                logger.debug(f"Cache miss for {safe_name}: unknown output type '{out_type}'")
                 return False
         except Exception as e:
-            logger.debug(f"Cache miss for {input_file.name}: error checking output: {e}")
+            safe_name = self._safe_filename_for_logging(input_file.name)
+            logger.debug(f"Cache miss for {safe_name}: error checking output: {e}")
             return False
         return False
 
@@ -1392,8 +1406,10 @@ class AutomatedWorkflow:
             if self.shutdown_requested:
                 return False
             
-            print(f"    🎨 Generating GIF: {mp4_file.name} -> {gif_name}")
-            logger.info(f"Generating GIF from MP4: {mp4_file.name} -> {gif_name}")
+            safe_name_in = self._safe_filename_for_logging(mp4_file.name)
+            safe_name_out = self._safe_filename_for_logging(gif_name)
+            print(f"    🎨 Generating GIF: {safe_name_in} -> {safe_name_out}")
+            logger.info(f"Generating GIF from MP4: {safe_name_in} -> {safe_name_out}")
             
             # Check for shutdown before starting GIF generation
             if self.shutdown_requested:
@@ -1615,7 +1631,9 @@ class AutomatedWorkflow:
                         print(f"    ⚠️  Could not get segment duration, proceeding with caution: {e}")
                         logger.warning(f"Could not get segment duration for {segment_file.name}: {e}")
 
-                    gif_name = segment_file.stem + ".gif"
+                    # Sanitize the filename to avoid Unicode encoding issues
+                    safe_stem = self._safe_filename_for_filesystem(segment_file.stem)
+                    gif_name = safe_stem + ".gif"
                     gif_path = segments_folder / gif_name
                     # Reuse if valid
                     if gif_path.exists():
@@ -1723,7 +1741,23 @@ class AutomatedWorkflow:
             return [], []
         
         # Collect GIF files first
-        gif_files = [f for f in segments_folder.iterdir() if f.is_file() and f.suffix.lower() == '.gif']
+        gif_files = sorted([f for f in segments_folder.iterdir() if f.is_file() and f.suffix.lower() == '.gif'])
+        # Heuristic: infer expected number of segments from filenames like *_segment_01.gif
+        expected = None
+        try:
+            import re
+            indices = []
+            for f in gif_files:
+                m = re.search(r"_segment_(\d+)\\.gif$", f.name)
+                if m:
+                    try:
+                        indices.append(int(m.group(1)))
+                    except Exception:
+                        pass
+            if indices:
+                expected = max(indices)
+        except Exception:
+            expected = None
         if not gif_files:
             return [], []
         
@@ -1752,6 +1786,21 @@ class AutomatedWorkflow:
                 else:
                     invalid_gifs.append(gf)
         
+        # If we can infer expected count, cross-check completeness; mark missing as invalid
+        if expected is not None:
+            present_count = len(gif_files)
+            if present_count < expected:
+                try:
+                    missing = expected - present_count
+                    print(f"    ⚠️  Segment completeness check: expected {expected}, found {present_count} (missing {missing})")
+                    logger.warning(
+                        f"Segment completeness check failed for {segments_folder.name}: expected {expected}, found {present_count}"
+                    )
+                except Exception:
+                    pass
+                # Consider folder invalid if incomplete; treat all as invalid to trigger regeneration
+                return [], gif_files
+
         return valid_gifs, invalid_gifs
     
     def _calculate_optimal_segmentation_workers(self) -> int:
@@ -2323,6 +2372,23 @@ class AutomatedWorkflow:
             if not should_segment:
                 print("    ℹ️  Segmentation not needed based on size/duration heuristics")
                 return False
+
+            # Prefer single file before splitting: try optimizing whole GIF first
+            try:
+                prefer_single_first = bool(self.config.get('gif_settings.segmentation.prefer_single_file_first', True))
+            except Exception:
+                prefer_single_first = True
+            if prefer_single_first and (preferred_segments is None or int(preferred_segments) == 1):
+                print("    🧪 Trying single-file optimization before segmentation...")
+                logger.info("Attempting single-file optimization before segmentation")
+                single_attempt = self._optimize_gif_file(gif_file, max_size_mb)
+                if single_attempt == 'success':
+                    print("    ✅ Single-file optimization succeeded; skipping segmentation")
+                    logger.info("Single-file optimization succeeded; segmentation skipped")
+                    return True
+                else:
+                    print("    ↪️  Single-file attempt did not meet target; proceeding with segmentation")
+                    logger.info("Single-file attempt failed to meet target; proceeding with segmentation")
 
             # Decide target segment duration using base durations if provided
             def pick_segment_duration(total_duration: float) -> float:

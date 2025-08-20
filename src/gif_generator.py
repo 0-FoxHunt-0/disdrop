@@ -19,6 +19,7 @@ import json
 import hashlib
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
+import threading
 
 from .config_manager import ConfigManager
 from .ffmpeg_utils import FFmpegUtils
@@ -78,6 +79,16 @@ class GifGenerator:
         except Exception:
             return bool(self.shutdown_requested)
 
+    def _safe_text_for_logging(self, text: str) -> str:
+        """Return a version of text safe for cp1252 consoles by replacing unsupported chars."""
+        try:
+            return text.encode('cp1252', errors='replace').decode('cp1252', errors='replace')
+        except Exception:
+            try:
+                return text.encode('ascii', errors='replace').decode('ascii', errors='replace')
+            except Exception:
+                return ''.join(c if ord(c) < 128 else '?' for c in text)
+
     def create_gif(self, input_video: str, output_path: str, platform: str = None,
                   max_size_mb: int = None, start_time: float = 0, 
                   duration: float = None, disable_segmentation: bool = False) -> Dict[str, Any]:
@@ -113,14 +124,81 @@ class GifGenerator:
             if duration is None:
                 duration = min(settings['max_duration'], video_info.get('duration', settings['max_duration']))
             
-            # Check if video should be split (unless segmentation is disabled)
+            # Quick feasibility pre-check to avoid long attempts when single-file is impossible
+            try:
+                quick_enabled = bool(self.config.get('gif_settings.single_gif.quick_feasibility.enabled', True))
+            except Exception:
+                quick_enabled = True
+            if (not disable_segmentation) and quick_enabled and (not self._is_segmented_video(input_video)):
+                logger.info("Starting quick single-GIF feasibility check before full optimization")
+                print("    🧪 Quick feasibility check: testing harsh single-file settings...")
+                feasible, feas_size_mb, feas_path = self._quick_single_feasibility_check(input_video, settings, start_time, duration)
+                if feasible:
+                    try:
+                        target_mb = float(settings.get('max_size_mb', 10.0) or 10.0)
+                    except Exception:
+                        target_mb = 10.0
+                    logger.info(f"Feasibility check PASSED: size={feas_size_mb:.2f}MB <= target {target_mb:.2f}MB; attempting single-file")
+                    # Adopt feasibility artifact if present to skip duplicate work
+                    if feas_path and os.path.exists(feas_path):
+                        try:
+                            out_dir = os.path.dirname(output_path)
+                            if out_dir and not os.path.exists(out_dir):
+                                os.makedirs(out_dir)
+                            shutil.move(feas_path, output_path)
+                            print(f"    ✅ Feasibility artifact adopted: {feas_size_mb:.2f}MB <= target {target_mb:.2f}MB")
+                            return {
+                                'success': True,
+                                'size_mb': feas_size_mb,
+                                'duration': duration,
+                                'fps': settings['fps'],
+                                'scale': settings.get('scale') or settings.get('width'),
+                                'method': 'single_feasibility_adopted'
+                            }
+                        except Exception as adopt_e:
+                            logger.debug(f"Could not adopt feasibility artifact, proceeding to full encode: {adopt_e}")
+                    print(f"    ✅ Feasibility check passed: {feas_size_mb:.2f}MB <= target {target_mb:.2f}MB; attempting single-file GIF first")
+                else:
+                    logger.info("Feasibility check FAILED: falling back to segmentation to save time")
+                    try:
+                        max_size_mb = float(settings.get('max_size_mb', 10.0) or 10.0)
+                    except Exception:
+                        max_size_mb = 10.0
+                    if feas_size_mb is not None:
+                        print(f"    ↩️  Feasibility check failed: {feas_size_mb:.2f}MB > target {max_size_mb:.2f}MB; falling back to segmentation")
+                    else:
+                        print("    ↩️  Feasibility check failed: falling back to segmentation")
+                    return self._create_segmented_gifs(input_video, output_path, settings, start_time, duration)
+
+            # Prefer single file before splitting: attempt single-GIF first
             if not disable_segmentation and self._should_split_video(input_video, duration, settings):
-                logger.info(f"Video duration ({duration:.1f}s) exceeds platform limit ({settings['max_duration']:.1f}s), splitting into segments")
+                logger.info(
+                    f"Segmentation suggested (duration {duration:.1f}s or estimated size). Trying single-file creation first."
+                )
+                single_result = self._create_single_gif(input_video, output_path, settings, start_time, duration)
+                if single_result and single_result.get('success', False):
+                    logger.info("Single-file GIF succeeded; skipping segmentation")
+                    return single_result
+                logger.info("Single-file attempt failed or not under target; proceeding with segmentation as fallback")
+                print("    ↩️  Single-file attempt failed/not under target; proceeding with segmentation")
                 return self._create_segmented_gifs(input_video, output_path, settings, start_time, duration)
             
-            # Create single GIF
-            logger.info(f"Creating single GIF: {input_video} -> {output_path}")
-            return self._create_single_gif(input_video, output_path, settings, start_time, duration)
+            # Create single GIF with robust fallback
+            logger.info(f"Creating single GIF: {self._safe_text_for_logging(str(input_video))} -> {self._safe_text_for_logging(str(output_path))}")
+            single_result = None
+            try:
+                single_result = self._create_single_gif(input_video, output_path, settings, start_time, duration)
+            except Exception as e:
+                logger.warning(f"Single-file GIF generation threw exception: {e}")
+                single_result = {'success': False, 'error': str(e)}
+            if single_result and single_result.get('success', False):
+                return single_result
+            # If single-file failed and segmentation is allowed, fallback to segmentation even if split wasn't suggested
+            if not disable_segmentation and (not self._is_segmented_video(input_video)):
+                logger.info("Single-file GIF failed; falling back to segmentation")
+                print("    ↩️  Single-file GIF failed; falling back to segmentation")
+                return self._create_segmented_gifs(input_video, output_path, settings, start_time, duration)
+            return single_result
             
         except Exception as e:
             logger.error(f"Error creating GIF: {e}")
@@ -199,6 +277,10 @@ class GifGenerator:
             settings['width'] = gif_config.get('width', settings.get('scale', 480))
             settings['height'] = gif_config.get('height', -1)  # -1 means preserve aspect ratio
             settings['fps'] = gif_config.get('fps', settings['fps'])
+            # Align generator limits with config where available
+            settings['max_duration'] = gif_config.get('max_duration_seconds', settings['max_duration'])
+            if max_size_mb is None:
+                settings['max_size_mb'] = gif_config.get('max_file_size_mb', settings['max_size_mb'])
         
         return settings
     
@@ -277,7 +359,7 @@ class GifGenerator:
             return settings['max_size_mb']  # Conservative estimate
     
     def _create_single_gif(self, input_video: str, output_path: str, settings: Dict[str, Any], 
-                          start_time: float, duration: float) -> Dict[str, Any]:
+                          start_time: float, duration: float, deadline: Optional[float] = None) -> Dict[str, Any]:
         """Create a single optimized GIF"""
         try:
             # Check if input video still exists
@@ -289,29 +371,73 @@ class GifGenerator:
             if output_dir and not os.path.exists(output_dir):
                 os.makedirs(output_dir)
             
-            # First try a single-pass split palette pipeline with mpdecimate and optional crop
-            split_success = self._create_gif_split_palette(input_video, output_path, settings, start_time, duration)
-            
-            if not split_success:
-                # Fallback: two-step palette path
-                palette_path = self._generate_palette(input_video, settings, start_time, duration)
-                if not palette_path:
-                    return {'success': False, 'error': 'Failed to generate palette'}
-                
-                # Double-check input video exists before creating GIF
-                if not os.path.exists(input_video):
+            # Optionally precompute palette in parallel while running split-palette encode
+            enable_parallel_palette = bool(self.config.get('gif_settings.performance.single_gif_parallel.precompute_palette', True))
+            palette_future = None
+            palette_tmp_path: Optional[str] = None
+            palette_cancel_event: Optional[threading.Event] = None
+            palette_generator: Optional[GifGenerator] = None
+
+            if enable_parallel_palette:
+                try:
+                    palette_cancel_event = threading.Event()
+                    # Use a dedicated generator so we can cancel only the palette run without affecting main encode
+                    palette_generator = GifGenerator(
+                        self.config,
+                        shutdown_checker=lambda: bool(self._is_shutdown_requested() or (palette_cancel_event.is_set() if palette_cancel_event else False))
+                    )
+                    def _gen_palette() -> Optional[str]:
+                        return palette_generator._generate_palette(input_video, settings, start_time, duration)
+                    with ThreadPoolExecutor(max_workers=1) as _exec:
+                        palette_future = _exec.submit(_gen_palette)
+                        # Run split-palette while palette is being generated in background
+                        split_success = self._create_gif_split_palette(input_video, output_path, settings, start_time, duration)
+                        if split_success:
+                            success = True
+                            # Cancel palette work if still running
+                            if palette_cancel_event:
+                                palette_cancel_event.set()
+                            # Best-effort: do not wait for palette_future; it will stop via shutdown checker
+                        else:
+                            # Need two-step path. Obtain palette result (or compute synchronously if failed)
+                            try:
+                                palette_tmp_path = palette_future.result(timeout=60) if palette_future else None
+                            except Exception:
+                                palette_tmp_path = None
+                            if not palette_tmp_path:
+                                # Background generation did not succeed; generate palette now
+                                palette_tmp_path = self._generate_palette(input_video, settings, start_time, duration)
+                            if not palette_tmp_path:
+                                return {'success': False, 'error': 'Failed to generate palette'}
+                            # Double-check input video exists before creating GIF
+                            if not os.path.exists(input_video):
+                                if os.path.exists(palette_tmp_path):
+                                    os.unlink(palette_tmp_path)
+                                return {'success': False, 'error': f'Input video disappeared during processing: {input_video}'}
+                            success = self._create_gif_with_palette(input_video, output_path, palette_tmp_path, settings, start_time, duration)
+                finally:
+                    # Cleanup palette file if created
+                    try:
+                        if palette_tmp_path and os.path.exists(palette_tmp_path):
+                            os.unlink(palette_tmp_path)
+                    except Exception:
+                        pass
+            else:
+                # Non-parallel original flow
+                split_success = self._create_gif_split_palette(input_video, output_path, settings, start_time, duration)
+                if not split_success:
+                    palette_path = self._generate_palette(input_video, settings, start_time, duration)
+                    if not palette_path:
+                        return {'success': False, 'error': 'Failed to generate palette'}
+                    if not os.path.exists(input_video):
+                        if os.path.exists(palette_path):
+                            os.unlink(palette_path)
+                        return {'success': False, 'error': f'Input video disappeared during processing: {input_video}'}
+                    success = self._create_gif_with_palette(input_video, output_path, palette_path, settings, start_time, duration)
                     if os.path.exists(palette_path):
                         os.unlink(palette_path)
-                    return {'success': False, 'error': f'Input video disappeared during processing: {input_video}'}
-                
-                # Create GIF with palette
-                success = self._create_gif_with_palette(input_video, output_path, palette_path, settings, start_time, duration)
-                
-                # Clean up palette
-                if os.path.exists(palette_path):
-                    os.unlink(palette_path)
-            else:
-                success = True
+                else:
+                    success = True
             
             if success:
                 # Get final file size
@@ -321,6 +447,7 @@ class GifGenerator:
                     # If still over limit, use iterative optimizer to target size precisely
                     if size_mb > settings['max_size_mb']:
                         logger.info(f"GIF size ({size_mb:.2f}MB) exceeds limit ({settings['max_size_mb']:.2f}MB), iterative optimization...")
+                        optimization_succeeded = False
                         try:
                             # Use iterative optimizer to generate best-under-limit GIF, then move to output_path
                             opt_result = self.optimizer.optimize_gif_with_quality_target(
@@ -341,23 +468,29 @@ class GifGenerator:
                                         # Fallback to copy
                                         shutil.copy2(opt_result['output_file'], output_path)
                                         os.remove(opt_result['output_file'])
-                                
                                 # Validate final size after move
                                 size_mb = os.path.getsize(output_path) / (1024 * 1024)
-                                if size_mb > settings['max_size_mb']:
-                                    logger.error(f"Final GIF after optimization still exceeds limit: {size_mb:.2f}MB > {settings['max_size_mb']:.2f}MB")
-                                    # Remove the oversized file
-                                    try:
-                                        os.remove(output_path)
-                                    except Exception:
-                                        pass
-                                    return {
-                                        'success': False,
-                                        'error': f"Final GIF size ({size_mb:.2f}MB) exceeds limit ({settings['max_size_mb']:.2f}MB)",
-                                        'size_mb': size_mb
-                                    }
+                                optimization_succeeded = (size_mb <= settings['max_size_mb'])
                         except Exception as e:
                             logger.warning(f"Iterative optimization failed: {e}")
+                            optimization_succeeded = False
+                        if not optimization_succeeded:
+                            # Ensure we don't return success if still over target
+                            try:
+                                final_size_mb = os.path.getsize(output_path) / (1024 * 1024) if os.path.exists(output_path) else size_mb
+                            except Exception:
+                                final_size_mb = size_mb
+                            logger.error(f"Final GIF exceeds limit after optimization attempts: {final_size_mb:.2f}MB > {settings['max_size_mb']:.2f}MB")
+                            try:
+                                if os.path.exists(output_path):
+                                    os.remove(output_path)
+                            except Exception:
+                                pass
+                            return {
+                                'success': False,
+                                'error': f"Final GIF size ({final_size_mb:.2f}MB) exceeds limit ({settings['max_size_mb']:.2f}MB)",
+                                'size_mb': final_size_mb
+                            }
                     
                     return {
                         'success': True,
@@ -391,16 +524,28 @@ class GifGenerator:
             
             # Build filter with mpdecimate + fps + scale (no crop)
             pre_chain = []
-            pre_chain.append('mpdecimate=hi=512:lo=256:frac=0.3')
+            # Support aggressive settings for feasibility checks
+            if settings.get('mpdecimate_aggressive'):
+                pre_chain.append('mpdecimate=hi=768:lo=64:frac=0.4')
+            else:
+                pre_chain.append('mpdecimate=hi=512:lo=256:frac=0.3')
             pre_chain.append(f"fps={settings['fps']}")
             
             # Get video info for optimal scaling
             video_info = self.ffmpeg_utils.get_video_info(safe_input_path)
-            optimal_width, optimal_height = self._calculate_optimal_scale(video_info, settings['scale'], settings['max_size_mb'])
+            # Prefer explicit width/height when provided (feasibility path may set width directly)
+            if 'width' in settings and int(settings.get('width') or 0) > 0:
+                optimal_width = int(settings['width'])
+                optimal_height = -2 if int(settings.get('height', -1) or -1) == -1 else int(settings['height'])
+            else:
+                optimal_width, optimal_height = self._calculate_optimal_scale(
+                    video_info, settings.get('scale', settings.get('width', 480)), settings['max_size_mb']
+                )
             
             # Improved scaling: preserve aspect ratio better and use higher quality
             pre_chain.append(f"scale={optimal_width}:{optimal_height}:flags=lanczos")
-            vf = ','.join(pre_chain + ["palettegen=max_colors=256:stats_mode=diff:reserve_transparent=1"])  # Improved palette settings
+            max_colors = int(settings.get('palette_max_colors', 256))
+            vf = ','.join(pre_chain + [f"palettegen=max_colors={max_colors}:stats_mode=diff:reserve_transparent=1"])  # Improved palette settings
 
             # Palette cache key
             cache_dir = os.path.join(self.config.get_temp_dir(), 'palette_cache')
@@ -477,7 +622,10 @@ class GifGenerator:
             
             # Build filter graph with mpdecimate, fps, scale and paletteuse (no crop)
             pre_chain = []
-            pre_chain.append('mpdecimate=hi=512:lo=256:frac=0.3')
+            if settings.get('mpdecimate_aggressive'):
+                pre_chain.append('mpdecimate=hi=768:lo=64:frac=0.4')
+            else:
+                pre_chain.append('mpdecimate=hi=512:lo=256:frac=0.3')
             pre_chain.append(f"fps={settings['fps']}")
             
             # Get video info for optimal scaling
@@ -497,7 +645,8 @@ class GifGenerator:
                 logger.info(f"GIF scaling: using specified dimensions {target_width}x{target_height}")
             
             pre_chain.append(scale_filter)
-            lavfi = ','.join(pre_chain) + " [x]; [x][1:v] paletteuse=dither=sierra2_4a:diff_mode=rectangle:new=1"
+            dither = settings.get('dither', 'sierra2_4a')
+            lavfi = ','.join(pre_chain) + f" [x]; [x][1:v] paletteuse=dither={dither}:diff_mode=rectangle:new=1"
 
             # Build FFmpeg command for GIF creation
             cmd = [
@@ -767,7 +916,9 @@ class GifGenerator:
             # Create output directory for segments
             output_dir = os.path.dirname(output_path)
             base_name = os.path.splitext(os.path.basename(output_path))[0]
-            segments_dir = os.path.join(output_dir, f"{base_name}_segments")
+            # Sanitize base_name to avoid Unicode encoding issues
+            safe_base_name = self._safe_filename_for_filesystem(base_name)
+            segments_dir = os.path.join(output_dir, f"{safe_base_name}_segments")
             
             if not os.path.exists(segments_dir):
                 os.makedirs(segments_dir)
@@ -786,7 +937,7 @@ class GifGenerator:
             def _process_segment(i: int) -> Tuple[bool, float, str]:
                 try:
                     if self._is_shutdown_requested():
-                        return (False, 0.0, f"{base_name}_segment_{i+1:02d}.gif")
+                        return (False, 0.0, f"{safe_base_name}_segment_{i+1:02d}.gif")
                     segment_start = start_time + (i * segment_duration)
                     raw_end = start_time + duration
                     segment_end = min(raw_end, segment_start + segment_duration)
@@ -796,7 +947,7 @@ class GifGenerator:
                     if segment_duration_actual <= 0:
                         return (False, 0.0, f"zero-length segment {i+1}")
 
-                    segment_name = f"{base_name}_segment_{i+1:02d}.gif"
+                    segment_name = f"{safe_base_name}_segment_{i+1:02d}.gif"
                     segment_path = os.path.join(segments_dir, segment_name)
 
                     # Use a fresh generator instance to avoid shared process state across threads
@@ -814,7 +965,7 @@ class GifGenerator:
                         return (False, 0.0, segment_name)
                 except Exception as e:
                     logger.warning(f"Exception in segment {i+1}: {e}")
-                    return (False, 0.0, f"{base_name}_segment_{i+1:02d}.gif")
+                    return (False, 0.0, f"{safe_base_name}_segment_{i+1:02d}.gif")
 
             indices = list(range(num_segments))
             results: List[Tuple[bool, float, str]] = []
@@ -868,7 +1019,7 @@ class GifGenerator:
                 
                 # Create comprehensive summary for the segments folder
                 try:
-                    self._create_comprehensive_segments_summary(segments_dir, base_name)
+                    self._create_comprehensive_segments_summary(segments_dir, safe_base_name)
                 except Exception as e:
                     logger.warning(f"Could not create comprehensive summary: {e}")
                 
@@ -1043,6 +1194,145 @@ class GifGenerator:
 
         except Exception as e:
             logger.warning(f"Comprehensive summary creation failed for {segments_dir}: {e}")
+    
+    def _safe_filename_for_filesystem(self, filename: str) -> str:
+        """Convert filename to safe string for filesystem operations, handling problematic Unicode characters."""
+        try:
+            # Replace problematic Unicode characters that cause Windows encoding issues
+            # Specifically handle the problematic character U+29F8 (⧸) and similar
+            safe_chars = []
+            for char in filename:
+                if ord(char) < 128:
+                    # Keep ASCII characters
+                    safe_chars.append(char)
+                elif char == '⧸':  # U+29F8 - replace with regular forward slash
+                    safe_chars.append('/')
+                elif char in ['/', '\\', ':', '*', '?', '"', '<', '>', '|']:
+                    # Replace Windows filesystem-invalid characters with underscore
+                    safe_chars.append('_')
+                else:
+                    # Replace other Unicode characters with underscore
+                    safe_chars.append('_')
+            
+            safe_name = ''.join(safe_chars)
+            
+            # Ensure the filename isn't empty after sanitization
+            if not safe_name.strip():
+                safe_name = 'sanitized_filename'
+            
+            return safe_name
+        except Exception:
+            # Fallback: replace any non-ASCII characters with safe alternatives
+            return ''.join(c if ord(c) < 128 else '_' for c in filename)
+    
+    def _quick_single_feasibility_check(self, input_video: str, settings: Dict[str, Any], 
+                                        start_time: float, duration: float) -> Tuple[bool, Optional[float], Optional[str]]:
+        """Fast pre-check: try an aggressively compressed single GIF to test feasibility.
+
+        Returns (True, size_mb) if a heavily-compressed full-length single GIF can be kept under the size target.
+        Returns (False, size_mb) if even harsh settings cannot meet the size target (suggest segmentation). When
+        an early error occurs before size is measurable, returns (False, None).
+        """
+        try:
+            if self._is_shutdown_requested():
+                return False, None
+            # Derive harsh settings from config, with safe defaults
+            try:
+                target_width = int(self.config.get('gif_settings.single_gif.quick_feasibility.width', 240))
+            except Exception:
+                target_width = 240
+            try:
+                target_fps = int(self.config.get('gif_settings.single_gif.quick_feasibility.fps', 12))
+            except Exception:
+                target_fps = 12
+            max_size_mb = float(settings.get('max_size_mb', 10.0) or 10.0)
+            logger.info(f"Feasibility settings: width={target_width}, fps={target_fps}, target={max_size_mb:.2f}MB, duration={duration:.1f}s")
+
+            # Construct settings overlay that mirrors the real encode parameters
+            feas_settings = dict(settings)
+            # Use exact fps/width/height/scale as real path for accurate prediction
+            feas_settings['fps'] = int(settings.get('fps', target_fps) or target_fps)
+            feas_settings['width'] = int(settings.get('width', target_width) or target_width)
+            feas_settings['height'] = int(settings.get('height', -1) or -1)
+            # Keep default palette and dither consistent with the main encode path
+            feas_settings['palette_max_colors'] = int(settings.get('palette_max_colors', 256))
+            feas_settings['dither'] = settings.get('dither', 'sierra2_4a')
+            feas_settings.pop('mpdecimate_aggressive', None)
+
+            # Generate palette and GIF to temp dir
+            temp_dir = self.config.get_temp_dir()
+            base = os.path.splitext(os.path.basename(input_video))[0]
+            temp_gif = os.path.join(temp_dir, f"{base}.feasibility.gif.tmp")
+            palette_path = None
+            try:
+                palette_path = self._generate_palette(input_video, feas_settings, start_time, duration)
+                if not palette_path:
+                    return False, None, None
+                ok = self._create_gif_with_palette(input_video, temp_gif, palette_path, feas_settings, start_time, duration)
+                if not ok or not os.path.exists(temp_gif):
+                    return False, None, None
+                size_mb = os.path.getsize(temp_gif) / (1024 * 1024)
+                fits = size_mb <= max_size_mb
+                if fits:
+                    logger.info(f"Feasibility result: size={size_mb:.2f}MB <= target {max_size_mb:.2f}MB")
+                    return True, size_mb, temp_gif
+                else:
+                    logger.info(f"Feasibility initial: size={size_mb:.2f}MB > target {max_size_mb:.2f}MB (exceeds by {size_mb - max_size_mb:.2f}MB)")
+                    # Try a very fast optimization pass to approximate final outcome and avoid false negatives
+                    try:
+                        prev = {
+                            'fast_mode': getattr(self.optimizer, 'fast_mode', False),
+                            'gifsicle_time_budget_sec': getattr(self.optimizer, 'gifsicle_time_budget_sec', 25),
+                            'gifsicle_max_candidates': getattr(self.optimizer, 'gifsicle_max_candidates', 48),
+                            'gifsicle_optimize_level': getattr(self.optimizer, 'gifsicle_optimize_level', 2),
+                            'skip_gifsicle_far_over_ratio': getattr(self.optimizer, 'skip_gifsicle_far_over_ratio', 0.35),
+                            'near_target_max_runs': getattr(self.optimizer, 'near_target_max_runs', 12),
+                        }
+                        # Quick mode: tighter budgets
+                        self.optimizer.fast_mode = True
+                        self.optimizer.gifsicle_time_budget_sec = 12
+                        self.optimizer.gifsicle_max_candidates = 24
+                        self.optimizer.gifsicle_optimize_level = 2
+                        self.optimizer.skip_gifsicle_far_over_ratio = 0.35
+                        self.optimizer.near_target_max_runs = 8
+                        ok = self.optimizer.optimize_gif(temp_gif, max_size_mb)
+                    except Exception as opt_e:
+                        logger.debug(f"Feasibility quick-opt failed: {opt_e}")
+                        ok = False
+                    finally:
+                        try:
+                            self.optimizer.fast_mode = prev['fast_mode']
+                            self.optimizer.gifsicle_time_budget_sec = prev['gifsicle_time_budget_sec']
+                            self.optimizer.gifsicle_max_candidates = prev['gifsicle_max_candidates']
+                            self.optimizer.gifsicle_optimize_level = prev['gifsicle_optimize_level']
+                            self.optimizer.skip_gifsicle_far_over_ratio = prev['skip_gifsicle_far_over_ratio']
+                            self.optimizer.near_target_max_runs = prev['near_target_max_runs']
+                        except Exception:
+                            pass
+                    # Recalculate size after quick optimization
+                    try:
+                        if os.path.exists(temp_gif):
+                            size_mb = os.path.getsize(temp_gif) / (1024 * 1024)
+                            fits = size_mb <= max_size_mb
+                            if fits:
+                                logger.info(f"Feasibility quick-opt result: size={size_mb:.2f}MB <= target {max_size_mb:.2f}MB")
+                                return True, size_mb, temp_gif
+                            else:
+                                logger.info(f"Feasibility quick-opt result: size={size_mb:.2f}MB > target {max_size_mb:.2f}MB")
+                                return False, size_mb, temp_gif
+                    except Exception:
+                        pass
+                    return False, size_mb, temp_gif
+            finally:
+                try:
+                    if palette_path and os.path.exists(palette_path):
+                        os.unlink(palette_path)
+                except Exception:
+                    pass
+                # Do not delete temp_gif here; caller may adopt it
+        except Exception as e:
+            logger.debug(f"Feasibility check failed with exception, assuming not feasible: {e}")
+            return False, None, None
     
     def optimize_existing_gif(self, gif_path: str, max_size_mb: float) -> bool:
         """Optimize an existing GIF file to meet size requirements"""

@@ -20,6 +20,10 @@ gif_settings:
   perf:
     threads: auto # auto or integer
     filter_threads: auto # auto or integer
+  performance:
+    # Threading for single GIF path
+    single_gif_parallel:
+      precompute_palette: true
 
   # Multiprocessing configuration
   multiprocessing:
@@ -29,7 +33,7 @@ gif_settings:
     analysis_mode: "recommended" # Analysis mode: "conservative", "recommended", or "maximum_safe"
 
   # Gifsicle performance controls
-  performance:
+  gifsicle_performance:
     fast_mode: true # When true, use faster gifsicle settings and limit search
     gifsicle_time_budget_seconds: 25 # Limit adaptive search time
     gifsicle_max_candidates: 48 # Cap on gifsicle candidate runs
@@ -40,6 +44,13 @@ gif_settings:
   stats_mode: "diff" # full, diff
 
   # Crop detection (disabled by default to avoid slight unintended crops)
+
+  # Single GIF feasibility pre-check (speeds up failure cases by avoiding long attempts)
+  single_gif:
+    quick_feasibility:
+      enabled: true
+      width: 240
+      fps: 12
   crop_detection:
     enabled: false
     # Only apply crop if borders exceed BOTH of these loosened thresholds
@@ -48,6 +59,7 @@ gif_settings:
 
   # Segmentation settings - DISABLED for segmented videos
   segmentation:
+    prefer_single_file_first: true
     # Size-based thresholds (primary decision factors) - More conservative
     size_threshold_multiplier: 2.5 # Increased from 2.2 to be more conservative
     fallback_duration_limit: 180 # Increased from 120 to 3 minutes
