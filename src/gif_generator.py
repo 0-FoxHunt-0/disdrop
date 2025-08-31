@@ -851,7 +851,12 @@ class GifGenerator:
         
         try:
             self.current_ffmpeg_process = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace'
             )
             
             # Poll periodically to check for shutdown requests
@@ -1365,7 +1370,15 @@ class GifGenerator:
             
             # Try to get GIF-specific info using FFmpeg
             cmd = ['ffmpeg', '-i', gif_path]
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=30
+            )
             
             duration = None
             fps = None

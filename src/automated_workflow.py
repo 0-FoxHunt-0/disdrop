@@ -2008,7 +2008,14 @@ class AutomatedWorkflow:
                     str(repaired_path)
                 ]
                 
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace',
+                    timeout=60
+                )
                 
                 if result.returncode == 0 and repaired_path.exists():
                     # Validate the repaired file
@@ -3147,7 +3154,15 @@ class AutomatedWorkflow:
             
             # Try to get GIF-specific info using FFmpeg
             cmd = ['ffmpeg', '-i', gif_path]
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=30
+            )
             
             duration = 0
             fps = 12.0  # Default GIF FPS

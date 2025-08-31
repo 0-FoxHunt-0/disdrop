@@ -130,7 +130,14 @@ class AdvancedVideoOptimizer:
                 'select=gt(scene\\,0.3),showinfo', '-f', 'null', '-'
             ]
             
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=120
+            )
             
             scene_changes = []
             for line in result.stderr.split('\n'):
@@ -163,7 +170,14 @@ class AdvancedVideoOptimizer:
                 '-vf', 'codecview=mv=pf+bf+bb', '-f', 'null', '-'
             ]
             
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=60
+            )
             
             # Analyze motion vector data (simplified)
             motion_data = {
@@ -205,7 +219,13 @@ class AdvancedVideoOptimizer:
                     '-vframes', '1', '-y', frame_path
                 ]
                 
-                result = subprocess.run(cmd, capture_output=True, timeout=30)
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    timeout=30,
+                    encoding='utf-8',
+                    errors='replace'
+                )
                 
                 if result.returncode == 0 and os.path.exists(frame_path):
                     # Analyze frame complexity (simplified)
@@ -250,7 +270,14 @@ class AdvancedVideoOptimizer:
                 '-f', 'null', '-'
             ]
             
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=60
+            )
             
             # Parse noise level (simplified)
             noise_level = 2.0  # Default low noise
@@ -280,7 +307,13 @@ class AdvancedVideoOptimizer:
                 '-y', sample_frame
             ]
             
-            result = subprocess.run(cmd, capture_output=True, timeout=30)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                timeout=30,
+                encoding='utf-8',
+                errors='replace'
+            )
             
             if result.returncode == 0 and os.path.exists(sample_frame):
                 # Analyze edge density based on file size
@@ -308,7 +341,13 @@ class AdvancedVideoOptimizer:
                 '-frames:v', '1', '-f', 'image2', '-'
             ]
             
-            result = subprocess.run(cmd, capture_output=True, timeout=30)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                timeout=30,
+                encoding='utf-8',
+                errors='replace'
+            )
             
             color_data = {
                 'color_variance': 5.0,
@@ -676,7 +715,14 @@ class AdvancedVideoOptimizer:
             ffmpeg_cmd = self._build_advanced_ffmpeg_command(input_path, temp_output, candidate)
             
             # Execute with timeout
-            result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=300)
+            result = subprocess.run(
+                ffmpeg_cmd,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=300
+            )
             
             if result.returncode != 0:
                 # Check if it's a hardware acceleration failure
@@ -873,7 +919,14 @@ class AdvancedVideoOptimizer:
         try:
             cmd = ['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration', 
                    '-of', 'csv=p=0', input_path]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=30
+            )
             
             if result.returncode == 0:
                 duration = float(result.stdout.strip())

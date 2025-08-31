@@ -40,11 +40,20 @@ class FFmpegUtils:
                 'ffprobe', '-v', 'quiet', '-print_format', 'json',
                 '-show_streams', '-select_streams', 'v:0', safe_path
             ]
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=30
+            )
             if result.returncode != 0:
                 return (1920, 1080)
             import json
-            data = json.loads(result.stdout)
+            stdout_text = result.stdout or ""
+            data = json.loads(stdout_text) if stdout_text.strip() else {}
             video_stream = None
             for stream in data.get('streams', []):
                 if stream.get('codec_type') == 'video':
@@ -92,7 +101,15 @@ class FFmpegUtils:
             
             cmd = ['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration', 
                    '-of', 'csv=p=0', safe_path]
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=30
+            )
             
             if result.returncode == 0:
                 duration_str = result.stdout.strip()
@@ -120,11 +137,20 @@ class FFmpegUtils:
                 'ffprobe', '-v', 'quiet', '-print_format', 'json',
                 '-show_format', '-show_streams', video_path
             ]
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=30
+            )
             
             if result.returncode == 0:
                 import json
-                data = json.loads(result.stdout)
+                stdout_text = result.stdout or ""
+                data = json.loads(stdout_text) if stdout_text.strip() else {}
                 
                 # Find video stream
                 video_stream = None
@@ -415,7 +441,15 @@ class FFmpegUtils:
             except Exception:
                 pass
 
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=60
+            )
             return result.returncode == 0 and os.path.exists(output_image_path) and os.path.getsize(output_image_path) > 0
         except Exception as e:
             logger.debug(f"extract_thumbnail_image failed: {e}")
@@ -430,10 +464,12 @@ class FFmpegUtils:
                 from tqdm import tqdm
                 
                 process = subprocess.Popen(
-                    cmd, 
-                    stdout=subprocess.PIPE, 
-                    stderr=subprocess.PIPE, 
-                    universal_newlines=True
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    universal_newlines=True,
+                    encoding='utf-8',
+                    errors='replace'
                 )
                 
                 progress_bar = tqdm(total=100, desc=description, unit="%")
@@ -463,7 +499,14 @@ class FFmpegUtils:
                 return process.returncode == 0
             else:
                 # Simple execution without progress
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace',
+                    timeout=300
+                )
                 return result.returncode == 0
                 
         except subprocess.TimeoutExpired:
@@ -483,7 +526,13 @@ class FFmpegUtils:
         ]
         
         try:
-            result = subprocess.run(cmd, capture_output=True, timeout=120)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                timeout=120,
+                encoding='utf-8',
+                errors='replace'
+            )
             return result.returncode == 0
         except Exception as e:
             logger.error(f"Failed to extract video segment: {e}")
@@ -522,13 +571,21 @@ class FFmpegUtils:
                 'ffprobe', '-v', 'quiet', '-print_format', 'json',
                 '-show_format', '-show_streams', video_path
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=30
+            )
             
             if result.returncode != 0:
                 raise subprocess.CalledProcessError(result.returncode, cmd, result.stderr)
             
             import json
-            data = json.loads(result.stdout)
+            stdout_text = result.stdout or ""
+            data = json.loads(stdout_text) if stdout_text.strip() else {}
             
             # Find video stream
             video_stream = None
@@ -609,13 +666,21 @@ class FFmpegUtils:
                 'ffprobe', '-v', 'quiet', '-print_format', 'json',
                 '-show_format', '-show_streams', gif_path
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=30
+            )
             
             if result.returncode != 0:
                 raise subprocess.CalledProcessError(result.returncode, cmd, result.stderr)
             
             import json
-            data = json.loads(result.stdout)
+            stdout_text = result.stdout or ""
+            data = json.loads(stdout_text) if stdout_text.strip() else {}
             
             format_info = data.get('format', {})
             video_stream = next((s for s in data.get('streams', []) if s.get('codec_type') == 'video'), None)

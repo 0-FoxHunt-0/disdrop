@@ -594,7 +594,14 @@ class VideoSegmenter:
             # Execute FFmpeg command
             try:
                 # Use Popen + polling to support fast shutdown; track process per-thread
-                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace'
+                )
                 with self._proc_lock:
                     self._active_processes.add(process)
                 start_time_poll = time.time()
@@ -995,12 +1002,21 @@ class VideoSegmenter:
                 video_path
             ]
             
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=60
+            )
             
             if result.returncode != 0:
                 raise subprocess.CalledProcessError(result.returncode, cmd, result.stderr)
             
-            probe_data = json.loads(result.stdout)
+            stdout_text = result.stdout or ""
+            probe_data = json.loads(stdout_text) if stdout_text.strip() else {}
             
             # Find video stream
             video_stream = next(
@@ -1098,12 +1114,21 @@ class VideoSegmenter:
                 video_path
             ]
             
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=30
+            )
             
             if result.returncode != 0:
                 raise subprocess.CalledProcessError(result.returncode, cmd, result.stderr)
             
-            probe_data = json.loads(result.stdout)
+            stdout_text = result.stdout or ""
+            probe_data = json.loads(stdout_text) if stdout_text.strip() else {}
             
             # Find video stream
             video_stream = next(
@@ -1264,7 +1289,15 @@ class VideoSegmenter:
             # Do not inject generic -hwaccel here; encoding choice already set by encoder
             
             # Execute FFmpeg command
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=300
+            )
             
             if result.returncode == 0:
                 file_size = os.path.getsize(output_path) / (1024 * 1024)
@@ -1470,7 +1503,15 @@ class VideoSegmenter:
             
             # Try to get GIF-specific info using FFmpeg
             cmd = ['ffmpeg', '-i', gif_path]
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=30
+            )
             
             duration = 0
             fps = 12.0  # Default GIF FPS

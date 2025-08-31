@@ -365,7 +365,15 @@ class DynamicVideoCompressor:
                 video_path
             ]
             
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=60
+            )
             
             if result.returncode != 0:
                 # If shutdown occurred during probe, treat as graceful cancel
@@ -373,7 +381,8 @@ class DynamicVideoCompressor:
                     raise GracefulCancellation()
                 raise subprocess.CalledProcessError(result.returncode, cmd, result.stderr)
             
-            probe_data = json.loads(result.stdout)
+            stdout_text = result.stdout or ""
+            probe_data = json.loads(stdout_text) if stdout_text.strip() else {}
             
             # Find video stream
             video_stream = next(
@@ -938,12 +947,21 @@ class DynamicVideoCompressor:
                 video_path
             ]
             
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=30
+            )
             
             if result.returncode != 0:
                 raise subprocess.CalledProcessError(result.returncode, cmd, result.stderr)
             
-            probe_data = json.loads(result.stdout)
+            stdout_text = result.stdout or ""
+            probe_data = json.loads(stdout_text) if stdout_text.strip() else {}
             
             # Find video stream
             video_stream = next(
@@ -1284,7 +1302,9 @@ class DynamicVideoCompressor:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             universal_newlines=True,
-            bufsize=1
+            bufsize=1,
+            encoding='utf-8',
+            errors='replace'
         )
         
         # Store reference to current process for shutdown handling

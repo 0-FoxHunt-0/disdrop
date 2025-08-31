@@ -40,7 +40,15 @@ class FileValidator:
                 '-show_format', '-show_streams', video_path
             ]
             
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=30
+            )
             
             if result.returncode != 0:
                 return False, f"FFprobe validation failed: {result.stderr.strip()}"
@@ -48,8 +56,11 @@ class FileValidator:
             # Parse JSON output
             import json
             try:
-                data = json.loads(result.stdout)
-            except json.JSONDecodeError:
+                stdout_text = result.stdout or ""
+                if not stdout_text.strip():
+                    return False, "Invalid FFprobe output"
+                data = json.loads(stdout_text)
+            except (json.JSONDecodeError, TypeError):
                 return False, "Invalid FFprobe output"
             
             # Check if there's at least one video stream
@@ -245,7 +256,15 @@ class FileValidator:
                 video_path
             ]
             
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=15)
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=15
+            )
             
             if result.returncode == 0:
                 codec = result.stdout.strip().lower()
@@ -579,11 +598,24 @@ class FileValidator:
                 '-show_format', video_path
             ]
             
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=15
+            )
             
             if result.returncode == 0:
                 import json
-                data = json.loads(result.stdout)
+                stdout_text = result.stdout or ""
+                if not stdout_text.strip():
+                    return 0.0
+                try:
+                    data = json.loads(stdout_text)
+                except Exception:
+                    return 0.0
                 duration = float(data.get('format', {}).get('duration', 0))
                 return duration
             
@@ -644,14 +676,28 @@ class FileValidator:
                 '-show_format', '-show_streams', file_path
             ]
             
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=15)
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=15
+            )
             
             if result.returncode != 0:
                 return False, f"FFprobe cannot parse file: {result.stderr.strip()}"
             
             # Parse JSON output
             import json
-            data = json.loads(result.stdout)
+            stdout_text = result.stdout or ""
+            if not stdout_text.strip():
+                return False, "Invalid FFprobe output"
+            try:
+                data = json.loads(stdout_text)
+            except Exception:
+                return False, "Invalid FFprobe output"
             
             # Check if format information is complete
             format_info = data.get('format', {})

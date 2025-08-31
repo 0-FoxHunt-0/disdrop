@@ -114,7 +114,13 @@ class AdvancedGifOptimizer:
         
         try:
             self.current_ffmpeg_process = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, **kwargs
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                **kwargs
             )
             
             # Poll periodically to check for shutdown requests
@@ -373,7 +379,15 @@ class AdvancedGifOptimizer:
                 'ffprobe', '-v', 'quiet', '-print_format', 'json',
                 '-show_streams', '-show_format', gif_path
             ]
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=20)
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=20
+            )
             if result.returncode == 0 and result.stdout:
                 import json as _json
                 data = _json.loads(result.stdout)
@@ -515,7 +529,15 @@ class AdvancedGifOptimizer:
             ]
             if self._shutdown_checker():
                 return False
-            r1 = subprocess.run(cmd1, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=180)
+            r1 = subprocess.run(
+                cmd1,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=180
+            )
             if r1.returncode != 0 or not os.path.exists(palette_path):
                 try:
                     if os.path.exists(palette_path):
@@ -534,7 +556,15 @@ class AdvancedGifOptimizer:
             ]
             if self._shutdown_checker():
                 return False
-            r2 = subprocess.run(cmd2, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
+            r2 = subprocess.run(
+                cmd2,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=300
+            )
             try:
                 if os.path.exists(palette_path):
                     os.remove(palette_path)
@@ -559,7 +589,15 @@ class AdvancedGifOptimizer:
             cmd = [
                 'gifsicle', '--optimize=3', '--careful', '--lossy=30', gif_path, '--output', temp
             ]
-            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120)
+            r = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=120
+            )
             if r.returncode == 0 and os.path.exists(temp):
                 # Apply only if improved
                 try:
@@ -578,7 +616,14 @@ class AdvancedGifOptimizer:
 
     def _is_tool_available(self, tool_name: str) -> bool:
         try:
-            result = subprocess.run([tool_name, "--version"], capture_output=True, text=True, timeout=5)
+            result = subprocess.run(
+                [tool_name, "--version"],
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=5
+            )
             return result.returncode == 0
         except Exception:
             return False
@@ -599,7 +644,14 @@ class AdvancedGifOptimizer:
                 output_path,
             ]
             timeout_sec = 30 if self.fast_mode else 60
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=timeout_sec
+            )
             return result.returncode == 0 and os.path.exists(output_path)
         except Exception as e:
             logger.debug(f"Lossless gifsicle optimize failed: {e}")
@@ -780,7 +832,14 @@ class AdvancedGifOptimizer:
                 cmd.extend(["--lossy", str(max(1, min(150, int(lossy))) )])
             cmd.extend([input_path, "--output", output_path])
             timeout_sec = 45 if self.fast_mode else 120
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=timeout_sec
+            )
             return result.returncode == 0 and os.path.exists(output_path)
         except Exception as e:
             logger.debug(f"gifsicle run failed: {e}")
@@ -794,7 +853,14 @@ class AdvancedGifOptimizer:
                 '-vf', f'mpdecimate=hi=512:lo=256:frac=0.3,fps={fps},{self._build_scale_filter(-1, -1)}',
                 '-loop', '0', output_path
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=120
+            )
             return result.returncode == 0 and os.path.exists(output_path)
         except Exception as e:
             logger.debug(f"fps preprocess failed: {e}")
@@ -1862,7 +1928,14 @@ class AdvancedGifOptimizer:
         ]
 
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=60
+            )
             if result.returncode == 0 and os.path.exists(palette_file):
                 return palette_file
         except Exception:
@@ -1889,7 +1962,14 @@ class AdvancedGifOptimizer:
                 '-frames:v', '10', f'{sample_frames_dir}/sample_%03d.png'
             ]
             
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=30
+            )
             
             if result.returncode == 0:
                 # Use PIL to generate palette
@@ -1966,7 +2046,14 @@ class AdvancedGifOptimizer:
         max_retries = 3
         for retry in range(max_retries):
             try:
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace',
+                    timeout=60
+                )
                 
                 if result.returncode == 0 and os.path.exists(palette_file):
                     return palette_file
@@ -2730,7 +2817,14 @@ class AdvancedGifOptimizer:
         # Add performance flags
         FFmpegUtils.add_ffmpeg_perf_flags(cmd)
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            timeout=120
+        )
         
         if result.returncode != 0:
             raise subprocess.CalledProcessError(result.returncode, cmd, result.stderr)
