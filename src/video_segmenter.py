@@ -594,22 +594,20 @@ class VideoSegmenter:
             # Execute FFmpeg command
             try:
                 # Use Popen + polling to support fast shutdown; track process per-thread
+                # IMPORTANT: Do not capture stdout/stderr to avoid pipe buffer deadlocks on verbose ffmpeg output
                 process = subprocess.Popen(
                     cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding='utf-8',
-                    errors='replace'
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
                 )
                 with self._proc_lock:
                     self._active_processes.add(process)
                 start_time_poll = time.time()
                 # Dynamic timeout based on encoder type and segment duration (configurable; can be disabled)
                 try:
-                    enable_timeout = bool(self.config.get('video_compression.segmentation.enable_timeout', False))
+                    enable_timeout = bool(self.config.get('video_compression.segmentation.enable_timeout', True))
                 except Exception:
-                    enable_timeout = False
+                    enable_timeout = True
                 if enable_timeout:
                     if accel_type == 'software':
                         timeout_seconds = max(duration * 6.0, 480)
@@ -630,7 +628,7 @@ class VideoSegmenter:
                             'error': 'Segment creation timed out'
                         }
                     time.sleep(0.1)
-                result_stdout, result_stderr = process.communicate()
+                # Process finished; get return code
                 rc = process.returncode
                 with self._proc_lock:
                     if process in self._active_processes:
@@ -652,10 +650,10 @@ class VideoSegmenter:
                     logger.info(f"Segment optimization successful: {segment_size:.2f}MB using direct FFmpeg method")
                     return result
                 else:
-                    logger.error(f"FFmpeg failed: {result_stderr}")
+                    logger.error(f"FFmpeg failed with return code {rc}")
                     return {
                         'success': False,
-                        'error': f"FFmpeg failed: {result_stderr}"
+                        'error': f'FFmpeg failed with return code {rc}'
                     }
                     
             except subprocess.TimeoutExpired:
