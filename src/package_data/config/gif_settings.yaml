@@ -1,0 +1,32 @@
+# Packaged default GIF settings (fallback if external config not found)
+gif_settings:
+  max_file_size_mb: 10
+  max_duration_seconds: 30
+  fps: 20
+  width: 360
+  height: -1
+  palette_size: 256
+  dither: "floyd_steinberg"
+  lossy: 60
+  multiprocessing:
+    max_concurrent_segments: 4
+    enabled: true
+    use_dynamic_analysis: true
+    analysis_mode: "recommended"
+  platforms:
+    twitter:
+      max_width: 506
+      max_height: 506
+      max_duration: 15
+    discord:
+      max_width: 400
+      max_height: 400
+      max_duration: 15
+      colors: 192
+      max_file_size_mb: 10
+      dither: "floyd_steinberg"
+      lossy: 40
+    slack:
+      max_width: 360
+      max_height: 360
+      max_duration: 12

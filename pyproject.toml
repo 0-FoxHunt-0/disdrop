@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "disdrop"
+version = "0.1.0"
+description = "Compress videos and create platform-optimized GIFs (Discord/Twitter/etc.)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "Disdrop" }
+]
+keywords = ["video", "gif", "compression", "ffmpeg", "discord", "twitter"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Topic :: Multimedia :: Video"
+]
+dependencies = [
+  "opencv-python>=4.8.0",
+  "Pillow>=10.1.0",
+  "PyYAML>=6.0",
+  "colorama>=0.4.6",
+  "tqdm>=4.66.0",
+  "psutil>=5.9.0",
+  "numpy>=1.24.0"
+]
+
+[project.scripts]
+disdrop = "disdrop.cli:main"
+
+[tool.setuptools]
+package-dir = {"": "."}
+packages = ["disdrop"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+disdrop = [
+  "package_data/config/*.yaml"
+]
+
+

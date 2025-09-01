@@ -4,6 +4,7 @@ Handles loading and managing configuration from YAML files and CLI arguments
 """
 
 import os
+import importlib.resources as pkg_resources
 import yaml
 import logging
 from typing import Dict, Any, Optional
@@ -30,10 +31,21 @@ class ConfigManager:
                 if os.path.exists(config_path):
                     with open(config_path, 'r', encoding='utf-8') as file:
                         config_data = yaml.safe_load(file)
-                        self.config.update(config_data)
+                        if config_data:
+                            self.config.update(config_data)
                         logger.debug(f"Loaded config from {config_file}")
                 else:
-                    logger.warning(f"Config file not found: {config_path}")
+                    # Fallback: load packaged defaults
+                    try:
+                        package_path = f"disdrop.package_data.config.{os.path.splitext(config_file)[0]}"
+                        # Use importlib.resources to read text safely from package
+                        with pkg_resources.files("disdrop.package_data.config").joinpath(config_file).open('r', encoding='utf-8') as file:
+                            config_data = yaml.safe_load(file)
+                            if config_data:
+                                self.config.update(config_data)
+                            logger.debug(f"Loaded packaged default config: {config_file}")
+                    except Exception as pkg_err:
+                        logger.warning(f"Config file not found and no packaged default available: {config_file} ({pkg_err})")
                     
         except Exception as e:
             logger.error(f"Error loading configuration: {e}")

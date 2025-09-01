@@ -332,15 +332,7 @@ class DynamicVideoCompressor:
             logger.info(f"Dynamic compression completed: {results.get('compression_ratio', 0):.1f}% reduction, "
                        f"strategy: {best_result.get('strategy', 'unknown')}")
 
-            # Best-effort: create a folder.jpg in the destination directory for Windows Explorer cover
-            try:
-                out_dir = os.path.dirname(os.path.abspath(output_path))
-                thumb_path = os.path.join(out_dir, 'folder.jpg')
-                if not os.path.exists(thumb_path):
-                    from .ffmpeg_utils import FFmpegUtils as _FFU
-                    _FFU.extract_thumbnail_image(output_path, thumb_path, time_position_seconds=1.0, width=640)
-            except Exception:
-                pass
+            # Note: Do not create folder.jpg for single MP4 outputs; reserved for segmented outputs only
             
             return results
             
@@ -358,13 +350,24 @@ class DynamicVideoCompressor:
             if self.shutdown_requested:
                 raise GracefulCancellation()
             # Get basic video info
+            # Lightweight ffprobe: avoid frame-level enumeration which is slow on long videos
             cmd = [
-                'ffprobe', '-v', 'quiet', '-print_format', 'json', 
-                '-show_format', '-show_streams', '-show_entries', 
-                'frame=pkt_pts_time,pict_type,pkt_size', '-select_streams', 'v:0',
+                'ffprobe', '-v', 'quiet', '-print_format', 'json',
+                '-show_format', '-show_streams',
                 video_path
             ]
             
+            # Increase timeout for large files to prevent premature timeouts
+            try:
+                file_size_mb_for_timeout = os.path.getsize(video_path) / (1024 * 1024)
+            except Exception:
+                file_size_mb_for_timeout = 0
+            probe_timeout = 60
+            if file_size_mb_for_timeout > 1000:
+                probe_timeout = 240
+            elif file_size_mb_for_timeout > 300:
+                probe_timeout = 120
+
             result = subprocess.run(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -372,7 +375,7 @@ class DynamicVideoCompressor:
                 text=True,
                 encoding='utf-8',
                 errors='replace',
-                timeout=60
+                timeout=probe_timeout
             )
             
             if result.returncode != 0:
@@ -428,13 +431,17 @@ class DynamicVideoCompressor:
         except GracefulCancellation:
             # Propagate cancellation to caller to avoid further work/log noise
             raise
+        except subprocess.TimeoutExpired as e:
+            # Gracefully degrade on timeout for massive videos
+            logger.warning(f"ffprobe analysis timed out after {getattr(e, 'timeout', 'unknown')}s; using basic video info")
+            return self._get_basic_video_info(video_path)
         except Exception as e:
             if self.shutdown_requested:
                 # Avoid alarming error logs on shutdown; return minimal info to allow fast exit
                 logger.info("Video analysis aborted due to shutdown request")
                 raise GracefulCancellation()
             else:
-                logger.error(f"Failed to analyze video content: {e}")
+                logger.warning(f"Failed to analyze video content quickly; using basic info: {e}")
                 # Fallback to basic analysis
                 return self._get_basic_video_info(video_path)
     

@@ -159,6 +159,7 @@ class VideoCompressorCLI:
                           help='Maximum output file size in MB (overrides platform defaults)')
         parser.add_argument('--max-files', type=int, metavar='N',
                           help='Maximum number of files to process before exiting')
+        parser.add_argument('--input-dir', help='Input directory for automated/other modes (default: ./input)')
         parser.add_argument('--output-dir', help='Output directory for generated files (default varies by mode, typically ./output)')
         parser.add_argument('--force-software', action='store_true',
                           help='Force software encoding (bypass hardware acceleration)')
@@ -256,6 +257,9 @@ class VideoCompressorCLI:
                                 help='Maximum output file size in MB (default: 10.0)')
         auto_parser.add_argument('--no-cache', action='store_true',
                                 help='Do not use success cache in automated workflow')
+        # Accept global-style flags after subcommand for convenience
+        auto_parser.add_argument('--input-dir', help='Input directory to watch (default: ./input)')
+        auto_parser.add_argument('--output-dir', help='Output directory (default: ./output)')
         
         # Cache management command
         cache_parser = subparsers.add_parser('cache', help='Cache management operations')
@@ -1342,7 +1346,8 @@ class VideoCompressorCLI:
             print("\n" + "="*60)
             print("AUTOMATED VIDEO PROCESSING WORKFLOW")
             print("="*60)
-            print(f"Input directory:    {os.path.abspath('input')}")
+            in_dir_display = os.path.abspath(args.input_dir) if getattr(args, 'input_dir', None) else os.path.abspath('input')
+            print(f"Input directory:    {in_dir_display}")
             # Respect global --output-dir if provided
             out_dir_display = os.path.abspath(args.output_dir) if getattr(args, 'output_dir', None) else os.path.abspath('output')
             print(f"Output directory:   {out_dir_display}")
@@ -1354,7 +1359,8 @@ class VideoCompressorCLI:
             print("Press Ctrl+C to stop the workflow gracefully.\n")
         else:
             out_dir_display = os.path.abspath(args.output_dir) if getattr(args, 'output_dir', None) else os.path.abspath('output')
-            print(f"Watching '{os.path.abspath('input')}' → '{out_dir_display}' every {args.check_interval}s (max {args.max_size}MB). Ctrl+C to stop.")
+            in_dir_display = os.path.abspath(args.input_dir) if getattr(args, 'input_dir', None) else os.path.abspath('input')
+            print(f"Watching '{in_dir_display}' → '{out_dir_display}' every {args.check_interval}s (max {args.max_size}MB). Ctrl+C to stop.")
         
         try:
             self.automated_workflow.run_automated_workflow(
@@ -1362,6 +1368,7 @@ class VideoCompressorCLI:
                 max_size_mb=args.max_size,
                 verbose=getattr(args, 'debug', False),
                 max_files=getattr(args, 'max_files', None),
+                input_dir=getattr(args, 'input_dir', None),
                 output_dir=getattr(args, 'output_dir', None),
                 no_cache=getattr(args, 'no_cache', False)
             )

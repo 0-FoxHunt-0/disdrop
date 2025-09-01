@@ -40,6 +40,20 @@ class VideoSegmenter:
         # Multiprocessing configuration - dynamic analysis with fallback
         self.max_workers = self._calculate_optimal_workers()
         
+        # Global FFmpeg process limiter to prevent GPU/CPU saturation across segment creation/optimization
+        try:
+            encoder, accel_type = self.hardware.get_best_encoder("h264")
+        except Exception:
+            encoder, accel_type = ("libx264", "software")
+        # Allow config override; default to 1 for hardware encoders, 2 for software
+        default_slots = 1 if accel_type != 'software' else 2
+        slots = int(self.config.get('video_compression.segmentation.max_concurrent_ffmpeg_processes', default_slots) or default_slots)
+        slots = max(1, slots)
+        self._ffmpeg_semaphore = threading.Semaphore(slots)
+        
+        # Optimization stage concurrency (applies to post-creation optimizations)
+        self._optimization_workers = int(self.config.get('video_compression.segmentation.max_concurrent_optimizations', 1) or 1)
+        
         logger.info(f"Video segmenter initialized with {self.max_workers} concurrent workers")
 
     def _threadsafe_print(self, message: str) -> None:
@@ -57,7 +71,15 @@ class VideoSegmenter:
         """
         Calculate optimal number of workers based on configuration and system analysis
         """
-        # Check if multiprocessing is enabled
+        # Prefer video segmentation concurrency settings when provided
+        if self.config.get('video_compression.segmentation.max_concurrent_segments') is not None:
+            try:
+                value = int(self.config.get('video_compression.segmentation.max_concurrent_segments'))
+                return max(1, value)
+            except Exception:
+                pass
+        
+        # Backward compatibility with GIF settings if no video-specific key is present
         if not self.config.get('gif_settings.multiprocessing.enabled', True):
             return 1  # Disable multiprocessing if configured
         
@@ -328,6 +350,9 @@ class VideoSegmenter:
         segments = []
         temp_files = []
         
+        # Load segmentation prefs from config
+        prefer_fast_seek = bool(self.config.get('video_compression.segmentation.prefer_fast_seek', True))
+        
         try:
             # Process segments in parallel with limited concurrency
             def _process_segment(i: int) -> Optional[Dict[str, Any]]:
@@ -357,7 +382,7 @@ class VideoSegmenter:
                     logger.info(f"Processing segment {i+1}/{num_segments}: {segment_duration_actual:.1f}s "
                                f"({segment_start:.1f}s - {segment_end:.1f}s)")
                     
-                    # Create high-quality segment
+                    # Create high-quality segment (creation-only; optimization deferred)
                     segment_result = self._create_high_quality_segment(
                         input_video, segment_path, segment_start, segment_duration_actual,
                         video_info, platform_config, target_size_mb
@@ -365,28 +390,8 @@ class VideoSegmenter:
                     
                     if segment_result.get('success', False):
                         segment_size_mb = segment_result.get('size_mb', 0)
-                        
-                        # Check if segment is too large and needs optimization
-                        if segment_size_mb > target_size_mb:
-                            logger.warning(f"Segment {i+1} is {segment_size_mb:.2f}MB (exceeds target {target_size_mb}MB), applying optimization...")
-                            
-                            # Apply post-segment optimization
-                            optimized_result = self._optimize_oversized_segment(
-                                segment_path, segment_duration_actual, video_info, 
-                                platform_config, target_size_mb
-                            )
-                            
-                            if optimized_result.get('success', False):
-                                segment_size_mb = optimized_result.get('size_mb', segment_size_mb)
-                                segment_result['method'] = f"{segment_result.get('method', 'unknown')}_optimized"
-                                segment_result['size_mb'] = segment_size_mb
-                                segment_result['optimization_applied'] = True
-                                logger.info(f"Segment {i+1} optimized to {segment_size_mb:.2f}MB")
-                            else:
-                                logger.warning(f"Failed to optimize segment {i+1}: {optimized_result.get('error', 'Unknown error')}")
-                                segment_result['optimization_applied'] = False
-                        else:
-                            segment_result['optimization_applied'] = False
+                        needs_optimization = segment_size_mb > target_size_mb
+                        segment_result['optimization_applied'] = False
                         
                         segment_info = {
                             'index': i + 1,
@@ -396,7 +401,8 @@ class VideoSegmenter:
                             'size_mb': segment_size_mb,
                             'method': segment_result.get('method', 'unknown'),
                             'quality_score': segment_result.get('quality_score', 0),
-                            'optimization_applied': segment_result.get('optimization_applied', False)
+                            'optimization_applied': False,
+                            'needs_optimization': needs_optimization
                         }
                         
                         logger.info(f"Segment {i+1} completed: {segment_size_mb:.2f}MB "
@@ -470,6 +476,51 @@ class VideoSegmenter:
                     'temp_files': temp_files
                 }
             
+            # Post-creation optimization phase (batch oversize segments with limited concurrency)
+            oversized = [s for s in segments if s.get('needs_optimization')]
+            if oversized:
+                logger.info(f"Starting optimization phase for {len(oversized)} oversized segments (target {target_size_mb}MB)")
+                self._threadsafe_print(f"    🛠️ Optimizing {len(oversized)} oversized segments (concurrency: {self._optimization_workers})...")
+                
+                def _optimize_wrapper(seg: Dict[str, Any]) -> Tuple[int, Optional[Dict[str, Any]]]:
+                    try:
+                        if self.shutdown_requested:
+                            return seg['index'], None
+                        # Ensure we don't overlap with any other FFmpeg-heavy work
+                        with self._ffmpeg_semaphore:
+                            result = self._optimize_oversized_segment(
+                                seg['path'], seg['duration'], video_info, platform_config, target_size_mb
+                            )
+                        return seg['index'], result
+                    except Exception as e:
+                        logger.warning(f"Optimization failed for segment {seg['index']}: {e}")
+                        return seg['index'], None
+                
+                # Run optimizations with limited concurrency
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=max(1, self._optimization_workers)) as opt_exec:
+                    futures = {opt_exec.submit(_optimize_wrapper, s): s for s in oversized}
+                    for fut in futures:
+                        try:
+                            idx, opt_res = fut.result()
+                        except Exception as e:
+                            logger.warning(f"Optimization future failed: {e}")
+                            continue
+                        # Find and update the segment entry
+                        for seg in segments:
+                            if seg['index'] == idx:
+                                if opt_res and opt_res.get('success', False):
+                                    seg['size_mb'] = opt_res.get('size_mb', seg['size_mb'])
+                                    seg['method'] = f"{seg.get('method', 'unknown')}_optimized"
+                                    seg['optimization_applied'] = True
+                                    seg['needs_optimization'] = False
+                                    self._threadsafe_print(
+                                        f"    ✅ Optimized segment {idx}/{num_segments}: {seg['size_mb']:.2f}MB")
+                                else:
+                                    self._threadsafe_print(
+                                        f"    ⚠️ Optimization skipped/failed for segment {idx}")
+                                break
+
             print(f"    🎉 All {len(segments)} segments completed successfully!")
             logger.info(f"All {len(segments)} segments completed successfully")
             
@@ -523,8 +574,10 @@ class VideoSegmenter:
             # Can afford longer segments for simple content
             base_duration *= 1.1
         
-        # Ensure reasonable bounds: 45s minimum, 120s maximum
-        final_duration = max(45, min(120, base_duration))
+        # Ensure reasonable bounds (configurable)
+        min_seg = int(self.config.get('video_compression.segmentation.min_segment_duration', 45) or 45)
+        max_seg = int(self.config.get('video_compression.segmentation.max_segment_duration', 120) or 120)
+        final_duration = max(min_seg, min(max_seg, base_duration))
         
         # Calculate expected number of segments
         expected_segments = math.ceil(total_duration / final_duration)
@@ -561,13 +614,24 @@ class VideoSegmenter:
             # Build FFmpeg command for segment creation (accurate seek: place -ss after -i)
             encoder = segment_params.get('encoder', 'libx264')
             accel_type = segment_params.get('acceleration_type', 'software')
-            cmd = [
-                'ffmpeg', '-y',
-                '-i', input_video,
-                '-ss', str(start_time),
-                '-t', str(duration),
-                '-c:v', encoder,
-            ]
+            prefer_fast_seek = bool(self.config.get('video_compression.segmentation.prefer_fast_seek', True))
+            if prefer_fast_seek:
+                # Fast demuxer seek to avoid decoding from beginning on long videos
+                cmd = [
+                    'ffmpeg', '-y',
+                    '-ss', str(start_time),
+                    '-i', input_video,
+                    '-t', str(duration),
+                    '-c:v', encoder,
+                ]
+            else:
+                cmd = [
+                    'ffmpeg', '-y',
+                    '-i', input_video,
+                    '-ss', str(start_time),
+                    '-t', str(duration),
+                    '-c:v', encoder,
+                ]
             # Quality/bitrate selection
             if accel_type == 'software':
                 # Software: CRF and preset are valid
@@ -593,13 +657,19 @@ class VideoSegmenter:
             
             # Execute FFmpeg command
             try:
-                # Use Popen + polling to support fast shutdown; track process per-thread
+                # Add performance flags (threads, analyzeduration) best-effort
+                try:
+                    FFmpegUtils.add_ffmpeg_perf_flags(cmd)
+                except Exception:
+                    pass
+                # Use Popen + polling to support fast shutdown; limit concurrency to avoid GPU/CPU saturation
                 # IMPORTANT: Do not capture stdout/stderr to avoid pipe buffer deadlocks on verbose ffmpeg output
-                process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                )
+                with self._ffmpeg_semaphore:
+                    process = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL
+                    )
                 with self._proc_lock:
                     self._active_processes.add(process)
                 start_time_poll = time.time()
@@ -610,9 +680,9 @@ class VideoSegmenter:
                     enable_timeout = True
                 if enable_timeout:
                     if accel_type == 'software':
-                        timeout_seconds = max(duration * 6.0, 480)
+                        timeout_seconds = max(duration * 6.0, 600)
                     else:
-                        timeout_seconds = max(duration * 3.0, 240)
+                        timeout_seconds = max(duration * 4.0, 360)
                 while process.poll() is None:
                     if self.shutdown_requested:
                         self._terminate_ffmpeg_process(process)
@@ -993,13 +1063,24 @@ class VideoSegmenter:
     def _get_video_info(self, video_path: str) -> Dict[str, Any]:
         """Get comprehensive video information using FFprobe"""
         try:
+            # Lightweight ffprobe: avoid frame-level enumeration which is slow on long videos
             cmd = [
-                'ffprobe', '-v', 'quiet', '-print_format', 'json', 
-                '-show_format', '-show_streams', '-show_entries', 
-                'frame=pkt_pts_time,pict_type,pkt_size', '-select_streams', 'v:0',
+                'ffprobe', '-v', 'quiet', '-print_format', 'json',
+                '-show_format', '-show_streams',
                 video_path
             ]
             
+            # Increase timeout for large files to prevent premature timeouts
+            try:
+                file_size_mb_for_timeout = os.path.getsize(video_path) / (1024 * 1024)
+            except Exception:
+                file_size_mb_for_timeout = 0
+            probe_timeout = 60
+            if file_size_mb_for_timeout > 1000:
+                probe_timeout = 240
+            elif file_size_mb_for_timeout > 300:
+                probe_timeout = 120
+
             result = subprocess.run(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -1007,7 +1088,7 @@ class VideoSegmenter:
                 text=True,
                 encoding='utf-8',
                 errors='replace',
-                timeout=60
+                timeout=probe_timeout
             )
             
             if result.returncode != 0:
@@ -1058,8 +1139,11 @@ class VideoSegmenter:
                 'bitrate_per_pixel': bitrate / (width * height) if (width * height) > 0 else 0
             }
             
+        except subprocess.TimeoutExpired as e:
+            logger.warning(f"ffprobe analysis timed out after {getattr(e, 'timeout', 'unknown')}s; using basic video info")
+            return self._get_basic_video_info(video_path)
         except Exception as e:
-            logger.error(f"Failed to analyze video content: {e}")
+            logger.warning(f"Failed to analyze video content quickly; using basic info: {e}")
             # Fallback to basic analysis
             return self._get_basic_video_info(video_path)
     
@@ -1299,15 +1383,7 @@ class VideoSegmenter:
             
             if result.returncode == 0:
                 file_size = os.path.getsize(output_path) / (1024 * 1024)
-                # Best-effort: extract a folder cover image if missing
-                try:
-                    from .ffmpeg_utils import FFmpegUtils as _FFU
-                    out_dir = os.path.dirname(os.path.abspath(output_path))
-                    thumb_path = os.path.join(out_dir, 'folder.jpg')
-                    if not os.path.exists(thumb_path):
-                        _FFU.extract_thumbnail_image(output_path, thumb_path, time_position_seconds=1.0, width=640)
-                except Exception:
-                    pass
+                # Note: Do not create folder.jpg for single MP4 outputs; reserved for segmented outputs only
                 return {
                     'success': True,
                     'size_mb': file_size,

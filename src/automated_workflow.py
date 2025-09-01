@@ -153,7 +153,7 @@ class AutomatedWorkflow:
             time.sleep(sleep_time)
             elapsed += sleep_time
     
-    def run_automated_workflow(self, check_interval: int = 5, max_size_mb: float = 10.0, verbose: bool = False, max_files: Optional[int] = None, output_dir: Optional[str] = None, no_cache: bool = False):
+    def run_automated_workflow(self, check_interval: int = 5, max_size_mb: float = 10.0, verbose: bool = False, max_files: Optional[int] = None, input_dir: Optional[str] = None, output_dir: Optional[str] = None, no_cache: bool = False):
         """
         Run the automated workflow
         
@@ -164,7 +164,13 @@ class AutomatedWorkflow:
         # Set verbosity for this run
         self.verbose = bool(verbose)
 
-        # Allow overriding output directory via CLI
+        # Allow overriding input/output directories via CLI
+        if input_dir:
+            try:
+                self.input_dir = Path(input_dir)
+                self.input_dir.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                logger.warning(f"Could not set input directory to '{input_dir}': {e}")
         if output_dir:
             try:
                 self.output_dir = Path(output_dir)
@@ -1247,21 +1253,7 @@ class AutomatedWorkflow:
                         except Exception as e:
                             logger.warning(f"Could not log detailed video specifications: {e}")
 
-                        # Generate a folder.jpg thumbnail for Windows Explorer folder cover
-                        try:
-                            thumb_path = self.output_dir / 'folder.jpg'
-                            # If already present, keep existing; otherwise, create from new MP4
-                            if not thumb_path.exists():
-                                ok = FFmpegUtils.extract_thumbnail_image(
-                                    input_path=str(output_path),
-                                    output_image_path=str(thumb_path),
-                                    time_position_seconds=1.0,
-                                    width=640
-                                )
-                                if ok:
-                                    logger.info(f"Created folder cover image: {thumb_path}")
-                        except Exception as e:
-                            logger.debug(f"Could not create folder cover image: {e}")
+                        # Note: Do not create folder.jpg for single MP4 outputs; reserved for segmented outputs only
                         
                         return output_path
                     else:
