@@ -102,6 +102,12 @@ class AutomatedWorkflow:
                 # Request shutdown from video compressor
                 if hasattr(self.video_compressor, 'request_shutdown'):
                     self.video_compressor.request_shutdown()
+                # Request shutdown from video segmenter if present on compressor
+                try:
+                    if hasattr(self.video_compressor, 'video_segmenter') and hasattr(self.video_compressor.video_segmenter, 'request_shutdown'):
+                        self.video_compressor.video_segmenter.request_shutdown()
+                except Exception:
+                    pass
                 
                 # Request shutdown from GIF generator if it has the method
                 if hasattr(self.gif_generator, 'request_shutdown'):
@@ -119,6 +125,11 @@ class AutomatedWorkflow:
                 # Force terminate any running processes
                 if hasattr(self.video_compressor, '_terminate_ffmpeg_process'):
                     self.video_compressor._terminate_ffmpeg_process()
+                try:
+                    if hasattr(self.video_compressor, 'video_segmenter') and hasattr(self.video_compressor.video_segmenter, '_terminate_ffmpeg_process'):
+                        self.video_compressor.video_segmenter._terminate_ffmpeg_process()
+                except Exception:
+                    pass
                 if hasattr(self.gif_generator, '_terminate_ffmpeg_process'):
                     self.gif_generator._terminate_ffmpeg_process()
                 if hasattr(self.gif_generator, 'optimizer') and hasattr(self.gif_generator.optimizer, '_terminate_ffmpeg_process'):
@@ -136,6 +147,26 @@ class AutomatedWorkflow:
         for directory in [self.input_dir, self.output_dir, self.temp_dir, self.failures_dir]:
             directory.mkdir(exist_ok=True)
             logger.debug(f"Directory ensured: {directory}")
+
+    def _safe_filename_for_filesystem(self, filename: str) -> str:
+        """Convert filename to safe string for filesystem operations, handling problematic Unicode characters."""
+        try:
+            safe_chars = []
+            for char in filename:
+                if ord(char) < 128:
+                    safe_chars.append(char)
+                elif char == '⧸':
+                    safe_chars.append('/')
+                elif char in ['/', '\\', ':', '*', '?', '"', '<', '>', '|']:
+                    safe_chars.append('_')
+                else:
+                    safe_chars.append('_')
+            safe_name = ''.join(safe_chars)
+            if not safe_name.strip():
+                safe_name = 'sanitized_filename'
+            return safe_name
+        except Exception:
+            return ''.join(c if ord(c) < 128 else '_' for c in filename)
 
         # Ensure nested cache directory exists for performance caching
         try:
@@ -1155,17 +1186,44 @@ class AutomatedWorkflow:
             print(f"    ♻️  Found existing segments folder: {segments_folder.name}")
             logger.debug(f"Found existing segments folder: {segments_folder.name}")
             
-            # Validate existing segments
+            # Prefer reusing existing MP4 segments if present and valid under target
+            try:
+                mp4_files = sorted([f for f in segments_folder.iterdir() if f.is_file() and f.suffix.lower() == '.mp4'])
+            except Exception:
+                mp4_files = []
+            if mp4_files:
+                all_valid = True
+                for mp4 in mp4_files:
+                    # Important: Do not compare segment duration against original video.
+                    # Validate integrity and size only to prevent false duration ratio failures.
+                    ok, err = self.file_validator.is_valid_video_with_enhanced_checks(
+                        str(mp4), original_path=None, max_size_mb=max_size_mb
+                    )
+                    if not ok:
+                        all_valid = False
+                        logger.info(f"Existing MP4 segment invalid or too large, will reprocess: {mp4.name} ({err})")
+                        break
+                if all_valid:
+                    print(f"    ♻️  Using existing MP4 segments: {segments_folder.name}")
+                    logger.info(f"Using existing MP4 segments: {segments_folder}")
+                    # Ensure comprehensive summary exists for the segments folder
+                    try:
+                        self._ensure_segments_summary_exists(segments_folder)
+                    except Exception:
+                        pass
+                    # Record success and return the folder as the output artifact
+                    self._record_success_cache(video_file, 'segments', segments_folder)
+                    return segments_folder
+
+            # If no valid MP4 segments, fall back to checking GIF segments for reuse
             valid_segments, invalid_segments = self._validate_segment_folder_gifs(segments_folder, max_size_mb)
-            
             if valid_segments and not invalid_segments:
                 print(f"    ♻️  Using existing segment GIFs: {segments_folder.name}")
                 logger.debug(f"Valid segment GIFs already exist: {segments_folder.name}")
-                
-                # Ensure comprehensive summary exists for the segments folder
-                self._ensure_segments_summary_exists(segments_folder)
-                
-                # Record success and return
+                try:
+                    self._ensure_segments_summary_exists(segments_folder)
+                except Exception:
+                    pass
                 self._record_success_cache(video_file, 'segments', segments_folder)
                 return segments_folder
         

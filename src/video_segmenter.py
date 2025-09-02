@@ -36,6 +36,9 @@ class VideoSegmenter:
         self._proc_lock = threading.Lock()
         self._active_processes: set[subprocess.Popen] = set()
         self._print_lock = threading.Lock()
+        # Track temporary compressors used during optimization so we can terminate them on shutdown
+        self._active_temp_lock = threading.Lock()
+        self._active_temp_compressors: set = set()
         
         # Multiprocessing configuration - dynamic analysis with fallback
         self.max_workers = self._calculate_optimal_workers()
@@ -497,7 +500,6 @@ class VideoSegmenter:
                         return seg['index'], None
                 
                 # Run optimizations with limited concurrency
-                from concurrent.futures import ThreadPoolExecutor
                 with ThreadPoolExecutor(max_workers=max(1, self._optimization_workers)) as opt_exec:
                     futures = {opt_exec.submit(_optimize_wrapper, s): s for s in oversized}
                     for fut in futures:
@@ -844,6 +846,12 @@ class VideoSegmenter:
             
             # Create a temporary compressor instance with our existing config and hardware
             temp_compressor = DynamicVideoCompressor(self.config, self.hardware)
+            # Track temp compressor so shutdown can terminate it
+            try:
+                with self._active_temp_lock:
+                    self._active_temp_compressors.add(temp_compressor)
+            except Exception:
+                pass
             
             # Create temp output path for optimized segment
             temp_optimized_path = segment_path.replace('.mp4', '_optimized_temp.mp4')
@@ -851,8 +859,8 @@ class VideoSegmenter:
             logger.info(f"Applying direct compression optimization to oversized segment: {segment_path}")
             logger.info(f"Target size for optimization: {target_size_mb}MB")
             
-            # Use 90% of target to provide buffer for potential size variations
-            optimization_target = target_size_mb * 0.9
+            # Use full target size to honor configured/default 10MB limit
+            optimization_target = target_size_mb
             
             # Get video info for the segment (it may be different from the original video)
             segment_video_info = temp_compressor._analyze_video_content(segment_path)
@@ -862,6 +870,12 @@ class VideoSegmenter:
             
             # Strategy 1: Advanced optimization (best quality but may fail)
             try:
+                if self.shutdown_requested:
+                    try:
+                        temp_compressor.request_shutdown()
+                    except Exception:
+                        pass
+                    return { 'success': False, 'error': 'shutdown' }
                 logger.info("Attempting advanced optimization strategy")
                 optimization_result = temp_compressor._compress_with_advanced_optimization(
                     input_path=segment_path,
@@ -878,6 +892,14 @@ class VideoSegmenter:
             if not optimization_result or not optimization_result.get('success', False):
                 logger.info("Attempting standard optimization strategy")
                 try:
+                    if self.shutdown_requested:
+                        try:
+                            temp_compressor.request_shutdown()
+                        except Exception:
+                            pass
+                    
+                    if self.shutdown_requested:
+                        return { 'success': False, 'error': 'shutdown' }
                     optimization_result = temp_compressor._compress_with_standard_optimization(
                         input_path=segment_path,
                         output_path=temp_optimized_path,
@@ -893,6 +915,12 @@ class VideoSegmenter:
             if not optimization_result or not optimization_result.get('success', False):
                 logger.info("Attempting adaptive quality optimization strategy")
                 try:
+                    if self.shutdown_requested:
+                        try:
+                            temp_compressor.request_shutdown()
+                        except Exception:
+                            pass
+                        return { 'success': False, 'error': 'shutdown' }
                     optimization_result = temp_compressor._compress_with_adaptive_quality(
                         input_path=segment_path,
                         output_path=temp_optimized_path,
@@ -967,6 +995,14 @@ class VideoSegmenter:
                 'success': False,
                 'error': f'Optimization error: {str(e)}'
             }
+        finally:
+            # Ensure temp compressor is removed from active tracking
+            try:
+                with self._active_temp_lock:
+                    if 'temp_compressor' in locals() and temp_compressor in self._active_temp_compressors:
+                        self._active_temp_compressors.discard(temp_compressor)
+            except Exception:
+                pass
     
     def _apply_content_aware_adjustments(self, params: Dict[str, Any], video_info: Dict[str, Any]) -> Dict[str, Any]:
         """Apply content-aware adjustments to compression parameters"""
@@ -1426,6 +1462,18 @@ class VideoSegmenter:
                 self._terminate_ffmpeg_process(proc)
             except Exception:
                 pass
+        # Terminate any active temporary compressors used during optimization
+        try:
+            with self._active_temp_lock:
+                temp_compressors = list(self._active_temp_compressors)
+            for comp in temp_compressors:
+                try:
+                    if hasattr(comp, 'request_shutdown'):
+                        comp.request_shutdown()
+                except Exception:
+                    pass
+        except Exception:
+            pass
     
     def _terminate_ffmpeg_process(self, process: Optional[subprocess.Popen] = None):
         """Terminate an FFmpeg process gracefully"""
