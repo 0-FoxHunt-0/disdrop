@@ -77,30 +77,44 @@ class VideoCompressorCLI:
     def _setup_signal_handlers(self):
         """Setup signal handlers for graceful cleanup"""
         def signal_handler(signum, frame):
-            signal_name = signal.Signals(signum).name
+            signal_name = None
+            try:
+                signal_name = signal.Signals(signum).name
+            except Exception:
+                signal_name = str(signum)
             if logger:
                 logger.info(f"Received {signal_name} signal, initiating graceful shutdown...")
             else:
                 print(f"\nReceived {signal_name} signal, cleaning up...")
-            
-            # Request shutdown for all components
-            if hasattr(self, 'gif_generator') and self.gif_generator:
-                self.gif_generator.request_shutdown()
-                # Also shutdown the GIF optimizer
-                if hasattr(self.gif_generator, 'optimizer') and hasattr(self.gif_generator.optimizer, 'request_shutdown'):
-                    self.gif_generator.optimizer.request_shutdown()
-            if hasattr(self, 'video_compressor') and self.video_compressor:
-                self.video_compressor.request_shutdown()
-            if hasattr(self, 'automated_workflow') and self.automated_workflow:
-                # Automated workflow uses shutdown_requested flag instead of method
-                self.automated_workflow.shutdown_requested = True
-            
+
+            # Request shutdown for all components (idempotent)
+            try:
+                if hasattr(self, 'gif_generator') and self.gif_generator:
+                    self.gif_generator.request_shutdown()
+                    if hasattr(self.gif_generator, 'optimizer') and hasattr(self.gif_generator.optimizer, 'request_shutdown'):
+                        self.gif_generator.optimizer.request_shutdown()
+            except Exception:
+                pass
+            try:
+                if hasattr(self, 'video_compressor') and self.video_compressor:
+                    self.video_compressor.request_shutdown()
+            except Exception:
+                pass
+            try:
+                if hasattr(self, 'automated_workflow') and self.automated_workflow:
+                    self.automated_workflow.shutdown_requested = True
+            except Exception:
+                pass
+
             # Clean up any remaining temp files
-            self._cleanup_temp_files_on_exit()
-            
+            try:
+                self._cleanup_temp_files_on_exit()
+            except Exception:
+                pass
+
             if logger:
-                logger.info("Graceful shutdown completed")
-            sys.exit(0)
+                logger.info("Graceful shutdown sequence requested. Waiting for tasks to end...")
+            # Do not sys.exit here; allow main control flow and threads to wind down.
         
         # Register handlers for common termination signals
         signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
@@ -165,6 +179,8 @@ class VideoCompressorCLI:
                           help='Force software encoding (bypass hardware acceleration)')
         parser.add_argument('--no-cache', action='store_true',
                           help='Do not use success cache; verify and process all files even if previously successful')
+        parser.add_argument('--max-input-size', dest='max_input_size', metavar='SIZE',
+                          help='Maximum input file size to process (e.g., 500, 750MB, 1.2GB, 2TB). Bare numbers are MB.')
         # Segmentation preference: prefer a fixed number of segments (1-10)
         parser.add_argument('--prefer-segments', type=int, choices=list(range(1, 11)), metavar='N',
                           help='Prefer N segments (1-10). If impossible, fall back to normal operations')
@@ -260,6 +276,10 @@ class VideoCompressorCLI:
         # Accept global-style flags after subcommand for convenience
         auto_parser.add_argument('--input-dir', help='Input directory to watch (default: ./input)')
         auto_parser.add_argument('--output-dir', help='Output directory (default: ./output)')
+        # Allow specifying temp directory after the subcommand as well as globally
+        auto_parser.add_argument('--temp-dir', help='Temporary directory for processing')
+        auto_parser.add_argument('--max-input-size', dest='max_input_size', metavar='SIZE',
+                                help='Maximum input file size to process (e.g., 500, 750MB, 1.2GB, 2TB). Bare numbers are MB.')
         
         # Cache management command
         cache_parser = subparsers.add_parser('cache', help='Cache management operations')
@@ -338,6 +358,11 @@ class VideoCompressorCLI:
             self.advanced_optimizer = AdvancedGifOptimizer(self.config)
             self.file_validator = FileValidator()
             self.automated_workflow = AutomatedWorkflow(self.config, self.hardware)
+            # Thread max input size through to workflow
+            try:
+                self.automated_workflow.max_input_size_bytes = self._parse_max_input_size_to_bytes(getattr(args, 'max_input_size', None))
+            except Exception:
+                self.automated_workflow.max_input_size_bytes = None
             # Propagate preferred segments (legacy single-segment retained via value 1)
             try:
                 preferred = getattr(args, 'prefer_segments', None)
@@ -353,6 +378,43 @@ class VideoCompressorCLI:
         except Exception as e:
             logger.error(f"Failed to initialize components: {e}")
             raise
+
+    def _parse_max_input_size_to_bytes(self, size_str: Optional[str]) -> Optional[int]:
+        """Parse a human-readable size string into bytes.
+
+        Rules: bare numbers => MB; supports KB/MB/GB/TB (case-insensitive). Examples: 500, 750MB, 1.2GB, 2TB.
+        Returns integer bytes or None if not provided.
+        """
+        try:
+            if not size_str:
+                return None
+            s = str(size_str).strip()
+            # If just digits (and optional decimal), treat as MB
+            import re
+            if re.fullmatch(r"\d+(?:\.\d+)?", s):
+                value_mb = float(s)
+                return int(value_mb * 1024 * 1024)
+            # Parse with unit
+            m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([Kk][Bb]?|[Mm][Bb]?|[Gg][Bb]?|[Tt][Bb]?)\s*", s)
+            if not m:
+                raise ValueError(f"Invalid size format: {size_str}")
+            value = float(m.group(1))
+            unit = m.group(2).lower()
+            if unit.startswith('k'):
+                mult = 1024
+            elif unit.startswith('m'):
+                mult = 1024 ** 2
+            elif unit.startswith('g'):
+                mult = 1024 ** 3
+            elif unit.startswith('t'):
+                mult = 1024 ** 4
+            else:
+                mult = 1024 ** 2
+            return int(value * mult)
+        except Exception as e:
+            if logger:
+                logger.warning(f"Failed to parse max input size '{size_str}': {e}")
+            return None
     
     def _extract_config_overrides(self, args: argparse.Namespace) -> Dict[str, Any]:
         """Extract configuration overrides from CLI arguments"""
@@ -439,6 +501,16 @@ class VideoCompressorCLI:
             # Validate input file
             if not os.path.exists(args.input):
                 raise FileNotFoundError(f"Input file not found: {args.input}")
+            # Enforce max input size if provided
+            max_input_bytes = self._parse_max_input_size_to_bytes(getattr(args, 'max_input_size', None))
+            if max_input_bytes is not None:
+                try:
+                    sz = os.path.getsize(args.input)
+                    if sz > max_input_bytes:
+                        logger.info(f"Skipping {os.path.basename(args.input)}: {sz/1024/1024:.2f}MB exceeds max input size")
+                        return
+                except Exception:
+                    pass
             
             # Create output directory if needed
             output_dir = os.path.dirname(args.output)
@@ -475,6 +547,16 @@ class VideoCompressorCLI:
             # Validate input file
             if not os.path.exists(args.input):
                 raise FileNotFoundError(f"Input file not found: {args.input}")
+            # Enforce max input size if provided
+            max_input_bytes = self._parse_max_input_size_to_bytes(getattr(args, 'max_input_size', None))
+            if max_input_bytes is not None:
+                try:
+                    sz = os.path.getsize(args.input)
+                    if sz > max_input_bytes:
+                        logger.info(f"Skipping {os.path.basename(args.input)}: {sz/1024/1024:.2f}MB exceeds max input size")
+                        return
+                except Exception:
+                    pass
             
             # Create output directory if needed
             output_dir = os.path.dirname(args.output)
@@ -658,8 +740,20 @@ class VideoCompressorCLI:
         # Determine number of parallel processes
         max_workers = args.parallel or min(4, len(input_files))
         
+        # Parse max input size once
+        max_input_bytes = self._parse_max_input_size_to_bytes(getattr(args, 'max_input_size', None))
+
         def compress_single(input_file):
             try:
+                # Enforce max input size if provided
+                if max_input_bytes is not None:
+                    try:
+                        sz = os.path.getsize(input_file)
+                        if sz > max_input_bytes:
+                            logger.info(f"Skipping {os.path.basename(input_file)}: {sz/1024/1024:.2f}MB exceeds max input size")
+                            return {'success': True, 'input': input_file, 'skipped': True, 'reason': 'max_input_size'}
+                    except Exception:
+                        pass
                 # Generate output filename
                 basename = os.path.splitext(os.path.basename(input_file))[0]
                 output_file = os.path.join(effective_output_dir, f"{basename}{args.suffix}.mp4")
@@ -726,8 +820,20 @@ class VideoCompressorCLI:
         # Determine number of parallel processes
         max_workers = args.parallel or min(4, len(input_files))
         
+        # Parse max input size once
+        max_input_bytes = self._parse_max_input_size_to_bytes(getattr(args, 'max_input_size', None))
+
         def create_single_gif(input_file):
             try:
+                # Enforce max input size if provided
+                if max_input_bytes is not None:
+                    try:
+                        sz = os.path.getsize(input_file)
+                        if sz > max_input_bytes:
+                            logger.info(f"Skipping {os.path.basename(input_file)}: {sz/1024/1024:.2f}MB exceeds max input size")
+                            return {'success': True, 'input': input_file, 'skipped': True, 'reason': 'max_input_size'}
+                    except Exception:
+                        pass
                 # Generate output filename
                 basename = os.path.splitext(os.path.basename(input_file))[0]
                 output_file = os.path.join(args.output_dir, f"{basename}.gif")
@@ -1351,7 +1457,11 @@ class VideoCompressorCLI:
             # Respect global --output-dir if provided
             out_dir_display = os.path.abspath(args.output_dir) if getattr(args, 'output_dir', None) else os.path.abspath('output')
             print(f"Output directory:   {out_dir_display}")
-            print(f"Temp directory:     {os.path.abspath('temp')}")
+            try:
+                temp_display = os.path.abspath(self.config.get_temp_dir()) if hasattr(self, 'config') and self.config else os.path.abspath('temp')
+            except Exception:
+                temp_display = os.path.abspath('temp')
+            print(f"Temp directory:     {temp_display}")
             print(f"Check interval:     {args.check_interval} seconds")
             print(f"Max file size:      {args.max_size} MB")
             print("="*60)
@@ -1370,7 +1480,8 @@ class VideoCompressorCLI:
                 max_files=getattr(args, 'max_files', None),
                 input_dir=getattr(args, 'input_dir', None),
                 output_dir=getattr(args, 'output_dir', None),
-                no_cache=getattr(args, 'no_cache', False)
+                no_cache=getattr(args, 'no_cache', False),
+                max_input_size_bytes=self._parse_max_input_size_to_bytes(getattr(args, 'max_input_size', None))
             )
         except KeyboardInterrupt:
             logger.info("Automated workflow stopped by user")

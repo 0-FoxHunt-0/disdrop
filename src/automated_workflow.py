@@ -137,10 +137,14 @@ class AutomatedWorkflow:
                 
                 os._exit(1)
         
-        # Handle common shutdown signals
+        # Handle common shutdown signals (Windows-safe). Note: Windows supports SIGINT and SIGTERM in Python.
         signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
-        if hasattr(signal, 'SIGTERM'):
-            signal.signal(signal.SIGTERM, signal_handler)  # Termination signal
+        try:
+            if hasattr(signal, 'SIGTERM'):
+                signal.signal(signal.SIGTERM, signal_handler)  # Termination signal
+        except Exception:
+            # Best-effort on platforms without SIGTERM
+            pass
     
     def _ensure_directories(self):
         """Ensure all required directories exist"""
@@ -184,7 +188,7 @@ class AutomatedWorkflow:
             time.sleep(sleep_time)
             elapsed += sleep_time
     
-    def run_automated_workflow(self, check_interval: int = 5, max_size_mb: float = 10.0, verbose: bool = False, max_files: Optional[int] = None, input_dir: Optional[str] = None, output_dir: Optional[str] = None, no_cache: bool = False):
+    def run_automated_workflow(self, check_interval: int = 5, max_size_mb: float = 10.0, verbose: bool = False, max_files: Optional[int] = None, input_dir: Optional[str] = None, output_dir: Optional[str] = None, no_cache: bool = False, max_input_size_bytes: Optional[int] = None):
         """
         Run the automated workflow
         
@@ -631,7 +635,7 @@ class AutomatedWorkflow:
             else:
                 print(f"🔍 Scanning {len(potential_files)} files for stability and existing outputs...")
         
-        # Check stability and existing outputs for each file
+        # Check stability, size limit, and existing outputs for each file
         for i, file_path in enumerate(potential_files):
             # Check for shutdown signal during file scanning
             if self.shutdown_requested:
@@ -645,6 +649,23 @@ class AutomatedWorkflow:
                 else:
                     print(f"\r  📁 Checking file {i+1}/{len(potential_files)}: {file_path.name[:30]}...", end="", flush=True)
             
+            # Enforce optional max input size
+            try:
+                max_allowed = getattr(self, 'max_input_size_bytes', None)
+            except Exception:
+                max_allowed = None
+            if max_allowed is not None:
+                try:
+                    if file_path.exists():
+                        sz = file_path.stat().st_size
+                        if sz > int(max_allowed):
+                            safe_name = self._safe_filename_for_logging(file_path.name)
+                            print(f"    ⏭️  Skipping {safe_name}: {sz/1024/1024:.2f}MB exceeds max input size")
+                            logger.info(f"Skipping {file_path} due to max input size limit: {sz} > {max_allowed} bytes")
+                            continue
+                except Exception as _e:
+                    logger.debug(f"Could not enforce max input size on {file_path}: {_e}")
+
             # Check if file is not currently being written to
             if skip_stability_check or self._is_file_stable(file_path):
                 files.append(file_path)

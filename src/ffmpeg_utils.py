@@ -305,6 +305,16 @@ class FFmpegUtils:
             if 'crf' in params:
                 cmd.extend(['-global_quality', str(params['crf'])])
         
+        # Ensure Sample Aspect Ratio is normalized when no explicit filter graph is present
+        # Add a lightweight '-vf setsar=1' only if there is no existing '-vf' or '-filter_complex'
+        try:
+            has_filtergraph = any(flag in cmd for flag in ['-vf', '-filter_complex'])
+            if not has_filtergraph:
+                cmd.extend(['-vf', 'setsar=1'])
+        except Exception:
+            # Best-effort; ignore if inspection fails
+            pass
+
         return cmd
     
     @staticmethod

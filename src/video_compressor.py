@@ -1178,8 +1178,8 @@ class DynamicVideoCompressor:
         params['maxrate_multiplier'] = 1.15
         cmd = FFmpegUtils.build_base_ffmpeg_command(input_path, output_path, params)
         
-        # Smart scaling with high-quality filter - removed problematic parameters
-        scale_filter = f"scale={params['width']}:{params['height']}:flags=lanczos"
+        # Smart scaling with high-quality filter and normalized SAR
+        scale_filter = f"scale={params['width']}:{params['height']}:flags=lanczos,setsar=1"
         cmd.extend(['-vf', scale_filter])
         
         # Add frame rate

@@ -509,7 +509,7 @@ class GifGenerator:
             return {'success': False, 'error': str(e)}
     
     def _generate_palette(self, input_video: str, settings: Dict[str, Any], 
-                         start_time: float, duration: float) -> Optional[str]:
+                         start_time: float, duration: float, timeout_override: Optional[int] = None) -> Optional[str]:
         """Generate optimized palette for GIF creation"""
         try:
             if self.shutdown_requested:
@@ -587,7 +587,7 @@ class GifGenerator:
             logger.debug(f"Generating palette: {' '.join(cmd)}")
             
             # Run FFmpeg
-            result = self._run_ffmpeg(cmd, timeout=30)
+            result = self._run_ffmpeg(cmd, timeout=(timeout_override if timeout_override is not None else 30))
             
             if result.returncode == 0 and os.path.exists(palette_path):
                 return palette_path
@@ -603,7 +603,7 @@ class GifGenerator:
             return None
     
     def _create_gif_with_palette(self, input_video: str, output_path: str, palette_path: str,
-                                settings: Dict[str, Any], start_time: float, duration: float) -> bool:
+                                settings: Dict[str, Any], start_time: float, duration: float, timeout_override: Optional[int] = None) -> bool:
         """Create GIF using generated palette"""
         try:
             if self.shutdown_requested:
@@ -645,6 +645,8 @@ class GifGenerator:
                 logger.info(f"GIF scaling: using specified dimensions {target_width}x{target_height}")
             
             pre_chain.append(scale_filter)
+            # Normalize sample aspect ratio to avoid stretching in some viewers
+            pre_chain.append('setsar=1')
             dither = settings.get('dither', 'sierra2_4a')
             lavfi = ','.join(pre_chain) + f" [x]; [x][1:v] paletteuse=dither={dither}:diff_mode=rectangle:new=1"
 
@@ -668,7 +670,7 @@ class GifGenerator:
             logger.debug(f"Creating GIF: {' '.join(cmd)}")
             
             # Run FFmpeg
-            result = self._run_ffmpeg(cmd, timeout=120)
+            result = self._run_ffmpeg(cmd, timeout=(timeout_override if timeout_override is not None else 120))
             
             if result.returncode == 0 and os.path.exists(output_path):
                 return True
@@ -684,7 +686,7 @@ class GifGenerator:
             return False
 
     def _create_gif_split_palette(self, input_video: str, output_path: str,
-                                  settings: Dict[str, Any], start_time: float, duration: float) -> bool:
+                                  settings: Dict[str, Any], start_time: float, duration: float, timeout_override: Optional[int] = None) -> bool:
         """Create GIF using split palette single-pass pipeline with mpdecimate and optional crop"""
         try:
             if self.shutdown_requested:
@@ -716,6 +718,8 @@ class GifGenerator:
                 logger.info(f"GIF scaling: using specified dimensions {target_width}x{target_height}")
             
             pre.append(scale_filter)
+            # Normalize SAR for consistent display
+            pre.append('setsar=1')
             chain = ','.join(pre)
 
             filter_complex = (
@@ -736,7 +740,7 @@ class GifGenerator:
             FFmpegUtils.add_ffmpeg_perf_flags(cmd)
 
             logger.debug(f"Split-palette GIF creation: {' '.join(cmd)}")
-            result = self._run_ffmpeg(cmd, timeout=180)
+            result = self._run_ffmpeg(cmd, timeout=(timeout_override if timeout_override is not None else 180))
             return result.returncode == 0 and os.path.exists(output_path)
         except Exception as e:
             logger.debug(f"Split-palette creation failed: {e}")
@@ -1263,6 +1267,7 @@ class GifGenerator:
             feas_settings['palette_max_colors'] = int(settings.get('palette_max_colors', 256))
             feas_settings['dither'] = settings.get('dither', 'sierra2_4a')
             feas_settings.pop('mpdecimate_aggressive', None)
+            
 
             # Generate palette and GIF to temp dir
             temp_dir = self.config.get_temp_dir()
