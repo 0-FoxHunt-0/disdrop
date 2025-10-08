@@ -2,6 +2,40 @@
 
 A comprehensive Python tool for compressing videos and creating optimized GIFs for social media platforms, with intelligent hardware detection and automated workflows.
 
+## What's New - Simplified CLI
+
+The CLI has been streamlined for easier use while maintaining full functionality:
+
+✨ **Smart Auto-Detection**
+
+- Glob patterns (`*.mp4`) automatically trigger batch mode
+- Unified `gif` command auto-detects operation type (create/optimize/quality)
+- No need for separate `batch-compress` or `batch-gif` commands
+
+⚡ **Command Aliases**
+
+- `c` / `v` / `video` → `compress`
+- `g` / `a` / `anim` → `gif`
+- `w` / `watch` / `m` / `monitor` → `auto`
+- `hw` / `i` / `info` → `hardware-info`
+- `cfg` → `config`, `ch` → `cache`
+
+🎯 **Short Flags**
+
+- `-p` → `--platform`
+- `-s` → `--max-size`
+- `-o` → `--output-dir`
+- `-i` → `--input-dir`
+- `-j` → `--parallel`
+- `-d` → `--duration`
+- `-q` → `--quality`
+- `-f` → `--fps`
+- `-v` → `--debug`
+
+**Example:** `python main.py g "*.mp4" -o gifs/ -p discord -j 3`
+
+All old commands still work for backward compatibility!
+
 ## Features
 
 - **Video Compression**: Optimize videos for various social media platforms
@@ -45,6 +79,8 @@ pip install -r requirements.txt
 
 ```bash
 python main.py
+# or use short alias:
+python main.py w
 ```
 
 Watches `input/` and processes new files to `output/` (defaults: max size 10 MB, check every 5s). Stop with Ctrl+C.
@@ -52,44 +88,63 @@ Watches `input/` and processes new files to `output/` (defaults: max size 10 MB,
 ### Basic Video Compression
 
 ```bash
+# Long form
 python main.py compress input.mp4 output.mp4 --platform instagram
+
+# Short form with aliases
+python main.py c input.mp4 output.mp4 -p instagram
+```
+
+### Batch Video Compression (Auto-Detected)
+
+```bash
+# Glob patterns automatically trigger batch mode
+python main.py c "*.mp4" -o compressed/ -p tiktok -j 4
 ```
 
 ### Basic GIF Creation
 
 ```bash
+# Long form
 python main.py gif input.mp4 output.gif --platform twitter
+
+# Short form with aliases
+python main.py g input.mp4 output.gif -p twitter -d 10
+```
+
+### Batch GIF Creation (Auto-Detected)
+
+```bash
+# Glob patterns automatically trigger batch mode
+python main.py g "*.mp4" -o gifs/ -p discord -j 3
 ```
 
 ### Quality-Optimized GIF Creation
 
 ```bash
-python main.py gif input.mp4 output.gif --max-size 5.0
-```
+# With max-size (iterative optimization)
+python main.py g input.mp4 output.gif -s 5.0 -p twitter
 
-### Quality-optimized GIF (explicit target)
-
-```bash
-python main.py quality-gif input.mp4 output.gif --target-size 5.0 --quality-preference balanced [--platform discord]
+# With target-size (advanced optimization)
+python main.py g input.mp4 output.gif --target-size 5.0 --quality-preference balanced
 ```
 
 ### Optimize an existing GIF
 
 ```bash
-python main.py optimize-gif input.gif output.gif
+# Auto-detected when both input and output are GIFs
+python main.py g input.gif output.gif
 ```
 
-### Batch Processing
+### Automated workflow
 
 ```bash
-python main.py batch-compress "*.mp4" --output-dir compressed/ --platform instagram --parallel 4
-python main.py batch-gif "*.mp4" --output-dir gifs/ --platform twitter --duration 8 --parallel 4
-```
+# Long form
+python main.py auto --check-interval 10 -s 8
 
-### Automated workflow (explicit)
-
-```bash
-python main.py auto --check-interval 10 --max-size 10.0
+# Short aliases
+python main.py w --check-interval 10 -s 8
+python main.py watch --check-interval 10 -s 8
 ```
 
 ## How It Works
@@ -145,25 +200,133 @@ The tool includes an advanced iterative optimization system that automatically t
 
 ## CLI Overview
 
+### Smart Features
+
+- **Auto-Batch Detection**: Glob patterns (`*.mp4`) automatically trigger batch mode
+- **Unified GIF Command**: Single `gif` command auto-detects optimization type
+- **Command Aliases**: Short versions for faster typing
+- **Short Flags**: Single-letter options for common flags
+
 ### Global Options
 
-- `--log-level [DEBUG|INFO|WARNING|ERROR]`, `--debug` (verbose console + file logs)
-- `--temp-dir PATH` (defaults to `./temp`)
-- `--output-dir PATH` (global output directory for all modes)
-- `--max-size MB` (global size cap applied to both video and GIF where relevant)
-- `--force-software` (bypass hardware encoders)
+| Long Form           | Short | Description                             |
+| ------------------- | ----- | --------------------------------------- |
+| `--debug`           | `-v`  | Verbose console + file logs             |
+| `--max-size MB`     | `-s`  | Global size cap for output files        |
+| `--output-dir PATH` | `-o`  | Output directory for all modes          |
+| `--input-dir PATH`  | `-i`  | Input directory for auto mode           |
+| `--temp-dir PATH`   |       | Temporary directory (default: `./temp`) |
+| `--force-software`  |       | Bypass hardware encoders                |
+| `--no-cache`        |       | Don't use success cache                 |
 
-### Commands
+### Commands and Aliases
 
-- `compress <in> <out> [--platform ...] [--encoder ...] [--quality CRF] [--bitrate 1000k] [--resolution WxH] [--fps N]`
-- `gif <in> <out> [--platform twitter|discord|slack] [--start S] [--duration S] [--max-size MB] [--fps N] [--width W] [--height H] [--colors C]`
-- `quality-gif <in> <out> --target-size MB [--quality-preference quality|balanced|size] [--platform ...] [--start] [--duration]`
-- `optimize-gif <in> <out>`
-- `batch-compress <glob> --output-dir DIR [--platform ...] [--suffix _compressed] [--parallel N]`
-- `batch-gif <glob> --output-dir DIR [--platform ...] [--duration S] [--parallel N]`
-- `hardware-info`
-- `config show|validate`
-- `auto [--check-interval S] [--max-size MB]`
+| Command         | Aliases                      | Description              |
+| --------------- | ---------------------------- | ------------------------ |
+| `compress`      | `c`, `v`, `video`            | Compress video file(s)   |
+| `gif`           | `g`, `a`, `anim`             | Create/optimize GIF(s)   |
+| `auto`          | `w`, `watch`, `m`, `monitor` | Watch input folder       |
+| `hardware-info` | `hw`, `i`, `info`            | Show hardware info       |
+| `config`        | `cfg`                        | Configuration management |
+| `cache`         | `ch`                         | Cache operations         |
+
+### Command Details
+
+#### compress / c / v / video
+
+Compress video file(s). Auto-detects batch mode from glob patterns.
+
+```bash
+compress <input> [output] [options]
+```
+
+**Options:**
+
+- `-p, --platform` - Target platform (instagram, twitter, tiktok, youtube_shorts, facebook)
+- `-q, --quality CRF` - Quality setting (lower = better)
+- `-f, --fps N` - Target frame rate
+- `--encoder` - Force specific encoder
+- `--bitrate` - Target bitrate (e.g., 1000k)
+- `--resolution` - Target resolution (e.g., 1080x1080)
+- `--suffix` - Suffix for batch output files (default: \_compressed)
+- `-j, --parallel N` - Number of parallel processes for batch
+
+#### gif / g / a / anim
+
+Create or optimize GIF(s). Auto-detects operation type and batch mode.
+
+```bash
+gif <input> [output] [options]
+```
+
+**Options:**
+
+- `-p, --platform` - Target platform (twitter, discord, slack)
+- `-s, --max-size MB` - Max file size (enables quality optimization)
+- `--target-size MB` - Target size for advanced optimization
+- `-d, --duration S` - Duration in seconds
+- `--start S` - Start time in seconds
+- `-f, --fps N` - Frame rate
+- `--width W` - Width in pixels
+- `--height H` - Height in pixels
+- `--colors C` - Number of colors in palette
+- `--quality-preference` - Strategy: quality, balanced, size
+- `-j, --parallel N` - Number of parallel processes for batch
+
+#### auto / w / watch / m / monitor
+
+Watch input folder and automatically process new files.
+
+```bash
+auto [options]
+```
+
+**Options:**
+
+- `--check-interval S` - Check frequency in seconds (default: 5)
+- `-s, --max-size MB` - Max output size (default: 10.0)
+- `-i, --input-dir PATH` - Input directory (default: ./input)
+- `-o, --output-dir PATH` - Output directory (default: ./output)
+- `--no-cache` - Don't use success cache
+
+#### Other Commands
+
+- `hardware-info` / `hw` / `i` / `info` - Display hardware acceleration info
+- `config` / `cfg` `show|validate` - Configuration management
+- `cache` / `ch` `clear|stats|validate` - Cache operations
+
+### Quick Reference Card
+
+Common tasks with shortest syntax:
+
+```bash
+# Compress single video for Instagram
+python main.py c video.mp4 out.mp4 -p instagram
+
+# Batch compress all videos for TikTok
+python main.py c "*.mp4" -o compressed/ -p tiktok -j 4
+
+# Create GIF for Twitter
+python main.py g video.mp4 out.gif -p twitter -s 5
+
+# Batch create GIFs for Discord
+python main.py g "*.mp4" -o gifs/ -p discord -j 3
+
+# Optimize existing GIF
+python main.py g input.gif output.gif
+
+# Watch folder for new files
+python main.py w
+
+# Check hardware capabilities
+python main.py hw
+
+# Show configuration
+python main.py cfg show
+
+# Clear cache
+python main.py ch clear
+```
 
 ## Configuration
 
@@ -239,56 +402,92 @@ The tool automatically detects and utilizes available hardware:
 ### Example 1: Social Media Content Creation
 
 ```bash
-# Create Instagram-optimized video
+# Create Instagram-optimized video (long form)
 python main.py compress raw_video.mp4 instagram_video.mp4 --platform instagram
 
-# Create Twitter GIF with quality optimization
-python main.py quality-gif raw_video.mp4 twitter_gif.gif --target-size 5.0 --quality-preference balanced --platform twitter
+# Create Instagram-optimized video (short form)
+python main.py c raw_video.mp4 instagram_video.mp4 -p instagram
+
+# Create Twitter GIF with quality optimization (long form)
+python main.py gif raw_video.mp4 twitter_gif.gif --target-size 5.0 --quality-preference balanced -p twitter
+
+# Create Twitter GIF with quality optimization (short form)
+python main.py g raw_video.mp4 twitter_gif.gif --target-size 5.0 -p twitter
 ```
 
-### Example 2: Batch Processing
+### Example 2: Batch Processing (Auto-Detected)
 
 ```bash
-# Process all videos in directory for multiple platforms
-python main.py batch-compress "videos/*.mp4" --output-dir instagram/ --platform instagram
-python main.py batch-compress "videos/*.mp4" --output-dir twitter/ --platform twitter
-python main.py batch-gif "videos/*.mp4" --output-dir gifs/ --platform discord --duration 8
+# Process all videos for Instagram (auto-detects batch mode from glob pattern)
+python main.py c "videos/*.mp4" -o instagram/ -p instagram -j 4
+
+# Process all videos for Twitter
+python main.py c "videos/*.mp4" -o twitter/ -p twitter -j 4
+
+# Create GIFs for Discord from all videos
+python main.py g "videos/*.mp4" -o gifs/ -p discord -d 8 -j 3
 ```
 
 ### Example 3: Automated Workflow
 
 ```bash
-# Start automated processing
-python main.py auto --check-interval 30 --max-size 8.0
+# Start automated processing (long form)
+python main.py auto --check-interval 30 -s 8.0
+
+# Start automated processing (short aliases)
+python main.py w --check-interval 30 -s 8.0
+python main.py watch --check-interval 30 -s 8.0
 
 # Place videos in input/ directory and they'll be processed automatically
+```
+
+### Example 4: Quick Commands with Aliases
+
+```bash
+# Check hardware capabilities
+python main.py hw
+
+# Show configuration
+python main.py cfg show
+
+# Clear cache
+python main.py ch clear
+
+# Optimize existing GIF (auto-detected)
+python main.py g input.gif output.gif
 ```
 
 ## Performance Tips
 
 1. **Use Hardware Acceleration**: The tool automatically detects and uses GPU acceleration when available
-2. **Batch Processing**: Use batch commands for multiple files to save time
-3. **Quality Optimization**: Use the quality-gif command for best results when file size is critical
-4. **Platform-Specific Settings**: Always specify the target platform for optimal results
-5. **Parallel Processing**: Use `--parallel` flag for batch operations on multi-core systems
-6. **Valid existing outputs in `output/` are reused to save time**
+2. **Batch Processing**: Use glob patterns (`*.mp4`) for automatic batch processing
+3. **Short Commands**: Use aliases (`c`, `g`, `w`) and short flags (`-p`, `-s`, `-o`) for faster typing
+4. **Quality Optimization**: The unified `gif` command automatically optimizes based on your flags
+5. **Platform-Specific Settings**: Always specify the target platform (`-p`) for optimal results
+6. **Parallel Processing**: Use `-j N` flag for batch operations on multi-core systems
+7. **Valid existing outputs in `output/` are reused to save time**
 
 ## Troubleshooting
 
 ### Common Issues
 
 - **FFmpeg not found**: Install FFmpeg and ensure it's in your system PATH
-- **Hardware encoder errors**: app falls back to software; use `--force-software` to skip hardware
-- **Outputs slightly over target**: try `quality-gif --target-size ...` or reduce FPS/scale/colors
-- **Large file sizes**: Use quality optimization or reduce target resolution
-- **Poor quality**: Increase quality settings or use quality-gif command
+- **Hardware encoder errors**: App falls back to software; use `--force-software` to skip hardware detection
+- **Outputs slightly over target**: Use `--target-size` for advanced optimization or reduce FPS/scale/colors
+- **Large file sizes**: Use `-s` or `--max-size` to enable automatic quality optimization
+- **Poor quality**: Increase quality settings or use `--target-size` with `--quality-preference quality`
+- **Batch mode not working**: Ensure glob patterns are quoted (`"*.mp4"` not `*.mp4`)
 
 ### Debug Mode
 
 Enable debug logging for detailed information:
 
 ```bash
-python main.py compress input.mp4 output.mp4 --log-level DEBUG
+# Long form
+python main.py compress input.mp4 output.mp4 --debug
+
+# Short form
+python main.py c input.mp4 output.mp4 -v
 ```
 
 ## Contributing

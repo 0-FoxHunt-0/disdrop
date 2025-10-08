@@ -153,10 +153,16 @@ class VideoCompressorCLI:
         parser = argparse.ArgumentParser(
             description="Video Compressor - Compress videos and create GIFs for social media platforms",
             epilog="Examples:\n"
-                   "  %(prog)s compress input.mp4 output.mp4 --platform instagram\n"
-                   "  %(prog)s gif input.mp4 output.gif --platform twitter --duration 10\n"
-                   "  %(prog)s batch-compress *.mp4 --platform tiktok --output-dir compressed/\n"
-                   "  %(prog)s hardware-info\n",
+                   "  %(prog)s c input.mp4 output.mp4 -p instagram\n"
+                   "  %(prog)s c \"*.mp4\" -o compressed/ -p tiktok -j 4\n"
+                   "  %(prog)s g input.mp4 output.gif -p twitter -d 10\n"
+                   "  %(prog)s g \"*.mp4\" -o gifs/ -p discord -j 3\n"
+                   "  %(prog)s w --check-interval 10 -s 8\n"
+                   "  %(prog)s hw\n\n"
+                   "Smart Features:\n"
+                   "  - Auto-detects batch mode from glob patterns (*.mp4)\n"
+                   "  - Unified 'gif' command auto-detects optimization type\n"
+                   "  - Short aliases: c/v (compress), g/a (gif), w/m (watch/auto), hw/i (info)\n",
             formatter_class=argparse.RawDescriptionHelpFormatter
         )
         
@@ -166,15 +172,15 @@ class VideoCompressorCLI:
         # Default to quieter console; use --debug to enable verbose output
         parser.add_argument('--log-level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
                           default=None, help='Override logging level (default: WARNING to console, DEBUG to file)')
-        parser.add_argument('--debug', action='store_true',
+        parser.add_argument('-v', '--debug', action='store_true',
                           help='Enable verbose debug output in console and logs')
         parser.add_argument('--temp-dir', help='Temporary directory for processing')
-        parser.add_argument('--max-size', type=float, metavar='MB',
+        parser.add_argument('-s', '--max-size', type=float, metavar='MB',
                           help='Maximum output file size in MB (overrides platform defaults)')
         parser.add_argument('--max-files', type=int, metavar='N',
                           help='Maximum number of files to process before exiting')
-        parser.add_argument('--input-dir', help='Input directory for automated/other modes (default: ./input)')
-        parser.add_argument('--output-dir', help='Output directory for generated files (default varies by mode, typically ./output)')
+        parser.add_argument('-i', '--input-dir', help='Input directory for automated/other modes (default: ./input)')
+        parser.add_argument('-o', '--output-dir', help='Output directory for generated files (default varies by mode, typically ./output)')
         parser.add_argument('--force-software', action='store_true',
                           help='Force software encoding (bypass hardware acceleration)')
         parser.add_argument('--no-cache', action='store_true',
@@ -188,37 +194,48 @@ class VideoCompressorCLI:
         # Create subcommands
         subparsers = parser.add_subparsers(dest='command', help='Available commands')
         
-        # Compress video command
-        compress_parser = subparsers.add_parser('compress', help='Compress a video file')
-        compress_parser.add_argument('input', help='Input video file')
-        compress_parser.add_argument('output', help='Output video file')
-        compress_parser.add_argument('--platform', choices=['instagram', 'twitter', 'tiktok', 'youtube_shorts', 'facebook'],
+        # Compress video command (with aliases: c, v, video)
+        compress_parser = subparsers.add_parser('compress', aliases=['c', 'v', 'video'],
+                                               help='Compress video file(s) - auto-detects batch mode from glob patterns')
+        compress_parser.add_argument('input', help='Input video file or glob pattern (e.g., *.mp4 for batch)')
+        compress_parser.add_argument('output', nargs='?', help='Output video file (optional for batch mode)')
+        compress_parser.add_argument('-p', '--platform', choices=['instagram', 'twitter', 'tiktok', 'youtube_shorts', 'facebook'],
                                    help='Target social media platform')
         compress_parser.add_argument('--encoder', help='Force specific encoder (overrides hardware detection)')
-        compress_parser.add_argument('--quality', type=int, metavar='CRF', help='Quality setting (CRF value, lower = better)')
+        compress_parser.add_argument('-q', '--quality', type=int, metavar='CRF', help='Quality setting (CRF value, lower = better)')
         compress_parser.add_argument('--bitrate', help='Target bitrate (e.g., 1000k)')
         compress_parser.add_argument('--resolution', help='Target resolution (e.g., 1080x1080)')
-        compress_parser.add_argument('--fps', type=int, help='Target frame rate')
+        compress_parser.add_argument('-f', '--fps', type=int, help='Target frame rate')
+        # Batch mode options (used when glob pattern detected)
+        compress_parser.add_argument('--suffix', default='_compressed', help='Suffix for batch output files (default: _compressed)')
+        compress_parser.add_argument('-j', '--parallel', type=int, metavar='N', help='Number of parallel processes for batch mode')
         
-        # Create GIF command
-        gif_parser = subparsers.add_parser('gif', help='Create GIF from video')
-        gif_parser.add_argument('input', help='Input video file')
-        gif_parser.add_argument('output', help='Output GIF file')
-        gif_parser.add_argument('--platform', choices=['twitter', 'discord', 'slack'],
+        # Unified GIF command (with aliases: g, a, anim) - merges gif, quality-gif, optimize-gif
+        gif_parser = subparsers.add_parser('gif', aliases=['g', 'a', 'anim'],
+                                          help='Create/optimize GIF(s) - auto-detects operation type and batch mode')
+        gif_parser.add_argument('input', help='Input video/GIF file or glob pattern (e.g., *.mp4 for batch)')
+        gif_parser.add_argument('output', nargs='?', help='Output GIF file (optional for batch mode)')
+        gif_parser.add_argument('-p', '--platform', choices=['twitter', 'discord', 'slack'],
                                help='Target platform for GIF optimization')
         gif_parser.add_argument('--start', type=float, default=0, metavar='SECONDS',
                                help='Start time in seconds (default: 0)')
-        gif_parser.add_argument('--duration', type=float, metavar='SECONDS',
+        gif_parser.add_argument('-d', '--duration', type=float, metavar='SECONDS',
                                help='Duration in seconds (default: platform/config limit)')
-        gif_parser.add_argument('--max-size', type=float, metavar='MB',
+        gif_parser.add_argument('-s', '--max-size', type=float, metavar='MB',
                                help='Maximum file size in MB (enables quality optimization)')
-        gif_parser.add_argument('--fps', type=int, help='Frame rate for GIF')
+        gif_parser.add_argument('--target-size', type=float, metavar='MB',
+                               help='Target file size in MB for quality-optimized GIF (triggers advanced optimization)')
+        gif_parser.add_argument('--quality-preference', choices=['quality', 'balanced', 'size'],
+                               default='balanced', help='Optimization strategy when using --target-size (default: balanced)')
+        gif_parser.add_argument('-f', '--fps', type=int, help='Frame rate for GIF')
         gif_parser.add_argument('--width', type=int, help='GIF width in pixels')
         gif_parser.add_argument('--height', type=int, help='GIF height in pixels')
         gif_parser.add_argument('--colors', type=int, help='Number of colors in GIF palette')
+        # Batch mode options (used when glob pattern detected)
+        gif_parser.add_argument('-j', '--parallel', type=int, metavar='N', help='Number of parallel processes for batch mode')
         
-        # Batch compress command
-        batch_parser = subparsers.add_parser('batch-compress', help='Compress multiple video files')
+        # Batch compress command (kept for backward compatibility, hidden)
+        batch_parser = subparsers.add_parser('batch-compress', help=argparse.SUPPRESS)
         batch_parser.add_argument('input_pattern', help='Input files pattern (e.g., *.mp4)')
         batch_parser.add_argument('--output-dir', help='Output directory (overrides global)')
         batch_parser.add_argument('--platform', choices=['instagram', 'twitter', 'tiktok', 'youtube_shorts', 'facebook'],
@@ -226,8 +243,8 @@ class VideoCompressorCLI:
         batch_parser.add_argument('--suffix', default='_compressed', help='Suffix for output files')
         batch_parser.add_argument('--parallel', type=int, metavar='N', help='Number of parallel processes')
         
-        # Batch GIF command
-        batch_gif_parser = subparsers.add_parser('batch-gif', help='Create GIFs from multiple videos')
+        # Batch GIF command (kept for backward compatibility, hidden)
+        batch_gif_parser = subparsers.add_parser('batch-gif', help=argparse.SUPPRESS)
         batch_gif_parser.add_argument('input_pattern', help='Input files pattern (e.g., *.mp4)')
         batch_gif_parser.add_argument('--output-dir', help='Output directory (overrides global)')
         batch_gif_parser.add_argument('--platform', choices=['twitter', 'discord', 'slack'],
@@ -236,13 +253,13 @@ class VideoCompressorCLI:
                                      help='Duration for each GIF')
         batch_gif_parser.add_argument('--parallel', type=int, metavar='N', help='Number of parallel processes')
         
-        # Optimize existing GIF
-        optimize_parser = subparsers.add_parser('optimize-gif', help='Optimize an existing GIF file')
+        # Optimize existing GIF (kept for backward compatibility, hidden - now handled by unified gif command)
+        optimize_parser = subparsers.add_parser('optimize-gif', help=argparse.SUPPRESS)
         optimize_parser.add_argument('input', help='Input GIF file')
         optimize_parser.add_argument('output', help='Output GIF file')
         
-        # Quality-optimized GIF command
-        quality_gif_parser = subparsers.add_parser('quality-gif', help='Create GIF with iterative quality optimization')
+        # Quality-optimized GIF command (kept for backward compatibility, hidden - now handled by unified gif command)
+        quality_gif_parser = subparsers.add_parser('quality-gif', help=argparse.SUPPRESS)
         quality_gif_parser.add_argument('input', help='Input video file')
         quality_gif_parser.add_argument('output', help='Output GIF file')
         quality_gif_parser.add_argument('--platform', choices=['twitter', 'discord', 'slack'],
@@ -256,33 +273,37 @@ class VideoCompressorCLI:
         quality_gif_parser.add_argument('--quality-preference', choices=['quality', 'balanced', 'size'],
                                        default='balanced', help='Optimization strategy (default: balanced)')
         
-        # Hardware info command
-        subparsers.add_parser('hardware-info', help='Display hardware acceleration information')
+        # Hardware info command (with aliases: hw, i, info)
+        subparsers.add_parser('hardware-info', aliases=['hw', 'i', 'info'],
+                             help='Display hardware acceleration information')
         
-        # Config command
-        config_parser = subparsers.add_parser('config', help='Configuration management')
+        # Config command (with alias: cfg)
+        config_parser = subparsers.add_parser('config', aliases=['cfg'],
+                                             help='Configuration management')
         config_subparsers = config_parser.add_subparsers(dest='config_action')
         config_subparsers.add_parser('show', help='Show current configuration')
         config_subparsers.add_parser('validate', help='Validate configuration files')
         
-        # Automated workflow command
-        auto_parser = subparsers.add_parser('auto', help='Run automated workflow (process videos from input folder)')
+        # Automated workflow command (with aliases: w, watch, m, monitor)
+        auto_parser = subparsers.add_parser('auto', aliases=['w', 'watch', 'm', 'monitor'],
+                                           help='Run automated workflow (watch input folder and process new files)')
         auto_parser.add_argument('--check-interval', type=int, default=5, metavar='SECONDS',
                                 help='How often to check for new files (default: 5 seconds)')
-        auto_parser.add_argument('--max-size', type=float, default=10.0, metavar='MB',
+        auto_parser.add_argument('-s', '--max-size', type=float, default=10.0, metavar='MB',
                                 help='Maximum output file size in MB (default: 10.0)')
         auto_parser.add_argument('--no-cache', action='store_true',
                                 help='Do not use success cache in automated workflow')
         # Accept global-style flags after subcommand for convenience
-        auto_parser.add_argument('--input-dir', help='Input directory to watch (default: ./input)')
-        auto_parser.add_argument('--output-dir', help='Output directory (default: ./output)')
+        auto_parser.add_argument('-i', '--input-dir', help='Input directory to watch (default: ./input)')
+        auto_parser.add_argument('-o', '--output-dir', help='Output directory (default: ./output)')
         # Allow specifying temp directory after the subcommand as well as globally
         auto_parser.add_argument('--temp-dir', help='Temporary directory for processing')
         auto_parser.add_argument('--max-input-size', dest='max_input_size', metavar='SIZE',
                                 help='Maximum input file size to process (e.g., 500, 750MB, 1.2GB, 2TB). Bare numbers are MB.')
         
-        # Cache management command
-        cache_parser = subparsers.add_parser('cache', help='Cache management operations')
+        # Cache management command (with alias: ch)
+        cache_parser = subparsers.add_parser('cache', aliases=['ch'],
+                                            help='Cache management operations')
         cache_subparsers = cache_parser.add_subparsers(dest='cache_action', help='Cache operations')
         cache_subparsers.add_parser('clear', help='Clear all cache entries')
         cache_subparsers.add_parser('stats', help='Show cache statistics')
@@ -459,39 +480,142 @@ class VideoCompressorCLI:
     def _execute_command(self, args: argparse.Namespace):
         """Execute the requested command"""
         
-        if args.command == 'compress':
-            self._compress_video(args)
+        # Normalize command aliases to base commands
+        command = args.command
+        if command in ['c', 'v', 'video']:
+            command = 'compress'
+        elif command in ['g', 'a', 'anim']:
+            command = 'gif'
+        elif command in ['w', 'watch', 'm', 'monitor']:
+            command = 'auto'
+        elif command in ['hw', 'i', 'info']:
+            command = 'hardware-info'
+        elif command in ['cfg']:
+            command = 'config'
+        elif command in ['ch']:
+            command = 'cache'
         
-        elif args.command == 'gif':
-            self._create_gif(args)
+        if command == 'compress':
+            self._compress_video_smart(args)
         
-        elif args.command == 'batch-compress':
+        elif command == 'gif':
+            self._create_gif_smart(args)
+        
+        elif command == 'batch-compress':
             self._batch_compress(args)
         
-        elif args.command == 'batch-gif':
+        elif command == 'batch-gif':
             self._batch_gif(args)
         
-        elif args.command == 'optimize-gif':
+        elif command == 'optimize-gif':
             self._optimize_gif(args)
         
-        elif args.command == 'quality-gif':
+        elif command == 'quality-gif':
             self._create_quality_gif(args)
         
-        elif args.command == 'hardware-info':
+        elif command == 'hardware-info':
             self._show_hardware_info()
         
-        elif args.command == 'config':
+        elif command == 'config':
             self._handle_config_command(args)
         
-        elif args.command == 'auto':
+        elif command == 'auto':
             self._run_automated_workflow(args)
         
-        elif args.command == 'cache':
+        elif command == 'cache':
             self._handle_cache_command(args)
         
         else:
-            logger.error(f"Unknown command: {args.command}")
+            logger.error(f"Unknown command: {command}")
             sys.exit(1)
+    
+    def _is_glob_pattern(self, path: str) -> bool:
+        """Check if a path contains glob pattern characters"""
+        return any(char in path for char in ['*', '?', '['])
+    
+    def _compress_video_smart(self, args: argparse.Namespace):
+        """Smart compress handler that auto-detects batch mode from glob patterns"""
+        # Check if input is a glob pattern
+        if self._is_glob_pattern(args.input):
+            logger.info(f"Detected glob pattern, switching to batch mode: {args.input}")
+            # Convert to batch mode arguments
+            batch_args = argparse.Namespace(
+                input_pattern=args.input,
+                output_dir=args.output if args.output else (getattr(args, 'output_dir', None) or 'output'),
+                platform=getattr(args, 'platform', None),
+                suffix=getattr(args, 'suffix', '_compressed'),
+                parallel=getattr(args, 'parallel', None),
+                max_size=getattr(args, 'max_size', None),
+                max_files=getattr(args, 'max_files', None),
+                max_input_size=getattr(args, 'max_input_size', None),
+                encoder=getattr(args, 'encoder', None),
+                quality=getattr(args, 'quality', None),
+                bitrate=getattr(args, 'bitrate', None),
+                resolution=getattr(args, 'resolution', None),
+                fps=getattr(args, 'fps', None)
+            )
+            self._batch_compress(batch_args)
+        else:
+            # Single file mode
+            if not args.output:
+                # Auto-generate output path
+                import os
+                output_dir = getattr(args, 'output_dir', None) or 'output'
+                os.makedirs(output_dir, exist_ok=True)
+                basename = os.path.splitext(os.path.basename(args.input))[0]
+                suffix = getattr(args, 'suffix', '_compressed')
+                args.output = os.path.join(output_dir, f"{basename}{suffix}.mp4")
+                logger.info(f"Auto-generated output path: {args.output}")
+            self._compress_video(args)
+    
+    def _create_gif_smart(self, args: argparse.Namespace):
+        """Smart GIF handler that auto-detects operation type and batch mode"""
+        # Check if input is a glob pattern (batch mode)
+        if self._is_glob_pattern(args.input):
+            logger.info(f"Detected glob pattern, switching to batch GIF mode: {args.input}")
+            # Convert to batch mode arguments
+            batch_args = argparse.Namespace(
+                input_pattern=args.input,
+                output_dir=args.output if args.output else (getattr(args, 'output_dir', None) or 'output'),
+                platform=getattr(args, 'platform', None),
+                duration=getattr(args, 'duration', None),
+                parallel=getattr(args, 'parallel', None),
+                max_size=getattr(args, 'max_size', None),
+                max_files=getattr(args, 'max_files', None),
+                max_input_size=getattr(args, 'max_input_size', None),
+                start=getattr(args, 'start', 0),
+                fps=getattr(args, 'fps', None),
+                width=getattr(args, 'width', None),
+                height=getattr(args, 'height', None),
+                colors=getattr(args, 'colors', None)
+            )
+            self._batch_gif(batch_args)
+        else:
+            # Single file mode - detect operation type
+            if not args.output:
+                # Auto-generate output path
+                import os
+                output_dir = getattr(args, 'output_dir', None) or 'output'
+                os.makedirs(output_dir, exist_ok=True)
+                basename = os.path.splitext(os.path.basename(args.input))[0]
+                args.output = os.path.join(output_dir, f"{basename}.gif")
+                logger.info(f"Auto-generated output path: {args.output}")
+            
+            # Detect operation type based on input/output and flags
+            input_is_gif = args.input.lower().endswith('.gif')
+            output_is_gif = args.output.lower().endswith('.gif')
+            
+            if input_is_gif and output_is_gif:
+                # GIF to GIF = optimize existing GIF
+                logger.info("Detected GIF optimization mode (input and output are both GIFs)")
+                self._optimize_gif(args)
+            elif hasattr(args, 'target_size') and args.target_size:
+                # target-size specified = quality-optimized GIF
+                logger.info(f"Detected quality-optimized GIF mode (target size: {args.target_size}MB)")
+                self._create_quality_gif(args)
+            else:
+                # Standard GIF creation (may include iterative optimization if max-size specified)
+                self._create_gif(args)
     
     def _compress_video(self, args: argparse.Namespace):
         """Handle video compression command"""
