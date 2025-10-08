@@ -33,13 +33,13 @@ dependencies = [
 disdrop = "disdrop.cli:main"
 
 [tool.setuptools]
-package-dir = {"": "."}
+package-dir = {"disdrop" = "src"}
 packages = ["disdrop"]
 include-package-data = true
 
 [tool.setuptools.package-data]
 disdrop = [
-  "package_data/config/*.yaml"
+  "config/*.yaml"
 ]
 
 
