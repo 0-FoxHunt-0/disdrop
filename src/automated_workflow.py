@@ -372,19 +372,23 @@ class AutomatedWorkflow:
         """Detect final outputs for the given input and record cache.
 
         Works for both video and GIF inputs by using the stem to find either a
-        single GIF in `output/` or a `<stem>_segments` folder with GIFs.
+        single GIF in the mirrored output folder or a `<stem>_segments` folder with GIFs.
         """
         try:
             stem = input_path.stem
+            # Get the mirrored output location
+            relative_path = self._get_relative_path(input_path)
+            output_category_dir = self.output_dir / relative_path.parent
+            
             # Prefer segments when they exist and contain valid GIFs
-            segments_dir = self.output_dir / f"{stem}_segments"
+            segments_dir = output_category_dir / f"{stem}_segments"
             if segments_dir.exists() and segments_dir.is_dir():
                 valid_segs, _ = self._validate_segment_folder_gifs(segments_dir, 10.0)
                 if valid_segs:
                     self._record_success_cache(input_path, 'segments', segments_dir)
                     return
             # Otherwise, check for single GIF
-            single_gif = self.output_dir / f"{stem}.gif"
+            single_gif = output_category_dir / f"{stem}.gif"
             if single_gif.exists():
                 # Fast check is sufficient for cache record
                 is_valid, _ = self.file_validator.is_valid_gif_fast(str(single_gif), max_size_mb=10.0)
@@ -454,11 +458,20 @@ class AutomatedWorkflow:
         except Exception:
             pass
 
-    def _make_cache_key(self, input_file: Path) -> str:
+    def _get_relative_path(self, file_path: Path) -> Path:
+        """Get relative path of file from input directory"""
         try:
-            return str(input_file.resolve())
+            return file_path.relative_to(self.input_dir)
+        except ValueError:
+            return Path(file_path.name)
+    
+    def _make_cache_key(self, input_file: Path) -> str:
+        """Create cache key using relative path to handle files with same name in different folders"""
+        try:
+            relative_path = self._get_relative_path(input_file)
+            return str(relative_path)
         except Exception:
-            return str(input_file)
+            return str(input_file.name)
 
     def _get_input_signature(self, input_file: Path) -> Dict[str, Any]:
         try:
@@ -569,7 +582,8 @@ class AutomatedWorkflow:
 
     def _move_input_to_failures(self, src_path: Path) -> None:
         """Move a failed input file from input/ to failures/ with safe unique naming.
-
+        
+        Preserves folder structure from input directory.
         Best-effort operation; logs and prints a short note on success.
         """
         try:
@@ -578,13 +592,20 @@ class AutomatedWorkflow:
             return
 
         try:
+            # Get relative path to preserve folder structure
+            relative_path = self._get_relative_path(src_path)
+            
+            # Create target directory structure in failures/
+            target_dir = self.failures_dir / relative_path.parent
+            target_dir.mkdir(parents=True, exist_ok=True)
+            
             stem = src_path.stem
             suffix = src_path.suffix
-            candidate = self.failures_dir / src_path.name
+            candidate = target_dir / src_path.name
             index = 1
             # Ensure we don't overwrite an existing file in failures
             while candidate.exists():
-                candidate = self.failures_dir / f"{stem} ({index}){suffix}"
+                candidate = target_dir / f"{stem} ({index}){suffix}"
                 index += 1
 
             shutil.move(str(src_path), str(candidate))
@@ -613,9 +634,9 @@ class AutomatedWorkflow:
         supported_gif_extensions = {'.gif'}
         supported_extensions = supported_video_extensions | supported_gif_extensions
         
-        # First, collect all potential files
+        # First, collect all potential files (recursively scan all subdirectories)
         potential_files = []
-        for file_path in self.input_dir.iterdir():
+        for file_path in self.input_dir.rglob("*"):
             if (file_path.is_file() and 
                 file_path.suffix.lower() in supported_extensions and
                 file_path not in processed_files):
@@ -685,7 +706,7 @@ class AutomatedWorkflow:
     
     def _has_existing_output(self, input_file: Path) -> bool:
         """
-        Check for existing output files.
+        Check for existing output files in the mirrored folder structure.
         
         For video files: Checks for MP4 outputs (video processing)
         For GIF files: Checks for optimized GIF outputs
@@ -701,6 +722,10 @@ class AutomatedWorkflow:
         
         base_name = input_file.stem
         
+        # Get relative path to determine correct output location
+        relative_path = self._get_relative_path(input_file)
+        output_category_dir = self.output_dir / relative_path.parent
+        
         # Check if input is a GIF file
         if input_file.suffix.lower() == '.gif':
             # For GIF files, check for existing optimized GIF output
@@ -708,24 +733,12 @@ class AutomatedWorkflow:
                 f"{base_name}.gif",
             ]
             
-            # Check root output directory first (most common case)
+            # Check in the mirrored category folder first
             for pattern in output_patterns:
-                output_path = self.output_dir / pattern
+                output_path = output_category_dir / pattern
                 if self._is_valid_existing_output(output_path, pattern, input_file):
                     logger.info(f"Found existing GIF output for {input_file.name}: {output_path}")
                     return True
-            
-            # Recursive search in all subdirectories
-            try:
-                for subdir in self.output_dir.rglob("*"):
-                    if subdir.is_dir():
-                        for pattern in output_patterns:
-                            output_path = subdir / pattern
-                            if self._is_valid_existing_output(output_path, pattern, input_file):
-                                logger.info(f"Found existing GIF output for {input_file.name}: {output_path}")
-                                return True
-            except Exception as e:
-                logger.debug(f"Error during recursive output search: {e}")
             
             return False
         else:
@@ -735,27 +748,15 @@ class AutomatedWorkflow:
                 f"{base_name}.mp4",
             ]
             
-            # Check root output directory first (most common case)
+            # Check in the mirrored category folder first
             for pattern in output_patterns:
-                output_path = self.output_dir / pattern
+                output_path = output_category_dir / pattern
                 if self._is_valid_existing_output(output_path, pattern, input_file):
                     logger.info(f"Found existing video output for {input_file.name}: {output_path}")
                     return True
             
-            # Recursive search in all subdirectories
-            try:
-                for subdir in self.output_dir.rglob("*"):
-                    if subdir.is_dir():
-                        for pattern in output_patterns:
-                            output_path = subdir / pattern
-                            if self._is_valid_existing_output(output_path, pattern, input_file):
-                                logger.info(f"Found existing video output for {input_file.name}: {output_path}")
-                                return True
-            except Exception as e:
-                logger.debug(f"Error during recursive output search: {e}")
-            
-            # Check for segmented output
-            segments_folder = self.output_dir / f"{base_name}_segments"
+            # Check for segmented output in the mirrored category folder
+            segments_folder = output_category_dir / f"{base_name}_segments"
             if segments_folder.exists() and segments_folder.is_dir():
                 # Use default 10MB when checking for generic existence, as size isn't known here
                 valid_segments, _ = self._validate_segment_folder_gifs(segments_folder, 10.0)
@@ -1050,9 +1051,9 @@ class AutomatedWorkflow:
             if self.shutdown_requested:
                 return 'cancelled'
             
-            # Step 1: Check for existing single GIF file
+            # Step 1: Check for existing single GIF file in the same category folder as MP4
             gif_name = mp4_file.stem + ".gif"
-            gif_path = self.output_dir / gif_name
+            gif_path = mp4_file.parent / gif_name
             
             if gif_path.exists():
                 print(f"  🔍 Found existing GIF, validating: {gif_name}")
@@ -1073,8 +1074,8 @@ class AutomatedWorkflow:
             else:
                 print(f"  📄 No single GIF found: {gif_name}")
             
-            # Step 2: Check for existing segment folder
-            segments_folder = self.output_dir / f"{mp4_file.stem}_segments"
+            # Step 2: Check for existing segment folder in the same category folder as MP4
+            segments_folder = mp4_file.parent / f"{mp4_file.stem}_segments"
             if segments_folder.exists() and segments_folder.is_dir():
                 print(f"  🔍 Found segments folder, validating: {segments_folder.name}")
                 
@@ -1148,34 +1149,31 @@ class AutomatedWorkflow:
             self.current_task = None
     
     def _find_existing_mp4_output(self, input_file: Path) -> Optional[Path]:
-        """Find the existing MP4 output file for a given input file"""
+        """Find the existing MP4 output file for a given input file in the mirrored folder structure"""
         base_name = input_file.stem
         
-        # Check root output directory first
-        mp4_path = self.output_dir / f"{base_name}.mp4"
+        # Check the mirrored output location first
+        relative_path = self._get_relative_path(input_file)
+        output_category_dir = self.output_dir / relative_path.parent
+        mp4_path = output_category_dir / f"{base_name}.mp4"
         if mp4_path.exists():
             is_valid, _ = self.file_validator.is_valid_video(str(mp4_path))
             if is_valid:
                 return mp4_path
         
-        # Recursive search in subdirectories
-        try:
-            for subdir in self.output_dir.rglob("*"):
-                if subdir.is_dir():
-                    mp4_path = subdir / f"{base_name}.mp4"
-                    if mp4_path.exists():
-                        is_valid, _ = self.file_validator.is_valid_video(str(mp4_path))
-                        if is_valid:
-                            return mp4_path
-        except Exception as e:
-            logger.debug(f"Error during recursive MP4 search: {e}")
-        
         return None
     
     def _ensure_mp4_format(self, video_file: Path, max_size_mb: float) -> Optional[Path]:
-        """Ensure video is in MP4 format and optimized"""
+        """Ensure video is in MP4 format and optimized, preserving folder structure"""
+        # Get relative path to preserve folder structure
+        relative_path = self._get_relative_path(video_file)
+        output_category_dir = self.output_dir / relative_path.parent
+        
+        # Create output directory structure
+        output_category_dir.mkdir(parents=True, exist_ok=True)
+        
         output_name = video_file.stem + ".mp4"
-        output_path = self.output_dir / output_name
+        output_path = output_category_dir / output_name
         
         # Check if optimized MP4 already exists and is valid with enhanced checks
         if output_path.exists():
@@ -1194,8 +1192,8 @@ class AutomatedWorkflow:
                 print(f"    🔄 Reprocessing MP4 (validation failed): {output_name}")
                 logger.info(f"Existing MP4 validation failed: {error_msg}, reprocessing: {output_name}")
         
-        # Check if segments folder already exists (from previous segmentation)
-        segments_folder = self.output_dir / f"{video_file.stem}_segments"
+        # Check if segments folder already exists (from previous segmentation) in the mirrored location
+        segments_folder = output_category_dir / f"{video_file.stem}_segments"
         if segments_folder.exists() and segments_folder.is_dir():
             print(f"    ♻️  Found existing segments folder: {segments_folder.name}")
             logger.debug(f"Found existing segments folder: {segments_folder.name}")
@@ -1367,7 +1365,8 @@ class AutomatedWorkflow:
                 
                 # Record cache for segments-based success
                 try:
-                    src = Path(self.output_dir / f"{base_name}.mp4") if base_name else mp4_file
+                    # The MP4 should be in the same directory as the segments folder
+                    src = segments_folder.parent / f"{base_name}.mp4" if base_name else mp4_file
                 except Exception:
                     src = mp4_file
                 self._record_success_cache(src, 'segments', segments_folder)
@@ -1395,12 +1394,15 @@ class AutomatedWorkflow:
                 return self._generate_gifs_from_segments(segments_folder, max_size_mb)
         else:
             # This is a single MP4 file, handle as before
+            # Determine output location based on MP4 file location (preserve folder structure)
+            mp4_category_dir = mp4_file.parent
+            
             gif_name = mp4_file.stem + ".gif"
             temp_gif_path = self.temp_dir / gif_name
-            final_gif_path = self.output_dir / gif_name
+            final_gif_path = mp4_category_dir / gif_name
             
-            # Check for existing segment folder first
-            segments_folder = self.output_dir / f"{mp4_file.stem}_segments"
+            # Check for existing segment folder first in the same category folder
+            segments_folder = mp4_category_dir / f"{mp4_file.stem}_segments"
             if segments_folder.exists() and segments_folder.is_dir():
                 logger.info(f"Found existing segments folder: {segments_folder}")
                 
@@ -1519,7 +1521,8 @@ class AutomatedWorkflow:
                         # Fallback: derive from temp gif name
                         temp_segments_dir = temp_gif_path.parent / f"{mp4_file.stem}_segments"
 
-                    final_segments_dir = self.output_dir / f"{mp4_file.stem}_segments"
+                    # Place segments in the same directory as the MP4 file (preserve folder structure)
+                    final_segments_dir = mp4_file.parent / f"{mp4_file.stem}_segments"
 
                     try:
                         if temp_segments_dir.exists():
@@ -2041,8 +2044,11 @@ class AutomatedWorkflow:
                     print(f"    ✅ Successfully repaired corrupted GIF ({current_size:.2f}MB)")
                     logger.info(f"Successfully repaired corrupted GIF {gif_file.name}")
                     
-                    # Move repaired file to output
-                    output_path = self.output_dir / gif_file.name
+                    # Move repaired file to output (preserve folder structure)
+                    relative_path = self._get_relative_path(gif_file)
+                    output_category_dir = self.output_dir / relative_path.parent
+                    output_category_dir.mkdir(parents=True, exist_ok=True)
+                    output_path = output_category_dir / gif_file.name
                     if output_path.exists():
                         output_path.unlink()
                     shutil.move(str(repaired_path), str(output_path))
@@ -2094,8 +2100,11 @@ class AutomatedWorkflow:
                         print(f"    ✅ Successfully repaired corrupted GIF using FFmpeg ({current_size:.2f}MB)")
                         logger.info(f"Successfully repaired corrupted GIF {gif_file.name} using FFmpeg")
                         
-                        # Move repaired file to output
-                        output_path = self.output_dir / gif_file.name
+                        # Move repaired file to output (preserve folder structure)
+                        relative_path = self._get_relative_path(gif_file)
+                        output_category_dir = self.output_dir / relative_path.parent
+                        output_category_dir.mkdir(parents=True, exist_ok=True)
+                        output_path = output_category_dir / gif_file.name
                         if output_path.exists():
                             output_path.unlink()
                         shutil.move(str(repaired_path), str(output_path))
@@ -2153,8 +2162,11 @@ class AutomatedWorkflow:
             if self.shutdown_requested:
                 return 'cancelled'
 
-            # Check if an output GIF already exists and validate it
-            existing_output = self.output_dir / gif_file.name
+            # Check if an output GIF already exists and validate it (preserve folder structure)
+            relative_path = self._get_relative_path(gif_file)
+            output_category_dir = self.output_dir / relative_path.parent
+            output_category_dir.mkdir(parents=True, exist_ok=True)
+            existing_output = output_category_dir / gif_file.name
             if existing_output.exists():
                 is_valid_out, err_out = self.file_validator.is_valid_gif_with_enhanced_checks(
                     str(existing_output),
@@ -2227,8 +2239,11 @@ class AutomatedWorkflow:
             print(f"    🎯 Optimizing GIF: {gif_file.name}")
             logger.info(f"Optimizing GIF file: {gif_file.name}")
             
-            # Create output path
-            output_path = self.output_dir / gif_file.name
+            # Create output path (preserve folder structure)
+            relative_path = self._get_relative_path(gif_file)
+            output_category_dir = self.output_dir / relative_path.parent
+            output_category_dir.mkdir(parents=True, exist_ok=True)
+            output_path = output_category_dir / gif_file.name
 
             # Prepare a working copy in temp to avoid modifying the original input
             working_path = self.temp_dir / f"{gif_file.stem}.work.gif"
@@ -2511,7 +2526,11 @@ class AutomatedWorkflow:
                 segment_duration = max(min_seg, min(max_seg, duration / num_segments))
 
             # Prepare output directory path per asset (defer creation of segments dir until first success)
-            output_dir = self.output_dir
+            # Preserve folder structure from input
+            relative_path = self._get_relative_path(gif_file)
+            output_dir = self.output_dir / relative_path.parent
+            output_dir.mkdir(parents=True, exist_ok=True)
+            
             base_name = gif_file.stem
             # Decide if we truly need multiple segments. If forced preference = 1 or prefer_single_segment is set,
             # write a single GIF directly to output. Otherwise, use a segments folder when num_segments > 1.
@@ -2772,7 +2791,7 @@ class AutomatedWorkflow:
                                 logger.info(f"Single-segment GIF moved to output: {single_output_path} ({total_size_mb:.2f}MB)")
                                 # Record cache for single GIF success (source = base MP4 if present)
                                 try:
-                                    src_input = self.output_dir / f"{base_name}.mp4"
+                                    src_input = segments_dir.parent / f"{base_name}.mp4"
                                     cache_input = src_input if src_input.exists() else segments_folder
                                     self._record_success_cache(cache_input, 'single_gif', single_output_path)
                                 except Exception:
@@ -2785,7 +2804,7 @@ class AutomatedWorkflow:
                     logger.info(f"GIF segmentation complete: {successful} segments at {segments_dir}")
                     # Record cache for segments-based success (source = base MP4 if present)
                     try:
-                        src_input = self.output_dir / f"{base_name}.mp4"
+                        src_input = segments_dir.parent / f"{base_name}.mp4"
                         cache_input = src_input if src_input.exists() else segments_folder
                         self._record_success_cache(cache_input, 'segments', segments_dir)
                     except Exception:
@@ -2796,7 +2815,7 @@ class AutomatedWorkflow:
                     logger.info(f"Single-segment GIF saved to output: {single_output_path} ({total_size_mb:.2f}MB)")
                     # Record cache for single GIF success (source = base MP4 if present)
                     try:
-                        src_input = self.output_dir / f"{base_name}.mp4"
+                        src_input = single_output_path.parent / f"{base_name}.mp4"
                         cache_input = src_input if src_input.exists() else segments_folder
                         self._record_success_cache(cache_input, 'single_gif', single_output_path)
                     except Exception:
@@ -2821,8 +2840,11 @@ class AutomatedWorkflow:
             if self.shutdown_requested:
                 return 'cancelled'
             
-            # Respect existing optimized outputs: if a valid compressed GIF exists in output, skip
-            existing_output = self.output_dir / gif_file.name
+            # Respect existing optimized outputs: if a valid compressed GIF exists in output, skip (preserve folder structure)
+            relative_path = self._get_relative_path(gif_file)
+            output_category_dir = self.output_dir / relative_path.parent
+            output_category_dir.mkdir(parents=True, exist_ok=True)
+            existing_output = output_category_dir / gif_file.name
             if existing_output.exists():
                 # Use fast validator to avoid 7-15s cost per file; we only need a quick accept here
                 is_valid_out, err_out = self.file_validator.is_valid_gif_fast(
