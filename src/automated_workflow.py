@@ -160,7 +160,8 @@ class AutomatedWorkflow:
                 if ord(char) < 128:
                     safe_chars.append(char)
                 elif char == '⧸':
-                    safe_chars.append('/')
+                    # Avoid creating path separators on Windows; substitute underscore
+                    safe_chars.append('_')
                 elif char in ['/', '\\', ':', '*', '?', '"', '<', '>', '|']:
                     safe_chars.append('_')
                 else:
@@ -171,14 +172,6 @@ class AutomatedWorkflow:
             return safe_name
         except Exception:
             return ''.join(c if ord(c) < 128 else '_' for c in filename)
-
-        # Ensure nested cache directory exists for performance caching
-        try:
-            cache_dir = self.temp_dir / 'cache'
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            logger.debug(f"Cache directory ensured: {cache_dir}")
-        except Exception as e:
-            logger.warning(f"Could not ensure cache directory: {e}")
     
     def _interruptible_sleep(self, duration: float, check_interval: float = 0.1):
         """Sleep that can be interrupted by shutdown signal"""
@@ -1109,7 +1102,7 @@ class AutomatedWorkflow:
                     except Exception:
                         pass
 
-                    return True
+                    return 'success'
                 else:
                     print(f"    🔄 Regenerating segment GIFs (invalid/corrupted): {segments_folder.name}")
                     logger.info(f"Segment GIFs invalid, will regenerate: {segments_folder.name}")
@@ -1819,7 +1812,7 @@ class AutomatedWorkflow:
             import re
             indices = []
             for f in gif_files:
-                m = re.search(r"_segment_(\d+)\\.gif$", f.name)
+                m = re.search(r"_segment_(\d+)\.gif$", f.name)
                 if m:
                     try:
                         indices.append(int(m.group(1)))
@@ -2990,7 +2983,7 @@ class AutomatedWorkflow:
         print(f"⏱️  Total time: {elapsed:.1f} seconds")
         print(f"📁 Files processed: {processing_stats.get('processed', 0)}")
         print(f"✅ Successful: {processing_stats.get('successful', 0)}")
-        print(f"❌ Failed: {processing_stats.get('failed', 0)}")
+        print(f"❌ Failed: {processing_stats.get('errors', 0)}")
         print(f"⚡ Skipped (cached): {processing_stats.get('skipped', 0)}")
         print(f"🔄 Retries: {processing_stats.get('retries', 0)}")
         

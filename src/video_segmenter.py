@@ -1396,6 +1396,10 @@ class VideoSegmenter:
                 '-c:v', params['encoder'],
                 '-vf', f"scale={params['width']}:{params['height']}:flags=lanczos",
                 '-r', str(params['fps']),
+                # Apply software-specific quality flags if using software encoding
+                *([arg for arg in (['-crf', str(params['crf'])] if 'crf' in params else [])]),
+                *([arg for arg in (['-preset', params.get('preset', 'medium')] if params.get('acceleration_type') == 'software' else [])]),
+                # Bitrate control (always include)
                 '-b:v', params['bitrate'],
                 '-c:a', 'aac',
                 '-b:a', '96k',

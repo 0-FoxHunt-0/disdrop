@@ -38,38 +38,13 @@ class GifGenerator:
         self.shutdown_requested = False
         self.current_ffmpeg_process = None
         
-        # Platform-specific settings
+        # Hardcoded defaults remain as fallback; config platforms override in _get_platform_settings
         self.platform_settings = {
-            'discord': {
-                'max_size_mb': 8.0,
-                'max_duration': 10.0,
-                'fps': 15,
-                'scale': 480
-            },
-            'twitter': {
-                'max_size_mb': 5.0,
-                'max_duration': 2.5,
-                'fps': 12,
-                'scale': 400
-            },
-            'slack': {
-                'max_size_mb': 10.0,
-                'max_duration': 15.0,
-                'fps': 15,
-                'scale': 480
-            },
-            'telegram': {
-                'max_size_mb': 50.0,  # Telegram allows larger files
-                'max_duration': 30.0,
-                'fps': 15,
-                'scale': 480
-            },
-            'reddit': {
-                'max_size_mb': 100.0,  # Reddit allows very large files
-                'max_duration': 60.0,
-                'fps': 15,
-                'scale': 480
-            }
+            'discord': {'max_size_mb': 8.0, 'max_duration': 10.0, 'fps': 15, 'scale': 480},
+            'twitter': {'max_size_mb': 5.0, 'max_duration': 2.5, 'fps': 12, 'scale': 400},
+            'slack': {'max_size_mb': 10.0, 'max_duration': 15.0, 'fps': 15, 'scale': 480},
+            'telegram': {'max_size_mb': 50.0, 'max_duration': 30.0, 'fps': 15, 'scale': 480},
+            'reddit': {'max_size_mb': 100.0, 'max_duration': 60.0, 'fps': 15, 'scale': 480}
         }
     
     def _is_shutdown_requested(self) -> bool:
@@ -255,22 +230,41 @@ class GifGenerator:
 
     def _get_platform_settings(self, platform: str, max_size_mb: float) -> Dict[str, Any]:
         """Get platform-specific settings"""
+        # Start from fallback defaults
+        settings = {'max_size_mb': 10.0, 'max_duration': 15.0, 'fps': 15, 'scale': 480}
+        # Merge hardcoded platform hints
         if platform and platform.lower() in self.platform_settings:
-            settings = self.platform_settings[platform.lower()].copy()
-        else:
-            # Default settings
-            settings = {
-                'max_size_mb': 10.0,
-                'max_duration': 15.0,
-                'fps': 15,
-                'scale': 480
-            }
+            settings.update(self.platform_settings[platform.lower()])
+        # Merge YAML gif_settings platform presets (override hardcoded)
+        try:
+            yaml_platform = self.config.get(f'gif_settings.platforms.{platform.lower()}', {}) if platform else {}
+            if isinstance(yaml_platform, dict):
+                # Normalize keys similar to defaults
+                if 'max_file_size_mb' in yaml_platform:
+                    settings['max_size_mb'] = yaml_platform.get('max_file_size_mb', settings['max_size_mb'])
+                if 'max_duration' in yaml_platform:
+                    settings['max_duration'] = yaml_platform.get('max_duration', settings['max_duration'])
+                if 'fps' in yaml_platform:
+                    settings['fps'] = yaml_platform.get('fps', settings['fps'])
+                # width/height over scale
+                if 'max_width' in yaml_platform:
+                    settings['width'] = yaml_platform.get('max_width')
+                if 'max_height' in yaml_platform:
+                    settings['height'] = yaml_platform.get('max_height')
+                if 'colors' in yaml_platform:
+                    settings['palette_max_colors'] = yaml_platform.get('colors')
+                if 'dither' in yaml_platform:
+                    settings['dither'] = yaml_platform.get('dither')
+                if 'lossy' in yaml_platform:
+                    settings['lossy'] = yaml_platform.get('lossy')
+        except Exception:
+            pass
         
         # Override with provided max_size_mb if specified
         if max_size_mb is not None:
             settings['max_size_mb'] = max_size_mb
         
-        # Get GIF-specific settings from config
+        # Get global GIF-specific settings from config
         gif_config = self.config.get('gif_settings', {})
         if gif_config:
             # Use configured width/height for better aspect ratio preservation
@@ -281,6 +275,15 @@ class GifGenerator:
             settings['max_duration'] = gif_config.get('max_duration_seconds', settings['max_duration'])
             if max_size_mb is None:
                 settings['max_size_mb'] = gif_config.get('max_file_size_mb', settings['max_size_mb'])
+            # Pull color/dither/lossy defaults from config
+            if 'colors' in gif_config:
+                settings['palette_max_colors'] = gif_config.get('colors')
+            if 'palette_size' in gif_config:
+                settings['palette_max_colors'] = gif_config.get('palette_size')
+            if 'dither' in gif_config:
+                settings['dither'] = gif_config.get('dither')
+            if 'lossy' in gif_config:
+                settings['lossy'] = gif_config.get('lossy')
         
         return settings
     
@@ -544,7 +547,7 @@ class GifGenerator:
             
             # Improved scaling: preserve aspect ratio better and use higher quality
             pre_chain.append(f"scale={optimal_width}:{optimal_height}:flags=lanczos")
-            max_colors = int(settings.get('palette_max_colors', 256))
+            max_colors = int(settings.get('palette_max_colors', settings.get('colors', 256)))
             vf = ','.join(pre_chain + [f"palettegen=max_colors={max_colors}:stats_mode=diff:reserve_transparent=1"])  # Improved palette settings
 
             # Palette cache key
@@ -647,7 +650,7 @@ class GifGenerator:
             pre_chain.append(scale_filter)
             # Normalize sample aspect ratio to avoid stretching in some viewers
             pre_chain.append('setsar=1')
-            dither = settings.get('dither', 'sierra2_4a')
+            dither = settings.get('dither', settings.get('gif_settings.dither', 'floyd_steinberg'))
             lavfi = ','.join(pre_chain) + f" [x]; [x][1:v] paletteuse=dither={dither}:diff_mode=rectangle:new=1"
 
             # Build FFmpeg command for GIF creation

@@ -472,7 +472,7 @@ class DynamicVideoCompressor:
     def _estimate_motion_level(self, video_stream: Dict, duration: float) -> str:
         """Estimate motion level in video"""
         # This is a simplified estimation - in reality you'd analyze actual frames
-        fps = eval(video_stream.get('r_frame_rate', '30/1'))
+        fps = FFmpegUtils.parse_fps(video_stream.get('r_frame_rate', '30/1'))
         
         if fps >= 50:
             return "high"
@@ -914,6 +914,15 @@ class DynamicVideoCompressor:
         
         final_width = max(optimal_width, final_min_width)
         final_height = max(optimal_height, final_min_height)
+
+        # Never upscale beyond original resolution
+        try:
+            if final_width > original_width:
+                final_width = original_width if original_width % 2 == 0 else original_width - 1
+            if final_height > original_height:
+                final_height = original_height if original_height % 2 == 0 else original_height - 1
+        except Exception:
+            pass
         
         logger.info(f"Final resolution: {final_width}x{final_height} "
                    f"(min allowed: {final_min_width}x{final_min_height})")
