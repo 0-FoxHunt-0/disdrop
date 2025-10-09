@@ -35,17 +35,8 @@ class ConfigManager:
                             self.config.update(config_data)
                         logger.debug(f"Loaded config from {config_file}")
                 else:
-                    # Fallback: load packaged defaults
-                    try:
-                        package_path = f"disdrop.package_data.config.{os.path.splitext(config_file)[0]}"
-                        # Use importlib.resources to read text safely from package
-                        with pkg_resources.files("disdrop.package_data.config").joinpath(config_file).open('r', encoding='utf-8') as file:
-                            config_data = yaml.safe_load(file)
-                            if config_data:
-                                self.config.update(config_data)
-                            logger.debug(f"Loaded packaged default config: {config_file}")
-                    except Exception as pkg_err:
-                        logger.warning(f"Config file not found and no packaged default available: {config_file} ({pkg_err})")
+                    # No packaged defaults anymore; prefer explicit config only
+                    logger.warning(f"Config file not found: {config_file}. Using existing defaults, if any.")
                     
         except Exception as e:
             logger.error(f"Error loading configuration: {e}")

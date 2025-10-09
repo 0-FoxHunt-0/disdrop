@@ -19,6 +19,7 @@ The CLI has been streamlined for easier use while maintaining full functionality
 - `w` / `watch` / `m` / `monitor` → `auto`
 - `hw` / `i` / `info` → `hardware-info`
 - `cfg` → `config`, `ch` → `cache`
+- `open` → Open application folders in file explorer
 
 🎯 **Short Flags**
 
@@ -69,9 +70,24 @@ pip install -r requirements.txt
 ```
 
 4. Ensure FFmpeg is installed on your system:
+
    - **Windows**: Download from https://ffmpeg.org/download.html
    - **macOS**: `brew install ffmpeg`
    - **Linux**: `sudo apt install ffmpeg` (Ubuntu/Debian)
+
+5. (Optional) Install globally for use from anywhere:
+
+```bash
+pip install --user -e .
+```
+
+After installation, you can use `disdrop` command from anywhere instead of `python main.py`:
+
+```bash
+disdrop auto           # Start automated workflow
+disdrop open -i -o     # Open input and output folders
+disdrop hw             # Show hardware info
+```
 
 ## Quick Start
 
@@ -226,6 +242,7 @@ The tool includes an advanced iterative optimization system that automatically t
 | `compress`      | `c`, `v`, `video`            | Compress video file(s)   |
 | `gif`           | `g`, `a`, `anim`             | Create/optimize GIF(s)   |
 | `auto`          | `w`, `watch`, `m`, `monitor` | Watch input folder       |
+| `open`          | -                            | Open app folders         |
 | `hardware-info` | `hw`, `i`, `info`            | Show hardware info       |
 | `config`        | `cfg`                        | Configuration management |
 | `cache`         | `ch`                         | Cache operations         |
@@ -289,6 +306,34 @@ auto [options]
 - `-o, --output-dir PATH` - Output directory (default: ./output)
 - `--no-cache` - Don't use success cache
 
+#### open
+
+Open application folders in file explorer. Useful for quickly accessing input, output, logs, or config directories.
+
+```bash
+open [options]
+```
+
+**Options:**
+
+- `-i, --input` - Open input folder
+- `-o, --output` - Open output folder
+- `-l, --logs` - Open logs folder
+- `-c, --config` - Open config folder
+
+**Examples:**
+
+```bash
+# Open single folder
+disdrop open -i                # Open input folder
+disdrop open -o                # Open output folder
+
+# Open multiple folders at once
+disdrop open -i -o -l          # Open input, output, and logs folders
+```
+
+Note: Folders are created if they don't exist. Works cross-platform (Windows, macOS, Linux).
+
 #### Other Commands
 
 - `hardware-info` / `hw` / `i` / `info` - Display hardware acceleration info
@@ -317,6 +362,9 @@ python main.py g input.gif output.gif
 
 # Watch folder for new files
 python main.py w
+
+# Open folders in file explorer
+python main.py open -i -o
 
 # Check hardware capabilities
 python main.py hw

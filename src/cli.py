@@ -167,7 +167,10 @@ class VideoCompressorCLI:
         )
         
         # Global options
-        parser.add_argument('--config-dir', default='config',
+        # Default config-dir to package base config folder
+        from .logger_setup import get_app_base_dir
+        default_config_dir = os.path.join(get_app_base_dir(), 'config')
+        parser.add_argument('--config-dir', default=default_config_dir,
                           help='Configuration directory (default: config)')
         # Default to quieter console; use --debug to enable verbose output
         parser.add_argument('--log-level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
@@ -294,8 +297,8 @@ class VideoCompressorCLI:
         auto_parser.add_argument('--no-cache', action='store_true',
                                 help='Do not use success cache in automated workflow')
         # Accept global-style flags after subcommand for convenience
-        auto_parser.add_argument('-i', '--input-dir', help='Input directory to watch (default: ./input)')
-        auto_parser.add_argument('-o', '--output-dir', help='Output directory (default: ./output)')
+        auto_parser.add_argument('-i', '--input-dir', help='Input directory to watch (default: package input folder)')
+        auto_parser.add_argument('-o', '--output-dir', help='Output directory (default: package output folder)')
         # Allow specifying temp directory after the subcommand as well as globally
         auto_parser.add_argument('--temp-dir', help='Temporary directory for processing')
         auto_parser.add_argument('--max-input-size', dest='max_input_size', metavar='SIZE',
@@ -308,6 +311,18 @@ class VideoCompressorCLI:
         cache_subparsers.add_parser('clear', help='Clear all cache entries')
         cache_subparsers.add_parser('stats', help='Show cache statistics')
         cache_subparsers.add_parser('validate', help='Validate cache entries and remove invalid ones')
+        
+        # Open folder command
+        open_parser = subparsers.add_parser('open',
+                                           help='Open application folders in file explorer')
+        open_parser.add_argument('-i', '--input', action='store_true',
+                                help='Open input folder')
+        open_parser.add_argument('-o', '--output', action='store_true',
+                                help='Open output folder')
+        open_parser.add_argument('-l', '--logs', action='store_true',
+                                help='Open logs folder')
+        open_parser.add_argument('-c', '--config', action='store_true',
+                                help='Open config folder')
         
         # Set default command if none provided
         args = parser.parse_args()
@@ -525,6 +540,9 @@ class VideoCompressorCLI:
         elif command == 'cache':
             self._handle_cache_command(args)
         
+        elif command == 'open':
+            self._handle_open_command(args)
+        
         else:
             logger.error(f"Unknown command: {command}")
             sys.exit(1)
@@ -535,13 +553,15 @@ class VideoCompressorCLI:
     
     def _compress_video_smart(self, args: argparse.Namespace):
         """Smart compress handler that auto-detects batch mode from glob patterns"""
+        from .logger_setup import get_app_base_dir
+        base_dir = get_app_base_dir()
         # Check if input is a glob pattern
         if self._is_glob_pattern(args.input):
             logger.info(f"Detected glob pattern, switching to batch mode: {args.input}")
             # Convert to batch mode arguments
             batch_args = argparse.Namespace(
                 input_pattern=args.input,
-                output_dir=args.output if args.output else (getattr(args, 'output_dir', None) or 'output'),
+                output_dir=args.output if args.output else (getattr(args, 'output_dir', None) or os.path.join(base_dir, 'output')),
                 platform=getattr(args, 'platform', None),
                 suffix=getattr(args, 'suffix', '_compressed'),
                 parallel=getattr(args, 'parallel', None),
@@ -560,7 +580,7 @@ class VideoCompressorCLI:
             if not args.output:
                 # Auto-generate output path
                 import os
-                output_dir = getattr(args, 'output_dir', None) or 'output'
+                output_dir = getattr(args, 'output_dir', None) or os.path.join(base_dir, 'output')
                 os.makedirs(output_dir, exist_ok=True)
                 basename = os.path.splitext(os.path.basename(args.input))[0]
                 suffix = getattr(args, 'suffix', '_compressed')
@@ -570,13 +590,15 @@ class VideoCompressorCLI:
     
     def _create_gif_smart(self, args: argparse.Namespace):
         """Smart GIF handler that auto-detects operation type and batch mode"""
+        from .logger_setup import get_app_base_dir
+        base_dir = get_app_base_dir()
         # Check if input is a glob pattern (batch mode)
         if self._is_glob_pattern(args.input):
             logger.info(f"Detected glob pattern, switching to batch GIF mode: {args.input}")
             # Convert to batch mode arguments
             batch_args = argparse.Namespace(
                 input_pattern=args.input,
-                output_dir=args.output if args.output else (getattr(args, 'output_dir', None) or 'output'),
+                output_dir=args.output if args.output else (getattr(args, 'output_dir', None) or os.path.join(base_dir, 'output')),
                 platform=getattr(args, 'platform', None),
                 duration=getattr(args, 'duration', None),
                 parallel=getattr(args, 'parallel', None),
@@ -595,7 +617,7 @@ class VideoCompressorCLI:
             if not args.output:
                 # Auto-generate output path
                 import os
-                output_dir = getattr(args, 'output_dir', None) or 'output'
+                output_dir = getattr(args, 'output_dir', None) or os.path.join(base_dir, 'output')
                 os.makedirs(output_dir, exist_ok=True)
                 basename = os.path.splitext(os.path.basename(args.input))[0]
                 args.output = os.path.join(output_dir, f"{basename}.gif")
@@ -844,6 +866,7 @@ class VideoCompressorCLI:
         """Handle batch video compression"""
         import glob
         import concurrent.futures
+        from .logger_setup import get_app_base_dir
         
         # Find input files
         input_files = glob.glob(args.input_pattern)
@@ -857,8 +880,8 @@ class VideoCompressorCLI:
         
         logger.info(f"Found {len(input_files)} files to compress")
         
-        # Resolve output directory: prefer provided --output-dir, else default to ./output
-        effective_output_dir = args.output_dir if getattr(args, 'output_dir', None) else os.path.join(os.getcwd(), 'output')
+        # Resolve output directory: prefer provided --output-dir, else default to package output
+        effective_output_dir = args.output_dir if getattr(args, 'output_dir', None) else os.path.join(get_app_base_dir(), 'output')
         os.makedirs(effective_output_dir, exist_ok=True)
         
         # Determine number of parallel processes
@@ -1592,8 +1615,10 @@ class VideoCompressorCLI:
             print("\nPlace video files in the 'input' directory to process them automatically.")
             print("Press Ctrl+C to stop the workflow gracefully.\n")
         else:
-            out_dir_display = os.path.abspath(args.output_dir) if getattr(args, 'output_dir', None) else os.path.abspath('output')
-            in_dir_display = os.path.abspath(args.input_dir) if getattr(args, 'input_dir', None) else os.path.abspath('input')
+            from .logger_setup import get_app_base_dir
+            base_dir = get_app_base_dir()
+            out_dir_display = os.path.abspath(args.output_dir) if getattr(args, 'output_dir', None) else os.path.join(base_dir, 'output')
+            in_dir_display = os.path.abspath(args.input_dir) if getattr(args, 'input_dir', None) else os.path.join(base_dir, 'input')
             print(f"Watching '{in_dir_display}' → '{out_dir_display}' every {args.check_interval}s (max {args.max_size}MB). Ctrl+C to stop.")
         
         try:
@@ -1669,6 +1694,79 @@ class VideoCompressorCLI:
         except Exception as e:
             print(f"❌ Failed to validate cache: {e}")
             logger.error(f"Failed to validate cache: {e}")
+
+    def _handle_open_command(self, args: argparse.Namespace):
+        """Handle open folder command"""
+        import subprocess
+        import platform
+        
+        # Check if any folder flag is set
+        if not any([args.input, args.output, args.logs, args.config]):
+            print("❌ No folder specified. Use -i, -o, -l, or -c to open folders.")
+            print("   Examples:")
+            print("     disdrop open -i        # Open input folder")
+            print("     disdrop open -o        # Open output folder")
+            print("     disdrop open -l        # Open logs folder")
+            print("     disdrop open -c        # Open config folder")
+            print("     disdrop open -i -o -l  # Open multiple folders")
+            sys.exit(1)
+        
+        # Determine folder paths
+        folders_to_open = []
+        
+        if args.input:
+            from .logger_setup import get_app_base_dir
+            input_dir = os.path.join(get_app_base_dir(), 'input')
+            folders_to_open.append(('input', input_dir))
+        
+        if args.output:
+            from .logger_setup import get_app_base_dir
+            output_dir = os.path.join(get_app_base_dir(), 'output')
+            folders_to_open.append(('output', output_dir))
+        
+        if args.logs:
+            from .logger_setup import get_app_base_dir
+            logs_dir = os.path.join(get_app_base_dir(), 'logs')
+            folders_to_open.append(('logs', logs_dir))
+        
+        if args.config:
+            from .logger_setup import get_app_base_dir
+            config_dir = os.path.join(get_app_base_dir(), 'config')
+            folders_to_open.append(('config', config_dir))
+        
+        # Create folders if they don't exist
+        for folder_name, folder_path in folders_to_open:
+            if not os.path.exists(folder_path):
+                try:
+                    os.makedirs(folder_path, exist_ok=True)
+                    print(f"✅ Created {folder_name} folder: {folder_path}")
+                except Exception as e:
+                    print(f"❌ Failed to create {folder_name} folder: {e}")
+                    continue
+        
+        # Detect platform and open folders
+        system = platform.system()
+        
+        for folder_name, folder_path in folders_to_open:
+            try:
+                if system == 'Windows':
+                    # Windows: use explorer
+                    subprocess.Popen(['explorer', folder_path])
+                elif system == 'Darwin':
+                    # macOS: use open
+                    subprocess.Popen(['open', folder_path])
+                else:
+                    # Linux: use xdg-open
+                    subprocess.Popen(['xdg-open', folder_path])
+                
+                print(f"📁 Opened {folder_name} folder: {folder_path}")
+                
+            except Exception as e:
+                print(f"❌ Failed to open {folder_name} folder: {e}")
+                logger.error(f"Failed to open {folder_name} folder: {e}")
+        
+        # Exit immediately after opening folders
+        sys.exit(0)
 
 def main():
     """Entry point for the CLI application"""

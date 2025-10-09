@@ -10,6 +10,7 @@ import logging.config
 import yaml
 from colorama import init, Fore, Style
 from typing import Optional
+import importlib.resources as pkg_resources
 import codecs
 import atexit
 from datetime import datetime
@@ -121,7 +122,27 @@ _ORIGINAL_STDOUT = None
 _ORIGINAL_STDERR = None
 _TEE_FILE_HANDLE = None
 
-def _enable_terminal_tee(logs_dir: str = "logs") -> str:
+def get_app_base_dir() -> str:
+    """Return the application base directory.
+
+    In development (src-layout), this is the project root (parent of 'src').
+    In installed environments (site-packages), this is the package directory.
+    """
+    try:
+        pkg_dir = os.path.abspath(os.path.dirname(__file__))
+        # If running from a src-layout checkout, __file__ lives in '<project>/src'.
+        # In that case, use the project root (parent of 'src') as base.
+        if os.path.basename(pkg_dir).lower() == 'src':
+            return os.path.abspath(os.path.join(pkg_dir, os.pardir))
+        return pkg_dir
+    except Exception:
+        return os.getcwd()
+
+def get_default_logs_dir() -> str:
+    """Return the default logs directory under the package base dir."""
+    return os.path.join(get_app_base_dir(), 'logs')
+
+def _enable_terminal_tee(logs_dir: str = None) -> str:
     """Enable teeing of stdout/stderr to a timestamped terminal log file.
 
     Returns the path to the terminal log file.
@@ -135,6 +156,7 @@ def _enable_terminal_tee(logs_dir: str = "logs") -> str:
         except Exception:
             return os.path.join(logs_dir, 'terminal.log')
 
+    logs_dir = logs_dir or get_default_logs_dir()
     os.makedirs(logs_dir, exist_ok=True)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     terminal_log_path = os.path.join(logs_dir, f'terminal_{timestamp}.log')
@@ -170,7 +192,7 @@ def _enable_terminal_tee(logs_dir: str = "logs") -> str:
     _TEE_ENABLED = True
     return terminal_log_path
 
-def _cleanup_old_logs(logs_dir: str = "logs", keep_count: int = 5):
+def _cleanup_old_logs(logs_dir: str = None, keep_count: int = 5):
     """
     Clean up old log files, keeping only the last N executions
     
@@ -179,6 +201,7 @@ def _cleanup_old_logs(logs_dir: str = "logs", keep_count: int = 5):
         keep_count: Number of most recent log files to keep
     """
     try:
+        logs_dir = logs_dir or get_default_logs_dir()
         # Find all terminal log files (timestamped)
         terminal_logs = glob.glob(os.path.join(logs_dir, "terminal_*.log"))
         
@@ -229,8 +252,8 @@ def setup_logging(config_path: str = "config/logging.yaml", log_level: Optional[
         log_level: Override log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
     """
     
-    # Create logs directory if it doesn't exist
-    logs_dir = "logs"
+    # Resolve logs directory to installed package location
+    logs_dir = get_default_logs_dir()
     os.makedirs(logs_dir, exist_ok=True)
     
     # Default logging configuration if file not found
@@ -276,13 +299,28 @@ def setup_logging(config_path: str = "config/logging.yaml", log_level: Optional[
     }
     
     try:
-        # Load configuration from file
-        if os.path.exists(config_path):
-            with open(config_path, 'r', encoding='utf-8') as file:
+        # Resolve logging config path: prefer explicit path; else use project config folder
+        resolved_config_path = None
+        try:
+            # 1) As provided (absolute or relative to CWD)
+            if config_path and os.path.exists(config_path):
+                resolved_config_path = config_path
+            else:
+                # 2) Relative to app base 'config/logging.yaml'
+                candidate_pkg_config = os.path.join(get_app_base_dir(), 'config', 'logging.yaml')
+                if os.path.exists(candidate_pkg_config):
+                    resolved_config_path = candidate_pkg_config
+        except Exception:
+            resolved_config_path = None
+
+        # Load configuration from resolved file, else use defaults
+        if resolved_config_path and os.path.exists(resolved_config_path):
+            with open(resolved_config_path, 'r', encoding='utf-8') as file:
                 config_data = yaml.safe_load(file)
                 logging_config = config_data.get('logging', default_config)
         else:
-            print(f"Warning: Logging config file not found at {config_path}, using default configuration")
+            if config_path:
+                print(f"Warning: Logging config file not found at {config_path}, using defaults (package dir)")
             logging_config = default_config
 
         # Clean logs at program start

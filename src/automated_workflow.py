@@ -18,6 +18,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 
 from .config_manager import ConfigManager
+from .logger_setup import get_app_base_dir
 from .hardware_detector import HardwareDetector
 from .video_compressor import DynamicVideoCompressor
 from .gif_generator import GifGenerator
@@ -45,12 +46,13 @@ class AutomatedWorkflow:
         # Console verbosity (controlled by CLI --debug)
         self.verbose = False
         
-        # Workflow directories
-        self.input_dir = Path("input")
-        self.output_dir = Path("output")
-        self.temp_dir = Path("temp")
+        # Workflow directories (default under installed package base)
+        base_dir = Path(get_app_base_dir())
+        self.input_dir = base_dir / "input"
+        self.output_dir = base_dir / "output"
+        self.temp_dir = base_dir / "temp"
         # Separate failures directory outside of output
-        self.failures_dir = Path("failures")
+        self.failures_dir = base_dir / "failures"
         self.move_failures_to_folder = True
         
         # User preference: prefer single output file (1 segment) when possible
@@ -65,7 +67,7 @@ class AutomatedWorkflow:
         # Caching of previously successful inputs
         self.use_cache: bool = True
         self._cache_index: Dict[str, Any] = {}
-        self._cache_dir: Path = Path("temp") / 'cache'
+        self._cache_dir: Path = self.temp_dir / 'cache'
         self._cache_file: Path = self._cache_dir / 'workflow_success_index.json'
         # Session timestamp to track current execution and clean up old cache entries
         self._session_start_time = time.time()

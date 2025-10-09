@@ -30,17 +30,14 @@ dependencies = [
 ]
 
 [project.scripts]
-disdrop = "disdrop.cli:main"
+disdrop = "disdrop:cli_main"
 
 [tool.setuptools]
-package-dir = {"" = "src"}
-packages = ["find:"]
-include-package-data = true
-
-[tool.setuptools.packages.find]
-where = ["src"]
+package-dir = {"disdrop" = "src"}
+packages = ["disdrop"]
+include-package-data = false
 
 [tool.setuptools.package-data]
-disdrop = ["config/*.yaml"]
+# No package data included; configs are read from project 'config/'
 
 
