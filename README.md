@@ -378,7 +378,7 @@ python main.py ch clear
 
 ## Configuration
 
-Configuration lives in `config/`:
+Default configuration files are packaged under `disdrop/config/` and used automatically. To override, use `--config-dir PATH` or set `DISDROP_BASE_DIR` to change the runtime base (for logs/input/output/temp).
 
 - `video_compression.yaml`: max size (default 10 MB), hardware encoders, conservative segmentation policy, platform presets
 - `gif_settings.yaml`: default max size (10 MB), FPS/resolution, palette/dither/lossy, quality-optimization stages, segmentation heuristics

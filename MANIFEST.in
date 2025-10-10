@@ -1,2 +1,7 @@
 include README.md
-recursive-include src/package_data/config *.yaml
+include LICENSE
+recursive-include src/config *.yaml
+prune logs
+prune output
+prune temp
+prune venv

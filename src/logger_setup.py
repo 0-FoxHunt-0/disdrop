@@ -10,6 +10,7 @@ import logging.config
 import yaml
 from colorama import init, Fore, Style
 from typing import Optional
+import shutil
 import importlib.resources as pkg_resources
 import codecs
 import atexit
@@ -122,19 +123,59 @@ _ORIGINAL_STDOUT = None
 _ORIGINAL_STDERR = None
 _TEE_FILE_HANDLE = None
 
-def get_app_base_dir() -> str:
-    """Return the application base directory.
+def get_package_base_dir() -> str:
+    """Return the installed package directory (where packaged data like config lives).
 
-    In development (src-layout), this is the project root (parent of 'src').
-    In installed environments (site-packages), this is the package directory.
+    - In development (src-layout), this returns the `src` directory
+      so that `src/config` is discoverable.
+    - In installed environments, this returns the site-packages `disdrop` dir.
     """
     try:
         pkg_dir = os.path.abspath(os.path.dirname(__file__))
-        # If running from a src-layout checkout, __file__ lives in '<project>/src'.
-        # In that case, use the project root (parent of 'src') as base.
+        return pkg_dir
+    except Exception:
+        return os.getcwd()
+
+
+def get_app_base_dir() -> str:
+    """Return the runtime base directory for user-writable data (logs/input/output/temp).
+
+    Resolution order:
+    1) DISDROP_BASE_DIR env var (created if missing)
+    2) Project root when developing (parent of 'src')
+    3) If installed: package dir if writable, else platform-specific user data dir
+    """
+    # 1) Explicit override via environment
+    try:
+        env = os.getenv("DISDROP_BASE_DIR")
+        if env:
+            os.makedirs(env, exist_ok=True)
+            return env
+    except Exception:
+        pass
+
+    try:
+        pkg_dir = get_package_base_dir()
+        # 2) In a src-layout checkout, prefer project root for runtime dirs
         if os.path.basename(pkg_dir).lower() == 'src':
             return os.path.abspath(os.path.join(pkg_dir, os.pardir))
-        return pkg_dir
+
+        # 3) Installed: test writability of package dir, else fall back to user data dir
+        try:
+            test_dir = os.path.join(pkg_dir, '.__wtest__')
+            os.makedirs(test_dir, exist_ok=True)
+            shutil.rmtree(test_dir, ignore_errors=True)
+            return pkg_dir
+        except Exception:
+            try:
+                # Lazy import to avoid mandatory dependency at import-time if unused
+                from platformdirs import user_data_dir
+                base = user_data_dir(appname="Disdrop", appauthor="Disdrop")
+                os.makedirs(base, exist_ok=True)
+                return base
+            except Exception:
+                # Last resort: current working directory
+                return os.getcwd()
     except Exception:
         return os.getcwd()
 
@@ -306,10 +347,15 @@ def setup_logging(config_path: str = "config/logging.yaml", log_level: Optional[
             if config_path and os.path.exists(config_path):
                 resolved_config_path = config_path
             else:
-                # 2) Relative to app base 'config/logging.yaml'
-                candidate_pkg_config = os.path.join(get_app_base_dir(), 'config', 'logging.yaml')
+                # 2) Packaged default under the installed package base
+                candidate_pkg_config = os.path.join(get_package_base_dir(), 'config', 'logging.yaml')
                 if os.path.exists(candidate_pkg_config):
                     resolved_config_path = candidate_pkg_config
+                else:
+                    # 3) Relative to runtime base (developer repo root)
+                    candidate_runtime = os.path.join(get_app_base_dir(), 'config', 'logging.yaml')
+                    if os.path.exists(candidate_runtime):
+                        resolved_config_path = candidate_runtime
         except Exception:
             resolved_config_path = None
 
@@ -363,6 +409,16 @@ def setup_logging(config_path: str = "config/logging.yaml", log_level: Optional[
             # Root level should be DEBUG to capture all into file handler
             if 'root' in logging_config:
                 logging_config['root']['level'] = 'DEBUG'
+        except Exception:
+            pass
+
+        # Ensure handler filenames use absolute logs_dir paths
+        try:
+            if 'handlers' in logging_config:
+                if 'file' in logging_config['handlers']:
+                    logging_config['handlers']['file']['filename'] = os.path.join(logs_dir, 'video_compressor.log')
+                if 'error_file' in logging_config['handlers']:
+                    logging_config['handlers']['error_file']['filename'] = os.path.join(logs_dir, 'errors.log')
         except Exception:
             pass
 

@@ -1,0 +1,44 @@
+# Logging Configuration (packaged defaults)
+logging:
+  version: 1
+  disable_existing_loggers: false
+
+  formatters:
+    detailed:
+      format: "[%(asctime)s] %(levelname)s [%(name)s.%(funcName)s:%(lineno)d] %(message)s"
+      datefmt: "%Y-%m-%d %H:%M:%S"
+
+    console:
+      format: "%(asctime)s | %(levelname)-8s | %(message)s"
+      datefmt: "%H:%M:%S"
+
+  handlers:
+    console:
+      class: logging.StreamHandler
+      level: WARNING
+      formatter: console
+      stream: ext://sys.stdout
+
+    file:
+      class: logging.FileHandler
+      level: DEBUG
+      formatter: detailed
+      filename: logs/video_compressor.log
+      mode: a
+
+    error_file:
+      class: logging.FileHandler
+      level: ERROR
+      formatter: detailed
+      filename: logs/errors.log
+      mode: a
+
+  loggers:
+    video_compressor:
+      level: DEBUG
+      handlers: [console, file, error_file]
+      propagate: false
+
+  root:
+    level: DEBUG
+    handlers: [console, file, error_file]

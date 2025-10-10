@@ -27,16 +27,32 @@ class ConfigManager:
             ]
             
             for config_file in config_files:
+                # 1) Prefer explicit external config dir
                 config_path = os.path.join(self.config_dir, config_file)
                 if os.path.exists(config_path):
                     with open(config_path, 'r', encoding='utf-8') as file:
                         config_data = yaml.safe_load(file)
                         if config_data:
                             self.config.update(config_data)
-                        logger.debug(f"Loaded config from {config_file}")
-                else:
-                    # No packaged defaults anymore; prefer explicit config only
-                    logger.warning(f"Config file not found: {config_file}. Using existing defaults, if any.")
+                        logger.debug(f"Loaded config from {config_path}")
+                    continue
+
+                # 2) Fall back to packaged defaults under installed package dir
+                try:
+                    package_dir = os.path.abspath(os.path.dirname(__file__))
+                    packaged_path = os.path.join(package_dir, 'config', config_file)
+                    if os.path.exists(packaged_path):
+                        with open(packaged_path, 'r', encoding='utf-8') as file:
+                            config_data = yaml.safe_load(file)
+                            if config_data:
+                                self.config.update(config_data)
+                            logger.debug(f"Loaded packaged default config from {packaged_path}")
+                        continue
+                except Exception as e:
+                    logger.debug(f"Error checking packaged config for {config_file}: {e}")
+
+                # 3) If neither found, keep existing defaults
+                logger.warning(f"Config file not found in '{self.config_dir}' or packaged defaults: {config_file}")
                     
         except Exception as e:
             logger.error(f"Error loading configuration: {e}")

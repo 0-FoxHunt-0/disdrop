@@ -1,0 +1,171 @@
+# GIF Generation Configuration
+# Note: Width and height are maximum dimensions. The actual dimensions will preserve the original video's aspect ratio.
+gif_settings:
+  # General settings - Platform-compatible defaults
+  max_file_size_mb: 10 # Keep at 10MB for platform compatibility (Discord, etc.)
+  max_duration_seconds: 30 # Allow longer content but compress aggressively
+
+  # Quality settings - Improved FPS
+  fps: 20 # Increased from 15 for better motion quality
+  width: 360 # Maximum width (aspect ratio will be preserved)
+  height: -1 # Use -1 to preserve aspect ratio automatically (was 360 which forced square)
+  # Note: height: -1 allows FFmpeg to automatically calculate height based on width while preserving aspect ratio
+
+  # Optimization settings - More balanced defaults
+  palette_size: 256
+  dither: "floyd_steinberg" # Better quality default
+  lossy: 60 # Reduced from 80 for better quality
+
+  # Performance tuning
+  perf:
+    threads: auto # auto or integer
+    filter_threads: auto # auto or integer
+  performance:
+    # Threading for single GIF path
+    single_gif_parallel:
+      precompute_palette: true
+
+  # Multiprocessing configuration
+  multiprocessing:
+    max_concurrent_segments: 4 # Maximum concurrent processes for segmentation (MP4 and GIF)
+    enabled: true # Enable multiprocessing for segmentation
+    use_dynamic_analysis: true # Enable dynamic worker analysis based on system capabilities
+    analysis_mode: "recommended" # Analysis mode: "conservative", "recommended", or "maximum_safe"
+
+  # Gifsicle performance controls
+  gifsicle_performance:
+    fast_mode: true # When true, use faster gifsicle settings and limit search
+    gifsicle_time_budget_seconds: 25 # Limit adaptive search time
+    gifsicle_max_candidates: 48 # Cap on gifsicle candidate runs
+    gifsicle_optimize_level: 2 # 1-3; 2 is faster, 3 is slowest
+
+  # Color reduction
+  colors: 256
+  stats_mode: "diff" # full, diff
+
+  # Crop detection (disabled by default to avoid slight unintended crops)
+
+  # Single GIF feasibility pre-check (speeds up failure cases by avoiding long attempts)
+  single_gif:
+    quick_feasibility:
+      enabled: true
+      width: 240
+      fps: 12
+  crop_detection:
+    enabled: false
+    # Only apply crop if borders exceed BOTH of these loosened thresholds
+    min_border_px: 12 # Require at least 12px on one side
+    min_border_ratio: 0.04 # Or at least 4% of dimension combined per axis
+
+  # Segmentation settings - DISABLED for segmented videos
+  segmentation:
+    prefer_single_file_first: true
+    # Size-based thresholds (primary decision factors) - More conservative
+    size_threshold_multiplier: 2.5 # Increased from 2.2 to be more conservative
+    fallback_duration_limit: 180 # Increased from 120 to 3 minutes
+
+    # Segment duration preferences - Shorter segments for better FPS
+    min_segment_duration: 12 # Reduced from 15s for more consistent quality
+    max_segment_duration: 35 # Reduced from 45s to maintain higher FPS
+
+    # Base durations by video length - Optimized for FPS
+    base_durations:
+      short_video_max: 40 # Videos up to 40s
+      short_segment_duration: 18 # Reduced from 20s for better FPS
+      medium_video_max: 80 # Videos up to 80s
+      medium_segment_duration: 22 # Reduced from 25s for better FPS
+      long_video_max: 120 # Videos up to 120s
+      long_segment_duration: 25 # Reduced from 30s for better FPS
+      very_long_segment_duration: 28 # Reduced from 35s for better FPS
+
+    # Quality adjustments for longer segments - Less aggressive FPS reduction
+    quality_scaling:
+      enabled: true
+      long_segment_fps_reduction: 0.9 # Increased from 0.8 (less FPS reduction)
+      long_segment_color_reduction: 0.9 # Slightly increased from 0.875
+
+    # Size estimation parameters
+    estimation:
+      # Parameters used for initial size estimation
+      default_fps: 20 # Increased from 15 to match new base FPS
+      default_colors: 256
+      default_lossy: 60
+
+      # Aggressive compression test parameters - Better FPS baseline
+      aggressive_fps: 15 # Increased from 12 for better motion
+      aggressive_colors: 192
+      aggressive_lossy: 100
+
+  # Quality optimization settings - Better FPS preservation
+  quality_optimization:
+    enabled: true # Enable iterative quality optimization
+    max_attempts_per_stage: 4 # Increased from 3 for better optimization
+    target_size_efficiency: 0.95 # Slightly reduced to be more accommodating
+    early_stop:
+      enabled: true
+      min_target_utilization: 0.92 # Accept early if >=92% of target and under limit
+      min_quality_score: 7.5 # Require minimum perceived quality
+    skip_uplift:
+      enabled: true
+      min_size_headroom: 0.04 # If under target by >=4%, skip quality-uplift passes
+      max_extra_attempts: 0 # Or allow N quick uplift attempts if desired
+    quality_stages:
+      - name: "Maximum Quality"
+        colors: 256
+        fps_multiplier: 1.0
+        resolution_multiplier: 1.0
+        lossy: 0
+        dither: "floyd_steinberg"
+      - name: "High Quality"
+        colors: 224 # Slightly higher than before
+        fps_multiplier: 0.98 # Increased from 0.95 (less FPS reduction)
+        resolution_multiplier: 0.98 # Less aggressive reduction
+        lossy: 20 # Reduced from 30
+        dither: "floyd_steinberg"
+      - name: "Medium High Quality" # New stage for better progression
+        colors: 192
+        fps_multiplier: 0.95 # Increased from 0.9 (less FPS reduction)
+        resolution_multiplier: 0.95
+        lossy: 40
+        dither: "floyd_steinberg"
+      - name: "Medium Quality"
+        colors: 160 # Increased from 128
+        fps_multiplier: 0.9 # Increased from 0.85 (less FPS reduction)
+        resolution_multiplier: 0.92 # Less aggressive
+        lossy: 60
+        dither: "bayer"
+      - name: "Standard Quality"
+        colors: 128 # Increased from 96
+        fps_multiplier: 0.85 # Increased from 0.8 (less FPS reduction)
+        resolution_multiplier: 0.88 # Less aggressive
+        lossy: 80 # Reduced from 100
+        dither: "bayer"
+      - name: "Low Quality" # New stage for very challenging content
+        colors: 96
+        fps_multiplier: 0.8 # Still reduced but better than before
+        resolution_multiplier: 0.8
+        lossy: 120
+        dither: "bayer"
+
+  # Platform specific settings
+  platforms:
+    twitter:
+      max_width: 506
+      max_height: 506
+      max_duration: 15
+
+    discord:
+      max_width: 400
+      max_height: 400
+      max_duration: 15 # Increased from 10
+      colors: 192
+      max_file_size_mb: 10 # Discord's actual 10MB limit for free users
+      dither: "floyd_steinberg"
+      lossy: 40
+
+    slack:
+      max_width: 360
+      max_height: 360
+      max_duration: 12 # Increased from 8
+      colors: 160 # Increased for better quality
+      lossy: 60
