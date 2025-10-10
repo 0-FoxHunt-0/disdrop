@@ -14,7 +14,7 @@ from typing import Dict, Any, Optional
 import logging
 import time
 
-from .logger_setup import setup_logging, get_logger, _cleanup_old_logs
+from .logger_setup import setup_logging, get_logger, _cleanup_old_logs, get_package_base_dir
 from .config_manager import ConfigManager
 from .hardware_detector import HardwareDetector
 from .video_compressor import DynamicVideoCompressor
@@ -168,8 +168,8 @@ class VideoCompressorCLI:
         
         # Global options
         # Default config-dir to package base config folder
-        from .logger_setup import get_app_base_dir
-        default_config_dir = os.path.join(get_app_base_dir(), 'config')
+        # Default config dir now points to packaged defaults inside the installed package
+        default_config_dir = os.path.join(get_package_base_dir(), 'config')
         parser.add_argument('--config-dir', default=default_config_dir,
                           help='Configuration directory (default: config)')
         # Default to quieter console; use --debug to enable verbose output
