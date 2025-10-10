@@ -2,6 +2,7 @@
 video_compression:
   # General settings
   max_file_size_mb: 10
+  # temp_dir is ignored as of v0.1.2; temp is fixed at <package_root>/temp
   temp_dir: "./temp"
 
   # Hardware acceleration settings

@@ -456,9 +456,8 @@ class VideoCompressorCLI:
         """Extract configuration overrides from CLI arguments"""
         overrides = {}
         
-        # Temporary directory
-        if hasattr(args, 'temp_dir') and args.temp_dir:
-            overrides['video_compression.temp_dir'] = args.temp_dir
+        # Temporary directory override is intentionally ignored as of v0.1.2.
+        # The application always uses <package_root>/temp regardless of CLI input.
         
         # File size limit
         if hasattr(args, 'max_size') and args.max_size:

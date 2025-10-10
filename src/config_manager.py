@@ -128,7 +128,19 @@ class ConfigManager:
         return True
     
     def get_temp_dir(self) -> str:
-        """Get temporary directory path"""
-        temp_dir = self.get('video_compression.temp_dir', './temp')
+        """Return the package-root temp directory path (<package_root>/temp).
+
+        Ignores any user-configured temp_dir to enforce a consistent location
+        outside of output directories and independent of CWD.
+        """
+        try:
+            # Resolve application base dir using existing helper
+            from .logger_setup import get_app_base_dir
+            base_dir = get_app_base_dir()
+        except Exception:
+            # Fallback to current working directory if helper fails
+            base_dir = os.getcwd()
+
+        temp_dir = os.path.join(base_dir, 'temp')
         os.makedirs(temp_dir, exist_ok=True)
         return temp_dir 
