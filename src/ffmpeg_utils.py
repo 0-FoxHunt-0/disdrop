@@ -362,7 +362,14 @@ class FFmpegUtils:
     @staticmethod
     def add_output_optimizations(cmd: List[str], output_path: str) -> List[str]:
         """Add output optimization settings to FFmpeg command"""
-        cmd.extend(['-movflags', '+faststart', '-pix_fmt', 'yuv420p'])
+        cmd.extend(['-movflags', '+faststart'])
+        # Only set pixel format if not already specified earlier in the command
+        try:
+            if '-pix_fmt' not in cmd:
+                cmd.extend(['-pix_fmt', 'yuv420p'])
+        except Exception:
+            # Best-effort; if inspection fails, keep default 8-bit for safety
+            cmd.extend(['-pix_fmt', 'yuv420p'])
         cmd.append(output_path)
         return cmd
     
@@ -404,6 +411,66 @@ class FFmpegUtils:
             cmd = FFmpegUtils.add_output_optimizations(cmd, output_path)
         
         logger.debug(f"Two-pass FFmpeg command (pass {pass_num}): {' '.join(cmd)}")
+        return cmd
+
+    @staticmethod
+    def build_two_pass_with_filters(input_path: str, output_path: str, params: Dict[str, Any],
+                                    pass_num: int, log_file: str) -> List[str]:
+        """Build two-pass FFmpeg command with explicit filter chain and optional 10-bit pix_fmt.
+
+        Honors:
+          - params['vf']    : full filter chain string
+          - params['width'] / params['height'] if no explicit 'vf' is provided (adds scale,setsar)
+          - params['fps']   : output frame rate
+          - params['preset'], params['tune']
+          - params['pix_fmt']: e.g., 'yuv420p10le' for 10-bit
+          - bitrate fields handled via add_bitrate_control
+        """
+        cmd = FFmpegUtils.build_base_ffmpeg_command(input_path, output_path, params)
+
+        # Filter chain
+        vf = params.get('vf')
+        if not vf:
+            if 'width' in params and 'height' in params:
+                vf = f"scale={params['width']}:{params['height']}:flags=lanczos,setsar=1"
+            else:
+                vf = "setsar=1"
+        cmd.extend(['-vf', vf])
+
+        # FPS
+        if 'fps' in params:
+            cmd.extend(['-r', str(params['fps'])])
+
+        # Preset/tune (software encoders)
+        if 'preset' in params:
+            cmd.extend(['-preset', str(params['preset'])])
+        if 'tune' in params:
+            cmd.extend(['-tune', str(params['tune'])])
+
+        # Pixel format
+        if 'pix_fmt' in params:
+            cmd.extend(['-pix_fmt', str(params['pix_fmt'])])
+
+        # Two-pass flags
+        cmd.extend(['-pass', str(pass_num)])
+        cmd.extend(['-passlogfile', log_file])
+
+        # Bitrate control
+        cmd = FFmpegUtils.add_bitrate_control(cmd, params, buffer_multiplier=2.0)
+
+        if pass_num == 1:
+            # First pass: analysis only
+            cmd.extend(['-an', '-f', 'null'])
+            if os.name == 'nt':
+                cmd.append('NUL')
+            else:
+                cmd.append('/dev/null')
+        else:
+            # Second pass: encoding with audio
+            cmd = FFmpegUtils.add_audio_settings(cmd, params)
+            cmd = FFmpegUtils.add_output_optimizations(cmd, output_path)
+
+        logger.debug(f"Two-pass FFmpeg command (with filters, pass {pass_num}): {' '.join(cmd)}")
         return cmd
 
     @staticmethod

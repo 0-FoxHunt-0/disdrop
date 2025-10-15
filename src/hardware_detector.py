@@ -24,6 +24,7 @@ class HardwareDetector:
         self.gpu_info = self._detect_gpus()
         self.ffmpeg_encoders = self._detect_ffmpeg_encoders()
         self.validation_results = {}  # Track validation results for encoders
+        self._codec_caps_cache = None
     
     def _get_system_info(self) -> Dict[str, str]:
         """Get basic system information"""
@@ -464,6 +465,71 @@ class HardwareDetector:
         # Fallback to software encoding
         logger.warning(f"No hardware acceleration available for {codec}, falling back to software")
         return 'libx264' if codec.lower() == "h264" else 'libx265', 'software'
+
+    def detect_codec_capabilities(self) -> Dict[str, bool]:
+        """Detect software codec capabilities including 10-bit support.
+
+        Returns keys:
+          - hevc_10bit, hevc_8bit, h264_10bit, h264_8bit
+          - hardware hevc (nvenc/amf/qsv) presence surfaced via existing ffmpeg_encoders
+        """
+        if self._codec_caps_cache is not None:
+            return dict(self._codec_caps_cache)
+
+        caps = {
+            'hevc_10bit': False,
+            'hevc_8bit': False,
+            'h264_10bit': False,
+            'h264_8bit': False,
+            # expose hardware presence for convenience
+            'hevc_nvenc': bool(self.ffmpeg_encoders.get('hevc_nvenc')),
+            'hevc_amf': bool(self.ffmpeg_encoders.get('hevc_amf')),
+            'hevc_qsv': bool(self.ffmpeg_encoders.get('hevc_qsv')),
+        }
+
+        try:
+            # Quick presence checks from encoder list
+            if self.ffmpeg_encoders.get('libx265'):
+                caps['hevc_8bit'] = True
+            if self.ffmpeg_encoders.get('libx264'):
+                caps['h264_8bit'] = True
+
+            # Functional probes for 10-bit paths (fast and tiny)
+            # HEVC 10-bit via libx265
+            if self.ffmpeg_encoders.get('libx265'):
+                cmd = [
+                    'ffmpeg', '-hide_banner', '-loglevel', 'error',
+                    '-f', 'lavfi', '-i', 'testsrc=size=320x240:rate=1:duration=1',
+                    '-c:v', 'libx265', '-pix_fmt', 'yuv420p10le',
+                    '-frames:v', '2', '-f', 'null', '-'
+                ]
+                try:
+                    res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                    if res.returncode == 0:
+                        caps['hevc_10bit'] = True
+                except Exception:
+                    pass
+
+            # H.264 10-bit (requires 10-bit build of libx264)
+            if self.ffmpeg_encoders.get('libx264'):
+                cmd = [
+                    'ffmpeg', '-hide_banner', '-loglevel', 'error',
+                    '-f', 'lavfi', '-i', 'testsrc=size=320x240:rate=1:duration=1',
+                    '-c:v', 'libx264', '-pix_fmt', 'yuv420p10le', '-profile:v', 'high10',
+                    '-frames:v', '2', '-f', 'null', '-'
+                ]
+                try:
+                    res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                    if res.returncode == 0:
+                        caps['h264_10bit'] = True
+                except Exception:
+                    pass
+        except Exception:
+            # Best-effort detection; keep defaults
+            pass
+
+        self._codec_caps_cache = dict(caps)
+        return caps
     
     def get_amd_encoder_options(self, encoder: str) -> List[str]:
         """Get AMD AMF-specific encoder options for better performance and compatibility"""

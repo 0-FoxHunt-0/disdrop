@@ -57,6 +57,300 @@ class DynamicVideoCompressor:
         
         # Optimize system resources
         self.system_optimizations = self.performance_enhancer.optimize_system_resources()
+
+    # ===== New helpers for refined final-pass encoding =====
+    def _calculate_target_video_kbps(self, target_size_mb: float, duration_s: float, audio_kbps: int) -> int:
+        total_bits = target_size_mb * 8 * 1024 * 1024
+        kbps = int(max((total_bits / max(duration_s, 1.0) / 1000) - audio_kbps, 64))
+        return kbps
+
+    def _utilization_ratio(self, actual_bytes: int, target_mb: float) -> float:
+        return float(actual_bytes) / max(target_mb * 1024 * 1024, 1.0)
+
+    def _ensure_min_bpp(self, width: int, height: int, fps: float, kbps: int, min_bpp: float) -> bool:
+        try:
+            pixels_per_sec = max(1, int(width) * int(height)) * max(1.0, float(fps))
+            current_bpp = (int(kbps) * 1000.0) / pixels_per_sec
+            return current_bpp >= float(min_bpp)
+        except Exception:
+            return True
+
+    def _derive_codec_priority(self) -> List[str]:
+        """Derive ordered codec preference keys like ['hevc_10bit', 'hevc_8bit', 'h264_10bit', 'h264_8bit']
+        based on config and runtime capability.
+        """
+        # Read config
+        allow_hevc = bool(self.config.get('video_compression.codec.allow_hevc', True))
+        allow_h264_high10 = bool(self.config.get('video_compression.codec.allow_h264_high10', True))
+        configured_priority = self.config.get('video_compression.codec.priority',
+                                              ['hevc_10bit', 'hevc_8bit', 'h264_10bit', 'h264_8bit'])
+
+        # Detect runtime capabilities
+        try:
+            caps = self.hardware.detect_codec_capabilities()
+        except Exception:
+            caps = {
+                'hevc_10bit': True,
+                'hevc_8bit': True,
+                'h264_10bit': False,
+                'h264_8bit': True,
+            }
+
+        ordered: List[str] = []
+        for key in configured_priority:
+            if key.startswith('hevc') and not allow_hevc:
+                continue
+            if key == 'h264_10bit' and not allow_h264_high10:
+                continue
+            if caps.get(key, False):
+                ordered.append(key)
+            else:
+                # If capability is unknown for 8-bit paths, allow graceful attempt
+                if key.endswith('8bit'):
+                    ordered.append(key)
+        # Ensure at least one fallback
+        if not ordered:
+            ordered = ['h264_8bit']
+        return ordered
+
+    def _build_final_vf_chain(self, width: int, height: int, out_fps: float) -> Tuple[str, float]:
+        """Construct the final video filter chain with optional prefilters."""
+        filters: List[str] = [f"scale={width}:{height}:flags=lanczos", "setsar=1"]
+        if bool(self.config.get('video_compression.prefilters.denoise', True)):
+            filters.append("hqdn3d=1.5:1.5:6:6")
+        if bool(self.config.get('video_compression.prefilters.deband', True)):
+            filters.append("gradfun")
+        return ",".join(filters), float(out_fps)
+
+    def _codec_to_encoder(self, codec_key: str) -> Tuple[str, Optional[str]]:
+        """Map codec key to encoder name and pixel format.
+        Returns (encoder, pix_fmt) where pix_fmt may be None for 8-bit.
+        """
+        if codec_key.startswith('hevc'):
+            encoder = 'libx265'
+            pix_fmt = 'yuv420p10le' if codec_key.endswith('10bit') else 'yuv420p'
+        else:
+            encoder = 'libx264'
+            pix_fmt = 'yuv420p10le' if codec_key.endswith('10bit') else 'yuv420p'
+        return encoder, pix_fmt
+
+    def _run_two_pass_encode_once(self,
+                                  codec_key: str,
+                                  input_path: str,
+                                  output_path: str,
+                                  v_kbps: int,
+                                  a_kbps: int,
+                                  width: int,
+                                  height: int,
+                                  out_fps: float) -> Tuple[bool, float, str]:
+        """Run a two-pass encode for the given codec key.
+        Returns (success, size_mb, log_base) where log_base is the passlogfile base path.
+        """
+        vf, out_fps = self._build_final_vf_chain(width, height, out_fps)
+        encoder, pix_fmt = self._codec_to_encoder(codec_key)
+
+        # Software-only for final pass for better quality/size
+        params = {
+            'encoder': encoder,
+            'vf': vf,
+            'fps': out_fps,
+            'preset': self.config.get('video_compression.codec.final_preset', 'slow'),
+            'tune': self.config.get('video_compression.codec.tune', 'animation'),
+            'bitrate': int(v_kbps),
+            'audio_bitrate': int(a_kbps),
+        }
+        if pix_fmt:
+            params['pix_fmt'] = pix_fmt
+
+        log_base = os.path.join(self.temp_dir, 'ffmpeg2pass_final')
+        # Pass 1
+        cmd1 = FFmpegUtils.build_two_pass_with_filters(input_path, output_path, params, pass_num=1, log_file=log_base)
+        ok1 = FFmpegUtils.execute_ffmpeg_with_progress(cmd1, description="Analyzing", duration=None)
+        if not ok1:
+            return False, 0.0, log_base
+        # Pass 2
+        cmd2 = FFmpegUtils.build_two_pass_with_filters(input_path, output_path, params, pass_num=2, log_file=log_base)
+        ok2 = FFmpegUtils.execute_ffmpeg_with_progress(cmd2, description="Encoding", duration=None)
+        if not ok2 or not os.path.exists(output_path):
+            return False, 0.0, log_base
+        size_mb = os.path.getsize(output_path) / (1024 * 1024)
+        # Track encoder used
+        try:
+            self._last_encoder_used = f"{encoder} ({'10-bit' if pix_fmt == 'yuv420p10le' else '8-bit'})"
+        except Exception:
+            pass
+        return True, size_mb, log_base
+
+    def _rerun_pass2_with_bitrate(self,
+                                  input_path: str,
+                                  output_path: str,
+                                  params: Dict[str, Any],
+                                  log_base: str,
+                                  new_v_kbps: int,
+                                  a_kbps: int) -> bool:
+        try:
+            params2 = dict(params)
+            params2['bitrate'] = int(new_v_kbps)
+            params2['audio_bitrate'] = int(a_kbps)
+            cmd2 = FFmpegUtils.build_two_pass_with_filters(input_path, output_path, params2, pass_num=2, log_file=log_base)
+            return FFmpegUtils.execute_ffmpeg_with_progress(cmd2, description="Refining", duration=None)
+        except Exception:
+            return False
+
+    def _maybe_sample_ssim(self, input_path: str, output_path: str, duration_s: float) -> Optional[float]:
+        """Optional SSIM sampling; returns SSIM or None on failure/disabled."""
+        try:
+            if not bool(self.config.get('video_compression.quality_controls.ssim_check.enabled', False)):
+                return None
+            sample_fraction = float(self.config.get('video_compression.quality_controls.ssim_check.sample_fraction', 0.12))
+            sample_fraction = max(0.02, min(0.5, sample_fraction))
+            seg = max(1.5, duration_s * sample_fraction)
+            start = max(0.0, duration_s * 0.44)
+            cmd = [
+                'ffmpeg', '-hide_banner', '-loglevel', 'error',
+                '-ss', str(start), '-t', str(seg), '-i', input_path,
+                '-ss', str(start), '-t', str(seg), '-i', output_path,
+                '-lavfi', 'ssim', '-f', 'null', '-'
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if res.returncode != 0:
+                return None
+            out = res.stderr or ''
+            # Parse like: SSIM Y:... All:0.95 (var)
+            import re
+            m = re.search(r'All:(\d+\.\d+)', out)
+            if m:
+                return float(m.group(1))
+            return None
+        except Exception:
+            return None
+
+    def _final_single_file_refinement(self, input_path: str, output_path: str, target_size_mb: float,
+                                      video_info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Run a refined, size-targeted software two-pass with codec priority and utilization tuning.
+        Returns result dict if applied and better, else None.
+        """
+        try:
+            # Config reads
+            min_util = float(self.config.get('video_compression.quality_controls.min_target_utilization', 0.92))
+            max_iters = int(self.config.get('video_compression.quality_controls.refine_iterations', 2) or 0)
+            prefer_24fps = bool(self.config.get('video_compression.fps_policy.prefer_24fps_for_low_motion', True))
+            low_motion_threshold = float(self.config.get('video_compression.fps_policy.low_motion_threshold', 0.35))
+
+            # Determine fps target
+            out_fps = min(video_info.get('fps', 30.0), 30.0)
+            if prefer_24fps and (video_info.get('motion_level') == 'low' or out_fps < 28.0):
+                out_fps = 24.0
+
+            # Compute conservative output resolution for target size
+            width, height = self._calculate_optimal_resolution(video_info, target_size_mb, {})
+
+            # Calculate initial bitrates
+            a_kbps = 96
+            v_kbps = self._calculate_target_video_kbps(target_size_mb, video_info['duration'], a_kbps)
+
+            # Select codec order
+            codec_order = self._derive_codec_priority()
+
+            # Min BPP floors
+            min_bpp_map = {
+                'h264_8bit': float(self.config.get('video_compression.codec.min_bpp.h264_8bit', 0.023)),
+                'h264_10bit': float(self.config.get('video_compression.codec.min_bpp.h264_10bit', 0.020)),
+                'hevc_8bit': float(self.config.get('video_compression.codec.min_bpp.hevc_8bit', 0.018)),
+                'hevc_10bit': float(self.config.get('video_compression.codec.min_bpp.hevc_10bit', 0.015)),
+            }
+
+            best_local_file = None
+            best_local_size_mb = 0.0
+            best_local_codec = None
+
+            for codec_key in codec_order:
+                # Ensure BPP floor by adjusting fps or bitrate if under
+                needed_kbps = v_kbps
+                min_bpp = min_bpp_map.get(codec_key, 0.018)
+                if not self._ensure_min_bpp(width, height, out_fps, v_kbps, min_bpp):
+                    if prefer_24fps and out_fps > 24.0:
+                        out_fps = 24.0
+                    # Recompute needed kbps to meet min_bpp given selected fps/res
+                    pixels_per_sec = max(1, width * height) * max(1.0, out_fps)
+                    needed_kbps = int(max(v_kbps, math.ceil(min_bpp * pixels_per_sec / 1000.0)))
+                    # Cap by theoretical target video kbps
+                    needed_kbps = min(needed_kbps, self._calculate_target_video_kbps(target_size_mb, video_info['duration'], a_kbps))
+
+                temp_out = os.path.join(self.temp_dir, 'refined_final_temp.mp4')
+                try:
+                    if os.path.exists(temp_out):
+                        os.remove(temp_out)
+                except Exception:
+                    pass
+
+                ok, size_mb, log_base = self._run_two_pass_encode_once(
+                    codec_key, input_path, temp_out, needed_kbps, a_kbps, width, height, out_fps
+                )
+                if not ok:
+                    logger.info(f"Final-pass encode failed for {codec_key}, trying next fallback")
+                    continue
+
+                util = self._utilization_ratio(int(size_mb * 1024 * 1024), target_size_mb)
+                logger.info(f"Final-pass initial result {codec_key}: {size_mb:.2f}MB, utilization={util*100:.1f}%")
+
+                # Refinement iterations to increase size utilization if too low
+                params_snapshot = {
+                    'encoder': self._codec_to_encoder(codec_key)[0],
+                    'vf': self._build_final_vf_chain(width, height, out_fps)[0],
+                    'fps': out_fps,
+                    'preset': self.config.get('video_compression.codec.final_preset', 'slow'),
+                    'tune': self.config.get('video_compression.codec.tune', 'animation'),
+                    'pix_fmt': self._codec_to_encoder(codec_key)[1],
+                }
+
+                iter_count = 0
+                cur_v_kbps = needed_kbps
+                while util < min_util and iter_count < max_iters:
+                    cur_v_kbps = int(cur_v_kbps * 1.2)
+                    ok2 = self._rerun_pass2_with_bitrate(input_path, temp_out, params_snapshot, log_base, cur_v_kbps, a_kbps)
+                    if not ok2 or not os.path.exists(temp_out):
+                        logger.info("Refinement pass failed, stopping refinement loop")
+                        break
+                    size_mb = os.path.getsize(temp_out) / (1024 * 1024)
+                    util = self._utilization_ratio(int(size_mb * 1024 * 1024), target_size_mb)
+                    logger.info(f"Refinement iteration {iter_count+1}: size={size_mb:.2f}MB, utilization={util*100:.1f}%")
+                    iter_count += 1
+
+                # Optional SSIM sampling
+                ssim_threshold = float(self.config.get('video_compression.quality_controls.ssim_check.threshold', 0.94))
+                ssim_val = self._maybe_sample_ssim(input_path, temp_out, video_info.get('duration', 0.0))
+                if ssim_val is not None:
+                    logger.info(f"SSIM sample for {codec_key}: {ssim_val:.3f} (threshold {ssim_threshold:.2f})")
+
+                # Track best so far (prefer closer to target and higher SSIM if available)
+                if size_mb > best_local_size_mb:
+                    best_local_file = temp_out
+                    best_local_size_mb = size_mb
+                    best_local_codec = codec_key
+                else:
+                    try:
+                        os.remove(temp_out)
+                    except Exception:
+                        pass
+
+                # Good enough if utilization is close to 100%
+                if util >= min(0.98, max(min_util, 0.92)):
+                    break
+
+            if best_local_file and os.path.exists(best_local_file):
+                # Replace output
+                try:
+                    if os.path.exists(output_path):
+                        os.remove(output_path)
+                except Exception:
+                    pass
+                shutil.move(best_local_file, output_path)
+                logger.info(f"Refined final-pass applied using {best_local_codec}: {best_local_size_mb:.2f}MB")
+                return self._get_compression_results(input_path, output_path, video_info, "refined_final")
+        except Exception as e:
+            logger.warning(f"Final single-file refinement failed: {e}")
+        return None
         
     def compress_video(self, input_path: str, output_path: str, platform: str = None,
                       max_size_mb: int = None, use_advanced_optimization: bool = True,
@@ -326,6 +620,14 @@ class DynamicVideoCompressor:
             
             # Move best result to final output
             shutil.move(best_result['temp_file'], output_path)
+
+            # Final-pass refinement to improve utilization/quality if under-utilized
+            try:
+                refined = self._final_single_file_refinement(input_path, output_path, target_size_mb, video_info)
+                if refined and refined.get('success'):
+                    return refined
+            except Exception as e:
+                logger.info(f"Refinement step skipped due to error: {e}")
             
             # Clean up other attempts
             for attempt in compression_attempts:

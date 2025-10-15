@@ -102,3 +102,32 @@ video_compression:
     preset: "slower" # ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow
     tune: "film" # film, animation, grain, stillimage, fastdecode, zerolatency
 
+  # Advanced codec and quality controls
+  codec:
+    allow_hevc: true
+    allow_h264_high10: true
+    priority: [hevc_10bit, hevc_8bit, h264_10bit, h264_8bit]
+    final_preset: slow
+    tune: animation
+    min_bpp:
+      h264_8bit: 0.023
+      h264_10bit: 0.020
+      hevc_8bit: 0.018
+      hevc_10bit: 0.015
+
+  fps_policy:
+    prefer_24fps_for_low_motion: true
+    low_motion_threshold: 0.35
+
+  prefilters:
+    denoise: true
+    deband: true
+
+  quality_controls:
+    min_target_utilization: 0.92
+    refine_iterations: 2
+    ssim_check:
+      enabled: true
+      sample_fraction: 0.12
+      threshold: 0.94
+
