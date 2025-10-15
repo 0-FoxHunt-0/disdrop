@@ -18,6 +18,8 @@ video_compression:
     # Size-based thresholds (primary decision factors) - More conservative for 2-3min videos
     size_threshold_multiplier: 3.0 # Split if estimated size > 3.0x target (increased from 2.5)
     fallback_duration_limit: 300 # Split extremely long videos (5 minutes, reduced from 10 for longer segments)
+    # Prefer single file; segment only as last resort
+    only_if_single_file_unacceptable: true
 
     # Segment duration preferences
     min_segment_duration: 45 # Minimum 30 seconds per segment (increased from 15)
