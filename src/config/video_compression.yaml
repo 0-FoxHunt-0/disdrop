@@ -132,4 +132,3 @@ video_compression:
       enabled: true
       sample_fraction: 0.12
       threshold: 0.94
-
