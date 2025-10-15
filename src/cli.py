@@ -306,6 +306,11 @@ class VideoCompressorCLI:
         auto_parser.add_argument('--temp-dir', help='Temporary directory for processing')
         auto_parser.add_argument('--max-input-size', dest='max_input_size', metavar='SIZE',
                                 help='Maximum input file size to process (e.g., 500, 750MB, 1.2GB, 2TB). Bare numbers are MB.')
+        # Segmentation options for automated workflow
+        auto_parser.add_argument('--prefer-segments', type=int, choices=list(range(1, 11)), metavar='N',
+                                help='Prefer N segments (1-10) for video processing')
+        auto_parser.add_argument('--no-segmentation', '-ns', action='store_true',
+                                help='Disable video segmentation entirely and force single-file processing with aggressive optimization')
         
         # Cache management command (with alias: ch)
         cache_parser = subparsers.add_parser('cache', aliases=['ch'],
@@ -411,6 +416,9 @@ class VideoCompressorCLI:
                     self.automated_workflow.preferred_segments = None
             except Exception:
                 self.automated_workflow.preferred_segments = None
+
+            # Propagate no-segmentation flag
+            self.automated_workflow.force_single_file = getattr(args, 'no_segmentation', False)
             
             logger.info("All components initialized successfully")
             
