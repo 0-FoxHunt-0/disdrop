@@ -24,7 +24,17 @@ logger = logging.getLogger(__name__)
 class AdvancedGifOptimizer:
     def __init__(self, config_manager, shutdown_checker: Optional[Callable[[], bool]] = None):
         self.config = config_manager
-        self.temp_dir = self.config.get_temp_dir()
+        # Ensure temp dir exists and is user-writable
+        try:
+            self.temp_dir = self.config.get_temp_dir()
+            if self.temp_dir:
+                os.makedirs(self.temp_dir, exist_ok=True)
+        except Exception:
+            self.temp_dir = os.path.abspath('temp')
+            try:
+                os.makedirs(self.temp_dir, exist_ok=True)
+            except Exception:
+                pass
         # Shutdown checker provided by caller; if not provided, never indicates shutdown
         self._shutdown_checker: Callable[[], bool] = shutdown_checker or (lambda: False)
         self.shutdown_requested = False

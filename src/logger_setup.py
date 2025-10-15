@@ -160,21 +160,20 @@ def get_app_base_dir() -> str:
         if os.path.basename(pkg_dir).lower() == 'src':
             return os.path.abspath(os.path.join(pkg_dir, os.pardir))
 
-        # 3) Installed: test writability of package dir, else fall back to user data dir
+        # 3) Installed: prefer per-user data directory (avoid writing inside site-packages)
         try:
-            test_dir = os.path.join(pkg_dir, '.__wtest__')
-            os.makedirs(test_dir, exist_ok=True)
-            shutil.rmtree(test_dir, ignore_errors=True)
-            return pkg_dir
+            # Lazy import to avoid mandatory dependency at import-time if unused
+            from platformdirs import user_data_dir
+            base = user_data_dir(appname="Disdrop", appauthor="Disdrop")
+            os.makedirs(base, exist_ok=True)
+            return base
         except Exception:
+            # Fallback to a directory under the user's home; as last resort, use CWD
             try:
-                # Lazy import to avoid mandatory dependency at import-time if unused
-                from platformdirs import user_data_dir
-                base = user_data_dir(appname="Disdrop", appauthor="Disdrop")
-                os.makedirs(base, exist_ok=True)
-                return base
+                home_base = os.path.join(os.path.expanduser("~"), "Disdrop")
+                os.makedirs(home_base, exist_ok=True)
+                return home_base
             except Exception:
-                # Last resort: current working directory
                 return os.getcwd()
     except Exception:
         return os.getcwd()

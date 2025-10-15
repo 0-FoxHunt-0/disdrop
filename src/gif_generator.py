@@ -369,10 +369,13 @@ class GifGenerator:
             if not os.path.exists(input_video):
                 return {'success': False, 'error': f'Input video no longer exists: {input_video}'}
             
-            # Create output directory if it doesn't exist
+            # Create output directory (idempotent, race-safe)
             output_dir = os.path.dirname(output_path)
-            if output_dir and not os.path.exists(output_dir):
-                os.makedirs(output_dir)
+            if output_dir:
+                try:
+                    os.makedirs(output_dir, exist_ok=True)
+                except FileExistsError:
+                    pass
             
             # Optionally precompute palette in parallel while running split-palette encode
             enable_parallel_palette = bool(self.config.get('gif_settings.performance.single_gif_parallel.precompute_palette', True))
@@ -550,9 +553,12 @@ class GifGenerator:
             max_colors = int(settings.get('palette_max_colors', settings.get('colors', 256)))
             vf = ','.join(pre_chain + [f"palettegen=max_colors={max_colors}:stats_mode=diff:reserve_transparent=1"])  # Improved palette settings
 
-            # Palette cache key
+            # Palette cache directory (writable user temp)
             cache_dir = os.path.join(self.config.get_temp_dir(), 'palette_cache')
-            os.makedirs(cache_dir, exist_ok=True)
+            try:
+                os.makedirs(cache_dir, exist_ok=True)
+            except FileExistsError:
+                pass
             key_payload = {
                 'path': safe_input_path,
                 'mtime': os.path.getmtime(safe_input_path),
@@ -927,13 +933,23 @@ class GifGenerator:
             
             # Create output directory for segments
             output_dir = os.path.dirname(output_path)
+            if output_dir:
+                try:
+                    os.makedirs(output_dir, exist_ok=True)
+                except Exception:
+                    # Non-fatal; will attempt to create segments dir directly below
+                    pass
             base_name = os.path.splitext(os.path.basename(output_path))[0]
             # Sanitize base_name to avoid Unicode encoding issues
             safe_base_name = self._safe_filename_for_filesystem(base_name)
             segments_dir = os.path.join(output_dir, f"{safe_base_name}_segments")
             
-            if not os.path.exists(segments_dir):
-                os.makedirs(segments_dir)
+            # Idempotent and race-safe creation for concurrent workers/processes
+            try:
+                os.makedirs(segments_dir, exist_ok=True)
+            except FileExistsError:
+                # Already exists; proceed
+                pass
             
             successful_segments = 0
             total_size = 0.0

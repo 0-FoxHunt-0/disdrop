@@ -1025,6 +1025,10 @@ class VideoCompressorCLI:
                         if temp_segments_folder and base_name and segments:
                             # Create final segments folder
                             final_segments_folder = os.path.join(args.output_dir, f"{base_name}_segments")
+                            try:
+                                os.makedirs(args.output_dir, exist_ok=True)
+                            except Exception:
+                                pass
                             os.makedirs(final_segments_folder, exist_ok=True)
                             
                             # Move segments from temp to final location
