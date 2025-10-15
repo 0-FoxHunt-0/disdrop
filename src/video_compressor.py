@@ -1294,11 +1294,29 @@ class DynamicVideoCompressor:
         # Calculate bitrate for new resolution
         pixel_ratio = (optimal_resolution[0] * optimal_resolution[1]) / (video_info['width'] * video_info['height'])
         base_bitrate = self._calculate_content_aware_bitrate(video_info, target_size_mb)
-        params['bitrate'] = int(base_bitrate * pixel_ratio * 1.1)  # Slight bonus for resolution change
+        # Use a higher multiplier when downscaling so we don't starve the encode
+        # and clamp a bitrate floor at higher resolutions to avoid pixelation
+        computed_bitrate = int(base_bitrate * pixel_ratio * 1.6)
+        if params['width'] >= 1280:
+            computed_bitrate = max(computed_bitrate, 500)  # kbps floor for ~720p+ outputs
+        params['bitrate'] = computed_bitrate
         
         # CRF for software encoding
         if accel_type == 'software':
             params['crf'] = 25  # Balanced quality for adaptive resolution
+        
+        # Prefer software encoding at very low bitrates for better quality-per-bit
+        try:
+            if params['bitrate'] < 400:  # kbps
+                params['encoder'] = 'libx264'
+                params['acceleration_type'] = 'software'
+                # Use a slower preset to extract more quality per bit
+                params['preset'] = 'slow'
+                # Provide a reasonable CRF in software path if not already set
+                if 'crf' not in params:
+                    params['crf'] = 25
+        except Exception:
+            pass
         
         return params
     
