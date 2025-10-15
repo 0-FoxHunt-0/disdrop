@@ -1093,14 +1093,15 @@ class DynamicVideoCompressor:
             logger.info(f"Applied platform constraints: max {max_width}x{max_height}, "
                        f"scale factor: {scale_factor:.3f}, final size: {optimal_width}x{optimal_height}")
         else:
-            # When no platform constraints, apply intelligent defaults based on video characteristics
-            if original_height > original_width:  # Vertical video
-                # For vertical videos, maintain reasonable minimums
-                min_width = max(480, int(original_width * 0.7))   # At least 70% of original width
-                min_height = max(640, int(original_height * 0.7)) # At least 70% of original height
-            else:  # Horizontal video
-                min_width = max(640, int(original_width * 0.7))   # At least 70% of original width
-                min_height = max(480, int(original_height * 0.7)) # At least 70% of original height
+        # When no platform constraints, apply intelligent defaults based on video characteristics
+        if original_height > original_width:  # Vertical video
+            # For vertical videos, maintain reasonable minimums (slightly less strict)
+            min_width = max(480, int(original_width * 0.65))   # 65% of original width
+            min_height = max(640, int(original_height * 0.65)) # 65% of original height
+        else:  # Horizontal video
+            # Reduce the minimum to allow smaller outputs when bitrate is constrained
+            min_width = max(640, int(original_width * 0.6))   # 60% of original width
+            min_height = max(480, int(original_height * 0.6)) # 60% of original height
             
             optimal_width = max(optimal_width, min_width)
             optimal_height = max(optimal_height, min_height)
@@ -1307,14 +1308,14 @@ class DynamicVideoCompressor:
         
         # Prefer software encoding at very low bitrates for better quality-per-bit
         try:
-            if params['bitrate'] < 400:  # kbps
+            # Prefer software at low bitrates for higher quality-per-bit
+            if params['bitrate'] < 600:  # kbps
                 params['encoder'] = 'libx264'
                 params['acceleration_type'] = 'software'
-                # Use a slower preset to extract more quality per bit
                 params['preset'] = 'slow'
-                # Provide a reasonable CRF in software path if not already set
-                if 'crf' not in params:
-                    params['crf'] = 25
+                # CRF optional; keep bitrate-targeted encode for size compliance
+                if 'crf' in params:
+                    params.pop('crf', None)
         except Exception:
             pass
         
