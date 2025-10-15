@@ -395,7 +395,7 @@ class DynamicVideoCompressor:
                    f"{video_info['duration']:.2f}s, {original_size_mb:.2f}MB, "
                    f"complexity: {video_info['complexity_score']:.2f}")
         
-        # Check if video should be segmented instead of compressed as single file
+        # Check if segmentation should be considered now or deferred to last resort
         logger.info(f"Checking video segmentation: original size {original_size_mb:.1f}MB, target {target_size_mb}MB")
         logger.info(f"Video info keys: {list(video_info.keys())}")
         logger.info(f"Video info size_bytes: {video_info.get('size_bytes', 'NOT FOUND')}")
@@ -406,12 +406,14 @@ class DynamicVideoCompressor:
             return self._compress_with_aggressive_single_file(
                 input_path, output_path, target_size_mb, platform_config, video_info
             )
-        
-        if self.video_segmenter.should_segment_video(video_info['duration'], video_info, target_size_mb):
-            logger.info("Video will be segmented instead of compressed as single file")
-            return self._compress_with_segmentation(
-                input_path, output_path, target_size_mb, platform_config, video_info, platform
-            )
+
+        seg_last_resort = bool(self.config.get('video_compression.segmentation.only_if_single_file_unacceptable', False))
+        if not seg_last_resort:
+            if self.video_segmenter.should_segment_video(video_info['duration'], video_info, target_size_mb):
+                logger.info("Video will be segmented instead of compressed as single file")
+                return self._compress_with_segmentation(
+                    input_path, output_path, target_size_mb, platform_config, video_info, platform
+                )
         
         # If already under target size and no platform specified, just copy
         if original_size_mb <= target_size_mb and not platform:
@@ -422,9 +424,41 @@ class DynamicVideoCompressor:
         # Choose optimization strategy based on file size and system resources
         if use_advanced_optimization and (original_size_mb > 50 or target_size_mb < 5):
             logger.info("Using advanced optimization for challenging compression requirements")
-            return self._compress_with_advanced_optimization(
-                input_path, output_path, target_size_mb, platform_config, video_info
-            )
+            try:
+                result = self._compress_with_advanced_optimization(
+                    input_path, output_path, target_size_mb, platform_config, video_info
+                )
+            except Exception:
+                result = None
+            if result and result.get('success'):
+                # Optional refinement if underutilized
+                try:
+                    refined = self._final_single_file_refinement(input_path, output_path, target_size_mb, video_info)
+                    if refined and refined.get('success'):
+                        return refined
+                except Exception:
+                    pass
+                return result
+            # Fallback to standard pipeline or segmentation as last resort
+            try:
+                std_result = self._compress_with_standard_optimization(
+                    input_path, output_path, target_size_mb, platform_config, video_info
+                )
+                # Attempt refinement
+                try:
+                    refined = self._final_single_file_refinement(input_path, output_path, target_size_mb, video_info)
+                    if refined and refined.get('success'):
+                        return refined
+                except Exception:
+                    pass
+                return std_result
+            except Exception:
+                if seg_last_resort:
+                    logger.info("Standard/advanced pipelines failed; falling back to segmentation as last resort")
+                    return self._compress_with_segmentation(
+                        input_path, output_path, target_size_mb, platform_config, video_info, platform
+                    )
+                raise
         
         
         # Use adaptive quality processing for medium complexity files
@@ -436,9 +470,25 @@ class DynamicVideoCompressor:
 
         # Use standard dynamic optimization for simpler cases
         else:
-            return self._compress_with_standard_optimization(
-                input_path, output_path, target_size_mb, platform_config, video_info
-            )
+            try:
+                std_result = self._compress_with_standard_optimization(
+                    input_path, output_path, target_size_mb, platform_config, video_info
+                )
+                # Attempt refinement
+                try:
+                    refined = self._final_single_file_refinement(input_path, output_path, target_size_mb, video_info)
+                    if refined and refined.get('success'):
+                        return refined
+                except Exception:
+                    pass
+                return std_result
+            except Exception:
+                if seg_last_resort:
+                    logger.info("Standard pipeline failed; falling back to segmentation as last resort")
+                    return self._compress_with_segmentation(
+                        input_path, output_path, target_size_mb, platform_config, video_info, platform
+                    )
+                raise
     
     def _compress_with_advanced_optimization(self, input_path: str, output_path: str,
                                            target_size_mb: float, platform_config: Dict[str, Any],
