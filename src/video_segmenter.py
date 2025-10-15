@@ -256,8 +256,8 @@ class VideoSegmenter:
                            f"challenging characteristics (complexity: {complexity:.1f}, motion: {motion_level})")
                 return True
 
-        # Fallback: still split extremely long videos regardless of estimated size (reduced limit for 2-3min videos)
-        fallback_duration_limit = segmentation_config.get('fallback_duration_limit', 600)  # Reduced from 600 to 300 for 2-3min videos
+        # Fallback: still split extremely long videos regardless of estimated size (reduced limit for longer segments)
+        fallback_duration_limit = segmentation_config.get('fallback_duration_limit', 300)  # Reduced from 600 to 300 for longer segments
         if duration > fallback_duration_limit:
             logger.info(f"Video segmentation recommended: duration {duration}s exceeds fallback limit {fallback_duration_limit}s")
             return True
@@ -573,52 +573,43 @@ class VideoSegmenter:
         complexity = video_info.get('complexity_score', 5.0)
         motion_level = video_info.get('motion_level', 'medium')
 
-        # Special handling for 2-3 minute videos - prefer single file compression
-        if 120 <= total_duration <= 180:  # 2-3 minutes
-            logger.info(f"2-3 minute video detected in segment duration calculation - favoring longer segments")
+        # Favor longer segments for better quality and fewer total segments
+        logger.info(f"Calculating optimal segment duration for {total_duration:.1f}s video - favoring longer segments")
 
-            # For 2-3 minute videos, try to keep segments closer to 90-120 seconds if possible
-            # This reduces the number of segments and maintains better quality
-            if total_duration <= 150:  # Up to 2.5 minutes
-                # Try for 1-2 segments maximum
-                base_duration = total_duration / max(1, min(2, int(total_duration / 90)))
-            else:  # 2.5-3 minutes
-                # Try for 2 segments maximum
-                base_duration = total_duration / 2
-
-            # For short videos, we can be more aggressive with longer segments
-            if complexity < 7:  # Not very complex
-                base_duration *= 1.2  # Allow longer segments for simpler content
+        # Calculate base duration to target 12-15MB segments (increased from 8-9MB)
+        # This allows for longer segments while staying under typical file size limits
+        bitrate = video_info.get('bitrate', 0)
+        if bitrate > 0:
+            # Use actual bitrate to estimate duration for larger target size
+            # Account for compression efficiency (segments often compress better)
+            target_bits = (target_size_mb * 1.2) * 8 * 1024 * 1024  # 120% of target for video, 15% for audio
+            estimated_duration = target_bits / bitrate
+            # Use longer duration multiplier to create fewer, larger segments
+            base_duration = min(estimated_duration * 3, total_duration / 2)  # At most 2 segments for most videos
         else:
-            # Original logic for other video lengths
-            # Calculate base duration to target 8-9MB segments (closer to the 10MB ceiling)
-            # Estimate duration needed to reach target size based on video characteristics
-            bitrate = video_info.get('bitrate', 0)
-            if bitrate > 0:
-                # Use actual bitrate to estimate duration for target size
-                # Account for compression efficiency (segments often compress better)
-                target_bits = (target_size_mb * 0.85) * 8 * 1024 * 1024  # 85% for video, 15% for audio
-                estimated_duration = target_bits / bitrate
-                # Double the duration to get closer to target size (as you requested)
-                base_duration = min(estimated_duration * 2, total_duration / 3)  # At least 3 segments max
-            else:
-                # Fallback: aim for fewer, larger segments
-                base_duration = total_duration / max(3, int(total_duration / 90))  # Max 90s per segment
+            # Fallback: aim for significantly longer segments (increased from 90s max)
+            # For longer videos, try to keep segments to 3-4 minutes maximum
+            if total_duration <= 300:  # Up to 5 minutes
+                base_duration = total_duration / max(1, min(3, int(total_duration / 120)))  # Max 2 minutes per segment
+            elif total_duration <= 600:  # 5-10 minutes
+                base_duration = total_duration / max(2, min(4, int(total_duration / 150)))  # Max 2.5 minutes per segment
+            else:  # Over 10 minutes
+                base_duration = total_duration / max(3, min(6, int(total_duration / 180)))  # Max 3 minutes per segment
 
-        # Adjust for content complexity
-        if complexity >= 8 or motion_level == 'very_high':
-            # Reduce duration for very complex content to maintain quality
-            base_duration *= 0.85
-        elif complexity >= 6:
+        # Adjust for content complexity - be more lenient for longer segments
+        if complexity >= 9 or motion_level == 'very_high':
+            # Reduce duration only for extremely complex content
+            base_duration *= 0.9
+        elif complexity >= 7:
             # Slight reduction for high complexity
             base_duration *= 0.95
-        elif complexity < 4:
-            # Can afford longer segments for simple content
-            base_duration *= 1.1
+        elif complexity < 5:
+            # Can afford even longer segments for simple content
+            base_duration *= 1.15
 
-        # Ensure reasonable bounds (configurable)
-        min_seg = int(self.config.get('video_compression.segmentation.min_segment_duration', 45) or 45)
-        max_seg = int(self.config.get('video_compression.segmentation.max_segment_duration', 120) or 120)
+        # Ensure reasonable bounds (configurable) - now allowing much longer segments
+        min_seg = int(self.config.get('video_compression.segmentation.min_segment_duration', 30) or 30)
+        max_seg = int(self.config.get('video_compression.segmentation.max_segment_duration', 240) or 240)
         final_duration = max(min_seg, min(max_seg, base_duration))
 
         # Calculate expected number of segments

@@ -17,7 +17,7 @@ video_compression:
     enable_timeout: true
     # Size-based thresholds (primary decision factors) - More conservative for 2-3min videos
     size_threshold_multiplier: 3.0 # Split if estimated size > 3.0x target (increased from 2.5)
-    fallback_duration_limit: 300 # Split extremely long videos (5 minutes, reduced from 10 for 2-3min videos)
+    fallback_duration_limit: 300 # Split extremely long videos (5 minutes, reduced from 10 for longer segments)
 
     # Special thresholds for 2-3 minute videos
     short_video_thresholds:
@@ -26,18 +26,18 @@ video_compression:
       aggressive_size_multiplier: 1.2 # More lenient for single-file compression
 
     # Segment duration preferences
-    min_segment_duration: 15 # Minimum 15 seconds per segment
-    max_segment_duration: 120 # Maximum 2 minutes per segment
+    min_segment_duration: 30 # Minimum 30 seconds per segment (increased from 15)
+    max_segment_duration: 240 # Maximum 4 minutes per segment (increased from 2)
 
     # Base durations by video length
     base_durations:
       short_video_max: 60 # Videos up to 1 minute
-      short_segment_duration: 30 # 30-second segments
+      short_segment_duration: 45 # 45-second segments (increased from 30)
       medium_video_max: 180 # Videos up to 3 minutes
-      medium_segment_duration: 45 # 45-second segments
+      medium_segment_duration: 90 # 90-second segments (increased from 45)
       long_video_max: 600 # Videos up to 10 minutes
-      long_segment_duration: 60 # 1-minute segments
-      very_long_segment_duration: 90 # 1.5-minute segments
+      long_segment_duration: 120 # 2-minute segments (increased from 60)
+      very_long_segment_duration: 180 # 3-minute segments (increased from 90)
 
     # Quality adjustments for longer segments
     quality_scaling:
