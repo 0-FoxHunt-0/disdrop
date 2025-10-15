@@ -48,6 +48,9 @@ class AutomatedWorkflow:
         
         # Workflow directories (default under installed package base)
         base_dir = Path(get_app_base_dir())
+
+        # Segmentation control flag (propagated from CLI)
+        self.force_single_file = False
         self.input_dir = base_dir / "input"
         self.output_dir = base_dir / "output"
         self.temp_dir = base_dir / "temp"
@@ -1257,7 +1260,8 @@ class AutomatedWorkflow:
             result = self.video_compressor.compress_video(
                 input_path=str(video_file),
                 output_path=str(output_path),
-                max_size_mb=max_size_mb
+                max_size_mb=max_size_mb,
+                force_single_file=self.force_single_file
             )
             
             # Check for shutdown after compression

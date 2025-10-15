@@ -126,8 +126,6 @@ class VideoSegmenter:
         Determine if a video should be split into segments based on estimated file size
         Video segmentation is now a LAST RESORT - only when single file compression cannot achieve decent quality
 
-        For 2-3 minute videos (120-180s), be much more lenient with single-file compression
-
         Args:
             duration: Video duration in seconds
             video_info: Video metadata including complexity, resolution, etc.
@@ -185,26 +183,6 @@ class VideoSegmenter:
 
         # Estimate file size with optimal compression
         estimated_size_mb = self._estimate_video_size(estimation_params, duration, video_info)
-
-        # For 2-3 minute videos, use MUCH more lenient thresholds
-        if 120 <= duration <= 180:  # 2-3 minutes
-            logger.info(f"2-3 minute video detected - using lenient segmentation thresholds")
-
-            # Try with more aggressive compression first to see if single video is feasible
-            aggressive_params = estimation_params.copy()
-            aggressive_params.update({
-                'fps': 24,
-                'bitrate': '800k',
-                'crf': 32
-            })
-
-            aggressive_size_mb = self._estimate_video_size(aggressive_params, duration, video_info)
-            logger.info(f"Aggressive estimation for 2-3min video: {aggressive_size_mb:.1f}MB (target: {max_size_mb * 1.2:.1f}MB)")
-
-            # Only segment if even aggressive compression cannot achieve reasonable target
-            if aggressive_size_mb <= max_size_mb * 1.2:
-                logger.info(f"2-3 minute video can be compressed as single file: {aggressive_size_mb:.1f}MB <= {max_size_mb * 1.2:.1f}MB")
-                return False
 
         # Try with more aggressive compression first to see if single video is feasible
         aggressive_params = estimation_params.copy()

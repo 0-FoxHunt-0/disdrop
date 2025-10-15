@@ -19,12 +19,6 @@ video_compression:
     size_threshold_multiplier: 3.0 # Split if estimated size > 3.0x target (increased from 2.5)
     fallback_duration_limit: 300 # Split extremely long videos (5 minutes, reduced from 10 for longer segments)
 
-    # Special thresholds for 2-3 minute videos
-    short_video_thresholds:
-      min_duration: 120 # 2 minutes
-      max_duration: 180 # 3 minutes
-      aggressive_size_multiplier: 1.2 # More lenient for single-file compression
-
     # Segment duration preferences
     min_segment_duration: 45 # Minimum 30 seconds per segment (increased from 15)
     max_segment_duration: 240 # Maximum 4 minutes per segment (increased from 2)
