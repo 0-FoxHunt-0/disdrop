@@ -15,9 +15,15 @@ video_compression:
   segmentation:
     # Enable watchdog timeout to prevent hanging ffmpeg segment encodes
     enable_timeout: true
-    # Size-based thresholds (primary decision factors) - More conservative
+    # Size-based thresholds (primary decision factors) - More conservative for 2-3min videos
     size_threshold_multiplier: 3.0 # Split if estimated size > 3.0x target (increased from 2.5)
-    fallback_duration_limit: 600 # Split extremely long videos (10 minutes, increased from 5)
+    fallback_duration_limit: 300 # Split extremely long videos (5 minutes, reduced from 10 for 2-3min videos)
+
+    # Special thresholds for 2-3 minute videos
+    short_video_thresholds:
+      min_duration: 120 # 2 minutes
+      max_duration: 180 # 3 minutes
+      aggressive_size_multiplier: 1.2 # More lenient for single-file compression
 
     # Segment duration preferences
     min_segment_duration: 15 # Minimum 15 seconds per segment

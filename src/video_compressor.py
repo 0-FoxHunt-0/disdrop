@@ -1171,12 +1171,20 @@ class DynamicVideoCompressor:
                                         params: Dict[str, Any]) -> List[str]:
         """Build FFmpeg command with intelligent parameters"""
         params['maxrate_multiplier'] = 1.2  # Set specific multiplier for intelligent command
+        try:
+            logger.info(f"Encoder selected: {params.get('encoder', 'unknown')} ({params.get('acceleration_type', 'software')})")
+        except Exception:
+            pass
         return FFmpegUtils.build_standard_ffmpeg_command(input_path, output_path, params)
     
     def _build_two_pass_command(self, input_path: str, output_path: str, params: Dict[str, Any], 
                               pass_num: int, log_file: str) -> List[str]:
         """Build two-pass FFmpeg command"""
         params['maxrate_multiplier'] = 1.1  # Set specific multiplier for two-pass
+        try:
+            logger.info(f"Encoder selected: {params.get('encoder', 'unknown')} ({params.get('acceleration_type', 'software')})")
+        except Exception:
+            pass
         return FFmpegUtils.build_two_pass_command(input_path, output_path, params, pass_num, log_file)
     
     def _build_adaptive_ffmpeg_command(self, input_path: str, output_path: str, 
@@ -1185,6 +1193,10 @@ class DynamicVideoCompressor:
         
         # Use shared utilities for base command
         params['maxrate_multiplier'] = 1.15
+        try:
+            logger.info(f"Encoder selected: {params.get('encoder', 'unknown')} ({params.get('acceleration_type', 'software')})")
+        except Exception:
+            pass
         cmd = FFmpegUtils.build_base_ffmpeg_command(input_path, output_path, params)
         
         # Smart scaling with high-quality filter and normalized SAR
@@ -1219,6 +1231,10 @@ class DynamicVideoCompressor:
         params['audio_channels'] = 1  # Mono audio
         
         # Use shared utilities for base command
+        try:
+            logger.info(f"Encoder selected: {params.get('encoder', 'unknown')} ({params.get('acceleration_type', 'software')})")
+        except Exception:
+            pass
         cmd = FFmpegUtils.build_base_ffmpeg_command(input_path, output_path, params)
         cmd = FFmpegUtils.add_video_settings(cmd, params)
         

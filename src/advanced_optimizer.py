@@ -778,6 +778,10 @@ class AdvancedVideoOptimizer:
             'acceleration_type': candidate['acceleration_type'],
             'maxrate_multiplier': 1.1
         }
+        try:
+            logger.info(f"Encoder selected: {params.get('encoder', 'unknown')} ({params.get('acceleration_type', 'software')})")
+        except Exception:
+            pass
         
         # Add quality settings
         if 'crf' in candidate:

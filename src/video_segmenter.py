@@ -125,24 +125,26 @@ class VideoSegmenter:
         """
         Determine if a video should be split into segments based on estimated file size
         Video segmentation is now a LAST RESORT - only when single file compression cannot achieve decent quality
-        
+
+        For 2-3 minute videos (120-180s), be much more lenient with single-file compression
+
         Args:
             duration: Video duration in seconds
             video_info: Video metadata including complexity, resolution, etc.
             max_size_mb: Target size limit
-            
+
         Returns:
             True if video should be split into segments (last resort only)
         """
-        
+
         # Get segmentation settings from config
         segmentation_config = self.config.get('video_compression.segmentation', {})
-        
+
         # Log original vs target size, but do not force segmentation solely on original size
         original_size_mb = video_info.get('size_bytes', 0) / (1024 * 1024)
         logger.info(f"Video segmentation check: original size {original_size_mb:.1f}MB, target {max_size_mb}MB, "
                    f"duration {duration:.1f}s, resolution {video_info.get('width', 0)}x{video_info.get('height', 0)}")
-        
+
         # Create optimal video parameters for size estimation
         estimation_params = {
             'width': min(1280, video_info.get('width', 1280)),
@@ -151,16 +153,16 @@ class VideoSegmenter:
             'bitrate': '1000k',  # Conservative bitrate for estimation
             'crf': 28  # Conservative quality for estimation
         }
-        
+
         # Preserve aspect ratio for estimation
         if video_info.get('width') and video_info.get('height'):
             original_width = video_info['width']
             original_height = video_info['height']
             original_aspect_ratio = original_width / original_height
-            
+
             max_width = estimation_params['width']
             max_height = estimation_params['height']
-            
+
             if original_aspect_ratio > 1:  # Landscape
                 new_width = min(original_width, max_width)
                 new_height = int(new_width / original_aspect_ratio)
@@ -173,17 +175,37 @@ class VideoSegmenter:
                 if new_width > max_width:
                     new_width = max_width
                     new_height = int(new_width / original_aspect_ratio)
-            
+
             # Ensure even dimensions
             estimation_params['width'] = new_width - (new_width % 2)
             estimation_params['height'] = new_height - (new_height % 2)
-        
+
         logger.info(f"Estimation parameters: {estimation_params['width']}x{estimation_params['height']}, "
                    f"{estimation_params['fps']}fps, {estimation_params['bitrate']}, CRF {estimation_params['crf']}")
-        
+
         # Estimate file size with optimal compression
         estimated_size_mb = self._estimate_video_size(estimation_params, duration, video_info)
-        
+
+        # For 2-3 minute videos, use MUCH more lenient thresholds
+        if 120 <= duration <= 180:  # 2-3 minutes
+            logger.info(f"2-3 minute video detected - using lenient segmentation thresholds")
+
+            # Try with more aggressive compression first to see if single video is feasible
+            aggressive_params = estimation_params.copy()
+            aggressive_params.update({
+                'fps': 24,
+                'bitrate': '800k',
+                'crf': 32
+            })
+
+            aggressive_size_mb = self._estimate_video_size(aggressive_params, duration, video_info)
+            logger.info(f"Aggressive estimation for 2-3min video: {aggressive_size_mb:.1f}MB (target: {max_size_mb * 1.2:.1f}MB)")
+
+            # Only segment if even aggressive compression cannot achieve reasonable target
+            if aggressive_size_mb <= max_size_mb * 1.2:
+                logger.info(f"2-3 minute video can be compressed as single file: {aggressive_size_mb:.1f}MB <= {max_size_mb * 1.2:.1f}MB")
+                return False
+
         # Try with more aggressive compression first to see if single video is feasible
         aggressive_params = estimation_params.copy()
         aggressive_params.update({
@@ -191,10 +213,10 @@ class VideoSegmenter:
             'bitrate': '800k',
             'crf': 32
         })
-        
+
         aggressive_size_mb = self._estimate_video_size(aggressive_params, duration, video_info)
         logger.info(f"Aggressive estimation: {aggressive_size_mb:.1f}MB (target: {max_size_mb * 1.5:.1f}MB)")
-        
+
         # Try with very aggressive compression as last resort
         very_aggressive_params = estimation_params.copy()
         very_aggressive_params.update({
@@ -202,44 +224,44 @@ class VideoSegmenter:
             'bitrate': '600k',
             'crf': 35
         })
-        
+
         very_aggressive_size_mb = self._estimate_video_size(very_aggressive_params, duration, video_info)
         logger.info(f"Very aggressive estimation: {very_aggressive_size_mb:.1f}MB (target: {max_size_mb * 1.8:.1f}MB)")
-        
+
         # Only segment if even very aggressive compression cannot achieve target
         if very_aggressive_size_mb > max_size_mb * 1.8:
             logger.info(f"Video segmentation recommended: even very aggressive compression estimates {very_aggressive_size_mb:.1f}MB > "
                        f"{max_size_mb * 1.8:.1f}MB")
             return True
-        
+
         # Primary decision: split if estimated size exceeds limit significantly (increased threshold)
         size_threshold_multiplier = segmentation_config.get('size_threshold_multiplier', 3.0)  # Increased from 2.5
         threshold_size = max_size_mb * size_threshold_multiplier
         logger.info(f"Estimated size: {estimated_size_mb:.1f}MB, threshold: {threshold_size:.1f}MB "
                    f"(multiplier: {size_threshold_multiplier})")
-        
+
         if estimated_size_mb > threshold_size:
             logger.info(f"Video segmentation recommended: estimated size {estimated_size_mb:.1f}MB > "
                        f"{threshold_size:.1f}MB threshold")
             return True
-        
+
         # Secondary decision: split if estimated size is close to limit but video has challenging characteristics
         if estimated_size_mb > max_size_mb * 2.2:  # Increased from 1.8
             complexity = video_info.get('complexity_score', 5.0)
             motion_level = video_info.get('motion_level', 'medium')
-            
+
             # Split only if very high complexity or motion makes compression unpredictable
             if complexity >= 9.0 or motion_level == 'very_high':  # Increased complexity threshold
                 logger.info(f"Video segmentation recommended: estimated size {estimated_size_mb:.1f}MB with "
                            f"challenging characteristics (complexity: {complexity:.1f}, motion: {motion_level})")
                 return True
-        
-        # Fallback: still split extremely long videos regardless of estimated size (increased limit)
-        fallback_duration_limit = segmentation_config.get('fallback_duration_limit', 600)  # Increased from 300 to 10 minutes
+
+        # Fallback: still split extremely long videos regardless of estimated size (reduced limit for 2-3min videos)
+        fallback_duration_limit = segmentation_config.get('fallback_duration_limit', 600)  # Reduced from 600 to 300 for 2-3min videos
         if duration > fallback_duration_limit:
             logger.info(f"Video segmentation recommended: duration {duration}s exceeds fallback limit {fallback_duration_limit}s")
             return True
-        
+
         logger.info(f"Single video recommended: estimated size {estimated_size_mb:.1f}MB (aggressive: {aggressive_size_mb:.1f}MB, "
                    f"very aggressive: {very_aggressive_size_mb:.1f}MB) within acceptable range for {max_size_mb}MB target")
         return False
@@ -547,24 +569,42 @@ class VideoSegmenter:
     
     def _calculate_optimal_segment_duration(self, total_duration: float, video_info: Dict[str, Any], target_size_mb: float) -> float:
         """Calculate optimal duration for each segment based on content characteristics and target size"""
-        
+
         complexity = video_info.get('complexity_score', 5.0)
         motion_level = video_info.get('motion_level', 'medium')
-        
-        # Calculate base duration to target 8-9MB segments (closer to the 10MB ceiling)
-        # Estimate duration needed to reach target size based on video characteristics
-        bitrate = video_info.get('bitrate', 0)
-        if bitrate > 0:
-            # Use actual bitrate to estimate duration for target size
-            # Account for compression efficiency (segments often compress better)
-            target_bits = (target_size_mb * 0.85) * 8 * 1024 * 1024  # 85% for video, 15% for audio
-            estimated_duration = target_bits / bitrate
-            # Double the duration to get closer to target size (as you requested)
-            base_duration = min(estimated_duration * 2, total_duration / 3)  # At least 3 segments max
+
+        # Special handling for 2-3 minute videos - prefer single file compression
+        if 120 <= total_duration <= 180:  # 2-3 minutes
+            logger.info(f"2-3 minute video detected in segment duration calculation - favoring longer segments")
+
+            # For 2-3 minute videos, try to keep segments closer to 90-120 seconds if possible
+            # This reduces the number of segments and maintains better quality
+            if total_duration <= 150:  # Up to 2.5 minutes
+                # Try for 1-2 segments maximum
+                base_duration = total_duration / max(1, min(2, int(total_duration / 90)))
+            else:  # 2.5-3 minutes
+                # Try for 2 segments maximum
+                base_duration = total_duration / 2
+
+            # For short videos, we can be more aggressive with longer segments
+            if complexity < 7:  # Not very complex
+                base_duration *= 1.2  # Allow longer segments for simpler content
         else:
-            # Fallback: aim for fewer, larger segments
-            base_duration = total_duration / max(3, int(total_duration / 90))  # Max 90s per segment
-        
+            # Original logic for other video lengths
+            # Calculate base duration to target 8-9MB segments (closer to the 10MB ceiling)
+            # Estimate duration needed to reach target size based on video characteristics
+            bitrate = video_info.get('bitrate', 0)
+            if bitrate > 0:
+                # Use actual bitrate to estimate duration for target size
+                # Account for compression efficiency (segments often compress better)
+                target_bits = (target_size_mb * 0.85) * 8 * 1024 * 1024  # 85% for video, 15% for audio
+                estimated_duration = target_bits / bitrate
+                # Double the duration to get closer to target size (as you requested)
+                base_duration = min(estimated_duration * 2, total_duration / 3)  # At least 3 segments max
+            else:
+                # Fallback: aim for fewer, larger segments
+                base_duration = total_duration / max(3, int(total_duration / 90))  # Max 90s per segment
+
         # Adjust for content complexity
         if complexity >= 8 or motion_level == 'very_high':
             # Reduce duration for very complex content to maintain quality
@@ -575,19 +615,19 @@ class VideoSegmenter:
         elif complexity < 4:
             # Can afford longer segments for simple content
             base_duration *= 1.1
-        
+
         # Ensure reasonable bounds (configurable)
         min_seg = int(self.config.get('video_compression.segmentation.min_segment_duration', 45) or 45)
         max_seg = int(self.config.get('video_compression.segmentation.max_segment_duration', 120) or 120)
         final_duration = max(min_seg, min(max_seg, base_duration))
-        
+
         # Calculate expected number of segments
         expected_segments = math.ceil(total_duration / final_duration)
-        
+
         logger.info(f"Optimized segment duration to: {final_duration:.1f}s "
                     f"(complexity: {complexity:.1f}, motion: {motion_level}, "
                     f"target: {target_size_mb}MB, expected segments: {expected_segments})")
-        
+
         return final_duration
     
     def _create_high_quality_segment(self, input_video: str, output_path: str, 
@@ -616,6 +656,10 @@ class VideoSegmenter:
             # Build FFmpeg command for segment creation (accurate seek: place -ss after -i)
             encoder = segment_params.get('encoder', 'libx264')
             accel_type = segment_params.get('acceleration_type', 'software')
+            try:
+                logger.info(f"Encoder selected: {encoder} ({accel_type})")
+            except Exception:
+                pass
             prefer_fast_seek = bool(self.config.get('video_compression.segmentation.prefer_fast_seek', True))
             if prefer_fast_seek:
                 # Fast demuxer seek to avoid decoding from beginning on long videos
@@ -1409,6 +1453,10 @@ class VideoSegmenter:
                 output_path
             ]
             # Do not inject generic -hwaccel here; encoding choice already set by encoder
+            try:
+                logger.info(f"Encoder selected: {params.get('encoder', 'unknown')} ({params.get('acceleration_type', 'software')})")
+            except Exception:
+                pass
             
             # Execute FFmpeg command
             result = subprocess.run(
