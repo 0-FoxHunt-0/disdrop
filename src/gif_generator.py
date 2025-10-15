@@ -595,14 +595,46 @@ class GifGenerator:
             
             logger.debug(f"Generating palette: {' '.join(cmd)}")
             
-            # Run FFmpeg
+            # Run FFmpeg (attempt 1)
             result = self._run_ffmpeg(cmd, timeout=(timeout_override if timeout_override is not None else 30))
-            
             if result.returncode == 0 and os.path.exists(palette_path):
                 return palette_path
-            else:
-                logger.error(f"Palette generation failed: {result.stderr}")
-                return None
+
+            # If first attempt failed, try a quick cleanup and retry to handle stale/locked files
+            try:
+                if os.path.exists(palette_path):
+                    # Remove zero-byte or partial files before retry
+                    try:
+                        if os.path.getsize(palette_path) == 0:
+                            os.remove(palette_path)
+                    except Exception:
+                        # Best-effort: attempt attribute clear on Windows before remove
+                        try:
+                            subprocess.run(['attrib', '-R', '-S', '-H', palette_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+                            os.remove(palette_path)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            retry_path = os.path.join(cache_dir, f"pal_{digest}_r1.png")
+            retry_cmd = [
+                'ffmpeg', '-y',
+                '-ss', str(start_time),
+                '-t', str(duration),
+                '-i', safe_input_path,
+                '-vf', vf,
+                '-f', 'image2',
+                retry_path
+            ]
+            FFmpegUtils.add_ffmpeg_perf_flags(retry_cmd)
+            logger.debug(f"Palette generation retry: {' '.join(retry_cmd)}")
+            retry_result = self._run_ffmpeg(retry_cmd, timeout=(timeout_override if timeout_override is not None else 30))
+            if retry_result.returncode == 0 and os.path.exists(retry_path):
+                return retry_path
+
+            logger.error(f"Palette generation failed: {result.stderr or ''} | retry: {retry_result.stderr or ''}")
+            return None
                 
         except FileNotFoundError as e:
             logger.error(f"File not found error during palette generation: {e}")
