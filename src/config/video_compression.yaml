@@ -26,13 +26,13 @@ video_compression:
       aggressive_size_multiplier: 1.2 # More lenient for single-file compression
 
     # Segment duration preferences
-    min_segment_duration: 30 # Minimum 30 seconds per segment (increased from 15)
+    min_segment_duration: 45 # Minimum 30 seconds per segment (increased from 15)
     max_segment_duration: 240 # Maximum 4 minutes per segment (increased from 2)
 
     # Base durations by video length
     base_durations:
-      short_video_max: 60 # Videos up to 1 minute
-      short_segment_duration: 45 # 45-second segments (increased from 30)
+      short_video_max: 90 # Videos up to 1 minute
+      short_segment_duration: 60 # 45-second segments (increased from 30)
       medium_video_max: 180 # Videos up to 3 minutes
       medium_segment_duration: 90 # 90-second segments (increased from 45)
       long_video_max: 600 # Videos up to 10 minutes
@@ -54,8 +54,8 @@ video_compression:
 
       # Aggressive compression test parameters
       aggressive_fps: 24
-      aggressive_bitrate: "800k"
-      aggressive_crf: 32
+      aggressive_bitrate: "700k"
+      aggressive_crf: 30
 
   # Social media platform presets
   platforms:
@@ -95,16 +95,16 @@ video_compression:
       fps: 30
 
     discord:
-      max_width: 1280
-      max_height: 720
+      max_width: 1920
+      max_height: 1080
       aspect_ratio: "16:9"
-      bitrate: "800k"
+      bitrate: "1000k"
       fps: 30
-      max_file_size_mb: 8 # Discord's 8MB limit for free users
+      max_file_size_mb: 10 # Discord's 10MB limit for free users
 
   # Quality settings
   quality:
-    crf: 28 # Constant Rate Factor (lower = higher quality)
-    preset: "medium" # ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow
+    crf: 24 # Constant Rate Factor (lower = higher quality)
+    preset: "slower" # ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow
     tune: "film" # film, animation, grain, stillimage, fastdecode, zerolatency
 
