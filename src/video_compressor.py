@@ -1093,19 +1093,19 @@ class DynamicVideoCompressor:
             logger.info(f"Applied platform constraints: max {max_width}x{max_height}, "
                        f"scale factor: {scale_factor:.3f}, final size: {optimal_width}x{optimal_height}")
         else:
-        # When no platform constraints, apply intelligent defaults based on video characteristics
-        if original_height > original_width:  # Vertical video
-            # For vertical videos, maintain reasonable minimums (slightly less strict)
-            min_width = max(480, int(original_width * 0.65))   # 65% of original width
-            min_height = max(640, int(original_height * 0.65)) # 65% of original height
-        else:  # Horizontal video
-            # Reduce the minimum to allow smaller outputs when bitrate is constrained
-            min_width = max(640, int(original_width * 0.6))   # 60% of original width
-            min_height = max(480, int(original_height * 0.6)) # 60% of original height
-            
+            # When no platform constraints, apply intelligent defaults based on video characteristics
+            if original_height > original_width:  # Vertical video
+                # For vertical videos, maintain reasonable minimums (slightly less strict)
+                min_width = max(480, int(original_width * 0.65))   # 65% of original width
+                min_height = max(640, int(original_height * 0.65)) # 65% of original height
+            else:  # Horizontal video
+                # Reduce the minimum to allow smaller outputs when bitrate is constrained
+                min_width = max(640, int(original_width * 0.6))   # 60% of original width
+                min_height = max(480, int(original_height * 0.6)) # 60% of original height
+
             optimal_width = max(optimal_width, min_width)
             optimal_height = max(optimal_height, min_height)
-            
+
             logger.info(f"No platform constraints, applied intelligent defaults: min {min_width}x{min_height}, "
                        f"adjusted size={optimal_width}x{optimal_height}")
         
