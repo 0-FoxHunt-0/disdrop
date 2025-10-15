@@ -193,6 +193,9 @@ class VideoCompressorCLI:
         # Segmentation preference: prefer a fixed number of segments (1-10)
         parser.add_argument('--prefer-segments', type=int, choices=list(range(1, 11)), metavar='N',
                           help='Prefer N segments (1-10). If impossible, fall back to normal operations')
+        # Disable segmentation entirely and force single-file processing
+        parser.add_argument('--no-segmentation', action='store_true',
+                          help='Disable video segmentation entirely and force single-file processing with aggressive optimization')
         
         # Create subcommands
         subparsers = parser.add_subparsers(dest='command', help='Available commands')
@@ -924,7 +927,8 @@ class VideoCompressorCLI:
                     input_path=input_file,
                     output_path=output_file,
                     platform=args.platform,
-                    max_size_mb=args.max_size
+                    max_size_mb=args.max_size,
+                    force_single_file=getattr(args, 'no_segmentation', False)
                 )
                 
                 return {'success': True, 'input': input_file, 'output': output_file, 'result': result}
