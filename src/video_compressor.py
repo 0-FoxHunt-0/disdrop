@@ -59,8 +59,7 @@ class DynamicVideoCompressor:
         self.system_optimizations = self.performance_enhancer.optimize_system_resources()
         
     def compress_video(self, input_path: str, output_path: str, platform: str = None,
-                      max_size_mb: int = None, use_advanced_optimization: bool = True,
-                      force_single_file: bool = False) -> Dict[str, Any]:
+                      max_size_mb: int = None, use_advanced_optimization: bool = True) -> Dict[str, Any]:
         """
         Compress video with dynamic optimization for maximum quality within size constraints
         Enhanced with advanced optimization techniques and performance improvements
@@ -106,10 +105,7 @@ class DynamicVideoCompressor:
         logger.info(f"Video info keys: {list(video_info.keys())}")
         logger.info(f"Video info size_bytes: {video_info.get('size_bytes', 'NOT FOUND')}")
 
-        # Check if segmentation is disabled via force_single_file flag
-        if force_single_file:
-            logger.info("Segmentation disabled via --no-segmentation flag, forcing single-file processing")
-        elif self.video_segmenter.should_segment_video(video_info['duration'], video_info, target_size_mb):
+        if self.video_segmenter.should_segment_video(video_info['duration'], video_info, target_size_mb):
             logger.info("Video will be segmented instead of compressed as single file")
             return self._compress_with_segmentation(
                 input_path, output_path, target_size_mb, platform_config, video_info, platform
@@ -128,13 +124,6 @@ class DynamicVideoCompressor:
                 input_path, output_path, target_size_mb, platform_config, video_info
             )
         
-        # When segmentation is disabled, use more aggressive optimization strategies
-        if force_single_file:
-            logger.info("Segmentation disabled - using aggressive single-file optimization")
-            # Try advanced optimization first, then fallback to very aggressive strategies
-            return self._compress_with_aggressive_single_file(
-                input_path, output_path, target_size_mb, platform_config, video_info
-            )
 
         # Use adaptive quality processing for medium complexity files
         elif original_size_mb > 20:
@@ -657,212 +646,6 @@ class DynamicVideoCompressor:
                 input_path, output_path, target_size_mb, platform_config, video_info
             )
     
-    def _compress_with_aggressive_single_file(self, input_path: str, output_path: str,
-                                           target_size_mb: float, platform_config: Dict[str, Any],
-                                           video_info: Dict[str, Any]) -> Dict[str, Any]:
-        """Aggressive single-file optimization when segmentation is disabled"""
-        logger.info("Starting aggressive single-file optimization with multiple strategies")
-
-        temp_output = os.path.join(self.temp_dir, "aggressive_single.mp4")
-
-        # Strategy 1: Try advanced optimization first
-        logger.info("Strategy 1: Advanced optimization")
-        try:
-            result = self._compress_with_advanced_optimization(
-                input_path, temp_output, target_size_mb, platform_config, video_info
-            )
-            if result and result.get('compressed_size_mb', float('inf')) <= target_size_mb:
-                shutil.move(temp_output, output_path)
-                return result
-        except Exception as e:
-            logger.warning(f"Advanced optimization failed: {e}")
-
-        # Strategy 2: Very aggressive adaptive quality
-        logger.info("Strategy 2: Very aggressive adaptive quality")
-        try:
-            result = self._compress_with_very_aggressive_quality(
-                input_path, temp_output, target_size_mb, platform_config, video_info
-            )
-            if result and result.get('compressed_size_mb', float('inf')) <= target_size_mb:
-                shutil.move(temp_output, output_path)
-                return result
-        except Exception as e:
-            logger.warning(f"Very aggressive quality failed: {e}")
-
-        # Strategy 3: Ultra-aggressive resolution and quality reduction
-        logger.info("Strategy 3: Ultra-aggressive optimization")
-        try:
-            result = self._compress_with_ultra_aggressive_optimization(
-                input_path, temp_output, target_size_mb, platform_config, video_info
-            )
-            if result and result.get('compressed_size_mb', float('inf')) <= target_size_mb:
-                shutil.move(temp_output, output_path)
-                return result
-        except Exception as e:
-            logger.warning(f"Ultra-aggressive optimization failed: {e}")
-
-        # Strategy 4: Last resort - extremely aggressive settings
-        logger.info("Strategy 4: Last resort - extremely aggressive settings")
-        try:
-            result = self._compress_with_extreme_aggressive_optimization(
-                input_path, temp_output, target_size_mb, platform_config, video_info
-            )
-            if result:
-                shutil.move(temp_output, output_path)
-                return result
-        except Exception as e:
-            logger.error(f"All aggressive optimization strategies failed: {e}")
-
-        # If all strategies failed, return error
-        return {
-            'success': False,
-            'error': 'All aggressive single-file optimization strategies failed to meet target size',
-            'method': 'failed_aggressive_single_file'
-        }
-
-    def _compress_with_very_aggressive_quality(self, input_path: str, output_path: str,
-                                           target_size_mb: float, platform_config: Dict[str, Any],
-                                           video_info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Very aggressive quality reduction for single-file processing"""
-        temp_output = os.path.join(self.temp_dir, "very_aggressive.mp4")
-
-        # Use extremely aggressive quality settings
-        encoder, accel_type = self.hardware.get_best_encoder("h264")
-
-        params = {
-            'encoder': encoder,
-            'acceleration_type': accel_type,
-            'width': max(320, int(video_info['width'] * 0.6)),  # More aggressive downscaling
-            'height': max(240, int(video_info['height'] * 0.6)),
-            'fps': max(15, int(video_info['fps'] * 0.5)),  # Significant FPS reduction
-            'crf': 35 if accel_type == 'software' else None,  # Very high CRF
-            'preset': 'ultrafast',  # Fastest preset for aggressive compression
-            'bitrate': f"{int(target_size_mb * 0.8 * 8 * 1024 * 1024 / video_info['duration'] / 1000)}k"
-        }
-
-        # Apply platform constraints
-        if platform_config:
-            params.update(self._apply_platform_constraints(params, platform_config))
-
-        # Build and execute FFmpeg command
-        ffmpeg_cmd = self._build_aggressive_ffmpeg_command(input_path, temp_output, params)
-        self._execute_ffmpeg_with_progress(ffmpeg_cmd, video_info['duration'])
-
-        if os.path.exists(temp_output):
-            compressed_size_mb = os.path.getsize(temp_output) / (1024 * 1024)
-            return {
-                'success': True,
-                'input_file': input_path,
-                'output_file': temp_output,
-                'method': 'very_aggressive_quality',
-                'original_size_mb': os.path.getsize(input_path) / (1024 * 1024),
-                'compressed_size_mb': compressed_size_mb,
-                'compression_ratio': ((os.path.getsize(input_path) - os.path.getsize(temp_output)) / os.path.getsize(input_path)) * 100,
-                'space_saved_mb': (os.path.getsize(input_path) - os.path.getsize(temp_output)) / (1024 * 1024),
-                'video_info': video_info,
-                'optimization_strategy': 'very_aggressive',
-                'quality_score': 3.0,  # Very low quality score
-                'attempts_made': 1,
-                'encoder_used': encoder
-            }
-
-        return None
-
-    def _compress_with_ultra_aggressive_optimization(self, input_path: str, output_path: str,
-                                           target_size_mb: float, platform_config: Dict[str, Any],
-                                           video_info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Ultra-aggressive optimization with extreme settings"""
-        temp_output = os.path.join(self.temp_dir, "ultra_aggressive.mp4")
-
-        # Use extremely aggressive settings
-        encoder, accel_type = self.hardware.get_best_encoder("h264")
-
-        params = {
-            'encoder': encoder,
-            'acceleration_type': accel_type,
-            'width': max(240, int(video_info['width'] * 0.4)),  # Very aggressive downscaling
-            'height': max(180, int(video_info['height'] * 0.4)),
-            'fps': max(12, int(video_info['fps'] * 0.4)),  # Very low FPS
-            'crf': 40 if accel_type == 'software' else None,  # Maximum CRF
-            'preset': 'ultrafast',
-            'bitrate': f"{int(target_size_mb * 0.7 * 8 * 1024 * 1024 / video_info['duration'] / 1000)}k"
-        }
-
-        # Apply platform constraints
-        if platform_config:
-            params.update(self._apply_platform_constraints(params, platform_config))
-
-        # Build and execute FFmpeg command
-        ffmpeg_cmd = self._build_ultra_aggressive_ffmpeg_command(input_path, temp_output, params)
-        self._execute_ffmpeg_with_progress(ffmpeg_cmd, video_info['duration'])
-
-        if os.path.exists(temp_output):
-            compressed_size_mb = os.path.getsize(temp_output) / (1024 * 1024)
-            return {
-                'success': True,
-                'input_file': input_path,
-                'output_file': temp_output,
-                'method': 'ultra_aggressive',
-                'original_size_mb': os.path.getsize(input_path) / (1024 * 1024),
-                'compressed_size_mb': compressed_size_mb,
-                'compression_ratio': ((os.path.getsize(input_path) - os.path.getsize(temp_output)) / os.path.getsize(input_path)) * 100,
-                'space_saved_mb': (os.path.getsize(input_path) - os.path.getsize(temp_output)) / (1024 * 1024),
-                'video_info': video_info,
-                'optimization_strategy': 'ultra_aggressive',
-                'quality_score': 1.0,  # Extremely low quality score
-                'attempts_made': 1,
-                'encoder_used': encoder
-            }
-
-        return None
-
-    def _compress_with_extreme_aggressive_optimization(self, input_path: str, output_path: str,
-                                           target_size_mb: float, platform_config: Dict[str, Any],
-                                           video_info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Extreme aggressive optimization as absolute last resort"""
-        temp_output = os.path.join(self.temp_dir, "extreme_aggressive.mp4")
-
-        # Use absolutely extreme settings
-        encoder, accel_type = self.hardware.get_best_encoder("h264")
-
-        params = {
-            'encoder': encoder,
-            'acceleration_type': accel_type,
-            'width': 160,  # Minimum reasonable width
-            'height': 120,  # Minimum reasonable height
-            'fps': 10,  # Very low FPS
-            'crf': 51 if accel_type == 'software' else None,  # Maximum possible CRF
-            'preset': 'ultrafast',
-            'bitrate': f"{int(target_size_mb * 0.6 * 8 * 1024 * 1024 / video_info['duration'] / 1000)}k"
-        }
-
-        # Apply platform constraints (but they'll be overridden by our extreme settings)
-        if platform_config:
-            params.update(self._apply_platform_constraints(params, platform_config))
-
-        # Build and execute FFmpeg command
-        ffmpeg_cmd = self._build_extreme_aggressive_ffmpeg_command(input_path, temp_output, params)
-        self._execute_ffmpeg_with_progress(ffmpeg_cmd, video_info['duration'])
-
-        if os.path.exists(temp_output):
-            compressed_size_mb = os.path.getsize(temp_output) / (1024 * 1024)
-            return {
-                'success': True,
-                'input_file': input_path,
-                'output_file': temp_output,
-                'method': 'extreme_aggressive',
-                'original_size_mb': os.path.getsize(input_path) / (1024 * 1024),
-                'compressed_size_mb': compressed_size_mb,
-                'compression_ratio': ((os.path.getsize(input_path) - os.path.getsize(temp_output)) / os.path.getsize(input_path)) * 100,
-                'space_saved_mb': (os.path.getsize(input_path) - os.path.getsize(temp_output)) / (1024 * 1024),
-                'video_info': video_info,
-                'optimization_strategy': 'extreme_aggressive',
-                'quality_score': 0.5,  # Extremely low quality score
-                'attempts_made': 1,
-                'encoder_used': encoder
-            }
-
-        return None
 
     def _compress_with_aggressive_optimization(self, input_path: str, video_info: Dict[str, Any],
                                              platform_config: Dict[str, Any], target_size_mb: float) -> Optional[Dict[str, Any]]:
@@ -1470,65 +1253,6 @@ class DynamicVideoCompressor:
         logger.debug(f"Aggressive FFmpeg command: {' '.join(cmd)}")
         return cmd
 
-    def _build_ultra_aggressive_ffmpeg_command(self, input_path: str, output_path: str,
-                                             params: Dict[str, Any]) -> List[str]:
-        """Build ultra-aggressive compression FFmpeg command"""
-
-        # Set ultra-aggressive parameters
-        params['maxrate_multiplier'] = 0.8  # Very tight tolerance
-        params['audio_bitrate'] = 32  # Very low audio quality
-        params['audio_channels'] = 1  # Mono audio
-
-        # Use shared utilities for base command
-        try:
-            logger.info(f"Encoder selected: {params.get('encoder', 'unknown')} ({params.get('acceleration_type', 'software')})")
-        except Exception:
-            pass
-        cmd = FFmpegUtils.build_base_ffmpeg_command(input_path, output_path, params)
-        cmd = FFmpegUtils.add_video_settings(cmd, params)
-
-        # Ultra-aggressive quality settings
-        if params.get('acceleration_type') == 'software':
-            cmd.extend(['-crf', str(params.get('crf', 40))])
-            cmd.extend(['-preset', 'ultrafast'])
-
-        # Very strict bitrate control
-        cmd = FFmpegUtils.add_bitrate_control(cmd, params, buffer_multiplier=0.3)
-        cmd = FFmpegUtils.add_audio_settings(cmd, params)
-        cmd = FFmpegUtils.add_output_optimizations(cmd, output_path)
-
-        logger.debug(f"Ultra-aggressive FFmpeg command: {' '.join(cmd)}")
-        return cmd
-
-    def _build_extreme_aggressive_ffmpeg_command(self, input_path: str, output_path: str,
-                                               params: Dict[str, Any]) -> List[str]:
-        """Build extreme aggressive compression FFmpeg command"""
-
-        # Set extreme parameters
-        params['maxrate_multiplier'] = 0.6  # Extremely tight tolerance
-        params['audio_bitrate'] = 16  # Minimal audio quality
-        params['audio_channels'] = 1  # Mono audio
-
-        # Use shared utilities for base command
-        try:
-            logger.info(f"Encoder selected: {params.get('encoder', 'unknown')} ({params.get('acceleration_type', 'software')})")
-        except Exception:
-            pass
-        cmd = FFmpegUtils.build_base_ffmpeg_command(input_path, output_path, params)
-        cmd = FFmpegUtils.add_video_settings(cmd, params)
-
-        # Extreme quality settings
-        if params.get('acceleration_type') == 'software':
-            cmd.extend(['-crf', str(params.get('crf', 51))])
-            cmd.extend(['-preset', 'ultrafast'])
-
-        # Extremely strict bitrate control
-        cmd = FFmpegUtils.add_bitrate_control(cmd, params, buffer_multiplier=0.2)
-        cmd = FFmpegUtils.add_audio_settings(cmd, params)
-        cmd = FFmpegUtils.add_output_optimizations(cmd, output_path)
-
-        logger.debug(f"Extreme aggressive FFmpeg command: {' '.join(cmd)}")
-        return cmd
     
     def _execute_ffmpeg_with_progress(self, cmd: List[str], duration: float):
         """Execute FFmpeg command with progress bar and hardware fallback"""
