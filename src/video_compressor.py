@@ -496,6 +496,15 @@ class DynamicVideoCompressor:
         """Use advanced optimization techniques for challenging compression"""
         
         try:
+            # Early bailout: Skip advanced optimization if source/target ratio is too high
+            # Advanced optimization is expensive and unlikely to help with extreme compression ratios
+            source_size_mb = os.path.getsize(input_path) / (1024 * 1024)
+            size_ratio = source_size_mb / target_size_mb
+            
+            if size_ratio > 6.0:
+                logger.info(f"Skipping advanced optimization: size ratio too high ({size_ratio:.1f}x > 6x)")
+                raise RuntimeError(f"Size ratio {size_ratio:.1f}x exceeds threshold for advanced optimization")
+            
             # Use the advanced optimizer
             result = self.advanced_optimizer.optimize_with_advanced_techniques(
                 input_path, output_path, target_size_mb, platform_config
@@ -607,39 +616,203 @@ class DynamicVideoCompressor:
             input_path, output_path, target_size_mb, platform_config, video_info
         )
     
+    def _refine_strategy_result(self, result: Dict[str, Any], input_path: str, 
+                                video_info: Dict[str, Any], target_size_mb: float,
+                                max_iterations: int = 2) -> Dict[str, Any]:
+        """
+        Refine a strategy result to better utilize the target size budget.
+        Only refines if result is between 60-95% of target utilization.
+        """
+        if not result or result['size_mb'] > target_size_mb:
+            return result
+        
+        utilization = result['size_mb'] / target_size_mb
+        
+        # Only refine if under-utilizing (60-95% range)
+        if utilization < 0.60 or utilization >= 0.95:
+            return result
+        
+        logger.info(f"Result under-utilizing target ({utilization*100:.1f}%), attempting refinement...")
+        
+        try:
+            refined_result = result
+            iteration = 0
+            
+            while utilization < 0.95 and iteration < max_iterations:
+                # Calculate new bitrate to get closer to target
+                bitrate_multiplier = min(target_size_mb / result['size_mb'] * 0.95, 1.3)
+                
+                # Get current params and adjust bitrate
+                params = result.get('params', {}).copy()
+                if 'bitrate' in params:
+                    params['bitrate'] = int(params['bitrate'] * bitrate_multiplier)
+                    
+                    # Re-encode with higher bitrate
+                    temp_refined = os.path.join(self.temp_dir, f"refined_{iteration}_{result['strategy']}.mp4")
+                    
+                    if result['strategy'] == 'two_pass':
+                        ffmpeg_cmd = self._build_two_pass_command(input_path, temp_refined, params, pass_num=2, 
+                                                                  log_file=os.path.join(self.temp_dir, "ffmpeg2pass"))
+                    else:
+                        ffmpeg_cmd = self._build_intelligent_ffmpeg_command(input_path, temp_refined, params)
+                    
+                    success = self._execute_ffmpeg_with_progress(ffmpeg_cmd, video_info['duration'])
+                    
+                    if success and os.path.exists(temp_refined):
+                        new_size_mb = os.path.getsize(temp_refined) / (1024 * 1024)
+                        new_utilization = new_size_mb / target_size_mb
+                        
+                        logger.info(f"Refinement iteration {iteration+1}: {new_size_mb:.2f}MB ({new_utilization*100:.1f}% utilization)")
+                        
+                        if new_size_mb <= target_size_mb and new_size_mb > refined_result['size_mb']:
+                            # Better result - update
+                            if os.path.exists(refined_result['temp_file']):
+                                os.remove(refined_result['temp_file'])
+                            refined_result = {
+                                'temp_file': temp_refined,
+                                'size_mb': new_size_mb,
+                                'strategy': result['strategy'] + '_refined',
+                                'quality_score': result.get('quality_score', 0) + 0.5,
+                                'params': params
+                            }
+                            utilization = new_utilization
+                        else:
+                            # Worse result or exceeded target - stop
+                            if os.path.exists(temp_refined):
+                                os.remove(temp_refined)
+                            break
+                    else:
+                        break
+                else:
+                    # Can't refine without bitrate param
+                    break
+                
+                iteration += 1
+            
+            if refined_result != result:
+                logger.info(f"Refinement successful: {refined_result['size_mb']:.2f}MB ({utilization*100:.1f}% utilization)")
+            
+            return refined_result
+            
+        except Exception as e:
+            logger.warning(f"Refinement failed: {e}")
+            return result
+    
+    def _execute_strategies_in_parallel(self, strategies: List[Dict[str, Any]], 
+                                       input_path: str, video_info: Dict[str, Any],
+                                       platform_config: Dict[str, Any], target_size_mb: float) -> List[Dict[str, Any]]:
+        """
+        Execute multiple compression strategies in parallel.
+        Returns list of successful results.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        results = []
+        max_workers = min(len(strategies), 2)  # Conservative: max 2 parallel strategies
+        
+        logger.info(f"Executing {len(strategies)} strategies in parallel with {max_workers} workers")
+        
+        def execute_strategy(strategy):
+            try:
+                strategy_name = strategy['name']
+                strategy_func = strategy['func']
+                strategy_args = strategy.get('args', [])
+                
+                logger.info(f"Starting parallel strategy: {strategy_name}")
+                result = strategy_func(input_path, video_info, platform_config, target_size_mb, *strategy_args)
+                
+                if result:
+                    # Refine if under-utilizing
+                    result = self._refine_strategy_result(result, input_path, video_info, target_size_mb)
+                    logger.info(f"Parallel strategy {strategy_name} completed: {result['size_mb']:.2f}MB")
+                    return result
+                return None
+            except Exception as e:
+                logger.warning(f"Parallel strategy {strategy.get('name', 'unknown')} failed: {e}")
+                return None
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_strategy = {executor.submit(execute_strategy, s): s for s in strategies}
+            
+            for future in as_completed(future_to_strategy):
+                result = future.result()
+                if result and result['size_mb'] <= target_size_mb:
+                    results.append(result)
+        
+        logger.info(f"Parallel execution completed: {len(results)} successful results")
+        return results
+    
     def _compress_with_standard_optimization(self, input_path: str, output_path: str,
                                            target_size_mb: float, platform_config: Dict[str, Any],
                                            video_info: Dict[str, Any]) -> Dict[str, Any]:
-        """Use standard dynamic optimization (original implementation)"""
+        """Use standard dynamic optimization with optional parallel strategy execution"""
         
-        # This is the original dynamic optimization logic
         best_result = None
         compression_attempts = []
         
         try:
-            # Strategy 1: Content-aware optimal compression
-            logger.info("Attempting Strategy 1: Content-aware optimal compression")
-            result = self._compress_with_content_awareness(
-                input_path, video_info, platform_config, target_size_mb
-            )
-            if result:
-                compression_attempts.append(result)
-                if result['size_mb'] <= target_size_mb:
-                    best_result = result
-                    logger.info(f"Strategy 1 successful: {result['size_mb']:.2f}MB")
+            # Determine if we should use parallel execution
+            # Use parallel for medium-high complexity videos
+            use_parallel = video_info.get('complexity_score', 5.0) >= 5.0 and self.hardware.has_hardware_acceleration()
             
-            # Strategy 2: Two-pass encoding if Strategy 1 didn't work perfectly
-            if not best_result or result['size_mb'] > target_size_mb * 0.95:
-                logger.info("Attempting Strategy 2: Two-pass precision encoding")
-                result = self._compress_with_two_pass(
-                    input_path, video_info, platform_config, target_size_mb, best_result
+            if use_parallel:
+                logger.info("Using parallel strategy execution for better performance")
+                
+                # Define strategies to run in parallel
+                parallel_strategies = [
+                    {
+                        'name': 'content_aware',
+                        'func': self._compress_with_content_awareness,
+                        'args': []
+                    },
+                    {
+                        'name': 'two_pass',
+                        'func': self._compress_with_two_pass,
+                        'args': [None]  # previous_result = None
+                    }
+                ]
+                
+                # Execute in parallel
+                results = self._execute_strategies_in_parallel(
+                    parallel_strategies, input_path, video_info, platform_config, target_size_mb
                 )
-                if result:
+                
+                # Select best result from parallel execution
+                for result in results:
                     compression_attempts.append(result)
                     if result['size_mb'] <= target_size_mb:
                         if not best_result or result['quality_score'] > best_result.get('quality_score', 0):
                             best_result = result
-                            logger.info(f"Strategy 2 improved result: {result['size_mb']:.2f}MB")
+                            logger.info(f"Parallel strategy '{result['strategy']}' selected: {result['size_mb']:.2f}MB")
+            else:
+                # Sequential execution (original behavior)
+                # Strategy 1: Content-aware optimal compression
+                logger.info("Attempting Strategy 1: Content-aware optimal compression")
+                result = self._compress_with_content_awareness(
+                    input_path, video_info, platform_config, target_size_mb
+                )
+                if result:
+                    # Refine if under-utilizing target
+                    result = self._refine_strategy_result(result, input_path, video_info, target_size_mb)
+                    compression_attempts.append(result)
+                    if result['size_mb'] <= target_size_mb:
+                        best_result = result
+                        logger.info(f"Strategy 1 successful: {result['size_mb']:.2f}MB")
+                
+                # Strategy 2: Two-pass encoding if Strategy 1 didn't work perfectly
+                if not best_result or result['size_mb'] > target_size_mb * 0.95:
+                    logger.info("Attempting Strategy 2: Two-pass precision encoding")
+                    result = self._compress_with_two_pass(
+                        input_path, video_info, platform_config, target_size_mb, best_result
+                    )
+                    if result:
+                        # Refine if under-utilizing target
+                        result = self._refine_strategy_result(result, input_path, video_info, target_size_mb)
+                        compression_attempts.append(result)
+                        if result['size_mb'] <= target_size_mb:
+                            if not best_result or result['quality_score'] > best_result.get('quality_score', 0):
+                                best_result = result
+                                logger.info(f"Strategy 2 improved result: {result['size_mb']:.2f}MB")
             
             # Strategy 3: Adaptive resolution and quality optimization
             if not best_result:
@@ -648,6 +821,8 @@ class DynamicVideoCompressor:
                     input_path, video_info, platform_config, target_size_mb
                 )
                 if result:
+                    # Refine if under-utilizing target
+                    result = self._refine_strategy_result(result, input_path, video_info, target_size_mb)
                     compression_attempts.append(result)
                     if result['size_mb'] <= target_size_mb:
                         best_result = result
@@ -670,14 +845,6 @@ class DynamicVideoCompressor:
             
             # Move best result to final output
             shutil.move(best_result['temp_file'], output_path)
-
-            # Final-pass refinement to improve utilization/quality if under-utilized
-            try:
-                refined = self._final_single_file_refinement(input_path, output_path, target_size_mb, video_info)
-                if refined and refined.get('success'):
-                    return refined
-            except Exception as e:
-                logger.info(f"Refinement step skipped due to error: {e}")
             
             # Clean up other attempts
             for attempt in compression_attempts:

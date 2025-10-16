@@ -1687,7 +1687,10 @@ class AutomatedWorkflow:
             logger.info(f"Starting parallel GIF generation with {max_workers} workers for {len(segment_files)} segments")
             print(f"    🔄 Processing {len(segment_files)} segments with {max_workers} concurrent workers...")
 
-            # Worker per segment; use a fresh GifGenerator instance to avoid shared ffmpeg process state
+            # Reuse GifGenerator to avoid repeated hardware detection overhead
+            # GifGenerator is thread-safe as it uses subprocess calls to ffmpeg
+            shared_generator = self.gif_generator
+            
             def _process_segment(segment_file: Path) -> Tuple[bool, Optional[str]]:
                 try:
                     if self.shutdown_requested:
@@ -1717,9 +1720,8 @@ class AutomatedWorkflow:
                             print(f"    ♻️  Using existing GIF: {gif_name}")
                             return (True, None)
 
-                    # Fresh generator instance for thread safety
-                    local_generator = GifGenerator(self.config)
-                    result = local_generator.create_gif(
+                    # Reuse shared generator (thread-safe via subprocess calls)
+                    result = shared_generator.create_gif(
                         input_video=str(segment_file),
                         output_path=str(gif_path),
                         max_size_mb=max_size_mb,

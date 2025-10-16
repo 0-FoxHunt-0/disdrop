@@ -35,11 +35,23 @@ class AdvancedVideoOptimizer:
         
         logger.info("Starting advanced optimization with cutting-edge techniques")
         
-        # 1. Advanced Scene Analysis
-        scene_data = self._perform_advanced_scene_analysis(input_path)
+        # Check if we should skip expensive scene analysis
+        source_size_mb = os.path.getsize(input_path) / (1024 * 1024)
+        size_ratio = source_size_mb / target_size_mb
+        skip_expensive_analysis = size_ratio > 5.0
         
-        # 2. Perceptual Quality Analysis
-        perceptual_data = self._analyze_perceptual_quality(input_path, scene_data)
+        # 1. Scene Analysis (lightweight if size ratio is high)
+        if skip_expensive_analysis:
+            logger.info(f"Using lightweight scene analysis due to high size ratio ({size_ratio:.1f}x)")
+            scene_data = self._fallback_scene_analysis(input_path)
+        else:
+            scene_data = self._perform_advanced_scene_analysis(input_path)
+        
+        # 2. Perceptual Quality Analysis (skip if using lightweight analysis)
+        if skip_expensive_analysis:
+            perceptual_data = {'quality_requirements': 'standard', 'critical_frames': []}
+        else:
+            perceptual_data = self._analyze_perceptual_quality(input_path, scene_data)
         
         # 3. Multi-Pass Optimization with Genetic Algorithm
         optimization_candidates = self._generate_optimization_candidates(
@@ -459,6 +471,8 @@ class AdvancedVideoOptimizer:
         
         # Generate candidates based on different optimization strategies
         
+        # Reduced to 3 candidates for better speed/quality balance
+        
         # 1. Quality-optimized candidate
         quality_candidate = self._generate_quality_optimized_candidate(
             encoder, accel_type, scene_data, perceptual_data, target_size_mb, platform_config
@@ -477,17 +491,8 @@ class AdvancedVideoOptimizer:
         )
         candidates.append(balanced_candidate)
         
-        # 4. Scene-adaptive candidate
-        adaptive_candidate = self._generate_scene_adaptive_candidate(
-            encoder, accel_type, scene_data, perceptual_data, target_size_mb, platform_config
-        )
-        candidates.append(adaptive_candidate)
-        
-        # 5. Perceptual-optimized candidate
-        perceptual_candidate = self._generate_perceptual_optimized_candidate(
-            encoder, accel_type, scene_data, perceptual_data, target_size_mb, platform_config
-        )
-        candidates.append(perceptual_candidate)
+        # Note: Removed scene-adaptive and perceptual-optimized candidates for faster processing
+        # The three remaining candidates provide good coverage of the optimization space
         
         return candidates
     

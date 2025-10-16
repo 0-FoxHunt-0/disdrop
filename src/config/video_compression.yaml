@@ -109,7 +109,7 @@ video_compression:
     allow_hevc: true
     allow_h264_high10: true
     priority: [hevc_10bit, hevc_8bit, h264_10bit, h264_8bit]
-    final_preset: slow
+    final_preset: medium
     tune: animation
     min_bpp:
       h264_8bit: 0.023
