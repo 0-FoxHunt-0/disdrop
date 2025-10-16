@@ -42,6 +42,11 @@ class AutomatedWorkflow:
         def _aw_shutdown_checker():
             return bool(getattr(self, 'shutdown_requested', False))
         self.gif_generator = gif_generator or GifGenerator(config_manager, shutdown_checker=_aw_shutdown_checker)
+
+        # Ensure video compressor also gets the shutdown checker
+        if hasattr(self.video_compressor, 'shutdown_requested'):
+            # Video compressor uses its own shutdown flag, but we'll sync it with ours
+            pass
         self.file_validator = FileValidator()
         # Console verbosity (controlled by CLI --debug)
         self.verbose = False
@@ -77,8 +82,7 @@ class AutomatedWorkflow:
         # Cache persistence: track when cache was last used to allow persistence between executions
         self._cache_last_used_file = self._cache_dir / 'last_used.txt'
         
-        # Setup signal handlers for graceful shutdown
-        self._setup_signal_handlers()
+        # Signal handlers are now handled by the CLI, not here
         
         # Ensure directories exist
         self._ensure_directories()
@@ -93,63 +97,6 @@ class AutomatedWorkflow:
         except Exception:
             self._cache_index = {}
     
-    def _setup_signal_handlers(self):
-        """Setup signal handlers for graceful shutdown"""
-        def signal_handler(signum, frame):
-            if not self.shutdown_requested:  # Only show message on first signal
-                print(f"\n\n🛑 Shutdown signal received. Stopping gracefully...")
-                if self.current_task:
-                    print(f"⏳ Finishing current task: {self.current_task}")
-                    print(f"💡 Press Ctrl+C again to force quit (may leave temp files)")
-                logger.info(f"Received signal {signum}. Initiating graceful shutdown...")
-                self.shutdown_requested = True
-                
-                # Request shutdown from video compressor
-                if hasattr(self.video_compressor, 'request_shutdown'):
-                    self.video_compressor.request_shutdown()
-                # Request shutdown from video segmenter if present on compressor
-                try:
-                    if hasattr(self.video_compressor, 'video_segmenter') and hasattr(self.video_compressor.video_segmenter, 'request_shutdown'):
-                        self.video_compressor.video_segmenter.request_shutdown()
-                except Exception:
-                    pass
-                
-                # Request shutdown from GIF generator if it has the method
-                if hasattr(self.gif_generator, 'request_shutdown'):
-                    self.gif_generator.request_shutdown()
-                
-                # Request shutdown from GIF optimizer if it exists
-                if hasattr(self.gif_generator, 'optimizer') and hasattr(self.gif_generator.optimizer, 'request_shutdown'):
-                    self.gif_generator.optimizer.request_shutdown()
-                # Defer temp cleanup to normal exit to avoid races with in-flight tasks
-            else:
-                # Second signal - force quit
-                print(f"\n💥 Force quit requested. Exiting immediately...")
-                logger.warning("Force quit - may leave temporary files")
-                
-                # Force terminate any running processes
-                if hasattr(self.video_compressor, '_terminate_ffmpeg_process'):
-                    self.video_compressor._terminate_ffmpeg_process()
-                try:
-                    if hasattr(self.video_compressor, 'video_segmenter') and hasattr(self.video_compressor.video_segmenter, '_terminate_ffmpeg_process'):
-                        self.video_compressor.video_segmenter._terminate_ffmpeg_process()
-                except Exception:
-                    pass
-                if hasattr(self.gif_generator, '_terminate_ffmpeg_process'):
-                    self.gif_generator._terminate_ffmpeg_process()
-                if hasattr(self.gif_generator, 'optimizer') and hasattr(self.gif_generator.optimizer, '_terminate_ffmpeg_process'):
-                    self.gif_generator.optimizer._terminate_ffmpeg_process()
-                
-                os._exit(1)
-        
-        # Handle common shutdown signals (Windows-safe). Note: Windows supports SIGINT and SIGTERM in Python.
-        signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
-        try:
-            if hasattr(signal, 'SIGTERM'):
-                signal.signal(signal.SIGTERM, signal_handler)  # Termination signal
-        except Exception:
-            # Best-effort on platforms without SIGTERM
-            pass
     
     def _ensure_directories(self):
         """Ensure all required directories exist"""
@@ -1801,13 +1748,22 @@ class AutomatedWorkflow:
             
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_map = {executor.submit(_process_segment, seg): seg for seg in segment_files}
-                for fut in as_completed(future_map):
-                    ok, reason = False, None
-                    try:
-                        ok, reason = fut.result()
-                    except Exception as e:
-                        logger.warning(f"Segment future failed: {e}")
-                        ok = False
+                try:
+                    for fut in as_completed(future_map):
+                        if self.shutdown_requested:
+                            logger.info("Shutdown requested during segment processing, cancelling remaining tasks...")
+                            # Cancel any remaining futures
+                            for remaining_fut in future_map:
+                                if not remaining_fut.done():
+                                    remaining_fut.cancel()
+                            break
+
+                        ok, reason = False, None
+                        try:
+                            ok, reason = fut.result()
+                        except Exception as e:
+                            logger.warning(f"Segment future failed: {e}")
+                            ok = False
                     if ok:
                         successful_gifs += 1
                         completed_count += 1

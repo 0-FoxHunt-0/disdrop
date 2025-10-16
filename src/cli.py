@@ -100,22 +100,22 @@ class VideoCompressorCLI:
                     self.video_compressor.request_shutdown()
             except Exception:
                 pass
-            try:
-                if hasattr(self, 'automated_workflow') and self.automated_workflow:
-                    self.automated_workflow.shutdown_requested = True
-            except Exception:
-                pass
 
-            # Clean up any remaining temp files
+            # Set shutdown flag for automated workflow if it exists
+            if hasattr(self, 'automated_workflow') and self.automated_workflow:
+                self.automated_workflow.shutdown_requested = True
+
+            # Clean up any remaining temp files immediately
             try:
                 self._cleanup_temp_files_on_exit()
-            except Exception:
-                pass
+                logger.info("Temporary files cleaned up during shutdown")
+            except Exception as e:
+                logger.warning(f"Error during temp file cleanup: {e}")
 
             if logger:
                 logger.info("Graceful shutdown sequence requested. Waiting for tasks to end...")
             # Do not sys.exit here; allow main control flow and threads to wind down.
-        
+
         # Register handlers for common termination signals
         signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
         if hasattr(signal, 'SIGTERM'):
@@ -127,23 +127,47 @@ class VideoCompressorCLI:
             if hasattr(self, 'config') and self.config:
                 temp_dir = self.config.get_temp_dir()
                 if temp_dir and os.path.exists(temp_dir):
-                    # Look for segment temp folders and other temp files
+                    # Look for all types of temp files and folders
                     for item in os.listdir(temp_dir):
                         item_path = os.path.join(temp_dir, item)
                         try:
-                            if os.path.isdir(item_path) and '_segments_temp' in item:
-                                # Clean up segment temp folders
+                            # Clean up segment temp folders
+                            if os.path.isdir(item_path) and ('_segments_temp' in item or '_segments' in item):
                                 shutil.rmtree(item_path)
                                 if logger:
                                     logger.info(f"Cleaned up temp segment folder: {item}")
-                            elif os.path.isfile(item_path) and ('temp_' in item or item.startswith('candidate_')):
-                                # Clean up other temp files
+                            # Clean up temp files
+                            elif os.path.isfile(item_path) and (
+                                'temp_' in item or
+                                item.startswith('candidate_') or
+                                item.endswith('.tmp') or
+                                item.startswith('temp') or
+                                'temp' in item.lower()
+                            ):
                                 os.remove(item_path)
                                 if logger:
                                     logger.debug(f"Cleaned up temp file: {item}")
+                            # Clean up palette cache files
+                            elif os.path.isfile(item_path) and 'palette' in item.lower():
+                                os.remove(item_path)
+                                if logger:
+                                    logger.debug(f"Cleaned up palette file: {item}")
                         except Exception as e:
                             if logger:
                                 logger.warning(f"Could not clean up {item}: {e}")
+
+                    # Also check for any .tmp files that might be missed
+                    for root, dirs, files in os.walk(temp_dir):
+                        for file in files:
+                            if file.endswith('.tmp'):
+                                file_path = os.path.join(root, file)
+                                try:
+                                    os.remove(file_path)
+                                    if logger:
+                                        logger.debug(f"Cleaned up .tmp file: {file}")
+                                except Exception as e:
+                                    if logger:
+                                        logger.warning(f"Could not clean up .tmp file {file}: {e}")
         except Exception as e:
             if logger:
                 logger.warning(f"Error during temp file cleanup: {e}")

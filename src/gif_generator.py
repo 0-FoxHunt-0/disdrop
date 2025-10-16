@@ -37,6 +37,8 @@ class GifGenerator:
         self.optimizer = AdvancedGifOptimizer(config_manager, shutdown_checker=self._is_shutdown_requested)
         self.shutdown_requested = False
         self.current_ffmpeg_process = None
+        self._ffmpeg_processes = []  # Track all running FFmpeg processes
+        self._shutdown_lock = threading.Lock()  # Protect shutdown state
         
         # Hardcoded defaults remain as fallback; config platforms override in _get_platform_settings
         self.platform_settings = {
@@ -897,22 +899,27 @@ class GifGenerator:
     # Shutdown/termination support for graceful exit
     def request_shutdown(self):
         """Request generator to stop and terminate any running FFmpeg process."""
-        self.shutdown_requested = True
-        try:
-            if hasattr(self, 'optimizer') and hasattr(self.optimizer, 'request_shutdown'):
-                self.optimizer.request_shutdown()
-        except Exception:
-            pass
-        self._terminate_ffmpeg_process()
+        with self._shutdown_lock:
+            if not self.shutdown_requested:  # Only log and terminate if not already shutting down
+                logger.info("Shutdown requested for GIF generator")
+                self.shutdown_requested = True
+                try:
+                    if hasattr(self, 'optimizer') and hasattr(self.optimizer, 'request_shutdown'):
+                        self.optimizer.request_shutdown()
+                except Exception:
+                    pass
+                logger.info("Terminating all FFmpeg processes in GIF generator...")
+                self._terminate_ffmpeg_process()
 
     def _terminate_ffmpeg_process(self):
-        """Terminate the current FFmpeg process gracefully"""
+        """Terminate all tracked FFmpeg processes gracefully"""
+        # Terminate current process
         if self.current_ffmpeg_process and self.current_ffmpeg_process.poll() is None:
             try:
-                logger.info("Terminating FFmpeg process in GIF generator...")
+                logger.info("Terminating current FFmpeg process in GIF generator...")
                 # Try graceful termination first
                 self.current_ffmpeg_process.terminate()
-                
+
                 # Wait a bit for graceful termination
                 try:
                     self.current_ffmpeg_process.wait(timeout=5)
@@ -923,11 +930,32 @@ class GifGenerator:
                     self.current_ffmpeg_process.kill()
                     self.current_ffmpeg_process.wait()
                     logger.info("FFmpeg process killed")
-                
+
             except Exception as e:
-                logger.error(f"Error terminating FFmpeg process in GIF generator: {e}")
+                logger.error(f"Error terminating current FFmpeg process in GIF generator: {e}")
             finally:
+                if self.current_ffmpeg_process in self._ffmpeg_processes:
+                    self._ffmpeg_processes.remove(self.current_ffmpeg_process)
                 self.current_ffmpeg_process = None
+
+        # Terminate any other tracked processes
+        for process in list(self._ffmpeg_processes):
+            if process and process.poll() is None:
+                try:
+                    logger.info("Terminating additional FFmpeg process in GIF generator...")
+                    process.terminate()
+                    try:
+                        process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        logger.warning("Additional FFmpeg process did not terminate gracefully, forcing kill...")
+                        process.kill()
+                        process.wait()
+                    logger.info("Additional FFmpeg process terminated successfully")
+                except Exception as e:
+                    logger.error(f"Error terminating additional FFmpeg process in GIF generator: {e}")
+                finally:
+                    if process in self._ffmpeg_processes:
+                        self._ffmpeg_processes.remove(process)
 
     def _run_ffmpeg(self, cmd: list, timeout: int = 120):
         """Run FFmpeg with the ability to terminate early on shutdown."""
@@ -951,6 +979,7 @@ class GifGenerator:
                 encoding='utf-8',
                 errors='replace'
             )
+            self._ffmpeg_processes.append(self.current_ffmpeg_process)
             
             # Poll periodically to check for shutdown requests
             start_time = time.time()
@@ -1086,9 +1115,11 @@ class GifGenerator:
                     while pending:
                         # Periodically check for shutdown to cancel promptly
                         if self._is_shutdown_requested():
+                            logger.info("Shutdown requested during GIF segmentation, cancelling all pending tasks...")
+                            # Cancel all pending futures
                             for f in list(pending):
                                 f.cancel()
-                            # Attempt to stop executor quickly and cancel futures (Py 3.9+)
+                            # Shutdown executor immediately with cancellation
                             try:
                                 executor.shutdown(wait=False, cancel_futures=True)
                             except TypeError:

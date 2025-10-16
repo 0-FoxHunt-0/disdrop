@@ -8,6 +8,7 @@ import os
 import subprocess
 import shutil
 import math
+import threading
 from typing import Dict, Any, Optional, Tuple, List
 import logging
 from pathlib import Path
@@ -40,6 +41,8 @@ class DynamicVideoCompressor:
         # Shutdown handling
         self.shutdown_requested = False
         self.current_ffmpeg_process = None
+        self._ffmpeg_processes = []  # Track all running FFmpeg processes
+        self._shutdown_lock = threading.Lock()  # Protect shutdown state
         
         # Statistics
         self.stats = {
@@ -2326,6 +2329,7 @@ class DynamicVideoCompressor:
         
         # Store reference to current process for shutdown handling
         self.current_ffmpeg_process = process
+        self._ffmpeg_processes.append(process)
         
         # Capture stderr output for error analysis
         stderr_output = []
@@ -2381,7 +2385,9 @@ class DynamicVideoCompressor:
                 self._terminate_ffmpeg_process()
             raise e
         finally:
-            # Clear current process reference
+            # Clear current process reference and remove from tracking list
+            if self.current_ffmpeg_process in self._ffmpeg_processes:
+                self._ffmpeg_processes.remove(self.current_ffmpeg_process)
             self.current_ffmpeg_process = None
         
         if return_code != 0:
@@ -2697,19 +2703,21 @@ class DynamicVideoCompressor:
 
     def request_shutdown(self):
         """Request graceful shutdown of the compressor"""
-        logger.info("Shutdown requested for video compressor")
-        self.shutdown_requested = True
-        if self.current_ffmpeg_process:
-            logger.info("Terminating current FFmpeg process...")
-            self._terminate_ffmpeg_process()
+        with self._shutdown_lock:
+            if not self.shutdown_requested:  # Only log and terminate if not already shutting down
+                logger.info("Shutdown requested for video compressor")
+                self.shutdown_requested = True
+                logger.info("Terminating all FFmpeg processes...")
+                self._terminate_ffmpeg_process()
     
     def _terminate_ffmpeg_process(self):
-        """Terminate the current FFmpeg process gracefully"""
+        """Terminate all tracked FFmpeg processes gracefully"""
+        # Terminate current process
         if self.current_ffmpeg_process and self.current_ffmpeg_process.poll() is None:
             try:
                 # Try graceful termination first
                 self.current_ffmpeg_process.terminate()
-                
+
                 # Wait a bit for graceful termination
                 try:
                     self.current_ffmpeg_process.wait(timeout=5)
@@ -2718,12 +2726,33 @@ class DynamicVideoCompressor:
                     logger.warning("FFmpeg process did not terminate gracefully, forcing kill...")
                     self.current_ffmpeg_process.kill()
                     self.current_ffmpeg_process.wait()
-                
-                logger.info("FFmpeg process terminated successfully")
+
+                logger.info("Current FFmpeg process terminated successfully")
             except Exception as e:
-                logger.error(f"Error terminating FFmpeg process: {e}")
+                logger.error(f"Error terminating current FFmpeg process: {e}")
             finally:
+                if self.current_ffmpeg_process in self._ffmpeg_processes:
+                    self._ffmpeg_processes.remove(self.current_ffmpeg_process)
                 self.current_ffmpeg_process = None
+
+        # Terminate any other tracked processes
+        for process in list(self._ffmpeg_processes):
+            if process and process.poll() is None:
+                try:
+                    logger.info("Terminating additional FFmpeg process...")
+                    process.terminate()
+                    try:
+                        process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        logger.warning("Additional FFmpeg process did not terminate gracefully, forcing kill...")
+                        process.kill()
+                        process.wait()
+                    logger.info("Additional FFmpeg process terminated successfully")
+                except Exception as e:
+                    logger.error(f"Error terminating additional FFmpeg process: {e}")
+                finally:
+                    if process in self._ffmpeg_processes:
+                        self._ffmpeg_processes.remove(process)
 
 # Keep all the existing methods from the original VideoCompressor class
 # by creating an alias for backward compatibility
