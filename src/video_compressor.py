@@ -441,13 +441,6 @@ class DynamicVideoCompressor:
             except Exception:
                 result = None
             if result and result.get('success'):
-                # Optional refinement if underutilized
-                try:
-                    refined = self._final_single_file_refinement(input_path, output_path, target_size_mb, video_info)
-                    if refined and refined.get('success'):
-                        return refined
-                except Exception:
-                    pass
                 return result
             # Fallback to standard pipeline or segmentation as last resort
             try:

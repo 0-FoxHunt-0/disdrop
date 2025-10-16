@@ -38,7 +38,7 @@ class AdvancedVideoOptimizer:
         # Check if we should skip expensive scene analysis
         source_size_mb = os.path.getsize(input_path) / (1024 * 1024)
         size_ratio = source_size_mb / target_size_mb
-        skip_expensive_analysis = size_ratio > 5.0
+        skip_expensive_analysis = size_ratio > 6.0
         
         # 1. Scene Analysis (lightweight if size ratio is high)
         if skip_expensive_analysis:
