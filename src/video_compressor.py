@@ -986,7 +986,9 @@ class DynamicVideoCompressor:
                 log_file = os.path.join(self.temp_dir, "ffmpeg2pass_uplift")
                 cmd = self._build_two_pass_command(input_path, temp_uplift, params, pass_num=2, log_file=log_file)
             else:
-                cmd = self._build_intelligent_ffmpeg_command(input_path, temp_uplift, params)
+                # For non-two-pass strategies, use a quick two-pass refinement for uplift to improve SSIM at same size
+                log_file = os.path.join(self.temp_dir, "ffmpeg2pass_uplift")
+                cmd = self._build_two_pass_command(input_path, temp_uplift, params, pass_num=2, log_file=log_file)
             
             success = self._execute_ffmpeg_with_progress(cmd, video_info['duration'])
             if not success or not os.path.exists(temp_uplift):
@@ -2162,14 +2164,28 @@ class DynamicVideoCompressor:
             'preset': 'medium',
         }
         
-        # Calculate bitrate for new resolution
+        # Calculate bitrate for new resolution and enforce min_bpp floor to avoid starving bits
         pixel_ratio = (optimal_resolution[0] * optimal_resolution[1]) / (video_info['width'] * video_info['height'])
         base_bitrate = self._calculate_content_aware_bitrate(video_info, target_size_mb)
-        # Use a higher multiplier when downscaling so we don't starve the encode
-        # and clamp a bitrate floor at higher resolutions to avoid pixelation
         computed_bitrate = int(base_bitrate * pixel_ratio * 1.6)
+        # Enforce BPP floor based on codec family (assume h264 8-bit floor if unknown)
+        min_bpp_map = {
+            'h264_8bit': float(self.config.get('video_compression.codec.min_bpp.h264_8bit', 0.023)),
+            'h264_10bit': float(self.config.get('video_compression.codec.min_bpp.h264_10bit', 0.020)),
+            'hevc_8bit': float(self.config.get('video_compression.codec.min_bpp.hevc_8bit', 0.018)),
+            'hevc_10bit': float(self.config.get('video_compression.codec.min_bpp.hevc_10bit', 0.015)),
+        }
+        # Infer a floor using selected encoder family
+        enc = (encoder or '').lower()
+        if 'hevc' in enc or '265' in enc:
+            min_bpp = min_bpp_map['hevc_8bit']
+        else:
+            min_bpp = min_bpp_map['h264_8bit']
+        pixels_per_sec = max(1, params['width'] * params['height']) * max(1.0, params['fps'])
+        min_kbps_for_bpp = int(math.ceil(min_bpp * pixels_per_sec / 1000.0))
+        computed_bitrate = max(computed_bitrate, min_kbps_for_bpp)
         if params['width'] >= 1280:
-            computed_bitrate = max(computed_bitrate, 500)  # kbps floor for ~720p+ outputs
+            computed_bitrate = max(computed_bitrate, 600)  # slightly higher floor for ~720p+ outputs
         params['bitrate'] = computed_bitrate
         
         # CRF for software encoding

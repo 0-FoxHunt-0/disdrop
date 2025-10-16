@@ -136,7 +136,7 @@ video_compression:
       floor: 0.95
     uplift:
       enabled: true
-      max_passes: 2
-      bitrate_step: 1.08
-      max_multiplier: 1.2
+      max_passes: 3
+      bitrate_step: 1.12
+      max_multiplier: 1.35
     on_fail_segment: true

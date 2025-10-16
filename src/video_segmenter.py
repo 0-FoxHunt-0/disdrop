@@ -585,9 +585,13 @@ class VideoSegmenter:
             # Can afford even longer segments for simple content
             base_duration *= 1.15
 
-        # Ensure reasonable bounds (configurable) - now allowing much longer segments
+        # Ensure reasonable bounds (configurable) - bias toward ~2 segments when total ~240s
         min_seg = int(self.config.get('video_compression.segmentation.min_segment_duration', 30) or 30)
         max_seg = int(self.config.get('video_compression.segmentation.max_segment_duration', 240) or 240)
+        # If total duration fits into ~2 segments under max_seg, bias duration toward half the total
+        if total_duration > 0 and total_duration <= max_seg * 2.2:
+            desired = max(total_duration / 2.0, min_seg)
+            base_duration = max(min(desired, max_seg), min_seg)
         final_duration = max(min_seg, min(max_seg, base_duration))
 
         # Calculate expected number of segments
