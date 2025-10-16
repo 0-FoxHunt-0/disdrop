@@ -202,27 +202,38 @@ class DynamicVideoCompressor:
         try:
             if not bool(self.config.get('video_compression.quality_controls.ssim_check.enabled', False)):
                 return None
+            
+            # Validate input files exist
+            if not os.path.exists(input_path) or not os.path.exists(output_path):
+                logger.warning(f"SSIM sampling: input or output file missing (input={os.path.exists(input_path)}, output={os.path.exists(output_path)})")
+                return None
+            
             sample_fraction = float(self.config.get('video_compression.quality_controls.ssim_check.sample_fraction', 0.12))
             sample_fraction = max(0.02, min(0.5, sample_fraction))
             seg = max(1.5, duration_s * sample_fraction)
             start = max(0.0, duration_s * 0.44)
             cmd = [
-                'ffmpeg', '-hide_banner', '-loglevel', 'error',
+                'ffmpeg', '-hide_banner', '-loglevel', 'info',
                 '-ss', str(start), '-t', str(seg), '-i', input_path,
                 '-ss', str(start), '-t', str(seg), '-i', output_path,
-                '-lavfi', 'ssim', '-f', 'null', '-'
+                '-lavfi', '[0:v][1:v]ssim', '-f', 'null', '-'
             ]
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
             if res.returncode != 0:
+                logger.warning(f"SSIM sampling FFmpeg failed (returncode={res.returncode}): {res.stderr[:200]}")
                 return None
             out = res.stderr or ''
             # Parse like: SSIM Y:... All:0.95 (var)
             import re
             m = re.search(r'All:(\d+\.\d+)', out)
             if m:
-                return float(m.group(1))
+                ssim_val = float(m.group(1))
+                logger.debug(f"SSIM sampling successful: {ssim_val:.4f}")
+                return ssim_val
+            logger.warning(f"SSIM parsing failed, FFmpeg output: {out[:300]}")
             return None
-        except Exception:
+        except Exception as e:
+            logger.warning(f"SSIM sampling exception: {e}")
             return None
 
     def _final_single_file_refinement(self, input_path: str, output_path: str, target_size_mb: float,
