@@ -953,8 +953,10 @@ class VideoSegmenter:
             if optimization_result and optimization_result.get('success', False):
                 optimized_size_mb = optimization_result.get('size_mb', 0)
                 
-                # Check if optimization was successful (made it smaller)
-                if optimized_size_mb < target_size_mb:
+                # Check if optimization was successful (made it smaller or acceptably close)
+                # Allow up to 5% over target to avoid rejecting near-perfect results
+                tolerance = target_size_mb * 1.05
+                if optimized_size_mb <= tolerance:
                     # Replace original segment with optimized version
                     if os.path.exists(temp_optimized_path):
                         shutil.move(temp_optimized_path, segment_path)

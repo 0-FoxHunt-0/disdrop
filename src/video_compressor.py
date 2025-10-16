@@ -9,6 +9,7 @@ import subprocess
 import shutil
 import math
 import threading
+import time
 from typing import Dict, Any, Optional, Tuple, List
 import logging
 from pathlib import Path
@@ -165,7 +166,9 @@ class DynamicVideoCompressor:
         if pix_fmt:
             params['pix_fmt'] = pix_fmt
 
-        log_base = os.path.join(self.temp_dir, 'ffmpeg2pass_final')
+        # Use unique passlogfile for final refinement to avoid conflicts
+        final_id = f"final_refinement_{int(time.time())}"
+        log_base = os.path.join(self.temp_dir, f'ffmpeg2pass_{final_id}')
         # Pass 1
         cmd1 = FFmpegUtils.build_two_pass_with_filters(input_path, output_path, params, pass_num=1, log_file=log_base)
         ok1 = FFmpegUtils.execute_ffmpeg_with_progress(cmd1, description="Analyzing", duration=None)
@@ -436,6 +439,9 @@ class DynamicVideoCompressor:
             # Calculate initial bitrates
             a_kbps = 96
             v_kbps = self._calculate_target_video_kbps(safe_target_mb, video_info['duration'], a_kbps)
+            # Safety check: prevent extremely high bitrates that might cause FFmpeg to crash
+            # Cap at 2000k for final refinement to avoid crashes
+            v_kbps = min(v_kbps, 2000)
 
             # Select codec order
             codec_order = self._derive_codec_priority()
@@ -872,12 +878,34 @@ class DynamicVideoCompressor:
                     temp_refined = os.path.join(self.temp_dir, f"refined_{iteration}_{result['strategy']}.mp4")
                     
                     if result['strategy'] == 'two_pass':
-                        ffmpeg_cmd = self._build_two_pass_command(input_path, temp_refined, params, pass_num=2, 
-                                                                  log_file=os.path.join(self.temp_dir, "ffmpeg2pass"))
+                        # Use unique passlogfile for each refinement attempt
+                        refine_id = f"refine_{iteration}_{result['strategy']}_{int(time.time())}"
+                        refine_log_file = os.path.join(self.temp_dir, f"ffmpeg2pass_{refine_id}")
+                        
+                        # Pass 1: Analysis
+                        ffmpeg_cmd_pass1 = self._build_two_pass_command(input_path, temp_refined, params, pass_num=1,
+                                                                         log_file=refine_log_file)
+                        success = self._execute_ffmpeg_with_progress(ffmpeg_cmd_pass1, video_info['duration'])
+                        if not success:
+                            break
+                        
+                        # Pass 2: Encoding
+                        ffmpeg_cmd = self._build_two_pass_command(input_path, temp_refined, params, pass_num=2,
+                                                                  log_file=refine_log_file)
                     else:
                         ffmpeg_cmd = self._build_intelligent_ffmpeg_command(input_path, temp_refined, params)
                     
                     success = self._execute_ffmpeg_with_progress(ffmpeg_cmd, video_info['duration'])
+                    
+                    # Clean up two-pass log files if applicable
+                    if result['strategy'] == 'two_pass':
+                        try:
+                            for log_ext in ['-0.log', '-0.log.mbtree']:
+                                log_path = f"{refine_log_file}{log_ext}"
+                                if os.path.exists(log_path):
+                                    os.remove(log_path)
+                        except Exception as e:
+                            logger.debug(f"Failed to clean up log files: {e}")
                     
                     if success and os.path.exists(temp_refined):
                         new_size_mb = os.path.getsize(temp_refined) / (1024 * 1024)
@@ -976,23 +1004,40 @@ class DynamicVideoCompressor:
             new_bitrate = int(base_bitrate * (uplift_step ** (pass_num + 1)))
             if new_bitrate > base_bitrate * uplift_cap:
                 break
+
+            # Safety check: prevent extremely high bitrates that might cause FFmpeg to crash
+            # Cap at 2000k for two-pass encoding to avoid crashes
+            new_bitrate = min(new_bitrate, 2000)
             
             temp_uplift = os.path.join(self.temp_dir, f"uplift_{result.get('strategy')}_{pass_num}.mp4")
             params['bitrate'] = new_bitrate
             
             # Re-encode with higher bitrate using same strategy approach
             strategy = result.get('strategy', '')
-            if 'two_pass' in strategy:
-                log_file = os.path.join(self.temp_dir, "ffmpeg2pass_uplift")
-                cmd = self._build_two_pass_command(input_path, temp_uplift, params, pass_num=2, log_file=log_file)
-            else:
-                # For non-two-pass strategies, use a quick two-pass refinement for uplift to improve SSIM at same size
-                log_file = os.path.join(self.temp_dir, "ffmpeg2pass_uplift")
-                cmd = self._build_two_pass_command(input_path, temp_uplift, params, pass_num=2, log_file=log_file)
+            # Use unique passlogfile for each uplift attempt to avoid conflicts
+            uplift_id = f"uplift_{result.get('strategy', 'unknown')}_{pass_num}_{int(time.time())}"
+            log_file = os.path.join(self.temp_dir, f"ffmpeg2pass_{uplift_id}")
             
-            success = self._execute_ffmpeg_with_progress(cmd, video_info['duration'])
+            # Pass 1: Analysis
+            cmd_pass1 = self._build_two_pass_command(input_path, temp_uplift, params, pass_num=1, log_file=log_file)
+            success = self._execute_ffmpeg_with_progress(cmd_pass1, video_info['duration'])
+            if not success:
+                break
+            
+            # Pass 2: Encoding
+            cmd_pass2 = self._build_two_pass_command(input_path, temp_uplift, params, pass_num=2, log_file=log_file)
+            success = self._execute_ffmpeg_with_progress(cmd_pass2, video_info['duration'])
             if not success or not os.path.exists(temp_uplift):
                 break
+            
+            # Clean up two-pass log files
+            try:
+                for log_ext in ['-0.log', '-0.log.mbtree']:
+                    log_path = f"{log_file}{log_ext}"
+                    if os.path.exists(log_path):
+                        os.remove(log_path)
+            except Exception as e:
+                logger.debug(f"Failed to clean up log files: {e}")
             
             new_size = os.path.getsize(temp_uplift) / (1024 * 1024)
             if new_size > target_size_mb:
@@ -1402,18 +1447,23 @@ class DynamicVideoCompressor:
         """Two-pass precision encoding for optimal quality/size ratio"""
         try:
             temp_output = os.path.join(self.temp_dir, "two_pass_output.mp4")
-            temp_log = os.path.join(self.temp_dir, "ffmpeg2pass")
-            
+            # Use unique passlogfile for two-pass strategy to avoid conflicts
+            strategy_id = f"two_pass_{int(time.time())}"
+            temp_log = os.path.join(self.temp_dir, f"ffmpeg2pass_{strategy_id}")
+
             # Calculate precise bitrate for target size
             target_bitrate = self._calculate_precise_bitrate(video_info, target_size_mb)
-            
+            # Safety check: prevent extremely high bitrates that might cause FFmpeg to crash
+            # Cap at 2000k for two-pass encoding to avoid crashes
+            target_bitrate = min(target_bitrate, 2000)
+
             # Adjust parameters based on previous attempt if available
             params = self._calculate_two_pass_params(video_info, platform_config, target_bitrate, previous_result)
-            
+
             # Pass 1: Analysis
             ffmpeg_cmd_pass1 = self._build_two_pass_command(input_path, temp_output, params, pass_num=1, log_file=temp_log)
             self._execute_ffmpeg_with_progress(ffmpeg_cmd_pass1, video_info['duration'])
-            
+
             # Pass 2: Encoding
             ffmpeg_cmd_pass2 = self._build_two_pass_command(input_path, temp_output, params, pass_num=2, log_file=temp_log)
             self._execute_ffmpeg_with_progress(ffmpeg_cmd_pass2, video_info['duration'])
