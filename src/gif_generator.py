@@ -1313,8 +1313,8 @@ class GifGenerator:
                 if ord(char) < 128:
                     # Keep ASCII characters
                     safe_chars.append(char)
-                elif char == '⧸':  # U+29F8 - replace with regular forward slash
-                    safe_chars.append('/')
+                elif char == '⧸':  # U+29F8 - avoid creating path separators on Windows; substitute underscore
+                    safe_chars.append('_')
                 elif char in ['/', '\\', ':', '*', '?', '"', '<', '>', '|']:
                     # Replace Windows filesystem-invalid characters with underscore
                     safe_chars.append('_')
