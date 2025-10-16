@@ -440,8 +440,8 @@ class DynamicVideoCompressor:
             a_kbps = 96
             v_kbps = self._calculate_target_video_kbps(safe_target_mb, video_info['duration'], a_kbps)
             # Safety check: prevent extremely high bitrates that might cause FFmpeg to crash
-            # Cap at 2000k for final refinement to avoid crashes
-            v_kbps = min(v_kbps, 2000)
+            # Cap at 3000k (increased from 2000k) for final refinement to allow better quality
+            v_kbps = min(v_kbps, 3000)
 
             # Select codec order
             codec_order = self._derive_codec_priority()
@@ -1006,38 +1006,49 @@ class DynamicVideoCompressor:
                 break
 
             # Safety check: prevent extremely high bitrates that might cause FFmpeg to crash
-            # Cap at 2000k for two-pass encoding to avoid crashes
-            new_bitrate = min(new_bitrate, 2000)
+            # Increased cap to 3000k (from 2000k) to allow more quality improvement
+            new_bitrate = min(new_bitrate, 3000)
             
             temp_uplift = os.path.join(self.temp_dir, f"uplift_{result.get('strategy')}_{pass_num}.mp4")
             params['bitrate'] = new_bitrate
             
-            # Re-encode with higher bitrate using same strategy approach
+            logger.info(f"Uplift pass {pass_num+1}: increasing bitrate from {base_bitrate}k to {new_bitrate}k")
+            
+            # Re-encode with higher bitrate using ORIGINAL strategy, not forcing two-pass
             strategy = result.get('strategy', '')
-            # Use unique passlogfile for each uplift attempt to avoid conflicts
-            uplift_id = f"uplift_{result.get('strategy', 'unknown')}_{pass_num}_{int(time.time())}"
-            log_file = os.path.join(self.temp_dir, f"ffmpeg2pass_{uplift_id}")
             
-            # Pass 1: Analysis
-            cmd_pass1 = self._build_two_pass_command(input_path, temp_uplift, params, pass_num=1, log_file=log_file)
-            success = self._execute_ffmpeg_with_progress(cmd_pass1, video_info['duration'])
-            if not success:
-                break
+            # Preserve original encoding strategy for better quality
+            if 'two_pass' in strategy:
+                # Use two-pass only if original strategy was two-pass
+                uplift_id = f"uplift_{result.get('strategy', 'unknown')}_{pass_num}_{int(time.time())}"
+                log_file = os.path.join(self.temp_dir, f"ffmpeg2pass_{uplift_id}")
+                
+                # Pass 1: Analysis
+                cmd_pass1 = self._build_two_pass_command(input_path, temp_uplift, params, pass_num=1, log_file=log_file)
+                success = self._execute_ffmpeg_with_progress(cmd_pass1, video_info['duration'])
+                if not success:
+                    break
+                
+                # Pass 2: Encoding
+                cmd = self._build_two_pass_command(input_path, temp_uplift, params, pass_num=2, log_file=log_file)
+            else:
+                # Use single-pass for non-two-pass strategies to preserve encoding characteristics
+                cmd = self._build_intelligent_ffmpeg_command(input_path, temp_uplift, params)
             
-            # Pass 2: Encoding
-            cmd_pass2 = self._build_two_pass_command(input_path, temp_uplift, params, pass_num=2, log_file=log_file)
-            success = self._execute_ffmpeg_with_progress(cmd_pass2, video_info['duration'])
+            success = self._execute_ffmpeg_with_progress(cmd, video_info['duration'])
             if not success or not os.path.exists(temp_uplift):
+                logger.warning(f"Uplift pass {pass_num+1} failed to produce output")
                 break
             
-            # Clean up two-pass log files
-            try:
-                for log_ext in ['-0.log', '-0.log.mbtree']:
-                    log_path = f"{log_file}{log_ext}"
-                    if os.path.exists(log_path):
-                        os.remove(log_path)
-            except Exception as e:
-                logger.debug(f"Failed to clean up log files: {e}")
+            # Clean up two-pass log files if applicable
+            if 'two_pass' in strategy:
+                try:
+                    for log_ext in ['-0.log', '-0.log.mbtree']:
+                        log_path = f"{log_file}{log_ext}"
+                        if os.path.exists(log_path):
+                            os.remove(log_path)
+                except Exception as e:
+                    logger.debug(f"Failed to clean up log files: {e}")
             
             new_size = os.path.getsize(temp_uplift) / (1024 * 1024)
             if new_size > target_size_mb:
@@ -1047,10 +1058,13 @@ class DynamicVideoCompressor:
             
             new_ssim = self._maybe_sample_ssim(input_path, temp_uplift, video_info.get('duration', 0.0))
             if new_ssim is None:
+                logger.warning(f"Uplift pass {pass_num+1}: SSIM sampling failed, stopping uplift attempts")
                 os.remove(temp_uplift)
                 break
             
-            logger.info(f"Uplift pass {pass_num+1}: bitrate={new_bitrate}, size={new_size:.2f}MB, SSIM={new_ssim:.3f}")
+            # Log detailed uplift progress
+            ssim_delta = new_ssim - best_ssim
+            logger.info(f"Uplift pass {pass_num+1}: bitrate={new_bitrate}k, size={new_size:.2f}MB, SSIM={new_ssim:.3f} (Δ{ssim_delta:+.3f}, floor={ssim_floor:.2f})")
             
             # Replace best if improved
             if os.path.exists(best_file) and best_file != temp_file:
@@ -1071,7 +1085,12 @@ class DynamicVideoCompressor:
         if best_file != temp_file and os.path.exists(best_file):
             os.remove(best_file)
         
-        logger.warning(f"SSIM {best_ssim:.3f} remains below floor {ssim_floor:.2f} after {uplift_max} uplifts; rejecting result")
+        # Log detailed rejection with improvement achieved
+        ssim_improvement = best_ssim - ssim_val
+        logger.warning(
+            f"SSIM {best_ssim:.3f} remains below floor {ssim_floor:.2f} after {uplift_max} uplifts "
+            f"(improved {ssim_improvement:+.3f} from {ssim_val:.3f}); rejecting result"
+        )
         return None
     
     def _execute_strategies_in_parallel(self, strategies: List[Dict[str, Any]], 
@@ -1454,8 +1473,8 @@ class DynamicVideoCompressor:
             # Calculate precise bitrate for target size
             target_bitrate = self._calculate_precise_bitrate(video_info, target_size_mb)
             # Safety check: prevent extremely high bitrates that might cause FFmpeg to crash
-            # Cap at 2000k for two-pass encoding to avoid crashes
-            target_bitrate = min(target_bitrate, 2000)
+            # Cap at 3000k (increased from 2000k) for two-pass encoding to allow better quality
+            target_bitrate = min(target_bitrate, 3000)
 
             # Adjust parameters based on previous attempt if available
             params = self._calculate_two_pass_params(video_info, platform_config, target_bitrate, previous_result)

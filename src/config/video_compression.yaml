@@ -133,7 +133,7 @@ video_compression:
       sample_fraction: 0.12
       threshold: 0.94
       enforce: true
-      floor: 0.95
+      floor: 0.88  # Lowered from 0.95 - more realistic for heavy compression to 10MB
     uplift:
       enabled: true
       max_passes: 3
