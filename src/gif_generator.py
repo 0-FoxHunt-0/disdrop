@@ -1405,7 +1405,8 @@ class GifGenerator:
             temp_gif = os.path.join(temp_dir, f"{base}.feasibility.gif.tmp")
             palette_path = None
             try:
-                palette_path = self._generate_palette(input_video, feas_settings, start_time, duration)
+                # Use longer timeout for palette generation in feasibility check to handle complex videos
+                palette_path = self._generate_palette(input_video, feas_settings, start_time, duration, timeout_override=90)
                 if not palette_path:
                     return False, None, None
                 ok = self._create_gif_with_palette(input_video, temp_gif, palette_path, feas_settings, start_time, duration)
