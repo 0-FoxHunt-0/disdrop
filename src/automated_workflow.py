@@ -1764,38 +1764,49 @@ class AutomatedWorkflow:
                         except Exception as e:
                             logger.warning(f"Segment future failed: {e}")
                             ok = False
-                    if ok:
-                        successful_gifs += 1
-                        completed_count += 1
-                        # Show progress with actual completion count
-                        print(f"    ✅ GIF {completed_count}/{len(segment_files)} completed successfully")
+
+                        if ok:
+                            successful_gifs += 1
+                            completed_count += 1
+                            # Show progress with actual completion count
+                            print(f"    ✅ GIF {completed_count}/{len(segment_files)} completed successfully")
+                        else:
+                            skipped_segments += 1
+
+                    # Report results
+                    if successful_gifs > 0:
+                        print(f"    🎉 GIF generation completed: {successful_gifs} GIFs created successfully!")
+                        if skipped_segments > 0:
+                            print(f"    ⏭️  Skipped {skipped_segments} segments (too long or would create multiple GIFs)")
+
+                        return True
                     else:
-                        skipped_segments += 1
-            
-            # Report results
-            if successful_gifs > 0:
-                print(f"    🎉 GIF generation completed: {successful_gifs} GIFs created successfully!")
-                if skipped_segments > 0:
-                    print(f"    ⏭️  Skipped {skipped_segments} segments (too long or would create multiple GIFs)")
-                
-                return True
-            else:
-                # No GIFs created, but this might be correct behavior if all segments were skipped
-                if skipped_segments > 0:
-                    print(f"    ⚠️  No GIFs created - all {skipped_segments} segments were skipped (too long or would create multiple GIFs)")
-                    print(f"    💡 This is expected behavior for segmented videos with long segments")
-                    logger.info(f"No GIFs created from segments - all {skipped_segments} segments were skipped as expected")
-                    
-                    return True  # Return True since this is correct behavior
-                else:
-                    print(f"    ❌ No valid GIFs created from segments")
+                        # No GIFs created, but this might be correct behavior if all segments were skipped
+                        if skipped_segments > 0:
+                            print(f"    ⚠️  No GIFs created - all {skipped_segments} segments were skipped (too long or would create multiple GIFs)")
+                            print(f"    💡 This is expected behavior for segmented videos with long segments")
+                            logger.info(f"No GIFs created from segments - all {skipped_segments} segments were skipped as expected")
+
+                            return True  # Return True since this is correct behavior
+                        else:
+                            print(f"    ❌ No valid GIFs created from segments")
+                            return False
+                except Exception as e:
+                    print(f"    ❌ Error generating GIFs from segments: {e}")
+                    logger.error(f"Error generating GIFs from segments: {e}")
                     return False
-            
+                finally:
+                    # Clean up any remaining temp files
+                    try:
+                        self._cleanup_temp_files()
+                    except Exception:
+                        pass
+                # End of ThreadPoolExecutor context
         except Exception as e:
             print(f"    ❌ Error generating GIFs from segments: {e}")
             logger.error(f"Error generating GIFs from segments: {e}")
             return False
-    
+
     def _validate_segment_folder_gifs(self, segments_folder: Path, max_size_mb: float) -> Tuple[List[Path], List[Path]]:
         """
         Validates all GIFs in a segment folder to ensure they are valid and within size limits.
