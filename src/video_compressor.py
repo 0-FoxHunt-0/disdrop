@@ -253,11 +253,13 @@ class DynamicVideoCompressor:
                     logger.warning(f"Failed to extract output segment: {result2.stderr.decode()[:200]}")
                     return None
 
-                # Now compare the extracted segments
+                # Now compare the extracted segments with alignment (scale2ref + format)
                 cmd = [
                     'ffmpeg', '-hide_banner', '-loglevel', 'info',
                     '-i', temp_input_seg, '-i', temp_output_seg,
-                    '-lavfi', '[0:v][1:v]ssim', '-f', 'null', '-'
+                    '-filter_complex',
+                    '[0:v]format=yuv420p,setsar=1[a];[1:v]format=yuv420p,setsar=1[b];[a][b]scale2ref=flags=bicubic[s0][s1];[s0][s1]ssim',
+                    '-f', 'null', '-'
                 ]
             except Exception as e:
                 logger.warning(f"SSIM segment extraction failed: {e}")
@@ -265,6 +267,106 @@ class DynamicVideoCompressor:
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
             if res.returncode != 0:
                 logger.warning(f"SSIM sampling FFmpeg failed (returncode={res.returncode}): {res.stderr[:200]}")
+                # Diagnostics: probe dimensions/FPS to help identify mismatches
+                try:
+                    in_info = FFmpegUtils.get_video_info(temp_input_seg)
+                    out_info = FFmpegUtils.get_video_info(temp_output_seg)
+                    logger.warning(
+                        f"SSIM probe: input={in_info.get('width')}x{in_info.get('height')}@{in_info.get('fps'):.2f}fps, "
+                        f"output={out_info.get('width')}x{out_info.get('height')}@{out_info.get('fps'):.2f}fps"
+                    )
+                except Exception:
+                    pass
+
+                # Fallback A: try direct two-input seek without temp segments
+                try:
+                    fallback_cmd = [
+                        'ffmpeg', '-hide_banner', '-loglevel', 'info',
+                        '-ss', str(start), '-t', str(seg), '-i', input_path,
+                        '-ss', str(start), '-t', str(seg), '-i', output_path,
+                        '-filter_complex',
+                        '[0:v]format=yuv420p,setsar=1[a];[1:v]format=yuv420p,setsar=1[b];[a][b]scale2ref=flags=bicubic[s0][s1];[s0][s1]ssim',
+                        '-f', 'null', '-'
+                    ]
+                    res2 = subprocess.run(fallback_cmd, capture_output=True, text=True, timeout=120)
+                    if res2.returncode == 0:
+                        out2 = res2.stderr or ''
+                        import re
+                        m2 = re.search(r'All:(\d+\.\d+)', out2)
+                        if m2:
+                            ssim_val = float(m2.group(1))
+                            # Clean up temp segments before return
+                            for temp_file in [temp_input_seg, temp_output_seg]:
+                                try:
+                                    if os.path.exists(temp_file):
+                                        os.remove(temp_file)
+                                except Exception:
+                                    pass
+                            logger.debug(f"SSIM sampling (fallback A) successful: {ssim_val:.4f}")
+                            return ssim_val
+                except Exception:
+                    pass
+
+                # Fallback B: mini re-encode segments to ensure decodability, then compare
+                try:
+                    temp_input_seg_rec = os.path.join(self.temp_dir, f"ssim_input_rec_{int(start)}.mp4")
+                    temp_output_seg_rec = os.path.join(self.temp_dir, f"ssim_output_rec_{int(start)}.mp4")
+
+                    # Clean up any existing re-encoded temp files
+                    for temp_file in [temp_input_seg_rec, temp_output_seg_rec]:
+                        try:
+                            if os.path.exists(temp_file):
+                                os.remove(temp_file)
+                        except Exception:
+                            pass
+
+                    reenc1 = [
+                        'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+                        '-ss', str(start), '-t', str(seg), '-i', input_path,
+                        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18', '-an', temp_input_seg_rec
+                    ]
+                    r1 = subprocess.run(reenc1, capture_output=True, text=True, timeout=120)
+                    reenc2 = [
+                        'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+                        '-ss', str(start), '-t', str(seg), '-i', output_path,
+                        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18', '-an', temp_output_seg_rec
+                    ]
+                    r2 = subprocess.run(reenc2, capture_output=True, text=True, timeout=120)
+                    if r1.returncode == 0 and r2.returncode == 0:
+                        cmd3 = [
+                            'ffmpeg', '-hide_banner', '-loglevel', 'info',
+                            '-i', temp_input_seg_rec, '-i', temp_output_seg_rec,
+                            '-filter_complex',
+                            '[0:v]format=yuv420p,setsar=1[a];[1:v]format=yuv420p,setsar=1[b];[a][b]scale2ref=flags=bicubic[s0][s1];[s0][s1]ssim',
+                            '-f', 'null', '-'
+                        ]
+                        res3 = subprocess.run(cmd3, capture_output=True, text=True, timeout=120)
+                        if res3.returncode == 0:
+                            out3 = res3.stderr or ''
+                            import re
+                            m3 = re.search(r'All:(\d+\.\d+)', out3)
+                            if m3:
+                                ssim_val = float(m3.group(1))
+                                logger.debug(f"SSIM sampling (fallback B re-encode) successful: {ssim_val:.4f}")
+                                # Clean up all temp files
+                                for temp_file in [temp_input_seg, temp_output_seg, temp_input_seg_rec, temp_output_seg_rec]:
+                                    try:
+                                        if os.path.exists(temp_file):
+                                            os.remove(temp_file)
+                                    except Exception:
+                                        pass
+                                return ssim_val
+
+                    # Clean up re-encoded temp files
+                    for temp_file in [temp_input_seg_rec, temp_output_seg_rec]:
+                        try:
+                            if os.path.exists(temp_file):
+                                os.remove(temp_file)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
                 # Clean up temporary segment files on FFmpeg failure too
                 for temp_file in [temp_input_seg, temp_output_seg]:
                     try:
