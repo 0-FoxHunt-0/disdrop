@@ -1085,6 +1085,38 @@ class DynamicVideoCompressor:
         if best_file != temp_file and os.path.exists(best_file):
             os.remove(best_file)
         
+        # Downscale recovery before rejection/segmentation: try modest resolution reduction
+        try:
+            enable_recovery = True
+            if enable_recovery:
+                logger.info("Attempting SSIM downscale recovery before segmentation")
+                # Reuse adaptive resolution path with slightly stricter efficiency via smaller target fraction
+                temp_output = os.path.join(self.temp_dir, "ssim_recovery_temp.mp4")
+                # Compute a slightly smaller effective target to encourage downscale
+                recovery_target = max(0.85 * target_size_mb, min(target_size_mb, result.get('size_mb', target_size_mb)))
+                # Use current video_info but ensure duration is set
+                rec_info = dict(video_info)
+                rec_info['duration'] = video_info.get('duration', rec_info.get('duration', 0.0))
+                rec = self._compress_with_adaptive_resolution(input_path, rec_info, platform_config={}, target_size_mb=recovery_target)
+                if rec and rec.get('temp_file') and os.path.exists(rec['temp_file']):
+                    new_size = os.path.getsize(rec['temp_file']) / (1024 * 1024)
+                    if new_size <= target_size_mb:
+                        new_ssim = self._maybe_sample_ssim(input_path, rec['temp_file'], rec_info.get('duration', 0.0))
+                        if new_ssim is not None and new_ssim >= ssim_floor:
+                            logger.info(f"SSIM downscale recovery succeeded: size={new_size:.2f}MB, SSIM={new_ssim:.3f}")
+                            result['temp_file'] = rec['temp_file']
+                            result['size_mb'] = new_size
+                            result['ssim_score'] = new_ssim
+                            result['strategy'] = 'adaptive_resolution_recovery'
+                            return result
+                    # Cleanup temp if not used
+                    try:
+                        os.remove(rec['temp_file'])
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.warning(f"SSIM downscale recovery failed: {e}")
+
         # Log detailed rejection with improvement achieved
         ssim_improvement = best_ssim - ssim_val
         logger.warning(
@@ -1263,6 +1295,21 @@ class DynamicVideoCompressor:
             # Move best result to final output
             shutil.move(best_result['temp_file'], output_path)
             
+            # Defensive: final size must not exceed target
+            try:
+                final_mb = os.path.getsize(output_path) / (1024 * 1024)
+                if final_mb > target_size_mb:
+                    logger.error(f"Final output exceeds size limit: {final_mb:.2f}MB > {target_size_mb}MB")
+                    try:
+                        os.remove(output_path)
+                    except Exception:
+                        pass
+                    raise RuntimeError(f"Final output exceeds size limit: {final_mb:.2f}MB > {target_size_mb}MB")
+            except Exception as e:
+                if isinstance(e, RuntimeError):
+                    raise
+                logger.warning(f"Final size validation error: {e}")
+
             # Clean up other attempts
             for attempt in compression_attempts:
                 if attempt != best_result and os.path.exists(attempt['temp_file']):

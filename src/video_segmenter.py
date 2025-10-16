@@ -534,7 +534,8 @@ class VideoSegmenter:
                 'segment_duration': segment_duration,
                 'temp_folder': temp_segments_folder,
                 'temp_files': temp_files,
-                'base_name': base_name
+                'base_name': base_name,
+                'target_size_mb': target_size_mb
             }
             
         except Exception as e:
@@ -781,6 +782,25 @@ class VideoSegmenter:
             'height': video_info['height'],
             'fps': min(video_info['fps'], 30),
         }
+        # Adaptive resolution selection for segments
+        try:
+            if bool(self.config.get('video_compression.segmentation.adapt_resolution', True)):
+                from .video_compressor import DynamicVideoCompressor
+                temp_compressor = DynamicVideoCompressor(self.config, self.hardware)
+                seg_info = dict(video_info)
+                seg_info['duration'] = duration
+                opt_w, opt_h = temp_compressor._calculate_optimal_resolution(seg_info, target_size_mb, platform_config or {})
+                # Ensure even dimensions
+                if opt_w % 2 != 0:
+                    opt_w -= 1
+                if opt_h % 2 != 0:
+                    opt_h -= 1
+                if opt_w > 0 and opt_h > 0:
+                    params['width'] = opt_w
+                    params['height'] = opt_h
+                    logger.info(f"Segment adaptive resolution: {opt_w}x{opt_h}")
+        except Exception as e:
+            logger.warning(f"Adaptive resolution selection failed: {e}")
         
         # Content-aware quality adjustment
         complexity = video_info.get('complexity_score', 5.0)
@@ -952,18 +972,12 @@ class VideoSegmenter:
             # Check results of optimization attempts
             if optimization_result and optimization_result.get('success', False):
                 optimized_size_mb = optimization_result.get('size_mb', 0)
-                
-                # Check if optimization was successful (made it smaller or acceptably close)
-                # Allow up to 5% over target to avoid rejecting near-perfect results
-                tolerance = target_size_mb * 1.05
-                if optimized_size_mb <= tolerance:
-                    # Replace original segment with optimized version
+
+                # Strict size enforcement: must be <= target
+                if optimized_size_mb <= target_size_mb:
                     if os.path.exists(temp_optimized_path):
                         shutil.move(temp_optimized_path, segment_path)
-                        
-                        logger.info(f"Segment optimization successful: {optimized_size_mb:.2f}MB "
-                                   f"(was oversized, now within {target_size_mb}MB target)")
-                        
+                        logger.info(f"Segment optimization successful: {optimized_size_mb:.2f}MB (<= {target_size_mb}MB)")
                         return {
                             'success': True,
                             'size_mb': optimized_size_mb,
@@ -971,23 +985,58 @@ class VideoSegmenter:
                             'original_method': 'segment_creation',
                             'compression_applied': True
                         }
-                    else:
-                        logger.error("Optimized segment file not found after processing")
-                        return {
-                            'success': False,
-                            'error': 'Optimized segment file not found'
-                        }
-                else:
-                    # Optimization didn't help enough, keep original
-                    if os.path.exists(temp_optimized_path):
-                        os.remove(temp_optimized_path)
-                    
-                    logger.warning(f"Optimization did not sufficiently reduce size: {optimized_size_mb:.2f}MB "
-                                  f"still exceeds target {target_size_mb}MB")
+                    logger.error("Optimized segment file not found after processing")
                     return {
                         'success': False,
-                        'error': f'Optimization insufficient: {optimized_size_mb:.2f}MB still too large'
+                        'error': 'Optimized segment file not found'
                     }
+
+                # Near-limit retry: one more attempt if within configured percent over target
+                try:
+                    near_pct = float(self.config.get('video_compression.size_control.near_limit_retry_percent', 0.08))
+                except Exception:
+                    near_pct = 0.08
+                if optimized_size_mb <= target_size_mb * (1.0 + near_pct):
+                    logger.info(f"Near-limit retry: {optimized_size_mb:.2f}MB within {(near_pct*100):.1f}% of target; attempting adaptive retry")
+                    try:
+                        from .video_compressor import DynamicVideoCompressor
+                        temp_compressor = DynamicVideoCompressor(self.config, self.hardware)
+                        seg_info = temp_compressor._analyze_video_content(segment_path)
+                        retry_res = temp_compressor._compress_with_adaptive_resolution(
+                            input_path=segment_path,
+                            video_info=seg_info,
+                            platform_config=platform_config or {},
+                            target_size_mb=target_size_mb
+                        )
+                    except Exception as e:
+                        logger.warning(f"Near-limit adaptive retry failed: {e}")
+                        retry_res = None
+                    if retry_res and retry_res.get('temp_file') and os.path.exists(retry_res['temp_file']):
+                        new_size = os.path.getsize(retry_res['temp_file']) / (1024 * 1024)
+                        if new_size <= target_size_mb:
+                            shutil.move(retry_res['temp_file'], segment_path)
+                            logger.info(f"Near-limit retry succeeded: {new_size:.2f}MB (<= {target_size_mb}MB)")
+                            return {
+                                'success': True,
+                                'size_mb': new_size,
+                                'method': retry_res.get('strategy', 'adaptive_resolution'),
+                                'original_method': 'segment_creation',
+                                'compression_applied': True
+                            }
+                        else:
+                            try:
+                                os.remove(retry_res['temp_file'])
+                            except Exception:
+                                pass
+
+                # Optimization didn't help enough
+                if os.path.exists(temp_optimized_path):
+                    os.remove(temp_optimized_path)
+                logger.warning(f"Optimization did not sufficiently reduce size: {optimized_size_mb:.2f}MB still exceeds target {target_size_mb}MB")
+                return {
+                    'success': False,
+                    'error': f'Optimization insufficient: {optimized_size_mb:.2f}MB still too large'
+                }
             else:
                 # All optimization strategies failed
                 if os.path.exists(temp_optimized_path):
@@ -1345,29 +1394,50 @@ class VideoSegmenter:
             logger.warning(f"Failed to create segments summary: {e}")
     
     def _finalize_segments(self, results: Dict[str, Any], output_base_path: str) -> Dict[str, Any]:
-        """Move segments from temp folder to final location"""
+        """Move segments from temp folder to final location with strict size enforcement"""
         try:
             temp_folder = results['temp_folder']
             base_name = results['base_name']
+            target_size_mb = results.get('target_size_mb') or self.config.get('video_compression.max_file_size_mb', 10)
+            reject_oversize = bool(self.config.get('video_compression.segmentation.reject_oversize_on_finalize', True))
             
-            # Create final segments folder inside output directory
+            # Prepare final segments; delay folder creation until we have a valid segment
             output_dir = os.path.dirname(output_base_path)
             final_segments_folder = os.path.join(output_dir, f"{base_name}_segments")
-            if not os.path.exists(final_segments_folder):
-                os.makedirs(final_segments_folder, exist_ok=True)
+            folder_created = False
             
             # Move segments to final location
             final_segments = []
             for segment in results['segments']:
                 temp_path = segment['path']
+                try:
+                    size_mb = os.path.getsize(temp_path) / (1024 * 1024)
+                except Exception:
+                    size_mb = segment.get('size_mb', float('inf'))
+
+                if reject_oversize and size_mb > target_size_mb:
+                    logger.warning(f"Skipping oversize segment {segment.get('index')} at finalize: {size_mb:.2f}MB > {target_size_mb}MB")
+                    try:
+                        if os.path.exists(temp_path):
+                            os.remove(temp_path)
+                    except Exception:
+                        pass
+                    continue
+
+                if not folder_created:
+                    if not os.path.exists(final_segments_folder):
+                        os.makedirs(final_segments_folder, exist_ok=True)
+                    folder_created = True
+
                 final_filename = f"{base_name}_segment_{segment['index']:03d}.mp4"
                 final_path = os.path.join(final_segments_folder, final_filename)
-                
+
                 shutil.move(temp_path, final_path)
-                
+
                 # Update segment info
                 segment['path'] = final_path
                 segment['filename'] = final_filename
+                segment['size_mb'] = size_mb
                 final_segments.append(segment)
             
             # Clean up temp folder
@@ -1382,6 +1452,14 @@ class VideoSegmenter:
             except Exception as e:
                 logger.warning(f"Could not create comprehensive summary: {e}")
             
+            if not final_segments:
+                logger.error("All segments exceeded size limit; no outputs written")
+                return {
+                    'success': False,
+                    'error': 'All segments exceeded size limit; no outputs written',
+                    'temp_files': results.get('temp_files', [])
+                }
+
             return {
                 'success': True,
                 'segments': final_segments,
