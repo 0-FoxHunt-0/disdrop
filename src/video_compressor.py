@@ -215,15 +215,63 @@ class DynamicVideoCompressor:
             sample_fraction = max(0.02, min(0.5, sample_fraction))
             seg = max(1.5, duration_s * sample_fraction)
             start = max(0.0, duration_s * 0.44)
-            cmd = [
-                'ffmpeg', '-hide_banner', '-loglevel', 'info',
-                '-ss', str(start), '-t', str(seg), '-i', input_path,
-                '-ss', str(start), '-t', str(seg), '-i', output_path,
-                '-lavfi', '[0:v][1:v]ssim', '-f', 'null', '-'
-            ]
+
+            # Use a simpler approach: extract segments first, then compare them
+            # This avoids the complex dual-input seeking that was causing issues
+            temp_input_seg = os.path.join(self.temp_dir, f"ssim_input_{int(start)}.mp4")
+            temp_output_seg = os.path.join(self.temp_dir, f"ssim_output_{int(start)}.mp4")
+
+            # Clean up any existing temp files first
+            for temp_file in [temp_input_seg, temp_output_seg]:
+                try:
+                    if os.path.exists(temp_file):
+                        os.remove(temp_file)
+                except Exception:
+                    pass
+
+            # These variables are now defined for cleanup in all cases
+            try:
+                # Extract input segment
+                extract_cmd1 = [
+                    'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+                    '-ss', str(start), '-t', str(seg), '-i', input_path,
+                    '-c', 'copy', '-avoid_negative_ts', 'make_zero', temp_input_seg
+                ]
+                result1 = subprocess.run(extract_cmd1, capture_output=True, timeout=60)
+                if result1.returncode != 0:
+                    logger.warning(f"Failed to extract input segment: {result1.stderr.decode()[:200]}")
+                    return None
+
+                # Extract output segment
+                extract_cmd2 = [
+                    'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+                    '-ss', str(start), '-t', str(seg), '-i', output_path,
+                    '-c', 'copy', '-avoid_negative_ts', 'make_zero', temp_output_seg
+                ]
+                result2 = subprocess.run(extract_cmd2, capture_output=True, timeout=60)
+                if result2.returncode != 0:
+                    logger.warning(f"Failed to extract output segment: {result2.stderr.decode()[:200]}")
+                    return None
+
+                # Now compare the extracted segments
+                cmd = [
+                    'ffmpeg', '-hide_banner', '-loglevel', 'info',
+                    '-i', temp_input_seg, '-i', temp_output_seg,
+                    '-lavfi', '[0:v][1:v]ssim', '-f', 'null', '-'
+                ]
+            except Exception as e:
+                logger.warning(f"SSIM segment extraction failed: {e}")
+                return None
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
             if res.returncode != 0:
                 logger.warning(f"SSIM sampling FFmpeg failed (returncode={res.returncode}): {res.stderr[:200]}")
+                # Clean up temporary segment files on FFmpeg failure too
+                for temp_file in [temp_input_seg, temp_output_seg]:
+                    try:
+                        if os.path.exists(temp_file):
+                            os.remove(temp_file)
+                    except Exception:
+                        pass
                 return None
             out = res.stderr or ''
             # Parse like: SSIM Y:... All:0.95 (var)
@@ -232,11 +280,32 @@ class DynamicVideoCompressor:
             if m:
                 ssim_val = float(m.group(1))
                 logger.debug(f"SSIM sampling successful: {ssim_val:.4f}")
+                # Clean up temporary segment files
+                for temp_file in [temp_input_seg, temp_output_seg]:
+                    try:
+                        if os.path.exists(temp_file):
+                            os.remove(temp_file)
+                    except Exception:
+                        pass
                 return ssim_val
             logger.warning(f"SSIM parsing failed, FFmpeg output: {out[:300]}")
+            # Clean up temporary segment files on failure too
+            for temp_file in [temp_input_seg, temp_output_seg]:
+                try:
+                    if os.path.exists(temp_file):
+                        os.remove(temp_file)
+                except Exception:
+                    pass
             return None
         except Exception as e:
             logger.warning(f"SSIM sampling exception: {e}")
+            # Clean up temporary segment files on exception too
+            for temp_file in [temp_input_seg, temp_output_seg]:
+                try:
+                    if os.path.exists(temp_file):
+                        os.remove(temp_file)
+                except Exception:
+                    pass
             return None
 
     def _final_single_file_refinement(self, input_path: str, output_path: str, target_size_mb: float,
