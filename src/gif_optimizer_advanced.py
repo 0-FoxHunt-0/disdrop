@@ -313,8 +313,17 @@ class AdvancedGifOptimizer:
             if near_target:
                 scale_factor = min(1.0, max(0.85, scale_factor))  # keep resolution when close
 
+            floors = self.config.get('gif_settings.quality_floors', {}) if hasattr(self, 'config') else {}
+            min_w = int((floors.get('min_width') if isinstance(floors, dict) else 0) or 0)
+            min_fps = int((floors.get('min_fps') if isinstance(floors, dict) else 0) or 0)
+            enforce = bool((floors.get('enforce') if isinstance(floors, dict) else False))
+
             new_width = max(2, int((info.get('width', 320) * scale_factor) // 2 * 2))
+            if enforce and min_w > 0 and new_width < min_w:
+                new_width = int(min_w // 2 * 2)
             fps = max(6, min(15, int(round(info.get('fps', 12)))))
+            if enforce and min_fps > 0 and fps < min_fps:
+                fps = min_fps
 
             if self._shutdown_checker():
                 return False
@@ -340,6 +349,11 @@ class AdvancedGifOptimizer:
             if current_bytes > target_bytes and not self._shutdown_checker():
                 attempt_width = max(2, int((new_width * 0.85) // 2 * 2))
                 attempt_fps = max(6, int(fps * 0.9))
+                if enforce:
+                    if min_w > 0 and attempt_width < min_w:
+                        attempt_width = int(min_w // 2 * 2)
+                    if min_fps > 0 and attempt_fps < min_fps:
+                        attempt_fps = min_fps
                 for colors in [192, 160]:
                     if self._shutdown_checker():
                         return False
@@ -358,9 +372,14 @@ class AdvancedGifOptimizer:
                                     pass
                             logger.info("GIF met target via iterative ffmpeg re-encode")
                             return True
-                    # Prepare even tighter next round
+                    # Prepare even tighter next round (respect floors)
                     attempt_width = max(2, int((attempt_width * 0.88) // 2 * 2))
                     attempt_fps = max(6, int(attempt_fps * 0.9))
+                    if enforce:
+                        if min_w > 0 and attempt_width < min_w:
+                            attempt_width = int(min_w // 2 * 2)
+                        if min_fps > 0 and attempt_fps < min_fps:
+                            attempt_fps = min_fps
 
             # Restore original if all attempts failed but original already <= target
             if backup_path and os.path.exists(backup_path):
@@ -683,17 +702,32 @@ class AdvancedGifOptimizer:
                 scale_factors = [1.0, 0.92, 0.9, 0.88, 0.85, 0.82, 0.8, 0.75, 0.7, 0.65]
                 color_steps = [192, 176, 160, 144, 128, 120, 112, 104, 96, 88, 80, 72, 64]
                 lossy_steps = [10, 15, 20, 30, 40, 60, 80, 100]
+                floors = self.config.get('gif_settings.quality_floors', {}) if hasattr(self, 'config') else {}
+                min_fps = int((floors.get('min_fps') if isinstance(floors, dict) else 0) or 0)
+                enforce = bool((floors.get('enforce') if isinstance(floors, dict) else False))
                 fps_levels = [12, 10, 8]
+                if enforce and min_fps > 0:
+                    fps_levels = [f for f in fps_levels if (f is None) or (f >= min_fps)] or [min_fps]
             elif target_ratio < 0.6:
                 scale_factors = [1.0, 0.95, 0.92, 0.9, 0.88, 0.85, 0.82, 0.8, 0.75]
                 color_steps = [224, 208, 192, 176, 160, 144, 128, 120, 112, 104, 96]
                 lossy_steps = [5, 10, 15, 20, 30, 40, 60]
+                floors = self.config.get('gif_settings.quality_floors', {}) if hasattr(self, 'config') else {}
+                min_fps = int((floors.get('min_fps') if isinstance(floors, dict) else 0) or 0)
+                enforce = bool((floors.get('enforce') if isinstance(floors, dict) else False))
                 fps_levels = [15, 12, 10]
+                if enforce and min_fps > 0:
+                    fps_levels = [f for f in fps_levels if (f is None) or (f >= min_fps)] or [min_fps]
             else:
                 scale_factors = [1.0, 0.98, 0.95, 0.92, 0.9, 0.88, 0.85]
                 color_steps = [256, 240, 224, 208, 192, 176, 160, 144, 128]
                 lossy_steps = [0, 5, 10, 15, 20, 30]
+                floors = self.config.get('gif_settings.quality_floors', {}) if hasattr(self, 'config') else {}
+                min_fps = int((floors.get('min_fps') if isinstance(floors, dict) else 0) or 0)
+                enforce = bool((floors.get('enforce') if isinstance(floors, dict) else False))
                 fps_levels = [None, 15]
+                if enforce and min_fps > 0:
+                    fps_levels = [f for f in fps_levels if (f is None) or (f >= min_fps)] or [min_fps]
 
             best_candidate = None  # (bytes, scale, colors, lossy, path)
 

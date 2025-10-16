@@ -320,13 +320,45 @@ class DynamicVideoCompressor:
                     logger.info(f"Refinement iteration {iter_count+1}: size={size_mb:.2f}MB, utilization={util*100:.1f}%")
                     iter_count += 1
 
-                # Optional SSIM sampling
+                # Optional SSIM sampling and enforcement with limited uplift
                 ssim_threshold = float(self.config.get('video_compression.quality_controls.ssim_check.threshold', 0.94))
+                ssim_floor = float(self.config.get('video_compression.quality_controls.ssim_check.floor', ssim_threshold))
+                ssim_enforce = bool(self.config.get('video_compression.quality_controls.ssim_check.enforce', False))
+                uplift_enabled = bool(self.config.get('video_compression.quality_controls.uplift.enabled', True))
+                uplift_max = int(self.config.get('video_compression.quality_controls.uplift.max_passes', 2) or 0)
+                uplift_step = float(self.config.get('video_compression.quality_controls.uplift.bitrate_step', 1.08))
+                uplift_cap = float(self.config.get('video_compression.quality_controls.uplift.max_multiplier', 1.2))
                 ssim_val = self._maybe_sample_ssim(input_path, temp_out, video_info.get('duration', 0.0))
                 if ssim_val is not None:
-                    logger.info(f"SSIM sample for {codec_key}: {ssim_val:.3f} (threshold {ssim_threshold:.2f})")
+                    logger.info(f"SSIM sample for {codec_key}: {ssim_val:.3f} (threshold {ssim_threshold:.2f}, floor {ssim_floor:.2f})")
+                    # If enforcing and below floor while under size, try bounded bitrate uplift
+                    if ssim_enforce and ssim_val < ssim_floor and size_mb <= target_size_mb and uplift_enabled:
+                        uplift_count = 0
+                        base_kbps = cur_v_kbps
+                        while uplift_count < uplift_max and ssim_val < ssim_floor:
+                            # Increase bitrate conservatively within cap
+                            next_kbps = int(min(base_kbps * (uplift_step ** (uplift_count + 1)), needed_kbps * uplift_cap))
+                            if next_kbps <= cur_v_kbps:
+                                break
+                            ok2 = self._rerun_pass2_with_bitrate(input_path, temp_out, params_snapshot, log_base, next_kbps, a_kbps)
+                            if not ok2 or not os.path.exists(temp_out):
+                                break
+                            cur_v_kbps = next_kbps
+                            size_mb = os.path.getsize(temp_out) / (1024 * 1024)
+                            if size_mb > target_size_mb:
+                                logger.info(f"Uplift pass {uplift_count+1} exceeded target size ({size_mb:.2f}MB), stopping uplift")
+                                break
+                            ssim_val_new = self._maybe_sample_ssim(input_path, temp_out, video_info.get('duration', 0.0))
+                            if ssim_val_new is None:
+                                break
+                            ssim_val = ssim_val_new
+                            logger.info(f"Uplift pass {uplift_count+1}: bitrate={cur_v_kbps} kbps, size={size_mb:.2f}MB, SSIM={ssim_val:.3f}")
+                            uplift_count += 1
+                        # If still below floor after uplifts, mark as not acceptable
+                        if ssim_val < ssim_floor:
+                            logger.info(f"SSIM remains below floor ({ssim_val:.3f} < {ssim_floor:.2f}) after {uplift_count} uplifts; will prefer other strategies")
 
-                # Track best so far (prefer closer to target and higher SSIM if available)
+                # Track best so far (prefer closer to target; SSIM considered implicitly via enforcement)
                 if size_mb > best_local_size_mb:
                     best_local_file = temp_out
                     best_local_size_mb = size_mb

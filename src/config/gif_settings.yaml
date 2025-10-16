@@ -149,6 +149,11 @@ gif_settings:
 
   # Platform specific settings
   platforms:
+  # Global quality floors to prevent unreadable tiny GIFs
+  quality_floors:
+    enforce: true
+    min_width: 320
+    min_fps: 18
     twitter:
       max_width: 506
       max_height: 506

@@ -132,3 +132,11 @@ video_compression:
       enabled: true
       sample_fraction: 0.12
       threshold: 0.94
+      enforce: true
+      floor: 0.95
+    uplift:
+      enabled: true
+      max_passes: 2
+      bitrate_step: 1.08
+      max_multiplier: 1.2
+    on_fail_segment: true

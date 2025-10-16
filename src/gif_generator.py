@@ -285,6 +285,16 @@ class GifGenerator:
             if 'lossy' in gif_config:
                 settings['lossy'] = gif_config.get('lossy')
         
+        # Merge global quality floors
+        try:
+            floors = self.config.get('gif_settings.quality_floors', {})
+            if isinstance(floors, dict):
+                settings['min_width'] = int(floors.get('min_width', 0) or 0)
+                settings['min_fps'] = int(floors.get('min_fps', 0) or 0)
+                settings['floors_enforce'] = bool(floors.get('enforce', False))
+        except Exception:
+            pass
+
         return settings
     
     def _should_split_video(self, input_video: str, duration: float, settings: Dict[str, Any]) -> bool:
@@ -299,10 +309,25 @@ class GifGenerator:
         if duration > settings['max_duration']:
             return True
         
-        # Split if estimated file size would be too large
+        # Split if estimated file size would be too large or would violate quality floors
         estimated_size = self._estimate_gif_size(input_video, duration, settings)
         if estimated_size > settings['max_size_mb'] * 0.8:  # 80% threshold
             return True
+        # Predict whether meeting target would require breaking floors (heuristic)
+        try:
+            if settings.get('floors_enforce'):
+                min_w = int(settings.get('min_width') or 0)
+                min_f = int(settings.get('min_fps') or 0)
+                # Rough capacity at floors: if estimated size at current width/fps is far over target,
+                # and current width/fps are already near floors, prefer segmentation
+                info = self.ffmpeg_utils.get_video_info(input_video) or {}
+                cur_w = int(info.get('width') or settings.get('width') or settings.get('scale') or 360)
+                cur_f = int(settings.get('fps') or 15)
+                if cur_w <= max(min_w * 1.1, min_w + 20) or cur_f <= max(min_f * 1.1, min_f + 2):
+                    if estimated_size > settings['max_size_mb'] * 0.95:
+                        return True
+        except Exception:
+            pass
         
         return False
     
@@ -548,6 +573,18 @@ class GifGenerator:
                     video_info, settings.get('scale', settings.get('width', 480)), settings['max_size_mb']
                 )
             
+            # Enforce quality floors if configured
+            try:
+                if settings.get('floors_enforce'):
+                    min_w = int(settings.get('min_width') or 0)
+                    min_f = int(settings.get('min_fps') or 0)
+                    if optimal_width < min_w:
+                        optimal_width = min_w
+                    if int(settings.get('fps') or 0) < min_f:
+                        settings['fps'] = min_f
+            except Exception:
+                pass
+
             # Improved scaling: preserve aspect ratio better and use higher quality
             pre_chain.append(f"scale={optimal_width}:{optimal_height}:flags=lanczos")
             max_colors = int(settings.get('palette_max_colors', settings.get('colors', 256)))
@@ -675,6 +712,17 @@ class GifGenerator:
             # Use configured width/height for proper aspect ratio preservation
             target_width = settings.get('width', 360)
             target_height = settings.get('height', -1)
+            # Enforce quality floors if configured
+            try:
+                if settings.get('floors_enforce'):
+                    min_w = int(settings.get('min_width') or 0)
+                    min_f = int(settings.get('min_fps') or 0)
+                    if target_width < min_w:
+                        target_width = min_w
+                    if int(settings.get('fps') or 0) < min_f:
+                        settings['fps'] = min_f
+            except Exception:
+                pass
             
             if target_height == -1:
                 # Preserve aspect ratio by only specifying width
