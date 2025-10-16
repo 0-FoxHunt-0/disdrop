@@ -1335,10 +1335,47 @@ class AutomatedWorkflow:
                     else:
                         print(f"    ❌ Processed MP4 validation failed: {error_msg}")
                         logger.error(f"Processed MP4 validation failed: {error_msg}")
-                        # Remove the invalid file
-                        if output_path.exists():
-                            output_path.unlink()
-                        return None
+                        
+                        # Check if the error is about file size being too large
+                        if "too large" in error_msg.lower() or "file size" in error_msg.lower():
+                            print(f"    🔄 Single file optimization exceeded target, falling back to segmentation...")
+                            logger.info(f"Single file optimization exceeded target ({error_msg}), attempting segmentation fallback")
+                            
+                            # Remove the oversized file
+                            if output_path.exists():
+                                output_path.unlink()
+                            
+                            # Retry with segmentation
+                            try:
+                                result = self.video_compressor.compress_video(
+                                    input_path=str(video_file),
+                                    output_path=str(output_path),
+                                    max_size_mb=max_size_mb,
+                                    force_single_file=False  # Allow segmentation
+                                )
+                                
+                                if result.get('success', False) and (result.get('method') == 'segmentation' or 'segments' in result):
+                                    if segments_folder.exists() and segments_folder.is_dir():
+                                        print(f"    ✅ Segmentation fallback successful: {segments_folder.name}")
+                                        logger.info(f"Segmentation fallback successful: {segments_folder.name}")
+                                        return segments_folder
+                                    else:
+                                        print(f"    ❌ Segmentation fallback completed but segments folder not found")
+                                        logger.error(f"Segmentation fallback completed but segments folder not found")
+                                        return None
+                                else:
+                                    print(f"    ❌ Segmentation fallback failed")
+                                    logger.error(f"Segmentation fallback failed: {result.get('error', 'Unknown error')}")
+                                    return None
+                            except Exception as e:
+                                print(f"    ❌ Segmentation fallback error: {e}")
+                                logger.error(f"Segmentation fallback error: {e}")
+                                return None
+                        else:
+                            # Other validation error, remove the invalid file
+                            if output_path.exists():
+                                output_path.unlink()
+                            return None
             else:
                 error_msg = result.get('error', 'Unknown error')
                 print(f"    ❌ Video optimization failed: {error_msg}")

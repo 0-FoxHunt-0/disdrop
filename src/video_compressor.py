@@ -242,12 +242,15 @@ class DynamicVideoCompressor:
             if prefer_24fps and (video_info.get('motion_level') == 'low' or out_fps < 28.0):
                 out_fps = 24.0
 
+            # Use 98% of target as safety margin to account for encoding variance
+            safe_target_mb = target_size_mb * 0.98
+            
             # Compute conservative output resolution for target size
-            width, height = self._calculate_optimal_resolution(video_info, target_size_mb, {})
+            width, height = self._calculate_optimal_resolution(video_info, safe_target_mb, {})
 
             # Calculate initial bitrates
             a_kbps = 96
-            v_kbps = self._calculate_target_video_kbps(target_size_mb, video_info['duration'], a_kbps)
+            v_kbps = self._calculate_target_video_kbps(safe_target_mb, video_info['duration'], a_kbps)
 
             # Select codec order
             codec_order = self._derive_codec_priority()
@@ -339,7 +342,14 @@ class DynamicVideoCompressor:
                     break
 
             if best_local_file and os.path.exists(best_local_file):
-                # Replace output
+                # Validate that refined result doesn't exceed target
+                if best_local_size_mb > target_size_mb:
+                    logger.warning(f"Final refinement exceeded target ({best_local_size_mb:.2f}MB > {target_size_mb}MB), keeping previous result")
+                    if os.path.exists(best_local_file):
+                        os.remove(best_local_file)
+                    return None  # Keep existing output_path as-is
+                
+                # Replace output with validated refinement
                 try:
                     if os.path.exists(output_path):
                         os.remove(output_path)
@@ -628,8 +638,8 @@ class DynamicVideoCompressor:
         
         utilization = result['size_mb'] / target_size_mb
         
-        # Only refine if under-utilizing (60-95% range)
-        if utilization < 0.60 or utilization >= 0.95:
+        # Only refine if under-utilizing (60-93% range) - more conservative to avoid overshooting
+        if utilization < 0.60 or utilization >= 0.93:
             return result
         
         logger.info(f"Result under-utilizing target ({utilization*100:.1f}%), attempting refinement...")
@@ -638,9 +648,10 @@ class DynamicVideoCompressor:
             refined_result = result
             iteration = 0
             
-            while utilization < 0.95 and iteration < max_iterations:
-                # Calculate new bitrate to get closer to target
-                bitrate_multiplier = min(target_size_mb / result['size_mb'] * 0.95, 1.3)
+            # Target 93% max to leave safety margin, stop if we get close
+            while utilization < 0.93 and iteration < max_iterations:
+                # More conservative multiplier to avoid overshooting (0.90 instead of 0.95)
+                bitrate_multiplier = min(target_size_mb / result['size_mb'] * 0.90, 1.2)
                 
                 # Get current params and adjust bitrate
                 params = result.get('params', {}).copy()
