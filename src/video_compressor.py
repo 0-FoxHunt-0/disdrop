@@ -734,6 +734,114 @@ class DynamicVideoCompressor:
             logger.warning(f"Refinement failed: {e}")
             return result
     
+    def _validate_and_uplift_result(self, result: Dict[str, Any], input_path: str, 
+                                    video_info: Dict[str, Any], target_size_mb: float) -> Optional[Dict[str, Any]]:
+        """
+        Validate result meets SSIM floor; if not, attempt bounded bitrate uplifts.
+        Returns validated result or None if quality floor cannot be met.
+        """
+        if not result or result.get('size_mb', float('inf')) > target_size_mb:
+            return None
+        
+        # Read config
+        ssim_enforce = bool(self.config.get('video_compression.quality_controls.ssim_check.enforce', False))
+        if not ssim_enforce:
+            return result  # No enforcement, accept as-is
+        
+        ssim_floor = float(self.config.get('video_compression.quality_controls.ssim_check.floor', 0.95))
+        uplift_enabled = bool(self.config.get('video_compression.quality_controls.uplift.enabled', True))
+        uplift_max = int(self.config.get('video_compression.quality_controls.uplift.max_passes', 2) or 0)
+        uplift_step = float(self.config.get('video_compression.quality_controls.uplift.bitrate_step', 1.08))
+        uplift_cap = float(self.config.get('video_compression.quality_controls.uplift.max_multiplier', 1.2))
+        
+        temp_file = result.get('temp_file')
+        if not temp_file or not os.path.exists(temp_file):
+            return result  # Can't validate without file
+        
+        # Sample SSIM
+        ssim_val = self._maybe_sample_ssim(input_path, temp_file, video_info.get('duration', 0.0))
+        if ssim_val is None:
+            logger.warning("SSIM sampling failed; accepting result without quality validation")
+            return result
+        
+        logger.info(f"Strategy '{result.get('strategy')}' SSIM: {ssim_val:.3f} (floor: {ssim_floor:.2f})")
+        
+        if ssim_val >= ssim_floor:
+            result['ssim_score'] = ssim_val
+            return result  # Passes floor
+        
+        if not uplift_enabled or uplift_max <= 0:
+            logger.warning(f"SSIM {ssim_val:.3f} below floor {ssim_floor:.2f}; uplift disabled, rejecting result")
+            return None
+        
+        # Attempt uplift
+        params = result.get('params', {}).copy()
+        base_bitrate = params.get('bitrate')
+        if not base_bitrate:
+            logger.warning("Cannot uplift: no bitrate in params")
+            return None
+        
+        logger.info(f"Attempting quality uplift: SSIM {ssim_val:.3f} < {ssim_floor:.2f}")
+        
+        best_file = temp_file
+        best_size = result['size_mb']
+        best_ssim = ssim_val
+        
+        for pass_num in range(uplift_max):
+            new_bitrate = int(base_bitrate * (uplift_step ** (pass_num + 1)))
+            if new_bitrate > base_bitrate * uplift_cap:
+                break
+            
+            temp_uplift = os.path.join(self.temp_dir, f"uplift_{result.get('strategy')}_{pass_num}.mp4")
+            params['bitrate'] = new_bitrate
+            
+            # Re-encode with higher bitrate using same strategy approach
+            strategy = result.get('strategy', '')
+            if 'two_pass' in strategy:
+                log_file = os.path.join(self.temp_dir, "ffmpeg2pass_uplift")
+                cmd = self._build_two_pass_command(input_path, temp_uplift, params, pass_num=2, log_file=log_file)
+            else:
+                cmd = self._build_intelligent_ffmpeg_command(input_path, temp_uplift, params)
+            
+            success = self._execute_ffmpeg_with_progress(cmd, video_info['duration'])
+            if not success or not os.path.exists(temp_uplift):
+                break
+            
+            new_size = os.path.getsize(temp_uplift) / (1024 * 1024)
+            if new_size > target_size_mb:
+                logger.info(f"Uplift pass {pass_num+1} exceeded size ({new_size:.2f}MB > {target_size_mb}MB), stopping")
+                os.remove(temp_uplift)
+                break
+            
+            new_ssim = self._maybe_sample_ssim(input_path, temp_uplift, video_info.get('duration', 0.0))
+            if new_ssim is None:
+                os.remove(temp_uplift)
+                break
+            
+            logger.info(f"Uplift pass {pass_num+1}: bitrate={new_bitrate}, size={new_size:.2f}MB, SSIM={new_ssim:.3f}")
+            
+            # Replace best if improved
+            if os.path.exists(best_file) and best_file != temp_file:
+                os.remove(best_file)
+            best_file = temp_uplift
+            best_size = new_size
+            best_ssim = new_ssim
+            
+            if new_ssim >= ssim_floor:
+                logger.info(f"Quality floor met after {pass_num+1} uplift passes")
+                result['temp_file'] = best_file
+                result['size_mb'] = best_size
+                result['ssim_score'] = best_ssim
+                result['params'] = params
+                return result
+        
+        # Clean up temp uplift files
+        if best_file != temp_file and os.path.exists(best_file):
+            os.remove(best_file)
+        
+        logger.warning(f"SSIM {best_ssim:.3f} remains below floor {ssim_floor:.2f} after {uplift_max} uplifts; rejecting result")
+        return None
+    
     def _execute_strategies_in_parallel(self, strategies: List[Dict[str, Any]], 
                                        input_path: str, video_info: Dict[str, Any],
                                        platform_config: Dict[str, Any], target_size_mb: float) -> List[Dict[str, Any]]:
@@ -813,13 +921,16 @@ class DynamicVideoCompressor:
                     parallel_strategies, input_path, video_info, platform_config, target_size_mb
                 )
                 
-                # Select best result from parallel execution
+                # Select best result from parallel execution with SSIM validation
                 for result in results:
-                    compression_attempts.append(result)
-                    if result['size_mb'] <= target_size_mb:
-                        if not best_result or result['quality_score'] > best_result.get('quality_score', 0):
-                            best_result = result
-                            logger.info(f"Parallel strategy '{result['strategy']}' selected: {result['size_mb']:.2f}MB")
+                    # Validate SSIM and attempt uplift if needed
+                    result = self._validate_and_uplift_result(result, input_path, video_info, target_size_mb)
+                    if result:  # Only process validated results
+                        compression_attempts.append(result)
+                        if result['size_mb'] <= target_size_mb:
+                            if not best_result or result['quality_score'] > best_result.get('quality_score', 0):
+                                best_result = result
+                                logger.info(f"Parallel strategy '{result['strategy']}' selected: {result['size_mb']:.2f}MB")
             else:
                 # Sequential execution (original behavior)
                 # Strategy 1: Content-aware optimal compression
@@ -830,13 +941,16 @@ class DynamicVideoCompressor:
                 if result:
                     # Refine if under-utilizing target
                     result = self._refine_strategy_result(result, input_path, video_info, target_size_mb)
-                    compression_attempts.append(result)
-                    if result['size_mb'] <= target_size_mb:
-                        best_result = result
-                        logger.info(f"Strategy 1 successful: {result['size_mb']:.2f}MB")
+                    # Validate SSIM and attempt uplift if needed
+                    result = self._validate_and_uplift_result(result, input_path, video_info, target_size_mb)
+                    if result:  # Only process validated results
+                        compression_attempts.append(result)
+                        if result['size_mb'] <= target_size_mb:
+                            best_result = result
+                            logger.info(f"Strategy 1 successful: {result['size_mb']:.2f}MB")
                 
                 # Strategy 2: Two-pass encoding if Strategy 1 didn't work perfectly
-                if not best_result or result['size_mb'] > target_size_mb * 0.95:
+                if not best_result or (result and result.get('size_mb', 0) > target_size_mb * 0.95):
                     logger.info("Attempting Strategy 2: Two-pass precision encoding")
                     result = self._compress_with_two_pass(
                         input_path, video_info, platform_config, target_size_mb, best_result
@@ -844,11 +958,14 @@ class DynamicVideoCompressor:
                     if result:
                         # Refine if under-utilizing target
                         result = self._refine_strategy_result(result, input_path, video_info, target_size_mb)
-                        compression_attempts.append(result)
-                        if result['size_mb'] <= target_size_mb:
-                            if not best_result or result['quality_score'] > best_result.get('quality_score', 0):
-                                best_result = result
-                                logger.info(f"Strategy 2 improved result: {result['size_mb']:.2f}MB")
+                        # Validate SSIM and attempt uplift if needed
+                        result = self._validate_and_uplift_result(result, input_path, video_info, target_size_mb)
+                        if result:  # Only process validated results
+                            compression_attempts.append(result)
+                            if result['size_mb'] <= target_size_mb:
+                                if not best_result or result['quality_score'] > best_result.get('quality_score', 0):
+                                    best_result = result
+                                    logger.info(f"Strategy 2 improved result: {result['size_mb']:.2f}MB")
             
             # Strategy 3: Adaptive resolution and quality optimization
             if not best_result:
@@ -859,10 +976,13 @@ class DynamicVideoCompressor:
                 if result:
                     # Refine if under-utilizing target
                     result = self._refine_strategy_result(result, input_path, video_info, target_size_mb)
-                    compression_attempts.append(result)
-                    if result['size_mb'] <= target_size_mb:
-                        best_result = result
-                        logger.info(f"Strategy 3 successful: {result['size_mb']:.2f}MB")
+                    # Validate SSIM and attempt uplift if needed
+                    result = self._validate_and_uplift_result(result, input_path, video_info, target_size_mb)
+                    if result:  # Only process validated results
+                        compression_attempts.append(result)
+                        if result['size_mb'] <= target_size_mb:
+                            best_result = result
+                            logger.info(f"Strategy 3 successful: {result['size_mb']:.2f}MB")
             
             # Strategy 4: Aggressive optimization as last resort
             if not best_result:
@@ -871,13 +991,23 @@ class DynamicVideoCompressor:
                     input_path, video_info, platform_config, target_size_mb
                 )
                 if result:
-                    compression_attempts.append(result)
-                    if result['size_mb'] <= target_size_mb:
-                        best_result = result
-                        logger.info(f"Strategy 4 successful: {result['size_mb']:.2f}MB")
+                    # Validate SSIM and attempt uplift if needed
+                    result = self._validate_and_uplift_result(result, input_path, video_info, target_size_mb)
+                    if result:  # Only process validated results
+                        compression_attempts.append(result)
+                        if result['size_mb'] <= target_size_mb:
+                            best_result = result
+                            logger.info(f"Strategy 4 successful: {result['size_mb']:.2f}MB")
             
             if not best_result:
-                raise RuntimeError(f"Failed to compress video under {target_size_mb}MB with all optimization strategies")
+                # Check if segmentation fallback is enabled
+                on_fail_segment = bool(self.config.get('video_compression.quality_controls.on_fail_segment', False))
+                if on_fail_segment:
+                    logger.warning("All strategies failed to meet quality floor; falling back to segmentation")
+                    return self._compress_with_segmentation(
+                        input_path, output_path, target_size_mb, platform_config, video_info, platform=None
+                    )
+                raise RuntimeError(f"Failed to compress video under {target_size_mb}MB with acceptable quality")
             
             # Move best result to final output
             shutil.move(best_result['temp_file'], output_path)
