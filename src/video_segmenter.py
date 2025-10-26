@@ -385,13 +385,31 @@ class VideoSegmenter:
                     logger.info(f"Processing segment {i+1}/{num_segments}: {segment_duration_actual:.1f}s "
                                f"({segment_start:.1f}s - {segment_end:.1f}s)")
                     
-                    # Create high-quality segment (creation-only; optimization deferred)
-                    segment_result = self._create_high_quality_segment(
-                        input_video, segment_path, segment_start, segment_duration_actual,
-                        video_info, platform_config, target_size_mb
-                    )
+                    # Create high-quality segment with retry logic (creation-only; optimization deferred)
+                    max_retries = 2
+                    segment_result = None
+                    for retry_attempt in range(max_retries + 1):
+                        if retry_attempt > 0:
+                            logger.warning(f"Retry {retry_attempt}/{max_retries} for segment {i+1}")
+                            # Wait briefly before retry
+                            time.sleep(1)
+                        
+                        segment_result = self._create_high_quality_segment(
+                            input_video, segment_path, segment_start, segment_duration_actual,
+                            video_info, platform_config, target_size_mb
+                        )
+                        
+                        if segment_result.get('success', False):
+                            # Success - break out of retry loop
+                            break
+                        else:
+                            error_msg = segment_result.get('error', 'Unknown error')
+                            if retry_attempt < max_retries:
+                                logger.warning(f"Segment {i+1} creation failed (attempt {retry_attempt + 1}), will retry: {error_msg}")
+                            else:
+                                logger.error(f"Segment {i+1} creation failed after {max_retries + 1} attempts: {error_msg}")
                     
-                    if segment_result.get('success', False):
+                    if segment_result and segment_result.get('success', False):
                         segment_size_mb = segment_result.get('size_mb', 0)
                         needs_optimization = segment_size_mb > target_size_mb
                         segment_result['optimization_applied'] = False
@@ -413,7 +431,7 @@ class VideoSegmenter:
                         
                         return segment_info
                     else:
-                        logger.error(f"Failed to create segment {i+1}: {segment_result.get('error', 'Unknown error')}")
+                        logger.error(f"Failed to create segment {i+1} after all retries")
                         return None
                         
                 except Exception as e:
@@ -725,6 +743,47 @@ class VideoSegmenter:
                         self._active_processes.discard(process)
                 
                 if rc == 0:
+                    # Validate segment is readable before marking success
+                    if not os.path.exists(output_path):
+                        logger.error(f"Segment file not created: {output_path}")
+                        return {'success': False, 'error': 'Segment file not created'}
+                    
+                    # Quick validation with ffprobe
+                    try:
+                        probe_cmd = [
+                            'ffprobe', '-v', 'quiet', '-print_format', 'json',
+                            '-show_format', '-show_streams', output_path
+                        ]
+                        probe_result = subprocess.run(
+                            probe_cmd, capture_output=True, text=True, timeout=10
+                        )
+                        if probe_result.returncode != 0:
+                            logger.error(f"Segment validation failed: ffprobe returned {probe_result.returncode}")
+                            logger.error(f"Segment may be corrupted: {output_path}")
+                            # Remove corrupted file
+                            try:
+                                os.remove(output_path)
+                            except Exception:
+                                pass
+                            return {
+                                'success': False,
+                                'error': f'Segment validation failed (ffprobe rc={probe_result.returncode})'
+                            }
+                        
+                        # Parse basic info to ensure it's valid
+                        import json
+                        probe_data = json.loads(probe_result.stdout)
+                        if 'format' not in probe_data or 'duration' not in probe_data.get('format', {}):
+                            logger.error("Segment validation: missing format/duration info")
+                            return {'success': False, 'error': 'Segment missing required metadata'}
+                            
+                    except subprocess.TimeoutExpired:
+                        logger.error("Segment validation timeout")
+                        return {'success': False, 'error': 'Segment validation timeout'}
+                    except Exception as e:
+                        logger.error(f"Segment validation exception: {e}")
+                        return {'success': False, 'error': f'Segment validation failed: {e}'}
+                    
                     # Get segment info
                     segment_size = os.path.getsize(output_path) / (1024 * 1024)
                     result = {
@@ -737,7 +796,7 @@ class VideoSegmenter:
                         'output_file': output_path
                     }
                     
-                    logger.info(f"Segment optimization successful: {segment_size:.2f}MB using direct FFmpeg method")
+                    logger.info(f"Segment created and validated: {segment_size:.2f}MB")
                     return result
                 else:
                     logger.error(f"FFmpeg failed with return code {rc}")
@@ -894,8 +953,7 @@ class VideoSegmenter:
         
         for attempt in quality_attempts:
             temp_compressor = None
-            temp_optimized_path = None
-            
+            temp_optimized_path = segment_path.replace('.mp4', f'_optimized_temp_q{attempt}.mp4')
             try:
                 # Create a temporary compressor instance with our existing config and hardware
                 temp_compressor = DynamicVideoCompressor(self.config, self.hardware)
@@ -905,9 +963,6 @@ class VideoSegmenter:
                         self._active_temp_compressors.add(temp_compressor)
                 except Exception:
                     pass
-                
-                # Create temp output path for optimized segment
-                temp_optimized_path = segment_path.replace('.mp4', f'_optimized_temp_q{attempt}.mp4')
                 
                 quality_floor = temp_compressor.quality_scorer.get_segment_quality_floor(attempt)
                 logger.info(f"🎯 Segment optimization attempt {attempt + 1}/4 with quality floor {quality_floor:.1f}/100")
@@ -919,56 +974,11 @@ class VideoSegmenter:
                 
                 # Get video info for the segment (it may be different from the original video)
                 segment_video_info = temp_compressor._analyze_video_content(segment_path)
-            
-            # Try different compression strategies to optimize the segment
-            optimization_result = None
-            
-            # Strategy 1: Advanced optimization (best quality but may fail)
-            try:
-                if self.shutdown_requested:
-                    try:
-                        temp_compressor.request_shutdown()
-                    except Exception:
-                        pass
-                    return { 'success': False, 'error': 'shutdown' }
-                logger.info("Attempting advanced optimization strategy")
-                optimization_result = temp_compressor._compress_with_advanced_optimization(
-                    input_path=segment_path,
-                    output_path=temp_optimized_path,
-                    target_size_mb=optimization_target,
-                    platform_config=platform_config or {},
-                    video_info=segment_video_info
-                )
-            except Exception as e:
-                logger.warning(f"Advanced optimization failed, trying standard: {e}")
+                
+                # Try different compression strategies to optimize the segment
                 optimization_result = None
-            
-            # Strategy 2: Standard optimization (fallback)
-            if not optimization_result or not optimization_result.get('success', False):
-                logger.info("Attempting standard optimization strategy")
-                try:
-                    if self.shutdown_requested:
-                        try:
-                            temp_compressor.request_shutdown()
-                        except Exception:
-                            pass
-                    
-                    if self.shutdown_requested:
-                        return { 'success': False, 'error': 'shutdown' }
-                    optimization_result = temp_compressor._compress_with_standard_optimization(
-                        input_path=segment_path,
-                        output_path=temp_optimized_path,
-                        target_size_mb=optimization_target,
-                        platform_config=platform_config or {},
-                        video_info=segment_video_info
-                    )
-                except Exception as e:
-                    logger.warning(f"Standard optimization failed, trying adaptive: {e}")
-                    optimization_result = None
-            
-            # Strategy 3: Adaptive quality (last resort)
-            if not optimization_result or not optimization_result.get('success', False):
-                logger.info("Attempting adaptive quality optimization strategy")
+                
+                # Strategy 1: Advanced optimization (best quality but may fail)
                 try:
                     if self.shutdown_requested:
                         try:
@@ -976,7 +986,8 @@ class VideoSegmenter:
                         except Exception:
                             pass
                         return { 'success': False, 'error': 'shutdown' }
-                    optimization_result = temp_compressor._compress_with_adaptive_quality(
+                    logger.info("Attempting advanced optimization strategy")
+                    optimization_result = temp_compressor._compress_with_advanced_optimization(
                         input_path=segment_path,
                         output_path=temp_optimized_path,
                         target_size_mb=optimization_target,
@@ -984,9 +995,53 @@ class VideoSegmenter:
                         video_info=segment_video_info
                     )
                 except Exception as e:
-                    logger.error(f"All optimization strategies failed: {e}")
+                    logger.warning(f"Advanced optimization failed, trying standard: {e}")
                     optimization_result = None
-            
+                
+                # Strategy 2: Standard optimization (fallback)
+                if not optimization_result or not optimization_result.get('success', False):
+                    logger.info("Attempting standard optimization strategy")
+                    try:
+                        if self.shutdown_requested:
+                            try:
+                                temp_compressor.request_shutdown()
+                            except Exception:
+                                pass
+                        
+                        if self.shutdown_requested:
+                            return { 'success': False, 'error': 'shutdown' }
+                        optimization_result = temp_compressor._compress_with_standard_optimization(
+                            input_path=segment_path,
+                            output_path=temp_optimized_path,
+                            target_size_mb=optimization_target,
+                            platform_config=platform_config or {},
+                            video_info=segment_video_info
+                        )
+                    except Exception as e:
+                        logger.warning(f"Standard optimization failed, trying adaptive: {e}")
+                        optimization_result = None
+                
+                # Strategy 3: Adaptive quality (last resort)
+                if not optimization_result or not optimization_result.get('success', False):
+                    logger.info("Attempting adaptive quality optimization strategy")
+                    try:
+                        if self.shutdown_requested:
+                            try:
+                                temp_compressor.request_shutdown()
+                            except Exception:
+                                pass
+                            return { 'success': False, 'error': 'shutdown' }
+                        optimization_result = temp_compressor._compress_with_adaptive_quality(
+                            input_path=segment_path,
+                            output_path=temp_optimized_path,
+                            target_size_mb=optimization_target,
+                            platform_config=platform_config or {},
+                            video_info=segment_video_info
+                        )
+                    except Exception as e:
+                        logger.error(f"All optimization strategies failed: {e}")
+                        optimization_result = None
+                
                 # Check results of optimization attempts
                 if optimization_result and optimization_result.get('success', False):
                     optimized_size_mb = optimization_result.get('size_mb', 0)
@@ -1059,13 +1114,11 @@ class VideoSegmenter:
                     # All optimization strategies failed for this attempt
                     if os.path.exists(temp_optimized_path):
                         os.remove(temp_optimized_path)
-                        
                     error_msg = optimization_result.get('error', 'All optimization strategies failed') if optimization_result else 'All optimization strategies failed'
                     logger.warning(f"⚠️  Attempt {attempt + 1} optimization failed: {error_msg}")
                     last_error = error_msg
                     # Continue to next quality attempt
                     continue
-                
             except Exception as e:
                 logger.warning(f"⚠️  Attempt {attempt + 1} encountered exception: {e}")
                 last_error = str(e)
@@ -1073,7 +1126,7 @@ class VideoSegmenter:
                 if temp_optimized_path and os.path.exists(temp_optimized_path):
                     try:
                         os.remove(temp_optimized_path)
-                    except:
+                    except Exception:
                         pass
                 # Continue to next quality attempt
                 continue

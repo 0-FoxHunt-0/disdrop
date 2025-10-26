@@ -1795,16 +1795,52 @@ class DynamicVideoCompressor:
         
         final_bitrate = int(base_bitrate * bitrate_multiplier)
         
-        # Ensure minimum viable bitrate
-        min_bitrate = 200
-        return max(final_bitrate, min_bitrate)
+        # Resolution-aware minimum bitrates
+        fps = video_info.get('fps', 30)
+        
+        # Calculate bits-per-pixel minimum (0.023 for h264_8bit)
+        min_bpp = 0.023
+        pixels_per_sec = pixel_count * fps
+        min_bitrate_bpp = int(math.ceil(min_bpp * pixels_per_sec / 1000.0))
+        
+        # Resolution-based absolute minimums (fallback)
+        if pixel_count >= 1920 * 1080:  # 1080p+
+            min_bitrate_res = 1500
+        elif pixel_count >= 1280 * 720:  # 720p+
+            min_bitrate_res = 800
+        elif pixel_count >= 854 * 480:   # 480p+
+            min_bitrate_res = 400
+        else:
+            min_bitrate_res = 200
+        
+        # Use highest of calculated, BPP-based, or resolution-based minimum
+        min_bitrate = max(min_bitrate_bpp, min_bitrate_res)
+        final_bitrate = max(final_bitrate, min_bitrate)
+        
+        if final_bitrate < min_bitrate * 1.1:
+            logger.warning(
+                f"Bitrate {final_bitrate}k is at/near minimum {min_bitrate}k for "
+                f"{video_info['width']}x{video_info['height']}@{fps}fps. "
+                f"Quality may be severely degraded. Consider reducing resolution or increasing target size."
+            )
+        
+        # Check if compression ratio is extreme (>10x)
+        original_size_mb = video_info.get('size_bytes', 0) / (1024 * 1024)
+        if original_size_mb > 0:
+            compression_ratio = original_size_mb / target_size_mb
+            if compression_ratio > 10:
+                logger.warning(
+                    f"Extreme compression ratio detected: {compression_ratio:.1f}x "
+                    f"({original_size_mb:.1f}MB -> {target_size_mb:.1f}MB). "
+                    f"Consider using segmentation or resolution reduction for better results."
+                )
+        
+        return final_bitrate
     
     def _calculate_precise_bitrate(self, video_info: Dict[str, Any], target_size_mb: float) -> int:
         """Calculate precise bitrate for two-pass encoding"""
-        duration = video_info['duration']
-        # More conservative calculation for two-pass
-        target_bits = target_size_mb * 8 * 1024 * 1024 * 0.90  # 90% target utilization
-        return max(int(target_bits / duration / 1000), 150)
+        # Use same resolution-aware calculation as content-aware
+        return self._calculate_content_aware_bitrate(video_info, target_size_mb)
     
     def _calculate_optimal_resolution(self, video_info: Dict[str, Any], target_size_mb: float, 
                                     platform_config: Dict[str, Any]) -> Tuple[int, int]:
@@ -2311,12 +2347,7 @@ class DynamicVideoCompressor:
         except Exception:
             pass
         cmd = FFmpegUtils.build_base_ffmpeg_command(input_path, output_path, params)
-        cmd = FFmpegUtils.add_video_settings(cmd, params)
-
-        # Aggressive quality settings
-        if params.get('acceleration_type') == 'software':
-            cmd.extend(['-crf', str(params.get('crf', 35))])
-            cmd.extend(['-preset', params.get('preset', 'veryfast')])
+        cmd = FFmpegUtils.add_video_settings(cmd, params)  # Already adds -crf and -preset
 
         # Strict bitrate control with small buffer
         cmd = FFmpegUtils.add_bitrate_control(cmd, params, buffer_multiplier=0.5)
