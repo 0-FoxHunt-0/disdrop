@@ -131,12 +131,18 @@ video_compression:
   quality_controls:
     min_target_utilization: 0.92
     refine_iterations: 2
-    ssim_check:
+    hybrid_quality_check:
       enabled: true
-      sample_fraction: 0.12
-      threshold: 0.94
-      enforce: true
-      floor: 0.88 # Lowered from 0.95 - more realistic for heavy compression to 10MB
+      single_file_floor: 65  # Out of 100 - reasonable quality for single compressed files
+      segment_floors: [70, 60, 50, 45]  # Progressive fallback for segments: higher quality expected, but fallback if needed
+      weights:
+        perceptual_hash: 0.40  # Human-perceivable similarity (most important)
+        size_efficiency: 0.20  # How well target size was utilized
+        frame_validity: 0.20   # Frames can be decoded without corruption
+        technical_validity: 0.20  # Format integrity, duration accuracy
+      sampling:
+        key_frames: 5  # start, 25%, 50%, 75%, end
+        random_frames: 3  # Additional random samples for validation
     uplift:
       enabled: true
       max_passes: 3

@@ -22,6 +22,7 @@ from .advanced_optimizer import AdvancedVideoOptimizer
 from .performance_enhancer import PerformanceEnhancer
 from .ffmpeg_utils import FFmpegUtils
 from .video_segmenter import VideoSegmenter
+from .quality_scorer import QualityScorer
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,7 @@ class DynamicVideoCompressor:
         # Initialize advanced components
         self.advanced_optimizer = AdvancedVideoOptimizer(config_manager, hardware_detector)
         self.video_segmenter = VideoSegmenter(config_manager, hardware_detector)
+        self.quality_scorer = QualityScorer(config_manager)
         
         # Optimize system resources
         self.system_optimizations = self.performance_enhancer.optimize_system_resources()
@@ -203,216 +205,6 @@ class DynamicVideoCompressor:
         except Exception:
             return False
 
-    def _maybe_sample_ssim(self, input_path: str, output_path: str, duration_s: float) -> Optional[float]:
-        """Optional SSIM sampling; returns SSIM or None on failure/disabled."""
-        try:
-            if not bool(self.config.get('video_compression.quality_controls.ssim_check.enabled', False)):
-                return None
-            
-            # Validate input files exist
-            if not os.path.exists(input_path) or not os.path.exists(output_path):
-                logger.warning(f"SSIM sampling: input or output file missing (input={os.path.exists(input_path)}, output={os.path.exists(output_path)})")
-                return None
-            
-            sample_fraction = float(self.config.get('video_compression.quality_controls.ssim_check.sample_fraction', 0.12))
-            sample_fraction = max(0.02, min(0.5, sample_fraction))
-            seg = max(1.5, duration_s * sample_fraction)
-            start = max(0.0, duration_s * 0.44)
-
-            # Use a simpler approach: extract segments first, then compare them
-            # This avoids the complex dual-input seeking that was causing issues
-            temp_input_seg = os.path.join(self.temp_dir, f"ssim_input_{int(start)}.mp4")
-            temp_output_seg = os.path.join(self.temp_dir, f"ssim_output_{int(start)}.mp4")
-
-            # Clean up any existing temp files first
-            for temp_file in [temp_input_seg, temp_output_seg]:
-                try:
-                    if os.path.exists(temp_file):
-                        os.remove(temp_file)
-                except Exception:
-                    pass
-
-            # These variables are now defined for cleanup in all cases
-            try:
-                # Extract input segment
-                extract_cmd1 = [
-                    'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-                    '-ss', str(start), '-t', str(seg), '-i', input_path,
-                    '-c', 'copy', '-avoid_negative_ts', 'make_zero', temp_input_seg
-                ]
-                result1 = subprocess.run(extract_cmd1, capture_output=True, timeout=60)
-                if result1.returncode != 0:
-                    logger.warning(f"Failed to extract input segment: {result1.stderr.decode()[:200]}")
-                    return None
-
-                # Extract output segment
-                extract_cmd2 = [
-                    'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-                    '-ss', str(start), '-t', str(seg), '-i', output_path,
-                    '-c', 'copy', '-avoid_negative_ts', 'make_zero', temp_output_seg
-                ]
-                result2 = subprocess.run(extract_cmd2, capture_output=True, timeout=60)
-                if result2.returncode != 0:
-                    logger.warning(f"Failed to extract output segment: {result2.stderr.decode()[:200]}")
-                    return None
-
-                # Now compare the extracted segments with alignment (scale2ref + format)
-                cmd = [
-                    'ffmpeg', '-hide_banner', '-loglevel', 'info',
-                    '-i', temp_input_seg, '-i', temp_output_seg,
-                    '-filter_complex',
-                    '[0:v]format=yuv420p,setsar=1[a];[1:v]format=yuv420p,setsar=1[b];[a][b]scale2ref=flags=bicubic[s0][s1];[s0][s1]ssim',
-                    '-f', 'null', '-'
-                ]
-            except Exception as e:
-                logger.warning(f"SSIM segment extraction failed: {e}")
-                return None
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-            if res.returncode != 0:
-                logger.warning(f"SSIM sampling FFmpeg failed (returncode={res.returncode}): {res.stderr[:200]}")
-                # Diagnostics: probe dimensions/FPS to help identify mismatches
-                try:
-                    in_info = FFmpegUtils.get_video_info(temp_input_seg)
-                    out_info = FFmpegUtils.get_video_info(temp_output_seg)
-                    logger.warning(
-                        f"SSIM probe: input={in_info.get('width')}x{in_info.get('height')}@{in_info.get('fps'):.2f}fps, "
-                        f"output={out_info.get('width')}x{out_info.get('height')}@{out_info.get('fps'):.2f}fps"
-                    )
-                except Exception:
-                    pass
-
-                # Fallback A: try direct two-input seek without temp segments
-                try:
-                    fallback_cmd = [
-                        'ffmpeg', '-hide_banner', '-loglevel', 'info',
-                        '-ss', str(start), '-t', str(seg), '-i', input_path,
-                        '-ss', str(start), '-t', str(seg), '-i', output_path,
-                        '-filter_complex',
-                        '[0:v]format=yuv420p,setsar=1[a];[1:v]format=yuv420p,setsar=1[b];[a][b]scale2ref=flags=bicubic[s0][s1];[s0][s1]ssim',
-                        '-f', 'null', '-'
-                    ]
-                    res2 = subprocess.run(fallback_cmd, capture_output=True, text=True, timeout=120)
-                    if res2.returncode == 0:
-                        out2 = res2.stderr or ''
-                        import re
-                        m2 = re.search(r'All:(\d+\.\d+)', out2)
-                        if m2:
-                            ssim_val = float(m2.group(1))
-                            # Clean up temp segments before return
-                            for temp_file in [temp_input_seg, temp_output_seg]:
-                                try:
-                                    if os.path.exists(temp_file):
-                                        os.remove(temp_file)
-                                except Exception:
-                                    pass
-                            logger.debug(f"SSIM sampling (fallback A) successful: {ssim_val:.4f}")
-                            return ssim_val
-                except Exception:
-                    pass
-
-                # Fallback B: mini re-encode segments to ensure decodability, then compare
-                try:
-                    temp_input_seg_rec = os.path.join(self.temp_dir, f"ssim_input_rec_{int(start)}.mp4")
-                    temp_output_seg_rec = os.path.join(self.temp_dir, f"ssim_output_rec_{int(start)}.mp4")
-
-                    # Clean up any existing re-encoded temp files
-                    for temp_file in [temp_input_seg_rec, temp_output_seg_rec]:
-                        try:
-                            if os.path.exists(temp_file):
-                                os.remove(temp_file)
-                        except Exception:
-                            pass
-
-                    reenc1 = [
-                        'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-                        '-ss', str(start), '-t', str(seg), '-i', input_path,
-                        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18', '-an', temp_input_seg_rec
-                    ]
-                    r1 = subprocess.run(reenc1, capture_output=True, text=True, timeout=120)
-                    reenc2 = [
-                        'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-                        '-ss', str(start), '-t', str(seg), '-i', output_path,
-                        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18', '-an', temp_output_seg_rec
-                    ]
-                    r2 = subprocess.run(reenc2, capture_output=True, text=True, timeout=120)
-                    if r1.returncode == 0 and r2.returncode == 0:
-                        cmd3 = [
-                            'ffmpeg', '-hide_banner', '-loglevel', 'info',
-                            '-i', temp_input_seg_rec, '-i', temp_output_seg_rec,
-                            '-filter_complex',
-                            '[0:v]format=yuv420p,setsar=1[a];[1:v]format=yuv420p,setsar=1[b];[a][b]scale2ref=flags=bicubic[s0][s1];[s0][s1]ssim',
-                            '-f', 'null', '-'
-                        ]
-                        res3 = subprocess.run(cmd3, capture_output=True, text=True, timeout=120)
-                        if res3.returncode == 0:
-                            out3 = res3.stderr or ''
-                            import re
-                            m3 = re.search(r'All:(\d+\.\d+)', out3)
-                            if m3:
-                                ssim_val = float(m3.group(1))
-                                logger.debug(f"SSIM sampling (fallback B re-encode) successful: {ssim_val:.4f}")
-                                # Clean up all temp files
-                                for temp_file in [temp_input_seg, temp_output_seg, temp_input_seg_rec, temp_output_seg_rec]:
-                                    try:
-                                        if os.path.exists(temp_file):
-                                            os.remove(temp_file)
-                                    except Exception:
-                                        pass
-                                return ssim_val
-
-                    # Clean up re-encoded temp files
-                    for temp_file in [temp_input_seg_rec, temp_output_seg_rec]:
-                        try:
-                            if os.path.exists(temp_file):
-                                os.remove(temp_file)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-
-                # Clean up temporary segment files on FFmpeg failure too
-                for temp_file in [temp_input_seg, temp_output_seg]:
-                    try:
-                        if os.path.exists(temp_file):
-                            os.remove(temp_file)
-                    except Exception:
-                        pass
-                return None
-            out = res.stderr or ''
-            # Parse like: SSIM Y:... All:0.95 (var)
-            import re
-            m = re.search(r'All:(\d+\.\d+)', out)
-            if m:
-                ssim_val = float(m.group(1))
-                logger.debug(f"SSIM sampling successful: {ssim_val:.4f}")
-                # Clean up temporary segment files
-                for temp_file in [temp_input_seg, temp_output_seg]:
-                    try:
-                        if os.path.exists(temp_file):
-                            os.remove(temp_file)
-                    except Exception:
-                        pass
-                return ssim_val
-            logger.warning(f"SSIM parsing failed, FFmpeg output: {out[:300]}")
-            # Clean up temporary segment files on failure too
-            for temp_file in [temp_input_seg, temp_output_seg]:
-                try:
-                    if os.path.exists(temp_file):
-                        os.remove(temp_file)
-                except Exception:
-                    pass
-            return None
-        except Exception as e:
-            logger.warning(f"SSIM sampling exception: {e}")
-            # Clean up temporary segment files on exception too
-            for temp_file in [temp_input_seg, temp_output_seg]:
-                try:
-                    if os.path.exists(temp_file):
-                        os.remove(temp_file)
-                except Exception:
-                    pass
-            return None
-
     def _final_single_file_refinement(self, input_path: str, output_path: str, target_size_mb: float,
                                       video_info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Run a refined, size-targeted software two-pass with codec priority and utilization tuning.
@@ -511,22 +303,27 @@ class DynamicVideoCompressor:
                     logger.info(f"Refinement iteration {iter_count+1}: size={size_mb:.2f}MB, utilization={util*100:.1f}%")
                     iter_count += 1
 
-                # Optional SSIM sampling and enforcement with limited uplift
-                ssim_threshold = float(self.config.get('video_compression.quality_controls.ssim_check.threshold', 0.94))
-                ssim_floor = float(self.config.get('video_compression.quality_controls.ssim_check.floor', ssim_threshold))
-                ssim_enforce = bool(self.config.get('video_compression.quality_controls.ssim_check.enforce', False))
+                # Optional quality sampling and enforcement with limited uplift
+                quality_enforce = bool(self.config.get('video_compression.quality_controls.hybrid_quality_check.enabled', True))
+                single_file_floor = float(self.config.get('video_compression.quality_controls.hybrid_quality_check.single_file_floor', 65))
                 uplift_enabled = bool(self.config.get('video_compression.quality_controls.uplift.enabled', True))
                 uplift_max = int(self.config.get('video_compression.quality_controls.uplift.max_passes', 2) or 0)
                 uplift_step = float(self.config.get('video_compression.quality_controls.uplift.bitrate_step', 1.08))
                 uplift_cap = float(self.config.get('video_compression.quality_controls.uplift.max_multiplier', 1.2))
-                ssim_val = self._maybe_sample_ssim(input_path, temp_out, video_info.get('duration', 0.0))
-                if ssim_val is not None:
-                    logger.info(f"SSIM sample for {codec_key}: {ssim_val:.3f} (threshold {ssim_threshold:.2f}, floor {ssim_floor:.2f})")
+                
+                # Calculate quality score for this codec result
+                if quality_enforce:
+                    quality_result = self.quality_scorer.calculate_quality_score(
+                        input_path, temp_out, target_size_mb, is_segment=False
+                    )
+                    quality_score = quality_result['overall_score']
+                    logger.info(f"Quality sample for {codec_key}: {quality_score:.1f}/100 (floor: {single_file_floor:.1f})")
+                    
                     # If enforcing and below floor while under size, try bounded bitrate uplift
-                    if ssim_enforce and ssim_val < ssim_floor and size_mb <= target_size_mb and uplift_enabled:
+                    if quality_score < single_file_floor and size_mb <= target_size_mb and uplift_enabled:
                         uplift_count = 0
                         base_kbps = cur_v_kbps
-                        while uplift_count < uplift_max and ssim_val < ssim_floor:
+                        while uplift_count < uplift_max and quality_score < single_file_floor:
                             # Increase bitrate conservatively within cap
                             next_kbps = int(min(base_kbps * (uplift_step ** (uplift_count + 1)), needed_kbps * uplift_cap))
                             if next_kbps <= cur_v_kbps:
@@ -539,17 +336,19 @@ class DynamicVideoCompressor:
                             if size_mb > target_size_mb:
                                 logger.info(f"Uplift pass {uplift_count+1} exceeded target size ({size_mb:.2f}MB), stopping uplift")
                                 break
-                            ssim_val_new = self._maybe_sample_ssim(input_path, temp_out, video_info.get('duration', 0.0))
-                            if ssim_val_new is None:
+                            quality_result_new = self.quality_scorer.calculate_quality_score(
+                                input_path, temp_out, target_size_mb, is_segment=False
+                            )
+                            if quality_result_new is None:
                                 break
-                            ssim_val = ssim_val_new
-                            logger.info(f"Uplift pass {uplift_count+1}: bitrate={cur_v_kbps} kbps, size={size_mb:.2f}MB, SSIM={ssim_val:.3f}")
+                            quality_score = quality_result_new['overall_score']
+                            logger.info(f"Uplift pass {uplift_count+1}: bitrate={cur_v_kbps} kbps, size={size_mb:.2f}MB, quality={quality_score:.1f}/100")
                             uplift_count += 1
                         # If still below floor after uplifts, mark as not acceptable
-                        if ssim_val < ssim_floor:
-                            logger.info(f"SSIM remains below floor ({ssim_val:.3f} < {ssim_floor:.2f}) after {uplift_count} uplifts; will prefer other strategies")
+                        if quality_score < single_file_floor:
+                            logger.info(f"Quality remains below floor ({quality_score:.1f} < {single_file_floor:.1f}) after {uplift_count} uplifts; will prefer other strategies")
 
-                # Track best so far (prefer closer to target; SSIM considered implicitly via enforcement)
+                # Track best so far (prefer closer to target; quality considered implicitly via enforcement)
                 if size_mb > best_local_size_mb:
                     best_local_file = temp_out
                     best_local_size_mb = size_mb
@@ -948,43 +747,73 @@ class DynamicVideoCompressor:
             return result
     
     def _validate_and_uplift_result(self, result: Dict[str, Any], input_path: str, 
-                                    video_info: Dict[str, Any], target_size_mb: float) -> Optional[Dict[str, Any]]:
+                                    video_info: Dict[str, Any], target_size_mb: float,
+                                    quality_attempt: int = 0) -> Optional[Dict[str, Any]]:
         """
-        Validate result meets SSIM floor; if not, attempt bounded bitrate uplifts.
-        Returns validated result or None if quality floor cannot be met.
+        Validate result meets hybrid quality floor; if not, attempt bounded bitrate uplifts.
+        Uses perceptual quality scoring instead of SSIM for better content-aware validation.
+        
+        Args:
+            result: Compression result to validate
+            input_path: Original input video path
+            video_info: Video metadata
+            target_size_mb: Target size limit
+            quality_attempt: For segments, tracks progressive fallback attempt (0-3)
+            
+        Returns:
+            Validated result or None if quality floor cannot be met
         """
         if not result or result.get('size_mb', float('inf')) > target_size_mb:
             return None
         
         # Read config
-        ssim_enforce = bool(self.config.get('video_compression.quality_controls.ssim_check.enforce', False))
-        if not ssim_enforce:
+        quality_check_enabled = bool(self.config.get('video_compression.quality_controls.hybrid_quality_check.enabled', True))
+        if not quality_check_enabled:
             return result  # No enforcement, accept as-is
         
-        ssim_floor = float(self.config.get('video_compression.quality_controls.ssim_check.floor', 0.95))
         uplift_enabled = bool(self.config.get('video_compression.quality_controls.uplift.enabled', True))
-        uplift_max = int(self.config.get('video_compression.quality_controls.uplift.max_passes', 2) or 0)
-        uplift_step = float(self.config.get('video_compression.quality_controls.uplift.bitrate_step', 1.08))
-        uplift_cap = float(self.config.get('video_compression.quality_controls.uplift.max_multiplier', 1.2))
+        uplift_max = int(self.config.get('video_compression.quality_controls.uplift.max_passes', 3) or 0)
+        uplift_step = float(self.config.get('video_compression.quality_controls.uplift.bitrate_step', 1.12))
+        uplift_cap = float(self.config.get('video_compression.quality_controls.uplift.max_multiplier', 1.35))
         
         temp_file = result.get('temp_file')
         if not temp_file or not os.path.exists(temp_file):
             return result  # Can't validate without file
         
-        # Sample SSIM
-        ssim_val = self._maybe_sample_ssim(input_path, temp_file, video_info.get('duration', 0.0))
-        if ssim_val is None:
-            logger.warning("SSIM sampling failed; accepting result without quality validation")
-            return result
+        # Determine if this is a segment (progressive quality floor)
+        is_segment = '_segment_' in temp_file.lower() or '_segments' in input_path.lower()
         
-        logger.info(f"Strategy '{result.get('strategy')}' SSIM: {ssim_val:.3f} (floor: {ssim_floor:.2f})")
+        # Get quality floor (with progressive fallback for segments)
+        quality_floor_override = None
+        if is_segment:
+            quality_floor_override = self.quality_scorer.get_segment_quality_floor(quality_attempt)
+            logger.info(f"Segment quality validation (attempt {quality_attempt + 1}): floor = {quality_floor_override:.1f}/100")
         
-        if ssim_val >= ssim_floor:
-            result['ssim_score'] = ssim_val
+        # Calculate hybrid quality score
+        quality_result = self.quality_scorer.calculate_quality_score(
+            input_path, temp_file, target_size_mb, 
+            is_segment=is_segment,
+            quality_floor_override=quality_floor_override
+        )
+        
+        quality_score = quality_result['overall_score']
+        quality_passes = quality_result['passes']
+        quality_floor = quality_result['floor_used']
+        
+        logger.info(
+            f"Strategy '{result.get('strategy')}' quality: {quality_score:.1f}/100 (floor: {quality_floor:.1f})"
+        )
+        
+        if quality_passes:
+            result['quality_score'] = quality_score
+            result['quality_details'] = quality_result['components']
             return result  # Passes floor
         
         if not uplift_enabled or uplift_max <= 0:
-            logger.warning(f"SSIM {ssim_val:.3f} below floor {ssim_floor:.2f}; uplift disabled, rejecting result")
+            logger.warning(
+                f"Quality {quality_score:.1f}/100 below floor {quality_floor:.1f}; "
+                f"uplift disabled, rejecting result"
+            )
             return None
         
         # Attempt uplift
@@ -994,19 +823,18 @@ class DynamicVideoCompressor:
             logger.warning("Cannot uplift: no bitrate in params")
             return None
         
-        logger.info(f"Attempting quality uplift: SSIM {ssim_val:.3f} < {ssim_floor:.2f}")
+        logger.info(f"Attempting quality uplift: {quality_score:.1f}/100 < {quality_floor:.1f}/100")
         
         best_file = temp_file
         best_size = result['size_mb']
-        best_ssim = ssim_val
+        best_quality = quality_score
         
         for pass_num in range(uplift_max):
             new_bitrate = int(base_bitrate * (uplift_step ** (pass_num + 1)))
             if new_bitrate > base_bitrate * uplift_cap:
                 break
 
-            # Safety check: prevent extremely high bitrates that might cause FFmpeg to crash
-            # Increased cap to 3000k (from 2000k) to allow more quality improvement
+            # Safety check: prevent extremely high bitrates
             new_bitrate = min(new_bitrate, 3000)
             
             temp_uplift = os.path.join(self.temp_dir, f"uplift_{result.get('strategy')}_{pass_num}.mp4")
@@ -1014,12 +842,11 @@ class DynamicVideoCompressor:
             
             logger.info(f"Uplift pass {pass_num+1}: increasing bitrate from {base_bitrate}k to {new_bitrate}k")
             
-            # Re-encode with higher bitrate using ORIGINAL strategy, not forcing two-pass
+            # Re-encode with higher bitrate using ORIGINAL strategy
             strategy = result.get('strategy', '')
             
             # Preserve original encoding strategy for better quality
             if 'two_pass' in strategy:
-                # Use two-pass only if original strategy was two-pass
                 uplift_id = f"uplift_{result.get('strategy', 'unknown')}_{pass_num}_{int(time.time())}"
                 log_file = os.path.join(self.temp_dir, f"ffmpeg2pass_{uplift_id}")
                 
@@ -1032,7 +859,7 @@ class DynamicVideoCompressor:
                 # Pass 2: Encoding
                 cmd = self._build_two_pass_command(input_path, temp_uplift, params, pass_num=2, log_file=log_file)
             else:
-                # Use single-pass for non-two-pass strategies to preserve encoding characteristics
+                # Use single-pass for non-two-pass strategies
                 cmd = self._build_intelligent_ffmpeg_command(input_path, temp_uplift, params)
             
             success = self._execute_ffmpeg_with_progress(cmd, video_info['duration'])
@@ -1056,28 +883,34 @@ class DynamicVideoCompressor:
                 os.remove(temp_uplift)
                 break
             
-            new_ssim = self._maybe_sample_ssim(input_path, temp_uplift, video_info.get('duration', 0.0))
-            if new_ssim is None:
-                logger.warning(f"Uplift pass {pass_num+1}: SSIM sampling failed, stopping uplift attempts")
-                os.remove(temp_uplift)
-                break
+            # Calculate new quality score
+            new_quality_result = self.quality_scorer.calculate_quality_score(
+                input_path, temp_uplift, target_size_mb,
+                is_segment=is_segment,
+                quality_floor_override=quality_floor_override
+            )
+            new_quality = new_quality_result['overall_score']
             
             # Log detailed uplift progress
-            ssim_delta = new_ssim - best_ssim
-            logger.info(f"Uplift pass {pass_num+1}: bitrate={new_bitrate}k, size={new_size:.2f}MB, SSIM={new_ssim:.3f} (Δ{ssim_delta:+.3f}, floor={ssim_floor:.2f})")
+            quality_delta = new_quality - best_quality
+            logger.info(
+                f"Uplift pass {pass_num+1}: bitrate={new_bitrate}k, size={new_size:.2f}MB, "
+                f"quality={new_quality:.1f}/100 (Δ{quality_delta:+.1f}, floor={quality_floor:.1f})"
+            )
             
             # Replace best if improved
             if os.path.exists(best_file) and best_file != temp_file:
                 os.remove(best_file)
             best_file = temp_uplift
             best_size = new_size
-            best_ssim = new_ssim
+            best_quality = new_quality
             
-            if new_ssim >= ssim_floor:
+            if new_quality >= quality_floor:
                 logger.info(f"Quality floor met after {pass_num+1} uplift passes")
                 result['temp_file'] = best_file
                 result['size_mb'] = best_size
-                result['ssim_score'] = best_ssim
+                result['quality_score'] = best_quality
+                result['quality_details'] = new_quality_result['components']
                 result['params'] = params
                 return result
         
@@ -1088,10 +921,8 @@ class DynamicVideoCompressor:
         # Downscale recovery before rejection/segmentation: try modest resolution reduction
         try:
             enable_recovery = True
-            if enable_recovery:
-                logger.info("Attempting SSIM downscale recovery before segmentation")
-                # Reuse adaptive resolution path with slightly stricter efficiency via smaller target fraction
-                temp_output = os.path.join(self.temp_dir, "ssim_recovery_temp.mp4")
+            if enable_recovery and not is_segment:  # Only for non-segments
+                logger.info("Attempting quality downscale recovery before segmentation")
                 # Compute a slightly smaller effective target to encourage downscale
                 recovery_target = max(0.85 * target_size_mb, min(target_size_mb, result.get('size_mb', target_size_mb)))
                 # Use current video_info but ensure duration is set
@@ -1101,12 +932,18 @@ class DynamicVideoCompressor:
                 if rec and rec.get('temp_file') and os.path.exists(rec['temp_file']):
                     new_size = os.path.getsize(rec['temp_file']) / (1024 * 1024)
                     if new_size <= target_size_mb:
-                        new_ssim = self._maybe_sample_ssim(input_path, rec['temp_file'], rec_info.get('duration', 0.0))
-                        if new_ssim is not None and new_ssim >= ssim_floor:
-                            logger.info(f"SSIM downscale recovery succeeded: size={new_size:.2f}MB, SSIM={new_ssim:.3f}")
+                        recovery_quality_result = self.quality_scorer.calculate_quality_score(
+                            input_path, rec['temp_file'], target_size_mb,
+                            is_segment=False,
+                            quality_floor_override=quality_floor_override
+                        )
+                        recovery_quality = recovery_quality_result['overall_score']
+                        if recovery_quality >= quality_floor:
+                            logger.info(f"Quality downscale recovery succeeded: size={new_size:.2f}MB, quality={recovery_quality:.1f}/100")
                             result['temp_file'] = rec['temp_file']
                             result['size_mb'] = new_size
-                            result['ssim_score'] = new_ssim
+                            result['quality_score'] = recovery_quality
+                            result['quality_details'] = recovery_quality_result['components']
                             result['strategy'] = 'adaptive_resolution_recovery'
                             return result
                     # Cleanup temp if not used
@@ -1115,13 +952,13 @@ class DynamicVideoCompressor:
                     except Exception:
                         pass
         except Exception as e:
-            logger.warning(f"SSIM downscale recovery failed: {e}")
+            logger.warning(f"Quality downscale recovery failed: {e}")
 
         # Log detailed rejection with improvement achieved
-        ssim_improvement = best_ssim - ssim_val
+        quality_improvement = best_quality - quality_score
         logger.warning(
-            f"SSIM {best_ssim:.3f} remains below floor {ssim_floor:.2f} after {uplift_max} uplifts "
-            f"(improved {ssim_improvement:+.3f} from {ssim_val:.3f}); rejecting result"
+            f"Quality {best_quality:.1f}/100 remains below floor {quality_floor:.1f}/100 after {uplift_max} uplifts "
+            f"(improved {quality_improvement:+.1f} from {quality_score:.1f}/100); rejecting result"
         )
         return None
     
@@ -1206,7 +1043,7 @@ class DynamicVideoCompressor:
                 
                 # Select best result from parallel execution with SSIM validation
                 for result in results:
-                    # Validate SSIM and attempt uplift if needed
+                    # Validate quality and attempt uplift if needed
                     result = self._validate_and_uplift_result(result, input_path, video_info, target_size_mb)
                     if result:  # Only process validated results
                         compression_attempts.append(result)
@@ -1224,7 +1061,7 @@ class DynamicVideoCompressor:
                 if result:
                     # Refine if under-utilizing target
                     result = self._refine_strategy_result(result, input_path, video_info, target_size_mb)
-                    # Validate SSIM and attempt uplift if needed
+                    # Validate quality and attempt uplift if needed
                     result = self._validate_and_uplift_result(result, input_path, video_info, target_size_mb)
                     if result:  # Only process validated results
                         compression_attempts.append(result)
@@ -1241,7 +1078,7 @@ class DynamicVideoCompressor:
                     if result:
                         # Refine if under-utilizing target
                         result = self._refine_strategy_result(result, input_path, video_info, target_size_mb)
-                        # Validate SSIM and attempt uplift if needed
+                        # Validate quality and attempt uplift if needed
                         result = self._validate_and_uplift_result(result, input_path, video_info, target_size_mb)
                         if result:  # Only process validated results
                             compression_attempts.append(result)
@@ -1259,7 +1096,7 @@ class DynamicVideoCompressor:
                 if result:
                     # Refine if under-utilizing target
                     result = self._refine_strategy_result(result, input_path, video_info, target_size_mb)
-                    # Validate SSIM and attempt uplift if needed
+                    # Validate quality and attempt uplift if needed
                     result = self._validate_and_uplift_result(result, input_path, video_info, target_size_mb)
                     if result:  # Only process validated results
                         compression_attempts.append(result)
@@ -1274,7 +1111,7 @@ class DynamicVideoCompressor:
                     input_path, video_info, platform_config, target_size_mb
                 )
                 if result:
-                    # Validate SSIM and attempt uplift if needed
+                    # Validate quality and attempt uplift if needed
                     result = self._validate_and_uplift_result(result, input_path, video_info, target_size_mb)
                     if result:  # Only process validated results
                         compression_attempts.append(result)

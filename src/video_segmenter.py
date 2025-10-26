@@ -875,32 +875,50 @@ class VideoSegmenter:
     def _optimize_oversized_segment(self, segment_path: str, duration: float, 
                                   video_info: Dict[str, Any], platform_config: Dict[str, Any], 
                                   target_size_mb: float) -> Dict[str, Any]:
-        """Optimize an oversized segment using direct compression (bypassing segmentation)"""
+        """
+        Optimize an oversized segment using direct compression with progressive quality fallback.
         
-        try:
-            # Import the video compressor to use its optimization capabilities
-            from .video_compressor import DynamicVideoCompressor
+        Implements progressive quality floor fallback for segments:
+        - Attempt 1: quality floor = 70/100 (high quality)
+        - Attempt 2: quality floor = 60/100 (medium-high quality)
+        - Attempt 3: quality floor = 50/100 (medium quality)
+        - Attempt 4: quality floor = 45/100 (acceptable quality - final fallback)
+        """
+        
+        # Import the video compressor to use its optimization capabilities
+        from .video_compressor import DynamicVideoCompressor
+        
+        # Progressive quality floor attempts for segments
+        quality_attempts = [0, 1, 2, 3]  # Maps to floors [70, 60, 50, 45]
+        last_error = None
+        
+        for attempt in quality_attempts:
+            temp_compressor = None
+            temp_optimized_path = None
             
-            # Create a temporary compressor instance with our existing config and hardware
-            temp_compressor = DynamicVideoCompressor(self.config, self.hardware)
-            # Track temp compressor so shutdown can terminate it
             try:
-                with self._active_temp_lock:
-                    self._active_temp_compressors.add(temp_compressor)
-            except Exception:
-                pass
-            
-            # Create temp output path for optimized segment
-            temp_optimized_path = segment_path.replace('.mp4', '_optimized_temp.mp4')
-            
-            logger.info(f"Applying direct compression optimization to oversized segment: {segment_path}")
-            logger.info(f"Target size for optimization: {target_size_mb}MB")
-            
-            # Use full target size to honor configured/default 10MB limit
-            optimization_target = target_size_mb
-            
-            # Get video info for the segment (it may be different from the original video)
-            segment_video_info = temp_compressor._analyze_video_content(segment_path)
+                # Create a temporary compressor instance with our existing config and hardware
+                temp_compressor = DynamicVideoCompressor(self.config, self.hardware)
+                # Track temp compressor so shutdown can terminate it
+                try:
+                    with self._active_temp_lock:
+                        self._active_temp_compressors.add(temp_compressor)
+                except Exception:
+                    pass
+                
+                # Create temp output path for optimized segment
+                temp_optimized_path = segment_path.replace('.mp4', f'_optimized_temp_q{attempt}.mp4')
+                
+                quality_floor = temp_compressor.quality_scorer.get_segment_quality_floor(attempt)
+                logger.info(f"🎯 Segment optimization attempt {attempt + 1}/4 with quality floor {quality_floor:.1f}/100")
+                logger.info(f"Applying direct compression optimization to oversized segment: {segment_path}")
+                logger.info(f"Target size for optimization: {target_size_mb}MB")
+                
+                # Use full target size to honor configured/default 10MB limit
+                optimization_target = target_size_mb
+                
+                # Get video info for the segment (it may be different from the original video)
+                segment_video_info = temp_compressor._analyze_video_content(segment_path)
             
             # Try different compression strategies to optimize the segment
             optimization_result = None
@@ -969,108 +987,111 @@ class VideoSegmenter:
                     logger.error(f"All optimization strategies failed: {e}")
                     optimization_result = None
             
-            # Check results of optimization attempts
-            if optimization_result and optimization_result.get('success', False):
-                optimized_size_mb = optimization_result.get('size_mb', 0)
+                # Check results of optimization attempts
+                if optimization_result and optimization_result.get('success', False):
+                    optimized_size_mb = optimization_result.get('size_mb', 0)
 
-                # Strict size enforcement: must be <= target
-                if optimized_size_mb <= target_size_mb:
-                    if os.path.exists(temp_optimized_path):
-                        shutil.move(temp_optimized_path, segment_path)
-                        logger.info(f"Segment optimization successful: {optimized_size_mb:.2f}MB (<= {target_size_mb}MB)")
-                        return {
-                            'success': True,
-                            'size_mb': optimized_size_mb,
-                            'method': optimization_result.get('method', 'compression_optimization'),
-                            'original_method': 'segment_creation',
-                            'compression_applied': True
-                        }
-                    logger.error("Optimized segment file not found after processing")
-                    return {
-                        'success': False,
-                        'error': 'Optimized segment file not found'
-                    }
-
-                # Near-limit retry: one more attempt if within configured percent over target
-                try:
-                    near_pct = float(self.config.get('video_compression.size_control.near_limit_retry_percent', 0.08))
-                except Exception:
-                    near_pct = 0.08
-                if optimized_size_mb <= target_size_mb * (1.0 + near_pct):
-                    logger.info(f"Near-limit retry: {optimized_size_mb:.2f}MB within {(near_pct*100):.1f}% of target; attempting adaptive retry")
-                    try:
-                        from .video_compressor import DynamicVideoCompressor
-                        temp_compressor = DynamicVideoCompressor(self.config, self.hardware)
-                        seg_info = temp_compressor._analyze_video_content(segment_path)
-                        retry_res = temp_compressor._compress_with_adaptive_resolution(
-                            input_path=segment_path,
-                            video_info=seg_info,
-                            platform_config=platform_config or {},
-                            target_size_mb=target_size_mb
-                        )
-                    except Exception as e:
-                        logger.warning(f"Near-limit adaptive retry failed: {e}")
-                        retry_res = None
-                    if retry_res and retry_res.get('temp_file') and os.path.exists(retry_res['temp_file']):
-                        new_size = os.path.getsize(retry_res['temp_file']) / (1024 * 1024)
-                        if new_size <= target_size_mb:
-                            shutil.move(retry_res['temp_file'], segment_path)
-                            logger.info(f"Near-limit retry succeeded: {new_size:.2f}MB (<= {target_size_mb}MB)")
+                    # Strict size enforcement: must be <= target
+                    if optimized_size_mb <= target_size_mb:
+                        if os.path.exists(temp_optimized_path):
+                            shutil.move(temp_optimized_path, segment_path)
+                            logger.info(f"✅ Segment optimization successful (attempt {attempt + 1}): {optimized_size_mb:.2f}MB (<= {target_size_mb}MB)")
                             return {
                                 'success': True,
-                                'size_mb': new_size,
-                                'method': retry_res.get('strategy', 'adaptive_resolution'),
+                                'size_mb': optimized_size_mb,
+                                'method': optimization_result.get('method', 'compression_optimization'),
                                 'original_method': 'segment_creation',
-                                'compression_applied': True
+                                'compression_applied': True,
+                                'quality_attempt': attempt
                             }
-                        else:
-                            try:
-                                os.remove(retry_res['temp_file'])
-                            except Exception:
-                                pass
+                        logger.warning("Optimized segment file not found after processing")
+                        last_error = 'Optimized segment file not found'
+                        # Continue to next quality attempt
+                        continue
 
-                # Optimization didn't help enough
-                if os.path.exists(temp_optimized_path):
-                    os.remove(temp_optimized_path)
-                logger.warning(f"Optimization did not sufficiently reduce size: {optimized_size_mb:.2f}MB still exceeds target {target_size_mb}MB")
-                return {
-                    'success': False,
-                    'error': f'Optimization insufficient: {optimized_size_mb:.2f}MB still too large'
-                }
-            else:
-                # All optimization strategies failed
-                if os.path.exists(temp_optimized_path):
-                    os.remove(temp_optimized_path)
-                    
-                error_msg = optimization_result.get('error', 'All optimization strategies failed') if optimization_result else 'All optimization strategies failed'
-                logger.error(f"Segment optimization failed: {error_msg}")
-                return {
-                    'success': False,
-                    'error': f'Optimization failed: {error_msg}'
-                }
-            
-        except Exception as e:
-            logger.error(f"Error during segment optimization: {e}")
-            # Clean up any temp files
-            temp_optimized_path = segment_path.replace('.mp4', '_optimized_temp.mp4')
-            if os.path.exists(temp_optimized_path):
+                    # Near-limit retry: one more attempt if within configured percent over target
+                    try:
+                        near_pct = float(self.config.get('video_compression.size_control.near_limit_retry_percent', 0.08))
+                    except Exception:
+                        near_pct = 0.08
+                    if optimized_size_mb <= target_size_mb * (1.0 + near_pct):
+                        logger.info(f"Near-limit retry: {optimized_size_mb:.2f}MB within {(near_pct*100):.1f}% of target; attempting adaptive retry")
+                        try:
+                            from .video_compressor import DynamicVideoCompressor
+                            temp_compressor2 = DynamicVideoCompressor(self.config, self.hardware)
+                            seg_info = temp_compressor2._analyze_video_content(segment_path)
+                            retry_res = temp_compressor2._compress_with_adaptive_resolution(
+                                input_path=segment_path,
+                                video_info=seg_info,
+                                platform_config=platform_config or {},
+                                target_size_mb=target_size_mb
+                            )
+                        except Exception as e:
+                            logger.warning(f"Near-limit adaptive retry failed: {e}")
+                            retry_res = None
+                        if retry_res and retry_res.get('temp_file') and os.path.exists(retry_res['temp_file']):
+                            new_size = os.path.getsize(retry_res['temp_file']) / (1024 * 1024)
+                            if new_size <= target_size_mb:
+                                shutil.move(retry_res['temp_file'], segment_path)
+                                logger.info(f"✅ Near-limit retry succeeded (attempt {attempt + 1}): {new_size:.2f}MB (<= {target_size_mb}MB)")
+                                return {
+                                    'success': True,
+                                    'size_mb': new_size,
+                                    'method': retry_res.get('strategy', 'adaptive_resolution'),
+                                    'original_method': 'segment_creation',
+                                    'compression_applied': True,
+                                    'quality_attempt': attempt
+                                }
+                            else:
+                                try:
+                                    os.remove(retry_res['temp_file'])
+                                except Exception:
+                                    pass
+
+                    # Optimization didn't help enough - try next quality floor
+                    if os.path.exists(temp_optimized_path):
+                        os.remove(temp_optimized_path)
+                    last_error = f'Optimization insufficient: {optimized_size_mb:.2f}MB still too large'
+                    logger.warning(f"⚠️  Attempt {attempt + 1} did not sufficiently reduce size: {optimized_size_mb:.2f}MB > {target_size_mb}MB")
+                    # Continue to next quality attempt
+                    continue
+                else:
+                    # All optimization strategies failed for this attempt
+                    if os.path.exists(temp_optimized_path):
+                        os.remove(temp_optimized_path)
+                        
+                    error_msg = optimization_result.get('error', 'All optimization strategies failed') if optimization_result else 'All optimization strategies failed'
+                    logger.warning(f"⚠️  Attempt {attempt + 1} optimization failed: {error_msg}")
+                    last_error = error_msg
+                    # Continue to next quality attempt
+                    continue
+                
+            except Exception as e:
+                logger.warning(f"⚠️  Attempt {attempt + 1} encountered exception: {e}")
+                last_error = str(e)
+                # Clean up any temp files for this attempt
+                if temp_optimized_path and os.path.exists(temp_optimized_path):
+                    try:
+                        os.remove(temp_optimized_path)
+                    except:
+                        pass
+                # Continue to next quality attempt
+                continue
+            finally:
+                # Ensure temp compressor is removed from active tracking for this attempt
                 try:
-                    os.remove(temp_optimized_path)
-                except:
+                    with self._active_temp_lock:
+                        if temp_compressor and temp_compressor in self._active_temp_compressors:
+                            self._active_temp_compressors.discard(temp_compressor)
+                except Exception:
                     pass
-            
-            return {
-                'success': False,
-                'error': f'Optimization error: {str(e)}'
-            }
-        finally:
-            # Ensure temp compressor is removed from active tracking
-            try:
-                with self._active_temp_lock:
-                    if 'temp_compressor' in locals() and temp_compressor in self._active_temp_compressors:
-                        self._active_temp_compressors.discard(temp_compressor)
-            except Exception:
-                pass
+        
+        # All quality attempts exhausted
+        logger.error(f"❌ All 4 quality attempts failed for segment optimization. Last error: {last_error}")
+        return {
+            'success': False,
+            'error': f'All quality attempts exhausted: {last_error}'
+        }
     
     def _apply_content_aware_adjustments(self, params: Dict[str, Any], video_info: Dict[str, Any]) -> Dict[str, Any]:
         """Apply content-aware adjustments to compression parameters"""
