@@ -76,16 +76,29 @@ class VideoCompressorCLI:
     
     def _setup_signal_handlers(self):
         """Setup signal handlers for graceful cleanup"""
+        # Track signal count for force exit
+        signal_count = {'count': 0}
+        
         def signal_handler(signum, frame):
+            signal_count['count'] += 1
+            
             signal_name = None
             try:
                 signal_name = signal.Signals(signum).name
             except Exception:
                 signal_name = str(signum)
+            
+            # Force exit on second signal
+            if signal_count['count'] >= 2:
+                print(f"\n{signal_name} received {signal_count['count']} times. Force exiting...")
+                if logger:
+                    logger.warning(f"{signal_name} received {signal_count['count']} times. Force exiting without cleanup.")
+                sys.exit(1)
+            
             if logger:
-                logger.info(f"Received {signal_name} signal, initiating graceful shutdown...")
+                logger.info(f"Received {signal_name} signal (attempt {signal_count['count']}), initiating graceful shutdown...")
             else:
-                print(f"\nReceived {signal_name} signal, cleaning up...")
+                print(f"\nReceived {signal_name} signal, cleaning up... (Press Ctrl+C again to force quit)")
 
             # Request shutdown for all components (idempotent)
             try:
@@ -108,13 +121,17 @@ class VideoCompressorCLI:
             # Clean up any remaining temp files immediately
             try:
                 self._cleanup_temp_files_on_exit()
-                logger.info("Temporary files cleaned up during shutdown")
+                if logger:
+                    logger.info("Temporary files cleaned up during shutdown")
             except Exception as e:
-                logger.warning(f"Error during temp file cleanup: {e}")
+                if logger:
+                    logger.warning(f"Error during temp file cleanup: {e}")
 
             if logger:
-                logger.info("Graceful shutdown sequence requested. Waiting for tasks to end...")
-            # Do not sys.exit here; allow main control flow and threads to wind down.
+                logger.info("Graceful shutdown sequence requested. Components will exit after current task...")
+            
+            # Exit after cleanup - don't wait indefinitely
+            sys.exit(0)
 
         # Register handlers for common termination signals
         signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C

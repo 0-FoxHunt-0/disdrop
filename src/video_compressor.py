@@ -1365,10 +1365,31 @@ class DynamicVideoCompressor:
 
             # Pass 1: Analysis
             ffmpeg_cmd_pass1 = self._build_two_pass_command(input_path, temp_output, params, pass_num=1, log_file=temp_log)
+            
+            # Store the command for error logging
+            pass1_cmd_str = ' '.join(ffmpeg_cmd_pass1)
+            
             pass1_success = self._execute_ffmpeg_with_progress(ffmpeg_cmd_pass1, video_info['duration'])
             
             if not pass1_success:
+                # Log the actual command and check for common issues
                 logger.warning("Two-pass compression: Pass 1 failed")
+                logger.debug(f"Failed Pass 1 command: {pass1_cmd_str}")
+                
+                # Check if log file was partially created
+                if os.path.exists(f"{temp_log}-0.log"):
+                    try:
+                        log_size = os.path.getsize(f"{temp_log}-0.log")
+                        logger.debug(f"Pass 1 log file exists but incomplete: {log_size} bytes")
+                    except Exception:
+                        pass
+                else:
+                    logger.debug("Pass 1 log file was not created - FFmpeg may have failed immediately")
+                
+                # Check common failure reasons
+                if target_bitrate < 500:
+                    logger.warning(f"Pass 1 may have failed due to very low bitrate: {target_bitrate}k")
+                
                 return None
 
             # Pass 2: Encoding
@@ -1377,6 +1398,7 @@ class DynamicVideoCompressor:
             
             if not pass2_success:
                 logger.warning("Two-pass compression: Pass 2 failed")
+                logger.debug(f"Failed Pass 2 command: {' '.join(ffmpeg_cmd_pass2)}")
                 return None
             
             # Clean up log files

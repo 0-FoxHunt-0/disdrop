@@ -56,6 +56,11 @@ video_compression:
     reject_oversize_on_finalize: true
     adapt_resolution: true
 
+    # Concurrency settings for parallel processing
+    max_concurrent_segments: 4  # Max segments to process in parallel
+    max_concurrent_ffmpeg_processes: 2  # Max ffmpeg processes for segment creation
+    max_concurrent_optimizations: 1  # Max concurrent segment optimizations
+
   # Social media platform presets
   platforms:
     instagram:
