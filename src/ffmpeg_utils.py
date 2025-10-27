@@ -613,6 +613,110 @@ class FFmpegUtils:
             return result.returncode == 0
         except Exception as e:
             logger.error(f"Failed to extract video segment: {e}")
+            return False
+    
+    @staticmethod
+    def build_x264_two_pass_cae(input_path: str, output_path: str, params: Dict[str, Any],
+                                pass_num: int, log_file: str) -> List[str]:
+        """Build x264 two-pass CAE command with VBV, psychovisual tuning, and optional prefilters.
+        
+        Args:
+            input_path: Source video
+            output_path: Destination (NUL/null for pass 1, actual path for pass 2)
+            params: Dictionary with keys:
+                - width, height: target resolution
+                - fps: target frame rate
+                - bitrate: target video bitrate in kbps (int)
+                - audio_bitrate: audio bitrate in kbps (int, default 64)
+                - vf: optional full filter chain string (overrides width/height)
+                - preset: x264 preset (default 'slow')
+                - tune: x264 tune (default 'film')
+                - gop, keyint_min, sc_threshold: GOP settings
+                - qcomp, aq_mode, aq_strength, rc_lookahead: psychovisual
+                - maxrate_multiplier, bufsize_multiplier: VBV control
+            pass_num: 1 or 2
+            log_file: passlogfile base path
+        
+        Returns:
+            Command list ready for subprocess
+        """
+        cmd = ['ffmpeg', '-y', '-i', input_path]
+        
+        # Filter chain
+        vf = params.get('vf')
+        if not vf:
+            w = params.get('width', 1280)
+            h = params.get('height', 720)
+            vf = f"scale={w}:{h}:flags=lanczos,setsar=1"
+        cmd.extend(['-vf', vf])
+        
+        # FPS
+        fps = params.get('fps', 30)
+        cmd.extend(['-r', str(fps)])
+        
+        # Video codec and pixel format
+        cmd.extend(['-c:v', 'libx264', '-pix_fmt', 'yuv420p'])
+        
+        # Preset and tune
+        preset = params.get('preset', 'slow')
+        tune = params.get('tune', 'film')
+        cmd.extend(['-preset', preset, '-tune', tune])
+        
+        # Bitrate and VBV
+        bitrate_kbps = int(params.get('bitrate', 1000))
+        maxrate_mult = float(params.get('maxrate_multiplier', 1.10))
+        bufsize_mult = float(params.get('bufsize_multiplier', 2.0))
+        maxrate = int(bitrate_kbps * maxrate_mult)
+        bufsize = int(bitrate_kbps * bufsize_mult)
+        cmd.extend(['-b:v', f"{bitrate_kbps}k", '-maxrate', f"{maxrate}k", '-bufsize', f"{bufsize}k"])
+        
+        # GOP settings
+        gop = int(params.get('gop', 240))
+        keyint_min = int(params.get('keyint_min', 23))
+        sc_threshold = int(params.get('sc_threshold', 40))
+        cmd.extend(['-g', str(gop), '-keyint_min', str(keyint_min), '-sc_threshold', str(sc_threshold)])
+        
+        # Psychovisual tuning
+        aq_mode = int(params.get('aq_mode', 2))
+        aq_strength = float(params.get('aq_strength', 1.1))
+        qcomp = float(params.get('qcomp', 0.65))
+        rc_lookahead = int(params.get('rc_lookahead', 40))
+        cmd.extend(['-aq-mode', str(aq_mode), '-aq-strength', str(aq_strength)])
+        cmd.extend(['-qcomp', str(qcomp), '-rc-lookahead', str(rc_lookahead)])
+        
+        # Two-pass flags
+        cmd.extend(['-pass', str(pass_num), '-passlogfile', log_file])
+        
+        if pass_num == 1:
+            # First pass: no audio, null output
+            cmd.extend(['-an', '-f', 'mp4'])
+            if os.name == 'nt':
+                cmd.append('NUL')
+            else:
+                cmd.append('/dev/null')
+        else:
+            # Second pass: add audio and output settings
+            audio_bitrate = int(params.get('audio_bitrate', 64))
+            cmd.extend(['-c:a', 'aac', '-b:a', f"{audio_bitrate}k", '-ac', '2'])
+            cmd.extend(['-movflags', '+faststart'])
+            cmd.append(output_path)
+        
+        return cmd
+    
+    @staticmethod
+    def check_libvmaf_available() -> bool:
+        """Check if FFmpeg has libvmaf filter available."""
+        try:
+            result = subprocess.run(
+                ['ffmpeg', '-filters'],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                encoding='utf-8',
+                errors='replace'
+            )
+            return 'libvmaf' in result.stdout.lower()
+        except Exception:
             return False 
 
     @staticmethod

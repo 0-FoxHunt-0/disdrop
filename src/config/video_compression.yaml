@@ -57,9 +57,9 @@ video_compression:
     adapt_resolution: true
 
     # Concurrency settings for parallel processing
-    max_concurrent_segments: 4  # Max segments to process in parallel
-    max_concurrent_ffmpeg_processes: 2  # Max ffmpeg processes for segment creation
-    max_concurrent_optimizations: 1  # Max concurrent segment optimizations
+    max_concurrent_segments: 4 # Max segments to process in parallel
+    max_concurrent_ffmpeg_processes: 2 # Max ffmpeg processes for segment creation
+    max_concurrent_optimizations: 1 # Max concurrent segment optimizations
 
   # Social media platform presets
   platforms:
@@ -138,16 +138,16 @@ video_compression:
     refine_iterations: 2
     hybrid_quality_check:
       enabled: true
-      single_file_floor: 65  # Out of 100 - reasonable quality for single compressed files
-      segment_floors: [70, 60, 50, 45]  # Progressive fallback for segments: higher quality expected, but fallback if needed
+      single_file_floor: 65 # Out of 100 - reasonable quality for single compressed files
+      segment_floors: [70, 60, 50, 45] # Progressive fallback for segments: higher quality expected, but fallback if needed
       weights:
-        perceptual_hash: 0.40  # Human-perceivable similarity (most important)
-        size_efficiency: 0.20  # How well target size was utilized
-        frame_validity: 0.20   # Frames can be decoded without corruption
-        technical_validity: 0.20  # Format integrity, duration accuracy
+        perceptual_hash: 0.40 # Human-perceivable similarity (most important)
+        size_efficiency: 0.20 # How well target size was utilized
+        frame_validity: 0.20 # Frames can be decoded without corruption
+        technical_validity: 0.20 # Format integrity, duration accuracy
       sampling:
-        key_frames: 5  # start, 25%, 50%, 75%, end
-        random_frames: 3  # Additional random samples for validation
+        key_frames: 5 # start, 25%, 50%, 75%, end
+        random_frames: 3 # Additional random samples for validation
     uplift:
       enabled: true
       max_passes: 3
@@ -158,3 +158,35 @@ video_compression:
   size_control:
     near_limit_retry_percent: 0.08
   # Segmentation finalize policy (merge into top segmentation block)
+
+  # Profiles for specialized pipelines
+  profiles:
+    discord_10mb:
+      size_limit_mb: 10
+      audio_kbps_range: [64, 96]
+      vmaf_threshold: 80
+      vmaf_threshold_low_res: 78 # when eval height <= 480p
+      ssim_threshold: 0.94 # Y-channel
+      # Bits-per-pixel floors to prevent blockiness (H.264 8-bit)
+      bpp_floor:
+        low_motion: 0.030
+        normal: 0.035
+        high_motion: 0.040
+      fps_policy:
+        prefer_24_for_low_motion: true
+      refine:
+        max_passes: 3
+        bitrate_step: 1.08
+      # x264 two-pass tuning
+      x264:
+        preset: slow
+        tune: film
+        gop: 240
+        keyint_min: 23
+        sc_threshold: 40
+        qcomp: 0.65
+        aq_mode: 2
+        aq_strength: 1.1
+        rc_lookahead: 40
+        maxrate_multiplier: 1.10
+        bufsize_multiplier: 2.0

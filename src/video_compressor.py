@@ -62,6 +62,12 @@ class DynamicVideoCompressor:
         self.video_segmenter = VideoSegmenter(config_manager, hardware_detector)
         self.quality_scorer = QualityScorer(config_manager)
         
+        # Initialize CAE components
+        from .quality_gates import QualityGates
+        from .artifact_detection import ArtifactDetector
+        self.quality_gates = QualityGates(config_manager)
+        self.artifact_detector = ArtifactDetector(config_manager)
+        
         # Optimize system resources
         self.system_optimizations = self.performance_enhancer.optimize_system_resources()
         
@@ -610,6 +616,345 @@ class DynamicVideoCompressor:
         except Exception as e:
             logger.warning(f"Final single-file refinement failed: {e}")
         return None
+    
+    # ===== Content-Adaptive Encoding (CAE) for Discord 10MB =====
+    
+    def _compress_with_cae_discord_10mb(self, input_path: str, output_path: str,
+                                       video_info: Dict[str, Any]) -> Dict[str, Any]:
+        """Content-Adaptive Encoding pipeline optimized for Discord 10MB limit.
+        
+        Uses 2-pass x264, BPP-driven resolution/FPS selection, VMAF/SSIM quality gates,
+        artifact detection, and adaptive refine loop.
+        """
+        logger.info("=== Starting Discord 10MB CAE Pipeline ===")
+        
+        # Load profile config
+        profile_cfg = self.config.get('video_compression.profiles.discord_10mb', {})
+        size_limit_mb = profile_cfg.get('size_limit_mb', 10.0)
+        
+        # Step 1: Analyze content complexity
+        motion_level = video_info.get('motion_level', 'medium')  # from _analyze_video_content
+        logger.info(f"Content analysis: motion={motion_level}, complexity={video_info.get('complexity_score', 5.0):.1f}")
+        
+        # Step 2: Budget calculation (reserve audio)
+        audio_range = profile_cfg.get('audio_kbps_range', [64, 96])
+        audio_bitrate_kbps = audio_range[1] if motion_level == 'low' else audio_range[0]  # More audio for low-motion
+        duration = video_info['duration']
+        audio_bits = audio_bitrate_kbps * 1000 * duration
+        total_bits_budget = size_limit_mb * 8 * 1024 * 1024
+        video_bits_budget = int(total_bits_budget - audio_bits)
+        target_video_bitrate_kbps = int(video_bits_budget / duration / 1000)
+        
+        logger.info(f"Budget: {size_limit_mb}MB = {target_video_bitrate_kbps}k video + {audio_bitrate_kbps}k audio over {duration:.1f}s")
+        
+        # Step 3: BPP-driven resolution/FPS selection
+        bpp_floors = profile_cfg.get('bpp_floor', {})
+        bpp_min = bpp_floors.get(motion_level, bpp_floors.get('normal', 0.035))
+        
+        initial_params = self._select_resolution_fps_by_bpp(
+            video_info, target_video_bitrate_kbps, bpp_min, profile_cfg
+        )
+        initial_params['bitrate'] = target_video_bitrate_kbps
+        initial_params['audio_bitrate'] = audio_bitrate_kbps
+        
+        logger.info(f"Initial target: {initial_params['width']}x{initial_params['height']}@{initial_params['fps']}fps, "
+                   f"BPP={bpp_min:.3f}, bitrate={target_video_bitrate_kbps}k")
+        
+        # Step 4: 2-pass encode with refine loop
+        x264_cfg = profile_cfg.get('x264', {})
+        refine_cfg = profile_cfg.get('refine', {})
+        max_passes = refine_cfg.get('max_passes', 3)
+        bitrate_step = refine_cfg.get('bitrate_step', 1.08)
+        
+        vmaf_threshold = profile_cfg.get('vmaf_threshold', 80.0)
+        vmaf_threshold_low_res = profile_cfg.get('vmaf_threshold_low_res', 78.0)
+        ssim_threshold = profile_cfg.get('ssim_threshold', 0.94)
+        
+        for refine_pass in range(max_passes):
+            logger.info(f"--- CAE Refine Pass {refine_pass + 1}/{max_passes} ---")
+            
+            # Encode with current params
+            encode_params = self._build_cae_encode_params(initial_params, x264_cfg, profile_cfg)
+            success = self._execute_two_pass_x264(input_path, output_path, encode_params)
+            
+            if not success or not os.path.exists(output_path):
+                logger.error(f"Encode failed on pass {refine_pass + 1}")
+                continue
+            
+            # Check size
+            output_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+            logger.info(f"Encoded size: {output_size_mb:.2f}MB (target: {size_limit_mb}MB)")
+            
+            if output_size_mb > size_limit_mb:
+                logger.warning(f"Output exceeds size limit: {output_size_mb:.2f} > {size_limit_mb}MB")
+                # Try reducing bitrate slightly
+                initial_params['bitrate'] = int(initial_params['bitrate'] * 0.92)
+                try:
+                    os.remove(output_path)
+                except:
+                    pass
+                continue
+            
+            # Step 5: Quality gates
+            eval_height = min(initial_params['height'], 540)  # Eval at 540p max
+            vmaf_thresh = vmaf_threshold_low_res if initial_params['height'] <= 480 else vmaf_threshold
+            
+            quality_result = self.quality_gates.evaluate_quality(
+                input_path, output_path, vmaf_thresh, ssim_threshold, eval_height
+            )
+            
+            # Step 6: Artifact detection
+            artifact_result = self.artifact_detector.detect_artifacts(
+                output_path, blockiness_threshold=0.12, banding_threshold=0.10
+            )
+            
+            logger.info(f"Quality: VMAF={quality_result.get('vmaf_score', 'N/A')}, "
+                       f"SSIM={quality_result.get('ssim_score', 'N/A')}, passes={quality_result.get('passes')}")
+            logger.info(f"Artifacts: blockiness={artifact_result.get('blockiness_score', 'N/A'):.4f}, "
+                       f"banding={artifact_result.get('banding_score', 'N/A'):.4f}, passes={artifact_result.get('passes')}")
+            
+            # Check if all gates pass
+            quality_pass = quality_result.get('passes', False)
+            artifact_pass = artifact_result.get('passes', True)  # Default pass if detection fails
+            
+            if quality_pass and artifact_pass:
+                logger.info(f"✓ All quality gates passed on refine pass {refine_pass + 1}")
+                
+                # Log structured metrics
+                self._log_cae_metrics({
+                    'input_path': input_path,
+                    'output_path': output_path,
+                    'params': encode_params,
+                    'size_mb': output_size_mb,
+                    'quality': quality_result,
+                    'artifacts': artifact_result,
+                    'refine_pass': refine_pass + 1
+                })
+                
+                return self._get_compression_results(input_path, output_path, video_info, "cae_discord_10mb")
+            
+            # Step 7: Refine strategy if gates failed
+            logger.warning(f"Quality gates failed on pass {refine_pass + 1}, attempting refinement")
+            
+            if refine_pass + 1 < max_passes:
+                # Try refinements in order: +bitrate, drop FPS, lower resolution
+                if not quality_pass and output_size_mb < size_limit_mb * 0.95:
+                    # Room to increase bitrate
+                    new_bitrate = int(initial_params['bitrate'] * bitrate_step)
+                    headroom_bitrate = int((size_limit_mb * 0.98 - output_size_mb) * 8 * 1024 / duration)
+                    initial_params['bitrate'] = min(new_bitrate, initial_params['bitrate'] + headroom_bitrate)
+                    logger.info(f"Refine: increasing bitrate to {initial_params['bitrate']}k")
+                    
+                elif initial_params['fps'] > 24:
+                    # Drop FPS to 24
+                    initial_params['fps'] = 24
+                    logger.info(f"Refine: dropping FPS to 24")
+                    
+                else:
+                    # Scale down resolution
+                    new_width, new_height = self._scale_down_one_step(initial_params['width'], initial_params['height'])
+                    if new_height >= 360:
+                        initial_params['width'] = new_width
+                        initial_params['height'] = new_height
+                        logger.info(f"Refine: scaling down to {new_width}x{new_height}")
+                    else:
+                        logger.warning("Cannot refine further (already at minimum resolution)")
+                        break
+                
+                # Clean up failed attempt
+                try:
+                    os.remove(output_path)
+                except:
+                    pass
+        
+        # If we exhausted refine passes, return best attempt or fail to segmentation
+        if os.path.exists(output_path):
+            output_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+            if output_size_mb <= size_limit_mb:
+                logger.warning("CAE completed with compromised quality (some gates failed)")
+                return self._get_compression_results(input_path, output_path, video_info, "cae_discord_10mb_compromised")
+        
+        logger.error("CAE pipeline failed after all refine passes")
+        return {'success': False, 'error': 'CAE quality gates failed', 'method': 'cae_failed'}
+    
+    def _select_resolution_fps_by_bpp(self, video_info: Dict[str, Any], 
+                                     target_bitrate_kbps: int, bpp_min: float,
+                                     profile_cfg: Dict[str, Any]) -> Dict[str, Any]:
+        """Select highest resolution and FPS that satisfy BPP floor constraint."""
+        orig_w = video_info['width']
+        orig_h = video_info['height']
+        orig_fps = video_info['fps']
+        
+        # Candidate resolutions (maintain aspect ratio)
+        aspect_ratio = orig_w / orig_h
+        candidate_heights = [1080, 720, 540, 480, 360]
+        candidates = []
+        
+        for h in candidate_heights:
+            if h > orig_h:
+                continue
+            w = int(h * aspect_ratio)
+            # Ensure even dimensions
+            w = w if w % 2 == 0 else w - 1
+            candidates.append((w, h))
+        
+        # Add original resolution if not in list
+        if orig_h not in candidate_heights:
+            candidates.insert(0, (orig_w, orig_h))
+        
+        # Candidate FPS values
+        fps_candidates = [30, 24] if orig_fps >= 30 else [24, int(orig_fps)]
+        fps_prefer_24 = profile_cfg.get('fps_policy', {}).get('prefer_24_for_low_motion', True)
+        motion_level = video_info.get('motion_level', 'medium')
+        
+        if fps_prefer_24 and motion_level == 'low':
+            fps_candidates = [24, 30]  # Prefer 24 for low motion
+        
+        # Find best combo that satisfies BPP
+        target_bits_per_sec = target_bitrate_kbps * 1000
+        
+        for w, h in candidates:
+            for fps in fps_candidates:
+                pixels_per_sec = w * h * fps
+                actual_bpp = target_bits_per_sec / pixels_per_sec
+                
+                if actual_bpp >= bpp_min:
+                    logger.info(f"Selected {w}x{h}@{fps}fps: BPP={actual_bpp:.4f} >= {bpp_min:.4f}")
+                    return {'width': w, 'height': h, 'fps': fps}
+        
+        # Fallback: use smallest resolution at lowest FPS
+        w, h = candidates[-1]
+        fps = fps_candidates[-1]
+        logger.warning(f"BPP floor not met; using minimum {w}x{h}@{fps}fps")
+        return {'width': w, 'height': h, 'fps': fps}
+    
+    def _build_cae_encode_params(self, base_params: Dict[str, Any], 
+                                 x264_cfg: Dict[str, Any],
+                                 profile_cfg: Dict[str, Any]) -> Dict[str, Any]:
+        """Build full encoding parameters from base + x264 config."""
+        params = base_params.copy()
+        
+        # Apply x264 tuning from config
+        params['preset'] = x264_cfg.get('preset', 'slow')
+        params['tune'] = x264_cfg.get('tune', 'film')
+        params['gop'] = x264_cfg.get('gop', 240)
+        params['keyint_min'] = x264_cfg.get('keyint_min', 23)
+        params['sc_threshold'] = x264_cfg.get('sc_threshold', 40)
+        params['qcomp'] = x264_cfg.get('qcomp', 0.65)
+        params['aq_mode'] = x264_cfg.get('aq_mode', 2)
+        params['aq_strength'] = x264_cfg.get('aq_strength', 1.1)
+        params['rc_lookahead'] = x264_cfg.get('rc_lookahead', 40)
+        params['maxrate_multiplier'] = x264_cfg.get('maxrate_multiplier', 1.10)
+        params['bufsize_multiplier'] = x264_cfg.get('bufsize_multiplier', 2.0)
+        
+        return params
+    
+    def _execute_two_pass_x264(self, input_path: str, output_path: str, 
+                               params: Dict[str, Any]) -> bool:
+        """Execute 2-pass x264 encode with given parameters."""
+        from .ffmpeg_utils import FFmpegUtils
+        
+        log_base = os.path.join(self.temp_dir, f"cae_pass_{int(time.time())}")
+        
+        try:
+            # Pass 1
+            logger.info("Running 2-pass encode: pass 1/2")
+            cmd_pass1 = FFmpegUtils.build_x264_two_pass_cae(
+                input_path, output_path, params, pass_num=1, log_file=log_base
+            )
+            result1 = subprocess.run(
+                cmd_pass1,
+                capture_output=True,
+                text=True,
+                timeout=600,
+                encoding='utf-8',
+                errors='replace'
+            )
+            
+            if result1.returncode != 0:
+                logger.error(f"Pass 1 failed: {result1.stderr}")
+                return False
+            
+            # Pass 2
+            logger.info("Running 2-pass encode: pass 2/2")
+            cmd_pass2 = FFmpegUtils.build_x264_two_pass_cae(
+                input_path, output_path, params, pass_num=2, log_file=log_base
+            )
+            result2 = subprocess.run(
+                cmd_pass2,
+                capture_output=True,
+                text=True,
+                timeout=600,
+                encoding='utf-8',
+                errors='replace'
+            )
+            
+            if result2.returncode != 0:
+                logger.error(f"Pass 2 failed: {result2.stderr}")
+                return False
+            
+            logger.info("2-pass encode completed successfully")
+            return True
+            
+        except subprocess.TimeoutExpired:
+            logger.error("2-pass encode timed out")
+            return False
+        except Exception as e:
+            logger.error(f"2-pass encode error: {e}")
+            return False
+        finally:
+            # Clean up pass logs
+            self._cleanup_two_pass_logs(log_base)
+    
+    def _scale_down_one_step(self, width: int, height: int) -> Tuple[int, int]:
+        """Scale resolution down one step (e.g., 720p -> 540p)."""
+        common_heights = [1080, 720, 540, 480, 360, 270]
+        
+        for i, h in enumerate(common_heights):
+            if height >= h and i + 1 < len(common_heights):
+                new_h = common_heights[i + 1]
+                aspect_ratio = width / height
+                new_w = int(new_h * aspect_ratio)
+                new_w = new_w if new_w % 2 == 0 else new_w - 1
+                return (new_w, new_h)
+        
+        # Fallback: scale by 0.75
+        new_h = int(height * 0.75)
+        new_h = new_h if new_h % 2 == 0 else new_h - 1
+        new_w = int(width * 0.75)
+        new_w = new_w if new_w % 2 == 0 else new_w - 1
+        return (new_w, new_h)
+    
+    def _log_cae_metrics(self, metrics: Dict[str, Any]):
+        """Log structured JSON metrics for CAE encoding."""
+        try:
+            import json
+            metrics_json = {
+                'timestamp': time.time(),
+                'input': os.path.basename(metrics['input_path']),
+                'output': os.path.basename(metrics['output_path']),
+                'size_mb': metrics['size_mb'],
+                'params': {
+                    'width': metrics['params']['width'],
+                    'height': metrics['params']['height'],
+                    'fps': metrics['params']['fps'],
+                    'bitrate_kbps': metrics['params']['bitrate'],
+                    'audio_bitrate_kbps': metrics['params']['audio_bitrate']
+                },
+                'quality': {
+                    'vmaf': metrics['quality'].get('vmaf_score'),
+                    'ssim': metrics['quality'].get('ssim_score'),
+                    'method': metrics['quality'].get('method')
+                },
+                'artifacts': {
+                    'blockiness': metrics['artifacts'].get('blockiness_score'),
+                    'banding': metrics['artifacts'].get('banding_score')
+                },
+                'refine_pass': metrics['refine_pass']
+            }
+            logger.info(f"CAE_METRICS: {json.dumps(metrics_json)}")
+        except Exception as e:
+            logger.warning(f"Failed to log CAE metrics: {e}")
         
     def compress_video(self, input_path: str, output_path: str, platform: str = None,
                       max_size_mb: int = None, use_advanced_optimization: bool = True,
@@ -653,6 +998,23 @@ class DynamicVideoCompressor:
         logger.info(f"Original video: {video_info['width']}x{video_info['height']}, "
                    f"{video_info['duration']:.2f}s, {original_size_mb:.2f}MB, "
                    f"complexity: {video_info['complexity_score']:.2f}")
+        
+        # Route to Discord 10MB CAE pipeline if target is exactly 10MB (or close)
+        # and no specific platform is set or platform is discord
+        use_cae = False
+        if 9.5 <= target_size_mb <= 10.5:
+            if platform is None or platform == 'discord':
+                use_cae = True
+                logger.info("Routing to Discord 10MB CAE pipeline")
+        
+        if use_cae:
+            try:
+                cae_result = self._compress_with_cae_discord_10mb(input_path, output_path, video_info)
+                if cae_result.get('success'):
+                    return cae_result
+                logger.warning("CAE pipeline failed, falling back to standard compression")
+            except Exception as e:
+                logger.error(f"CAE pipeline error: {e}, falling back to standard compression")
         
         # Check if segmentation should be considered now or deferred to last resort
         logger.info(f"Checking video segmentation: original size {original_size_mb:.1f}MB, target {target_size_mb}MB")
