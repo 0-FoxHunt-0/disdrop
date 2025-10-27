@@ -243,6 +243,44 @@ class DynamicVideoCompressor:
             return current_bpp >= float(min_bpp)
         except Exception:
             return True
+    
+    def _validate_encoding_parameters(self, width: int, height: int, fps: float, bitrate_kbps: int) -> bool:
+        """Ensure encoding parameters are feasible and will produce acceptable quality
+        
+        Returns True if parameters are valid, False if BPP is too low for acceptable quality
+        """
+        try:
+            pixels_per_sec = width * height * fps
+            if pixels_per_sec <= 0 or bitrate_kbps <= 0:
+                return False
+            
+            actual_bpp = (bitrate_kbps * 1000) / pixels_per_sec
+            
+            # Absolute minimum for any acceptable quality
+            # Below 0.012, quality will be severely degraded (heavy pixelation)
+            min_acceptable_bpp = 0.012
+            
+            if actual_bpp < min_acceptable_bpp:
+                logger.warning(
+                    f"QUALITY WARNING: BPP too low for acceptable quality: {actual_bpp:.4f} < {min_acceptable_bpp:.4f} "
+                    f"at {width}x{height}@{fps:.1f}fps with {bitrate_kbps}kbps. "
+                    f"This will result in severe pixelation. Consider reducing resolution or increasing target size."
+                )
+                return False
+            
+            # Warn if below recommended minimum but still technically feasible
+            recommended_min_bpp = 0.018
+            if actual_bpp < recommended_min_bpp:
+                logger.info(
+                    f"Quality notice: BPP below recommended: {actual_bpp:.4f} < {recommended_min_bpp:.4f} "
+                    f"at {width}x{height}@{fps:.1f}fps with {bitrate_kbps}kbps. "
+                    f"Quality may be lower than optimal."
+                )
+            
+            return True
+        except Exception as e:
+            logger.debug(f"Parameter validation error: {e}")
+            return True  # Allow on error to avoid blocking valid encodes
 
     def _calculate_codec_efficiency(self, codec_key: str, complexity: float) -> float:
         """Get realistic bits-per-pixel efficiency for codec
@@ -1509,6 +1547,16 @@ class DynamicVideoCompressor:
             # Calculate optimal parameters based on content analysis
             params = self._calculate_intelligent_params(video_info, platform_config, target_size_mb)
             
+            # Validate parameters before encoding
+            if not self._validate_encoding_parameters(
+                params.get('width', video_info['width']),
+                params.get('height', video_info['height']),
+                params.get('fps', video_info['fps']),
+                params.get('bitrate', 0)
+            ):
+                logger.warning("Content-aware strategy rejected: insufficient BPP for quality")
+                return None
+            
             # Build and execute FFmpeg command
             ffmpeg_cmd = self._build_intelligent_ffmpeg_command(input_path, temp_output, params)
             self._execute_ffmpeg_with_progress(ffmpeg_cmd, video_info['duration'])
@@ -1619,6 +1667,16 @@ class DynamicVideoCompressor:
             optimal_resolution = self._calculate_optimal_resolution(video_info, target_size_mb, platform_config)
             
             params = self._calculate_adaptive_params(video_info, platform_config, target_size_mb, optimal_resolution)
+            
+            # Validate parameters before encoding
+            if not self._validate_encoding_parameters(
+                params.get('width', video_info['width']),
+                params.get('height', video_info['height']),
+                params.get('fps', video_info['fps']),
+                params.get('bitrate', 0)
+            ):
+                logger.warning("Adaptive resolution strategy rejected: insufficient BPP for quality")
+                return None
             
             ffmpeg_cmd = self._build_adaptive_ffmpeg_command(input_path, temp_output, params)
             self._execute_ffmpeg_with_progress(ffmpeg_cmd, video_info['duration'])
@@ -1738,39 +1796,39 @@ class DynamicVideoCompressor:
         """
         # Aggressiveness level configurations
         configs = {
-            1: {  # Conservative aggressive
-                'res_scale': 0.90,
+            1: {  # Conservative aggressive (matches old "standard" behavior)
+                'res_scale': 0.90,  # 90% of original (old high-res behavior)
                 'fps_scale': 0.9,
-                'crf': 32,
+                'crf': 28,  # Moderate CRF
                 'min_res': (720, 540),
-                'size_budget': 0.85,
+                'size_budget': 0.82,
                 'audio_bitrate': 80,
                 'name': 'conservative_aggressive'
             },
-            2: {  # Standard aggressive
-                'res_scale': 0.75,
-                'fps_scale': 0.75,
-                'crf': 36,
+            2: {  # Standard aggressive (matches old aggressive behavior exactly)
+                'res_scale': 0.80,  # 80% of original (old standard-res behavior)
+                'fps_scale': 0.8,
+                'crf': 35,  # Matches old CRF
                 'min_res': (640, 480),
-                'size_budget': 0.80,
+                'size_budget': 0.75,  # Matches old 75% budget
                 'audio_bitrate': 64,
                 'name': 'aggressive'
             },
             3: {  # Very aggressive
-                'res_scale': 0.60,
-                'fps_scale': 0.5,
-                'crf': 40,
-                'min_res': (480, 360),
-                'size_budget': 0.75,
+                'res_scale': 0.65,
+                'fps_scale': 0.6,
+                'crf': 38,
+                'min_res': (540, 360),
+                'size_budget': 0.70,
                 'audio_bitrate': 48,
                 'name': 'very_aggressive'
             },
-            4: {  # Extreme
-                'res_scale': 0.40,
-                'fps_scale': 0.4,
-                'crf': 45,
-                'min_res': (320, 240),
-                'size_budget': 0.70,
+            4: {  # Extreme (last resort)
+                'res_scale': 0.50,
+                'fps_scale': 0.5,
+                'crf': 42,
+                'min_res': (480, 320),
+                'size_budget': 0.65,
                 'audio_bitrate': 32,
                 'name': 'extreme_aggressive'
             }
@@ -2058,12 +2116,19 @@ class DynamicVideoCompressor:
             # Convert efficiency to BPP requirement
             required_bpp = 1.0 / codec_efficiency
             
-            # Calculate affordable pixels at target FPS (assume 24-30fps for calculations)
+            # Calculate affordable pixels at target FPS (assume 24fps for calculations)
             target_fps = 24
-            affordable_pixels = int(bits_per_second / (required_bpp * target_fps))
+            
+            # CRITICAL FIX: Apply conservative multiplier to match old behavior
+            # Old formula gave: bps * 0.0146 pixels
+            # New formula without multiplier gives: bps / 0.6 = bps * 1.667
+            # That's 114x more! Need to scale down to match quality expectations
+            conservative_multiplier = 0.35  # Empirically tuned to match old behavior
+            affordable_pixels = int((bits_per_second / (required_bpp * target_fps)) * conservative_multiplier)
             
             logger.info(f"High-res calculation: duration={duration:.1f}s, complexity={complexity:.1f}, "
-                       f"required_bpp={required_bpp:.4f}, affordable_pixels={affordable_pixels:,}")
+                       f"required_bpp={required_bpp:.4f}, conservative_mult={conservative_multiplier:.2f}, "
+                       f"affordable_pixels={affordable_pixels:,}")
             
             if affordable_pixels >= original_pixels:
                 # Can keep original resolution
@@ -2095,10 +2160,15 @@ class DynamicVideoCompressor:
             
             # Calculate affordable pixels at 24fps
             target_fps = 24
-            affordable_pixels = int(bits_per_second / (required_bpp * target_fps))
+            
+            # CRITICAL FIX: Apply conservative multiplier to match old behavior
+            # This prevents trying to encode at too high resolution with insufficient bitrate
+            conservative_multiplier = 0.35  # Empirically tuned to match old behavior
+            affordable_pixels = int((bits_per_second / (required_bpp * target_fps)) * conservative_multiplier)
             
             logger.info(f"Standard calculation: duration={duration:.1f}s, complexity={complexity:.1f}, "
-                       f"required_bpp={required_bpp:.4f}, affordable_pixels={affordable_pixels:,}")
+                       f"required_bpp={required_bpp:.4f}, conservative_mult={conservative_multiplier:.2f}, "
+                       f"affordable_pixels={affordable_pixels:,}")
             
             if affordable_pixels >= original_pixels:
                 optimal_width, optimal_height = original_width, original_height
