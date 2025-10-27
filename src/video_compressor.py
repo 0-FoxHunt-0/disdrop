@@ -687,8 +687,27 @@ class DynamicVideoCompressor:
             
             if output_size_mb > size_limit_mb:
                 logger.warning(f"Output exceeds size limit: {output_size_mb:.2f} > {size_limit_mb}MB")
-                # Try reducing bitrate slightly
-                initial_params['bitrate'] = int(initial_params['bitrate'] * 0.92)
+                # Calculate how much we need to reduce
+                overage_ratio = output_size_mb / size_limit_mb
+                
+                # More aggressive reduction based on overage
+                if overage_ratio > 1.10:
+                    # More than 10% over: reduce bitrate significantly AND consider scaling down
+                    initial_params['bitrate'] = int(initial_params['bitrate'] * 0.85)
+                    
+                    # Also try scaling down if we're still at high resolution
+                    if initial_params['height'] > 480:
+                        new_width, new_height = self._scale_down_one_step(initial_params['width'], initial_params['height'])
+                        initial_params['width'] = new_width
+                        initial_params['height'] = new_height
+                        logger.info(f"Refine (overage): scaling down to {new_width}x{new_height}")
+                else:
+                    # Less than 10% over: just reduce bitrate proportionally
+                    reduction_factor = 0.98 / overage_ratio  # Target 98% of limit
+                    initial_params['bitrate'] = int(initial_params['bitrate'] * reduction_factor)
+                
+                logger.info(f"Refine (overage): reducing bitrate to {initial_params['bitrate']}k")
+                
                 try:
                     os.remove(output_path)
                 except:
@@ -708,10 +727,17 @@ class DynamicVideoCompressor:
                 output_path, blockiness_threshold=0.12, banding_threshold=0.10
             )
             
-            logger.info(f"Quality: VMAF={quality_result.get('vmaf_score', 'N/A')}, "
-                       f"SSIM={quality_result.get('ssim_score', 'N/A')}, passes={quality_result.get('passes')}")
-            logger.info(f"Artifacts: blockiness={artifact_result.get('blockiness_score', 'N/A'):.4f}, "
-                       f"banding={artifact_result.get('banding_score', 'N/A'):.4f}, passes={artifact_result.get('passes')}")
+            vmaf_score = quality_result.get('vmaf_score')
+            ssim_score = quality_result.get('ssim_score')
+            vmaf_str = f"{vmaf_score:.2f}" if vmaf_score is not None else "N/A"
+            ssim_str = f"{ssim_score:.4f}" if ssim_score is not None else "N/A"
+            logger.info(f"Quality: VMAF={vmaf_str}, SSIM={ssim_str}, passes={quality_result.get('passes')}")
+            
+            blockiness_score = artifact_result.get('blockiness_score')
+            banding_score = artifact_result.get('banding_score')
+            blockiness_str = f"{blockiness_score:.4f}" if blockiness_score is not None else "N/A"
+            banding_str = f"{banding_score:.4f}" if banding_score is not None else "N/A"
+            logger.info(f"Artifacts: blockiness={blockiness_str}, banding={banding_str}, passes={artifact_result.get('passes')}")
             
             # Check if all gates pass
             quality_pass = quality_result.get('passes', False)
@@ -787,7 +813,7 @@ class DynamicVideoCompressor:
         
         # Candidate resolutions (maintain aspect ratio)
         aspect_ratio = orig_w / orig_h
-        candidate_heights = [1080, 720, 540, 480, 360]
+        candidate_heights = [1080, 720, 540, 480, 360, 270]
         candidates = []
         
         for h in candidate_heights:
@@ -803,12 +829,12 @@ class DynamicVideoCompressor:
             candidates.insert(0, (orig_w, orig_h))
         
         # Candidate FPS values
-        fps_candidates = [30, 24] if orig_fps >= 30 else [24, int(orig_fps)]
+        fps_candidates = [30, 24, 20] if orig_fps >= 30 else [24, 20, int(orig_fps)]
         fps_prefer_24 = profile_cfg.get('fps_policy', {}).get('prefer_24_for_low_motion', True)
         motion_level = video_info.get('motion_level', 'medium')
         
         if fps_prefer_24 and motion_level == 'low':
-            fps_candidates = [24, 30]  # Prefer 24 for low motion
+            fps_candidates = [24, 20, 30]  # Prefer 24 for low motion
         
         # Find best combo that satisfies BPP
         target_bits_per_sec = target_bitrate_kbps * 1000
@@ -822,10 +848,12 @@ class DynamicVideoCompressor:
                     logger.info(f"Selected {w}x{h}@{fps}fps: BPP={actual_bpp:.4f} >= {bpp_min:.4f}")
                     return {'width': w, 'height': h, 'fps': fps}
         
-        # Fallback: use smallest resolution at lowest FPS
+        # Fallback: use smallest resolution at lowest FPS and reduce BPP floor by 20%
         w, h = candidates[-1]
         fps = fps_candidates[-1]
-        logger.warning(f"BPP floor not met; using minimum {w}x{h}@{fps}fps")
+        pixels_per_sec = w * h * fps
+        actual_bpp = target_bits_per_sec / pixels_per_sec
+        logger.warning(f"BPP floor not fully met at {w}x{h}@{fps}fps: BPP={actual_bpp:.4f} < {bpp_min:.4f} (proceeding anyway)")
         return {'width': w, 'height': h, 'fps': fps}
     
     def _build_cae_encode_params(self, base_params: Dict[str, Any], 

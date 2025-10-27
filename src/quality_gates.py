@@ -122,10 +122,17 @@ class QualityGates:
         Returns VMAF score (0-100) or None on error.
         """
         try:
-            # Build filter chain: scale both to eval resolution, then libvmaf
-            scale_filter = ""
-            if eval_height:
-                scale_filter = f"scale=-2:{eval_height}:flags=bicubic,"
+            # Always scale both videos to same resolution for comparison
+            # Use eval_height or the smaller of the two video heights
+            if not eval_height:
+                # Get both video resolutions
+                from .ffmpeg_utils import FFmpegUtils
+                ref_w, ref_h = FFmpegUtils.get_video_resolution(ref_path)
+                dist_w, dist_h = FFmpegUtils.get_video_resolution(dist_path)
+                eval_height = min(ref_h, dist_h)
+            
+            # Build filter chain: scale both to same resolution, then libvmaf
+            scale_filter = f"scale=-2:{eval_height}:flags=bicubic,"
             
             # libvmaf filter: [distorted][reference]libvmaf
             filter_complex = (
@@ -201,10 +208,16 @@ class QualityGates:
         Returns SSIM score (0-1) or None on error.
         """
         try:
-            # Build filter chain
-            scale_filter = ""
-            if eval_height:
-                scale_filter = f"scale=-2:{eval_height}:flags=bicubic,"
+            # Always scale both videos to same resolution for comparison
+            if not eval_height:
+                # Get both video resolutions
+                from .ffmpeg_utils import FFmpegUtils
+                ref_w, ref_h = FFmpegUtils.get_video_resolution(ref_path)
+                dist_w, dist_h = FFmpegUtils.get_video_resolution(dist_path)
+                eval_height = min(ref_h, dist_h)
+            
+            # Build filter chain: scale both to same resolution
+            scale_filter = f"scale=-2:{eval_height}:flags=bicubic,"
             
             filter_complex = (
                 f"[0:v]{scale_filter}setpts=PTS-STARTPTS[dist];"
