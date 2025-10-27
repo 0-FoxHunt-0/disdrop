@@ -15,6 +15,7 @@ import logging
 from pathlib import Path
 from tqdm import tqdm
 import json
+from functools import lru_cache
 
 from .hardware_detector import HardwareDetector
 from .config_manager import ConfigManager
@@ -63,12 +64,174 @@ class DynamicVideoCompressor:
         
         # Optimize system resources
         self.system_optimizations = self.performance_enhancer.optimize_system_resources()
+        
+        # Cache for expensive calculations
+        self._resolution_cache = {}
 
     # ===== New helpers for refined final-pass encoding =====
+    def _calculate_safe_bitrate_cap(self, width: int, height: int, fps: float, duration: float) -> int:
+        """Calculate reasonable bitrate cap based on video characteristics"""
+        pixels_per_sec = width * height * fps
+        # Cap at 0.15 bits-per-pixel (high quality ceiling)
+        max_bpp = 0.15
+        cap = int(pixels_per_sec * max_bpp / 1000)
+        # Absolute bounds: 500k-8000k
+        return max(500, min(cap, 8000))
+    
+    def _cleanup_two_pass_logs(self, log_base: str):
+        """Clean up all two-pass log files reliably"""
+        for ext in ['-0.log', '-0.log.mbtree', '-0.log.temp', '-0.log.mbtree.temp']:
+            try:
+                log_path = f"{log_base}{ext}"
+                if os.path.exists(log_path):
+                    os.remove(log_path)
+            except Exception as e:
+                logger.debug(f"Could not remove {log_path}: {e}")
+    
+    def _binary_search_bitrate(self, input_path: str, output_path: str, params: Dict[str, Any],
+                               video_info: Dict[str, Any], target_mb: float,
+                               low_kbps: int, high_kbps: int, log_base: str,
+                               min_utilization: float = 0.95, max_utilization: float = 0.98,
+                               max_iterations: int = 3) -> Optional[Tuple[int, float]]:
+        """Binary search for optimal bitrate within target utilization range.
+        Returns (best_bitrate, best_size_mb) or None if failed."""
+        
+        best_bitrate = low_kbps
+        best_size = 0.0
+        
+        for iteration in range(max_iterations):
+            # Calculate midpoint bitrate
+            mid_kbps = (low_kbps + high_kbps) // 2
+            
+            # Test this bitrate
+            params_test = params.copy()
+            params_test['bitrate'] = mid_kbps
+            
+            logger.info(f"Binary search iteration {iteration+1}: testing bitrate {mid_kbps}k (range: {low_kbps}k-{high_kbps}k)")
+            
+            # Build and execute command
+            cmd = self._build_two_pass_command(input_path, output_path, params_test, pass_num=2, log_file=log_base)
+            success = self._execute_ffmpeg_with_progress(cmd, video_info['duration'])
+            
+            if not success or not os.path.exists(output_path):
+                logger.warning(f"Binary search iteration {iteration+1} failed")
+                high_kbps = mid_kbps - 1
+                continue
+            
+            test_size = os.path.getsize(output_path) / (1024 * 1024)
+            utilization = test_size / target_mb
+            
+            logger.info(f"Binary search iteration {iteration+1}: size={test_size:.2f}MB, utilization={utilization*100:.1f}%")
+            
+            # Check if within target range
+            if min_utilization <= utilization <= max_utilization:
+                logger.info(f"Binary search converged: bitrate={mid_kbps}k, size={test_size:.2f}MB")
+                return mid_kbps, test_size
+            elif utilization > max_utilization:
+                # Too large, reduce bitrate
+                high_kbps = mid_kbps - 1
+            else:
+                # Too small, increase bitrate
+                low_kbps = mid_kbps + 1
+                if test_size > best_size and test_size <= target_mb:
+                    best_bitrate = mid_kbps
+                    best_size = test_size
+            
+            # Stop if range collapsed
+            if low_kbps >= high_kbps:
+                break
+        
+        # Return best found if we have one
+        if best_size > 0:
+            logger.info(f"Binary search ended: best bitrate={best_bitrate}k, size={best_size:.2f}MB")
+            return best_bitrate, best_size
+        
+        return None
+    
     def _calculate_target_video_kbps(self, target_size_mb: float, duration_s: float, audio_kbps: int) -> int:
         total_bits = target_size_mb * 8 * 1024 * 1024
         kbps = int(max((total_bits / max(duration_s, 1.0) / 1000) - audio_kbps, 64))
         return kbps
+    
+    def _calculate_optimal_fps(self, video_info: Dict[str, Any], target_size_mb: float, strategy: str = 'balanced') -> float:
+        """Determine best FPS based on motion, size constraints, and strategy"""
+        original_fps = video_info.get('fps', 30.0)
+        motion_level = video_info.get('motion_level', 'medium')
+        duration = video_info.get('duration', 0)
+        original_size_mb = video_info.get('size_bytes', 0) / (1024 * 1024)
+        
+        # Calculate compression ratio to gauge difficulty
+        compression_ratio = original_size_mb / max(target_size_mb, 0.1) if original_size_mb > 0 else 1.0
+        
+        # Base FPS selection based on motion level
+        if motion_level == 'high':
+            base_fps = min(original_fps, 60)  # Keep high FPS for motion
+        elif motion_level == 'low':
+            base_fps = 24  # Low motion can use 24fps
+        else:
+            base_fps = 30  # Medium motion uses 30fps
+        
+        # Adjust based on strategy
+        if strategy == 'aggressive':
+            # Reduce FPS more aggressively
+            if compression_ratio > 10:
+                base_fps = min(base_fps * 0.5, 24)
+            elif compression_ratio > 5:
+                base_fps = min(base_fps * 0.7, 30)
+        elif strategy == 'quality':
+            # Try to preserve FPS
+            base_fps = min(original_fps, 60)
+        
+        # Further reduce if extreme compression is needed
+        if compression_ratio > 15:
+            base_fps = max(base_fps * 0.6, 15)
+        
+        # Always cap at 60 and floor at 10
+        return max(10, min(base_fps, 60))
+    
+    def _calculate_optimal_audio_bitrate(self, input_path: str, video_info: Dict[str, Any], 
+                                        target_size_mb: float) -> int:
+        """Choose audio bitrate based on input quality and size budget"""
+        duration = video_info.get('duration', 0)
+        
+        # Try to probe input audio bitrate
+        try:
+            cmd = [
+                'ffprobe', '-v', 'quiet', '-select_streams', 'a:0',
+                '-show_entries', 'stream=bit_rate', '-of', 'json', input_path
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                probe_data = json.loads(result.stdout)
+                if probe_data.get('streams') and len(probe_data['streams']) > 0:
+                    input_audio_bitrate = int(probe_data['streams'][0].get('bit_rate', 0)) // 1000
+                else:
+                    input_audio_bitrate = 128  # Default if no audio stream
+            else:
+                input_audio_bitrate = 128
+        except Exception:
+            input_audio_bitrate = 128  # Default on error
+        
+        # Calculate what we can afford (reserve 10-15% of budget for audio)
+        total_bitrate = (target_size_mb * 8 * 1024) / max(duration, 1)  # kbps
+        audio_budget = total_bitrate * 0.12  # 12% for audio
+        
+        # Scale down from input quality, never exceed it
+        target_audio = min(input_audio_bitrate, audio_budget)
+        
+        # Quantize to standard bitrates
+        if target_audio >= 160:
+            return min(192, input_audio_bitrate)
+        elif target_audio >= 112:
+            return min(128, input_audio_bitrate)
+        elif target_audio >= 80:
+            return min(96, input_audio_bitrate)
+        elif target_audio >= 56:
+            return 64
+        elif target_audio >= 40:
+            return 48
+        else:
+            return 32  # Minimum acceptable quality
 
     def _utilization_ratio(self, actual_bytes: int, target_mb: float) -> float:
         return float(actual_bytes) / max(target_mb * 1024 * 1024, 1.0)
@@ -81,6 +244,31 @@ class DynamicVideoCompressor:
         except Exception:
             return True
 
+    def _calculate_codec_efficiency(self, codec_key: str, complexity: float) -> float:
+        """Get realistic bits-per-pixel efficiency for codec
+        Returns efficiency factor (higher = more efficient = fewer bits needed)
+        """
+        # Base efficiency values (bits per pixel at medium complexity)
+        # These are empirically derived from real-world encoding
+        base_efficiency = {
+            'hevc_10bit': 0.017,  # Most efficient
+            'hevc_8bit': 0.019,
+            'h264_10bit': 0.021,
+            'h264_8bit': 0.025,   # Least efficient, needs most bits
+        }
+        
+        # Get base for this codec
+        base_bpp = base_efficiency.get(codec_key, 0.025)
+        
+        # Adjust for complexity (higher complexity = needs more bits = lower efficiency)
+        # Complexity ranges 0-10, normalize to 0-1
+        complexity_factor = 1.0 + (complexity / 10.0) * 0.4  # Up to 40% more bits for complex content
+        
+        adjusted_bpp = base_bpp * complexity_factor
+        
+        # Return as efficiency factor (inverted, so higher = better)
+        return 1.0 / adjusted_bpp
+    
     def _derive_codec_priority(self) -> List[str]:
         """Derive ordered codec preference keys like ['hevc_10bit', 'hevc_8bit', 'h264_10bit', 'h264_8bit']
         based on config and runtime capability.
@@ -232,8 +420,9 @@ class DynamicVideoCompressor:
             a_kbps = 96
             v_kbps = self._calculate_target_video_kbps(safe_target_mb, video_info['duration'], a_kbps)
             # Safety check: prevent extremely high bitrates that might cause FFmpeg to crash
-            # Cap at 3000k (increased from 2000k) for final refinement to allow better quality
-            v_kbps = min(v_kbps, 3000)
+            # Use dynamic cap based on video characteristics
+            safe_cap = self._calculate_safe_bitrate_cap(width, height, out_fps, video_info['duration'])
+            v_kbps = min(v_kbps, safe_cap)
 
             # Select codec order
             codec_order = self._derive_codec_priority()
@@ -457,13 +646,13 @@ class DynamicVideoCompressor:
         if use_advanced_optimization and (original_size_mb > 50 or target_size_mb < 5):
             logger.info("Using advanced optimization for challenging compression requirements")
             try:
-                result = self._compress_with_advanced_optimization(
+                adv_result = self._compress_with_advanced_optimization(
                     input_path, output_path, target_size_mb, platform_config, video_info
                 )
             except Exception:
-                result = None
-            if result and result.get('success'):
-                return result
+                adv_result = None
+            if adv_result and adv_result.get('success'):
+                return adv_result
             # Fallback to standard pipeline or segmentation as last resort
             try:
                 std_result = self._compress_with_standard_optimization(
@@ -471,9 +660,9 @@ class DynamicVideoCompressor:
                 )
                 # Attempt refinement
                 try:
-                    refined = self._final_single_file_refinement(input_path, output_path, target_size_mb, video_info)
-                    if refined and refined.get('success'):
-                        return refined
+                    refined_result = self._final_single_file_refinement(input_path, output_path, target_size_mb, video_info)
+                    if refined_result and refined_result.get('success'):
+                        return refined_result
                 except Exception:
                     pass
                 return std_result
@@ -501,9 +690,9 @@ class DynamicVideoCompressor:
                 )
                 # Attempt refinement
                 try:
-                    refined = self._final_single_file_refinement(input_path, output_path, target_size_mb, video_info)
-                    if refined and refined.get('success'):
-                        return refined
+                    refined_result = self._final_single_file_refinement(input_path, output_path, target_size_mb, video_info)
+                    if refined_result and refined_result.get('success'):
+                        return refined_result
                 except Exception:
                     pass
                 return std_result
@@ -698,13 +887,7 @@ class DynamicVideoCompressor:
                     
                     # Clean up two-pass log files if applicable
                     if result['strategy'] == 'two_pass':
-                        try:
-                            for log_ext in ['-0.log', '-0.log.mbtree']:
-                                log_path = f"{refine_log_file}{log_ext}"
-                                if os.path.exists(log_path):
-                                    os.remove(log_path)
-                        except Exception as e:
-                            logger.debug(f"Failed to clean up log files: {e}")
+                        self._cleanup_two_pass_logs(refine_log_file)
                     
                     if success and os.path.exists(temp_refined):
                         new_size_mb = os.path.getsize(temp_refined) / (1024 * 1024)
@@ -834,8 +1017,14 @@ class DynamicVideoCompressor:
             if new_bitrate > base_bitrate * uplift_cap:
                 break
 
-            # Safety check: prevent extremely high bitrates
-            new_bitrate = min(new_bitrate, 3000)
+            # Safety check: prevent extremely high bitrates using dynamic cap
+            safe_cap = self._calculate_safe_bitrate_cap(
+                params.get('width', video_info['width']),
+                params.get('height', video_info['height']),
+                params.get('fps', video_info['fps']),
+                video_info['duration']
+            )
+            new_bitrate = min(new_bitrate, safe_cap)
             
             temp_uplift = os.path.join(self.temp_dir, f"uplift_{result.get('strategy')}_{pass_num}.mp4")
             params['bitrate'] = new_bitrate
@@ -869,13 +1058,7 @@ class DynamicVideoCompressor:
             
             # Clean up two-pass log files if applicable
             if 'two_pass' in strategy:
-                try:
-                    for log_ext in ['-0.log', '-0.log.mbtree']:
-                        log_path = f"{log_file}{log_ext}"
-                        if os.path.exists(log_path):
-                            os.remove(log_path)
-                except Exception as e:
-                    logger.debug(f"Failed to clean up log files: {e}")
+                self._cleanup_two_pass_logs(log_file)
             
             new_size = os.path.getsize(temp_uplift) / (1024 * 1024)
             if new_size > target_size_mb:
@@ -972,9 +1155,11 @@ class DynamicVideoCompressor:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         
         results = []
-        max_workers = min(len(strategies), 2)  # Conservative: max 2 parallel strategies
+        # Dynamic worker calculation based on system capabilities
+        cpu_count = getattr(self.hardware, 'cpu_count', 4)  # Default to 4 if not available
+        max_workers = min(len(strategies), max(2, cpu_count // 2))
         
-        logger.info(f"Executing {len(strategies)} strategies in parallel with {max_workers} workers")
+        logger.info(f"Executing {len(strategies)} strategies in parallel with {max_workers} workers (CPU count: {cpu_count})")
         
         def execute_strategy(strategy):
             try:
@@ -1055,69 +1240,69 @@ class DynamicVideoCompressor:
                 # Sequential execution (original behavior)
                 # Strategy 1: Content-aware optimal compression
                 logger.info("Attempting Strategy 1: Content-aware optimal compression")
-                result = self._compress_with_content_awareness(
+                strategy1_result = self._compress_with_content_awareness(
                     input_path, video_info, platform_config, target_size_mb
                 )
-                if result:
+                if strategy1_result:
                     # Refine if under-utilizing target
-                    result = self._refine_strategy_result(result, input_path, video_info, target_size_mb)
+                    strategy1_result = self._refine_strategy_result(strategy1_result, input_path, video_info, target_size_mb)
                     # Validate quality and attempt uplift if needed
-                    result = self._validate_and_uplift_result(result, input_path, video_info, target_size_mb)
-                    if result:  # Only process validated results
-                        compression_attempts.append(result)
-                        if result['size_mb'] <= target_size_mb:
-                            best_result = result
-                            logger.info(f"Strategy 1 successful: {result['size_mb']:.2f}MB")
+                    strategy1_result = self._validate_and_uplift_result(strategy1_result, input_path, video_info, target_size_mb)
+                    if strategy1_result:  # Only process validated results
+                        compression_attempts.append(strategy1_result)
+                        if strategy1_result['size_mb'] <= target_size_mb:
+                            best_result = strategy1_result
+                            logger.info(f"Strategy 1 successful: {strategy1_result['size_mb']:.2f}MB")
                 
                 # Strategy 2: Two-pass encoding if Strategy 1 didn't work perfectly
-                if not best_result or (result and result.get('size_mb', 0) > target_size_mb * 0.95):
+                if not best_result or (strategy1_result and strategy1_result.get('size_mb', 0) > target_size_mb * 0.95):
                     logger.info("Attempting Strategy 2: Two-pass precision encoding")
-                    result = self._compress_with_two_pass(
+                    strategy2_result = self._compress_with_two_pass(
                         input_path, video_info, platform_config, target_size_mb, best_result
                     )
-                    if result:
+                    if strategy2_result:
                         # Refine if under-utilizing target
-                        result = self._refine_strategy_result(result, input_path, video_info, target_size_mb)
+                        strategy2_result = self._refine_strategy_result(strategy2_result, input_path, video_info, target_size_mb)
                         # Validate quality and attempt uplift if needed
-                        result = self._validate_and_uplift_result(result, input_path, video_info, target_size_mb)
-                        if result:  # Only process validated results
-                            compression_attempts.append(result)
-                            if result['size_mb'] <= target_size_mb:
-                                if not best_result or result['quality_score'] > best_result.get('quality_score', 0):
-                                    best_result = result
-                                    logger.info(f"Strategy 2 improved result: {result['size_mb']:.2f}MB")
+                        strategy2_result = self._validate_and_uplift_result(strategy2_result, input_path, video_info, target_size_mb)
+                        if strategy2_result:  # Only process validated results
+                            compression_attempts.append(strategy2_result)
+                            if strategy2_result['size_mb'] <= target_size_mb:
+                                if not best_result or strategy2_result['quality_score'] > best_result.get('quality_score', 0):
+                                    best_result = strategy2_result
+                                    logger.info(f"Strategy 2 improved result: {strategy2_result['size_mb']:.2f}MB")
             
             # Strategy 3: Adaptive resolution and quality optimization
             if not best_result:
                 logger.info("Attempting Strategy 3: Adaptive resolution optimization")
-                result = self._compress_with_adaptive_resolution(
+                strategy3_result = self._compress_with_adaptive_resolution(
                     input_path, video_info, platform_config, target_size_mb
                 )
-                if result:
+                if strategy3_result:
                     # Refine if under-utilizing target
-                    result = self._refine_strategy_result(result, input_path, video_info, target_size_mb)
+                    strategy3_result = self._refine_strategy_result(strategy3_result, input_path, video_info, target_size_mb)
                     # Validate quality and attempt uplift if needed
-                    result = self._validate_and_uplift_result(result, input_path, video_info, target_size_mb)
-                    if result:  # Only process validated results
-                        compression_attempts.append(result)
-                        if result['size_mb'] <= target_size_mb:
-                            best_result = result
-                            logger.info(f"Strategy 3 successful: {result['size_mb']:.2f}MB")
+                    strategy3_result = self._validate_and_uplift_result(strategy3_result, input_path, video_info, target_size_mb)
+                    if strategy3_result:  # Only process validated results
+                        compression_attempts.append(strategy3_result)
+                        if strategy3_result['size_mb'] <= target_size_mb:
+                            best_result = strategy3_result
+                            logger.info(f"Strategy 3 successful: {strategy3_result['size_mb']:.2f}MB")
             
             # Strategy 4: Aggressive optimization as last resort
             if not best_result:
                 logger.info("Attempting Strategy 4: Aggressive optimization (last resort)")
-                result = self._compress_with_aggressive_optimization(
+                strategy4_result = self._compress_with_aggressive_optimization(
                     input_path, video_info, platform_config, target_size_mb
                 )
-                if result:
+                if strategy4_result:
                     # Validate quality and attempt uplift if needed
-                    result = self._validate_and_uplift_result(result, input_path, video_info, target_size_mb)
-                    if result:  # Only process validated results
-                        compression_attempts.append(result)
-                        if result['size_mb'] <= target_size_mb:
-                            best_result = result
-                            logger.info(f"Strategy 4 successful: {result['size_mb']:.2f}MB")
+                    strategy4_result = self._validate_and_uplift_result(strategy4_result, input_path, video_info, target_size_mb)
+                    if strategy4_result:  # Only process validated results
+                        compression_attempts.append(strategy4_result)
+                        if strategy4_result['size_mb'] <= target_size_mb:
+                            best_result = strategy4_result
+                            logger.info(f"Strategy 4 successful: {strategy4_result['size_mb']:.2f}MB")
             
             if not best_result:
                 # Check if segmentation fallback is enabled
@@ -1357,8 +1542,12 @@ class DynamicVideoCompressor:
             # Calculate precise bitrate for target size
             target_bitrate = self._calculate_precise_bitrate(video_info, target_size_mb)
             # Safety check: prevent extremely high bitrates that might cause FFmpeg to crash
-            # Cap at 3000k (increased from 2000k) for two-pass encoding to allow better quality
-            target_bitrate = min(target_bitrate, 3000)
+            # Use dynamic cap based on video characteristics
+            safe_cap = self._calculate_safe_bitrate_cap(
+                video_info['width'], video_info['height'], 
+                min(video_info['fps'], 30), video_info['duration']
+            )
+            target_bitrate = min(target_bitrate, safe_cap)
 
             # Adjust parameters based on previous attempt if available
             params = self._calculate_two_pass_params(video_info, platform_config, target_bitrate, previous_result)
@@ -1402,9 +1591,7 @@ class DynamicVideoCompressor:
                 return None
             
             # Clean up log files
-            for log_file in [f"{temp_log}-0.log", f"{temp_log}-0.log.mbtree"]:
-                if os.path.exists(log_file):
-                    os.remove(log_file)
+            self._cleanup_two_pass_logs(temp_log)
             
             if os.path.exists(temp_output):
                 size_mb = os.path.getsize(temp_output) / (1024 * 1024)
@@ -1868,6 +2055,14 @@ class DynamicVideoCompressor:
                                     platform_config: Dict[str, Any]) -> Tuple[int, int]:
         """Calculate optimal resolution for target file size"""
         
+        # Check cache first
+        cache_key = (video_info['width'], video_info['height'], 
+                    video_info.get('duration', 0), target_size_mb,
+                    video_info.get('complexity_score', 5.0))
+        if cache_key in self._resolution_cache:
+            logger.debug(f"Using cached resolution calculation for {cache_key[0]}x{cache_key[1]}")
+            return self._resolution_cache[cache_key]
+        
         original_width, original_height = video_info['width'], video_info['height']
         original_pixels = original_width * original_height
         
@@ -1900,20 +2095,21 @@ class DynamicVideoCompressor:
             duration = video_info['duration']
             complexity = video_info.get('complexity_score', 5.0)
             
-            # Much more conservative bitrate calculation
-            target_bits = target_size_mb * 8 * 1024 * 1024 * 0.85
+            # Conservative bitrate calculation (reserve for audio)
+            target_bits = target_size_mb * 8 * 1024 * 1024 * 0.88  # 88% for video, 12% for audio
             bits_per_second = target_bits / duration
             
-            # For high-resolution videos, use a much higher efficiency factor
-            # This prevents the extreme downscaling that was happening
-            base_efficiency = 0.6  # Much higher than the previous 0.25
-            complexity_penalty = min(complexity * 0.002, 0.05)  # Much smaller penalty
-            efficiency_factor = base_efficiency - complexity_penalty
+            # Use codec-based efficiency (assume h264_8bit as conservative default)
+            codec_efficiency = self._calculate_codec_efficiency('h264_8bit', complexity)
+            # Convert efficiency to BPP requirement
+            required_bpp = 1.0 / codec_efficiency
             
-            affordable_pixels = int((bits_per_second * efficiency_factor) / 24)
+            # Calculate affordable pixels at target FPS (assume 24-30fps for calculations)
+            target_fps = 24
+            affordable_pixels = int(bits_per_second / (required_bpp * target_fps))
             
             logger.info(f"High-res calculation: duration={duration:.1f}s, complexity={complexity:.1f}, "
-                       f"efficiency_factor={efficiency_factor:.3f}, affordable_pixels={affordable_pixels:,}")
+                       f"required_bpp={required_bpp:.4f}, affordable_pixels={affordable_pixels:,}")
             
             if affordable_pixels >= original_pixels:
                 # Can keep original resolution
@@ -1931,23 +2127,24 @@ class DynamicVideoCompressor:
                 
                 logger.info(f"Conservative scaling: factor={scale_factor:.3f}, new size={optimal_width}x{optimal_height}")
         else:
-            # For lower resolution videos, use the existing logic but with improvements
+            # For lower resolution videos, use codec-based model
             duration = video_info['duration']
             complexity = video_info.get('complexity_score', 5.0)
             
-            # Improved calculation for lower resolution videos
-            target_bits = target_size_mb * 8 * 1024 * 1024 * 0.85
+            # Conservative bitrate calculation (reserve for audio)
+            target_bits = target_size_mb * 8 * 1024 * 1024 * 0.88  # 88% for video
             bits_per_second = target_bits / duration
             
-            # Better efficiency factors for lower resolution
-            base_efficiency = 0.35  # Increased from 0.25
-            complexity_penalty = min(complexity * 0.003, 0.08)  # Reduced penalty
-            efficiency_factor = base_efficiency - complexity_penalty
+            # Use codec-based efficiency (h264_8bit as default)
+            codec_efficiency = self._calculate_codec_efficiency('h264_8bit', complexity)
+            required_bpp = 1.0 / codec_efficiency
             
-            affordable_pixels = int((bits_per_second * efficiency_factor) / 24)
+            # Calculate affordable pixels at 24fps
+            target_fps = 24
+            affordable_pixels = int(bits_per_second / (required_bpp * target_fps))
             
             logger.info(f"Standard calculation: duration={duration:.1f}s, complexity={complexity:.1f}, "
-                       f"efficiency_factor={efficiency_factor:.3f}, affordable_pixels={affordable_pixels:,}")
+                       f"required_bpp={required_bpp:.4f}, affordable_pixels={affordable_pixels:,}")
             
             if affordable_pixels >= original_pixels:
                 optimal_width, optimal_height = original_width, original_height
@@ -2028,16 +2225,23 @@ class DynamicVideoCompressor:
         logger.info(f"Final resolution: {final_width}x{final_height} "
                    f"(min allowed: {final_min_width}x{final_min_height})")
         
+        # Store in cache before returning
+        self._resolution_cache[cache_key] = (final_width, final_height)
+        
         return final_width, final_height
     
     def _calculate_quality_score(self, params: Dict[str, Any], video_info: Dict[str, Any]) -> float:
-        """Calculate estimated quality score for comparison"""
+        """Calculate estimated quality score for comparison (heuristic-based for strategy selection)
+        
+        Note: This is a fast heuristic for comparing strategies during compression.
+        For actual quality validation, use QualityScorer.calculate_quality_score() instead.
+        """
         score = 10.0  # Start with perfect score
         
         # Resolution penalty
         original_pixels = video_info['width'] * video_info['height']
-        current_pixels = params['width'] * params['height']
-        resolution_factor = current_pixels / original_pixels
+        current_pixels = params.get('width', original_pixels) * params.get('height', video_info['height'])
+        resolution_factor = current_pixels / max(original_pixels, 1)
         score *= resolution_factor
         
         # CRF penalty (if using software encoding)
@@ -2050,8 +2254,17 @@ class DynamicVideoCompressor:
         # Bitrate consideration
         if params.get('bitrate'):
             # Higher bitrate generally means better quality
-            bitrate_bonus = min(params['bitrate'] / 2000, 1.2)  # Cap bonus at 1.2x
-            score *= bitrate_bonus
+            # Normalize against resolution for fair comparison
+            bpp = params['bitrate'] * 1000 / (current_pixels * params.get('fps', 30))
+            # Target BPP around 0.02-0.05 for good quality
+            bpp_score = min(bpp / 0.03, 1.2)  # Cap bonus at 1.2x
+            score *= bpp_score
+        
+        # FPS penalty for reduced frame rates
+        original_fps = video_info.get('fps', 30)
+        current_fps = params.get('fps', original_fps)
+        fps_factor = current_fps / max(original_fps, 1)
+        score *= max(fps_factor, 0.7)  # At least 70% of score even at low FPS
         
         return max(0, min(10, score))
     
@@ -2440,6 +2653,38 @@ class DynamicVideoCompressor:
         return cmd
 
     
+    def _is_hardware_acceleration_error(self, error_output: str, return_code: int = None) -> tuple[bool, str]:
+        """Check if error is hardware acceleration related and return encoder type"""
+        error_lower = error_output.lower()
+        
+        # Enhanced hardware error detection patterns
+        hardware_error_patterns = {
+            'AMD AMF': ['amf', 'h264_amf', 'hevc_amf', 'av1_amf',
+                       'failed to initialize amf', 'amf encoder init failed',
+                       'cannot load amfrt64.dll', 'cannot load amfrt32.dll',
+                       'no amf device found', 'amf session init failed'],
+            'NVIDIA NVENC': ['nvenc', 'h264_nvenc', 'hevc_nvenc', 'av1_nvenc',
+                            'cannot load nvcuda.dll', 'cuda driver not found',
+                            'nvenc init failed', 'no nvidia device found'],
+            'Intel QuickSync': ['qsv', 'h264_qsv', 'hevc_qsv', 'mfx session',
+                               'qsv init failed', 'no qsv device found'],
+            'General': ['hardware', 'hwaccel', 'gpu', 'device not found',
+                       'encoder not found', 'codec not supported']
+        }
+        
+        # Check patterns
+        for encoder_type, patterns in hardware_error_patterns.items():
+            if any(pattern in error_lower for pattern in patterns):
+                return True, encoder_type
+        
+        # Check error codes
+        if return_code is not None:
+            hardware_error_codes = [4294967274, -22, -12, -2]
+            if return_code in hardware_error_codes:
+                return True, "Unknown"
+        
+        return False, ""
+    
     def _execute_ffmpeg_with_progress(self, cmd: List[str], duration: float):
         """Execute FFmpeg command with progress bar and hardware fallback"""
         
@@ -2455,44 +2700,11 @@ class DynamicVideoCompressor:
             error_output = str(e.stderr) if e.stderr else str(e)
             logger.error(f"FFmpeg command failed with error: {error_output[:500]}...")  # Limit error output length
             
-            # Enhanced hardware error detection patterns
-            hardware_error_patterns = [
-                # AMD AMF specific errors
-                'amf', 'h264_amf', 'hevc_amf', 'av1_amf',
-                'failed to initialize amf', 'amf encoder init failed',
-                'cannot load amfrt64.dll', 'cannot load amfrt32.dll',
-                'no amf device found', 'amf session init failed',
-                
-                # NVIDIA NVENC specific errors
-                'nvenc', 'h264_nvenc', 'hevc_nvenc', 'av1_nvenc',
-                'cannot load nvcuda.dll', 'cuda driver not found',
-                'nvenc init failed', 'no nvidia device found',
-                
-                # Intel QuickSync specific errors
-                'qsv', 'h264_qsv', 'hevc_qsv', 'mfx session',
-                'qsv init failed', 'no qsv device found',
-                
-                # General hardware acceleration errors
-                'hardware', 'hwaccel', 'gpu', 'device not found',
-                'encoder not found', 'codec not supported'
-            ]
-            
-            is_hardware_error = any(pattern in error_output.lower() for pattern in hardware_error_patterns)
-            
-            # Additional check for specific error codes that indicate hardware issues
-            hardware_error_codes = [4294967274, -22, -12, -2]  # Common hardware failure codes
-            is_hardware_error = is_hardware_error or (hasattr(e, 'returncode') and e.returncode in hardware_error_codes)
+            # Use consolidated hardware error detection
+            return_code = e.returncode if hasattr(e, 'returncode') else None
+            is_hardware_error, encoder_type = self._is_hardware_acceleration_error(error_output, return_code)
             
             if is_hardware_error:
-                # Determine the type of hardware encoder that failed
-                encoder_type = "Unknown"
-                if any(amd in error_output.lower() for amd in ['amf', 'h264_amf', 'hevc_amf']):
-                    encoder_type = "AMD AMF"
-                elif any(nvidia in error_output.lower() for nvidia in ['nvenc', 'h264_nvenc', 'hevc_nvenc']):
-                    encoder_type = "NVIDIA NVENC"
-                elif any(intel in error_output.lower() for intel in ['qsv', 'h264_qsv', 'hevc_qsv']):
-                    encoder_type = "Intel QuickSync"
-                
                 logger.warning(f"{encoder_type} hardware acceleration failed, trying software fallback...")
                 
                 # Replace hardware encoder with software encoder
@@ -2595,45 +2807,29 @@ class DynamicVideoCompressor:
             # Join all stderr output for error analysis
             full_stderr_output = ''.join(stderr_output)
             
-            # Check if this is an AMD AMF encoder error
-            if any(encoder in ' '.join(cmd) for encoder in ['h264_amf', 'hevc_amf', 'av1_amf']):
-                # Check for specific AMD AMF error patterns
-                amd_error_patterns = [
-                    'Invalid argument',
-                    'Failed to initialize AMF',
-                    'AMF encoder init failed',
-                    'No AMF device found',
-                    'AMF session init failed',
-                    'Cannot load amfrt64.dll',
-                    'Cannot load amfrt32.dll'
-                ]
-                
-                # Convert unsigned error code to signed for comparison
+            # Use consolidated hardware error detection
+            is_hardware_error, encoder_type = self._is_hardware_acceleration_error(full_stderr_output, return_code)
+            
+            if is_hardware_error:
+                # Convert unsigned error code to signed for comparison (for logging)
                 signed_return_code = return_code if return_code < 2147483648 else return_code - 4294967296
                 
-                is_amd_error = (
-                    str(return_code) == '4294967274' or  # Unsigned version of -22
-                    signed_return_code == -22 or          # Signed version (Invalid argument)
-                    any(pattern in full_stderr_output for pattern in amd_error_patterns)
-                )
+                logger.warning(f"{encoder_type} encoder failed with error code {return_code} (signed: {signed_return_code}), attempting software fallback...")
+                logger.debug(f"{encoder_type} error details: {full_stderr_output[-500:]}")  # Log last 500 chars of stderr
                 
-                if is_amd_error:
-                    logger.warning(f"AMD AMF encoder failed with error code {return_code} (signed: {signed_return_code}), attempting software fallback...")
-                    logger.debug(f"AMD AMF error details: {full_stderr_output[-500:]}")  # Log last 500 chars of stderr
-                    
-                    # Create software fallback command
-                    fallback_cmd = self._create_software_fallback_command(cmd)
-                    if fallback_cmd:
-                        logger.info("Replaced h264_amf with libx264 for software fallback")
-                        logger.info("Attempting software fallback...")
-                        # Try the fallback command
-                        try:
-                            return self._execute_ffmpeg_command(fallback_cmd, duration)
-                        except subprocess.CalledProcessError as fallback_error:
-                            logger.error(f"Software fallback also failed: {fallback_error}")
-                            raise fallback_error
-                    else:
-                        logger.error("Failed to create software fallback command")
+                # Create software fallback command
+                fallback_cmd = self._create_software_fallback_command(cmd)
+                if fallback_cmd:
+                    logger.info(f"Created software fallback command for {encoder_type}")
+                    logger.info("Attempting software fallback...")
+                    # Try the fallback command
+                    try:
+                        return self._execute_ffmpeg_command(fallback_cmd, duration)
+                    except subprocess.CalledProcessError as fallback_error:
+                        logger.error(f"Software fallback also failed: {fallback_error}")
+                        raise fallback_error
+                else:
+                    logger.error("Failed to create software fallback command")
             
             raise subprocess.CalledProcessError(return_code, cmd, full_stderr_output)
     
