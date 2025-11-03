@@ -188,3 +188,10 @@ test_files/
 .Trashes
 ehthumbs.db
 Thumbs.db 
+
+# Kiro AI Assistant
+.kiro/
+*.kiro
+.kiro-cache/
+kiro-temp/
+.kiro-logs/
