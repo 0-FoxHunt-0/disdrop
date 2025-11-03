@@ -7,3 +7,4 @@ from .cli import main as cli_main  # noqa: F401
 from .video_compressor import DynamicVideoCompressor  # noqa: F401
 from .gif_generator import GifGenerator  # noqa: F401
 from .automated_workflow import AutomatedWorkflow  # noqa: F401
+from .bitrate_validator import BitrateValidator, ValidationResult, AdjustmentPlan, BitrateValidationError  # noqa: F401

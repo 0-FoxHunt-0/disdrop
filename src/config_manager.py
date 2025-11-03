@@ -124,8 +124,149 @@ class ConfigManager:
                 logger.error(f"Required configuration key missing: {key}")
                 return False
         
+        # Validate bitrate validation configuration if enabled
+        if self.get('video_compression.bitrate_validation.enabled', True):
+            if not self._validate_bitrate_validation_config():
+                return False
+        
         logger.info("Configuration validation passed")
         return True
+    
+    def _validate_bitrate_validation_config(self) -> bool:
+        """Validate bitrate validation specific configuration"""
+        # Validate encoder minimums
+        encoder_minimums = self.get('video_compression.bitrate_validation.encoder_minimums', {})
+        if not isinstance(encoder_minimums, dict):
+            logger.error("bitrate_validation.encoder_minimums must be a dictionary")
+            return False
+        
+        # Validate encoder minimum values are positive numbers
+        for encoder, minimum in encoder_minimums.items():
+            if not isinstance(minimum, (int, float)) or minimum <= 0:
+                logger.error(f"Invalid encoder minimum for {encoder}: {minimum} (must be positive number)")
+                return False
+        
+        # Validate fallback resolutions format
+        fallback_resolutions = self.get('video_compression.bitrate_validation.fallback_resolutions', [])
+        if fallback_resolutions and not isinstance(fallback_resolutions, list):
+            logger.error("bitrate_validation.fallback_resolutions must be a list")
+            return False
+        
+        for res in fallback_resolutions:
+            if not isinstance(res, list) or len(res) != 2:
+                logger.error(f"Invalid fallback resolution format: {res} (must be [width, height])")
+                return False
+            if not all(isinstance(dim, int) and dim > 0 for dim in res):
+                logger.error(f"Invalid fallback resolution dimensions: {res} (must be positive integers)")
+                return False
+        
+        # Validate segmentation threshold
+        segmentation_threshold = self.get('video_compression.bitrate_validation.segmentation_threshold_mb')
+        if segmentation_threshold is not None:
+            if not isinstance(segmentation_threshold, (int, float)) or segmentation_threshold <= 0:
+                logger.error(f"Invalid segmentation_threshold_mb: {segmentation_threshold} (must be positive number)")
+                return False
+        
+        # Validate safety margin
+        safety_margin = self.get('video_compression.bitrate_validation.safety_margin')
+        if safety_margin is not None:
+            if not isinstance(safety_margin, (int, float)) or safety_margin <= 0:
+                logger.error(f"Invalid safety_margin: {safety_margin} (must be positive number)")
+                return False
+        
+        # Validate minimum resolution constraints
+        min_resolution = self.get('video_compression.bitrate_validation.min_resolution', {})
+        if min_resolution:
+            if not isinstance(min_resolution, dict):
+                logger.error("bitrate_validation.min_resolution must be a dictionary")
+                return False
+            
+            width = min_resolution.get('width')
+            height = min_resolution.get('height')
+            
+            if width is not None and (not isinstance(width, int) or width <= 0):
+                logger.error(f"Invalid min_resolution.width: {width} (must be positive integer)")
+                return False
+            
+            if height is not None and (not isinstance(height, int) or height <= 0):
+                logger.error(f"Invalid min_resolution.height: {height} (must be positive integer)")
+                return False
+        
+        # Validate minimum FPS
+        min_fps = self.get('video_compression.bitrate_validation.min_fps')
+        if min_fps is not None:
+            if not isinstance(min_fps, (int, float)) or min_fps <= 0:
+                logger.error(f"Invalid min_fps: {min_fps} (must be positive number)")
+                return False
+        
+        # Validate FPS reduction steps
+        fps_reduction_steps = self.get('video_compression.bitrate_validation.fps_reduction_steps', [])
+        if fps_reduction_steps:
+            if not isinstance(fps_reduction_steps, list):
+                logger.error("bitrate_validation.fps_reduction_steps must be a list")
+                return False
+            
+            for step in fps_reduction_steps:
+                if not isinstance(step, (int, float)) or step <= 0 or step > 1:
+                    logger.error(f"Invalid FPS reduction step: {step} (must be between 0 and 1)")
+                    return False
+        
+        return True
+    
+    def set_encoder_bitrate_floor(self, encoder: str, bitrate_kbps: int):
+        """Set runtime bitrate floor override for a specific encoder"""
+        if not isinstance(bitrate_kbps, (int, float)) or bitrate_kbps <= 0:
+            logger.error(f"Invalid bitrate floor for {encoder}: {bitrate_kbps} (must be positive number)")
+            return
+        
+        encoder_minimums = self.get('video_compression.bitrate_validation.encoder_minimums', {})
+        encoder_minimums[encoder] = bitrate_kbps
+        self._set_nested_value('video_compression.bitrate_validation.encoder_minimums', encoder_minimums)
+        logger.info(f"Set bitrate floor override for {encoder}: {bitrate_kbps}kbps")
+    
+    def set_all_encoder_bitrate_floors(self, bitrate_kbps: int):
+        """Set runtime bitrate floor override for all encoders"""
+        if not isinstance(bitrate_kbps, (int, float)) or bitrate_kbps <= 0:
+            logger.error(f"Invalid bitrate floor: {bitrate_kbps} (must be positive number)")
+            return
+        
+        # Get current encoder minimums or use defaults
+        encoder_minimums = self.get('video_compression.bitrate_validation.encoder_minimums', {
+            'libx264': 3,
+            'libx265': 5,
+            'h264_nvenc': 2,
+            'h264_amf': 2,
+            'h264_qsv': 2,
+            'h264_videotoolbox': 2
+        })
+        
+        # Override all encoder minimums with the specified floor
+        for encoder in encoder_minimums.keys():
+            encoder_minimums[encoder] = bitrate_kbps
+        
+        self._set_nested_value('video_compression.bitrate_validation.encoder_minimums', encoder_minimums)
+        logger.info(f"Set bitrate floor override for all encoders: {bitrate_kbps}kbps")
+    
+    def validate_encoder_name(self, encoder: str) -> bool:
+        """Validate that an encoder name is supported"""
+        supported_encoders = [
+            'libx264', 'libx265', 'h264_nvenc', 'h264_amf', 
+            'h264_qsv', 'h264_videotoolbox'
+        ]
+        return encoder in supported_encoders
+    
+    def get_bitrate_validation_config(self) -> Dict[str, Any]:
+        """Get complete bitrate validation configuration"""
+        return {
+            'enabled': self.get('video_compression.bitrate_validation.enabled', True),
+            'encoder_minimums': self.get('video_compression.bitrate_validation.encoder_minimums', {}),
+            'fallback_resolutions': self.get('video_compression.bitrate_validation.fallback_resolutions', []),
+            'segmentation_threshold_mb': self.get('video_compression.bitrate_validation.segmentation_threshold_mb', 50),
+            'safety_margin': self.get('video_compression.bitrate_validation.safety_margin', 1.1),
+            'min_resolution': self.get('video_compression.bitrate_validation.min_resolution', {'width': 320, 'height': 180}),
+            'min_fps': self.get('video_compression.bitrate_validation.min_fps', 10),
+            'fps_reduction_steps': self.get('video_compression.bitrate_validation.fps_reduction_steps', [0.8, 0.6, 0.5])
+        }
     
     def get_temp_dir(self) -> str:
         """Return the package-root temp directory path (<package_root>/temp).

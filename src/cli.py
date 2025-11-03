@@ -22,6 +22,7 @@ from .gif_generator import GifGenerator
 from .gif_optimizer_advanced import AdvancedGifOptimizer
 from .automated_workflow import AutomatedWorkflow
 from .file_validator import FileValidator
+from .bitrate_validator import BitrateValidationError
 
 logger = None  # Will be initialized after logging setup
 
@@ -235,6 +236,21 @@ class VideoCompressorCLI:
         parser.add_argument('--prefer-segments', type=int, choices=list(range(1, 11)), metavar='N',
                           help='Prefer N segments (1-10). If impossible, fall back to normal operations')
         
+        # Bitrate validation options
+        parser.add_argument('--bitrate-floor', type=int, metavar='KBPS',
+                          help='Override minimum bitrate floor for all encoders (in kbps)')
+        parser.add_argument('--encoder-bitrate-floor', action='append', nargs=2, 
+                          metavar=('ENCODER', 'KBPS'),
+                          help='Override minimum bitrate floor for specific encoder (e.g., --encoder-bitrate-floor libx264 5)')
+        parser.add_argument('--disable-bitrate-validation', action='store_true',
+                          help='Disable bitrate validation and allow encoding below encoder minimums')
+        parser.add_argument('--bitrate-safety-margin', type=float, metavar='MULTIPLIER',
+                          help='Safety margin multiplier for bitrate calculations (default: 1.1)')
+        parser.add_argument('--min-resolution', nargs=2, type=int, metavar=('WIDTH', 'HEIGHT'),
+                          help='Override minimum resolution constraints (e.g., --min-resolution 320 180)')
+        parser.add_argument('--min-fps', type=float, metavar='FPS',
+                          help='Override minimum FPS constraint (default: 10)')
+        
         # Create subcommands
         subparsers = parser.add_subparsers(dest='command', help='Available commands')
         
@@ -419,6 +435,22 @@ class VideoCompressorCLI:
                     self.config.update_from_args(overrides)
                     if logger:
                         logger.debug(f"Applied CLI config overrides: {overrides}")
+                
+                # Apply bitrate validation specific overrides using dedicated methods
+                if hasattr(args, 'bitrate_floor') and args.bitrate_floor:
+                    self.config.set_all_encoder_bitrate_floors(args.bitrate_floor)
+                
+                if hasattr(args, 'encoder_bitrate_floor') and args.encoder_bitrate_floor:
+                    for encoder, bitrate_str in args.encoder_bitrate_floor:
+                        try:
+                            bitrate = int(bitrate_str)
+                            if self.config.validate_encoder_name(encoder):
+                                self.config.set_encoder_bitrate_floor(encoder, bitrate)
+                            else:
+                                logger.warning(f"Unsupported encoder for bitrate override: {encoder}")
+                        except ValueError:
+                            logger.warning(f"Invalid bitrate value for {encoder}: {bitrate_str}")
+                
             except Exception as e:
                 if logger:
                     logger.warning(f"Failed to apply CLI config overrides: {e}")
@@ -538,6 +570,78 @@ class VideoCompressorCLI:
         
         if hasattr(args, 'colors') and args.colors:
             overrides['gif_settings.colors'] = args.colors
+        
+        # Bitrate validation overrides
+        if hasattr(args, 'disable_bitrate_validation') and args.disable_bitrate_validation:
+            overrides['video_compression.bitrate_validation.enabled'] = False
+        
+        if hasattr(args, 'bitrate_safety_margin') and args.bitrate_safety_margin:
+            overrides['video_compression.bitrate_validation.safety_margin'] = args.bitrate_safety_margin
+        
+        # Handle minimum resolution override
+        if hasattr(args, 'min_resolution') and args.min_resolution:
+            overrides['video_compression.bitrate_validation.min_resolution'] = {
+                'width': args.min_resolution[0],
+                'height': args.min_resolution[1]
+            }
+        
+        # Handle minimum FPS override
+        if hasattr(args, 'min_fps') and args.min_fps:
+            overrides['video_compression.bitrate_validation.min_fps'] = args.min_fps
+        
+        # Handle bitrate floor override - this needs special handling since it affects all encoders
+        if hasattr(args, 'bitrate_floor') and args.bitrate_floor:
+            # Override all encoder minimums with the specified floor
+            encoder_minimums = {
+                'libx264': args.bitrate_floor,
+                'libx265': args.bitrate_floor,
+                'h264_nvenc': args.bitrate_floor,
+                'h264_amf': args.bitrate_floor,
+                'h264_qsv': args.bitrate_floor,
+                'h264_videotoolbox': args.bitrate_floor
+            }
+            overrides['video_compression.bitrate_validation.encoder_minimums'] = encoder_minimums
+        
+        # Handle encoder-specific bitrate floor overrides
+        if hasattr(args, 'encoder_bitrate_floor') and args.encoder_bitrate_floor:
+            # Get current encoder minimums from config or use defaults
+            current_minimums = self.config.get('video_compression.bitrate_validation.encoder_minimums', {
+                'libx264': 3,
+                'libx265': 5,
+                'h264_nvenc': 2,
+                'h264_amf': 2,
+                'h264_qsv': 2,
+                'h264_videotoolbox': 2
+            }) if hasattr(self, 'config') and self.config else {
+                'libx264': 3,
+                'libx265': 5,
+                'h264_nvenc': 2,
+                'h264_amf': 2,
+                'h264_qsv': 2,
+                'h264_videotoolbox': 2
+            }
+            
+            # Apply encoder-specific overrides
+            for encoder, bitrate_str in args.encoder_bitrate_floor:
+                try:
+                    bitrate = int(bitrate_str)
+                    if bitrate <= 0:
+                        logger.warning(f"Invalid bitrate floor for {encoder}: {bitrate} (must be positive)")
+                        continue
+                    
+                    # Validate encoder name
+                    supported_encoders = ['libx264', 'libx265', 'h264_nvenc', 'h264_amf', 'h264_qsv', 'h264_videotoolbox']
+                    if encoder not in supported_encoders:
+                        logger.warning(f"Unsupported encoder: {encoder}. Supported: {', '.join(supported_encoders)}")
+                        continue
+                    
+                    current_minimums[encoder] = bitrate
+                    logger.debug(f"Set bitrate floor override for {encoder}: {bitrate}kbps")
+                except ValueError:
+                    logger.warning(f"Invalid bitrate value for {encoder}: {bitrate_str} (must be integer)")
+                    continue
+            
+            overrides['video_compression.bitrate_validation.encoder_minimums'] = current_minimums
         
         return overrides
     
@@ -980,18 +1084,156 @@ class VideoCompressorCLI:
                 return {'success': True, 'input': input_file, 'output': output_file, 'result': result}
                 
             except Exception as e:
-                logger.error(f"Failed to compress {input_file}: {e}")
-                return {'success': False, 'input': input_file, 'error': str(e)}
+                # Enhanced error handling for bitrate validation failures
+                error_msg = str(e)
+                error_type = 'general'
+                basename = os.path.basename(input_file)
+                
+                # Detailed error categorization for better batch processing
+                if isinstance(e, BitrateValidationError):
+                    error_type = 'bitrate_validation'
+                    logger.error(f"Bitrate validation failure for {basename}: {e.get_short_message()}")
+                    logger.info(f"Detailed error for {basename}:\n{e.get_detailed_message()}")
+                    
+                    # Context-specific suggestions
+                    if e.severity == 'critical':
+                        logger.error(f"Critical bitrate failure for {basename} - segmentation strongly recommended")
+                        logger.info(f"Suggestions: --enable-segmentation or increase target size")
+                    else:
+                        logger.info(f"Suggestions: --bitrate-floor {max(1, e.bitrate_kbps)} or --enable-auto-adjustment")
+                        
+                elif 'bitrate' in error_msg.lower() and ('minimum' in error_msg.lower() or 'floor' in error_msg.lower()):
+                    error_type = 'bitrate_validation'
+                    logger.error(f"Bitrate validation failure for {basename}: {error_msg}")
+                    logger.info(f"Suggestion: Try using --bitrate-floor to override minimum requirements or enable segmentation")
+                    
+                elif 'segmentation' in error_msg.lower():
+                    error_type = 'segmentation'
+                    logger.error(f"Segmentation failure for {basename}: {error_msg}")
+                    logger.info(f"Suggestion: Check video duration and size limits, or try --force-single-file")
+                    
+                elif 'encoder' in error_msg.lower() or 'ffmpeg' in error_msg.lower():
+                    error_type = 'encoder'
+                    logger.error(f"Encoder failure for {basename}: {error_msg}")
+                    logger.info(f"Suggestion: Try --force-software or different encoder settings")
+                    
+                elif 'timeout' in error_msg.lower():
+                    error_type = 'timeout'
+                    logger.error(f"Processing timeout for {basename}: {error_msg}")
+                    logger.info(f"Suggestion: Try smaller files or increase timeout settings")
+                    
+                elif 'memory' in error_msg.lower() or 'out of memory' in error_msg.lower():
+                    error_type = 'memory'
+                    logger.error(f"Memory error for {basename}: {error_msg}")
+                    logger.info(f"Suggestion: Reduce resolution or enable segmentation")
+                    
+                else:
+                    logger.error(f"Failed to compress {basename}: {error_msg}")
+                    logger.debug(f"Full error details for {basename}: {repr(e)}")
+                
+                # Continue processing other files in batch mode
+                logger.info(f"Continuing batch processing despite failure of {basename}")
+                
+                return {
+                    'success': False, 
+                    'input': input_file, 
+                    'error': error_msg,
+                    'error_type': error_type,
+                    'basename': basename,
+                    'exception_type': type(e).__name__
+                }
         
         # Process files in parallel
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             results = list(executor.map(compress_single, input_files))
         
-        # Summary
+        # Enhanced summary with error categorization
         successful = sum(1 for r in results if r['success'])
+        skipped = sum(1 for r in results if r.get('skipped', False))
         failed = len(results) - successful
         
-        logger.info(f"Batch compression completed: {successful} successful, {failed} failed")
+        # Enhanced failure categorization and reporting
+        bitrate_failures = sum(1 for r in results if not r['success'] and r.get('error_type') == 'bitrate_validation')
+        segmentation_failures = sum(1 for r in results if not r['success'] and r.get('error_type') == 'segmentation')
+        encoder_failures = sum(1 for r in results if not r['success'] and r.get('error_type') == 'encoder')
+        timeout_failures = sum(1 for r in results if not r['success'] and r.get('error_type') == 'timeout')
+        memory_failures = sum(1 for r in results if not r['success'] and r.get('error_type') == 'memory')
+        other_failures = failed - bitrate_failures - segmentation_failures - encoder_failures - timeout_failures - memory_failures
+        
+        logger.info(f"Batch compression completed: {successful} successful, {skipped} skipped, {failed} failed")
+        
+        if failed > 0:
+            logger.error("=== BATCH PROCESSING FAILURE ANALYSIS ===")
+            
+            if bitrate_failures > 0:
+                logger.error(f"Bitrate validation failures: {bitrate_failures}")
+                logger.error("  Root cause: Calculated bitrate below encoder minimum requirements")
+                logger.error("  Solutions:")
+                logger.error("    • Enable segmentation: --enable-segmentation")
+                logger.error("    • Lower bitrate floor: --bitrate-floor 1")
+                logger.error("    • Use hardware encoders: --force-hardware")
+                logger.error("    • Increase target size: --max-size 15")
+                
+            if segmentation_failures > 0:
+                logger.error(f"Segmentation failures: {segmentation_failures}")
+                logger.error("  Root cause: Unable to split video into acceptable segments")
+                logger.error("  Solutions:")
+                logger.error("    • Check video duration and complexity")
+                logger.error("    • Try smaller segment duration: --segment-duration 30")
+                logger.error("    • Force single file: --force-single-file")
+                
+            if encoder_failures > 0:
+                logger.error(f"Encoder failures: {encoder_failures}")
+                logger.error("  Root cause: FFmpeg encoding process failed")
+                logger.error("  Solutions:")
+                logger.error("    • Try software encoding: --force-software")
+                logger.error("    • Check video file integrity")
+                logger.error("    • Update FFmpeg installation")
+                
+            if timeout_failures > 0:
+                logger.error(f"Timeout failures: {timeout_failures}")
+                logger.error("  Root cause: Processing took too long")
+                logger.error("  Solutions:")
+                logger.error("    • Reduce video resolution or duration")
+                logger.error("    • Enable segmentation for large files")
+                
+            if memory_failures > 0:
+                logger.error(f"Memory failures: {memory_failures}")
+                logger.error("  Root cause: Insufficient system memory")
+                logger.error("  Solutions:")
+                logger.error("    • Reduce video resolution")
+                logger.error("    • Enable segmentation")
+                logger.error("    • Close other applications")
+                
+            if other_failures > 0:
+                logger.error(f"Other failures: {other_failures}")
+                logger.error("  Check individual file logs for specific error details")
+        
+        # Enhanced failed files logging with error categorization
+        failed_files = [r for r in results if not r['success']]
+        if failed_files:
+            logger.error("=== FAILED FILES DETAILS ===")
+            
+            # Group by error type for better organization
+            error_groups = {}
+            for failure in failed_files:
+                error_type = failure.get('error_type', 'unknown')
+                if error_type not in error_groups:
+                    error_groups[error_type] = []
+                error_groups[error_type].append(failure)
+            
+            for error_type, failures in error_groups.items():
+                logger.error(f"{error_type.upper()} FAILURES ({len(failures)} files):")
+                for failure in failures:
+                    basename = failure.get('basename', 'unknown')
+                    error_msg = failure.get('error', 'unknown error')
+                    exception_type = failure.get('exception_type', 'Exception')
+                    logger.error(f"  • {basename}: {exception_type} - {error_msg}")
+        
+        # Log batch processing resilience message
+        if failed > 0 and successful > 0:
+            success_rate = (successful / (successful + failed)) * 100
+            logger.info(f"Batch processing resilience: {success_rate:.1f}% success rate - processing continued despite {failed} failures")
     
     def _batch_gif(self, args: argparse.Namespace):
         """Handle batch GIF creation"""
@@ -1194,18 +1436,70 @@ class VideoCompressorCLI:
                 return {'success': True, 'input': input_file, 'output': output_info, 'result': result}
                 
             except Exception as e:
-                logger.error(f"Failed to create GIF from {input_file}: {e}")
-                return {'success': False, 'input': input_file, 'error': str(e)}
+                # Enhanced error handling for GIF creation failures
+                error_msg = str(e)
+                error_type = 'general'
+                
+                # Check if this is a bitrate validation related error
+                if 'bitrate' in error_msg.lower() and ('minimum' in error_msg.lower() or 'floor' in error_msg.lower()):
+                    error_type = 'bitrate_validation'
+                    logger.error(f"Bitrate validation failure for GIF {os.path.basename(input_file)}: {error_msg}")
+                    logger.info(f"Suggestion: Try using --bitrate-floor to override minimum requirements")
+                elif 'segmentation' in error_msg.lower():
+                    error_type = 'segmentation'
+                    logger.error(f"GIF segmentation failure for {os.path.basename(input_file)}: {error_msg}")
+                elif 'size limit' in error_msg.lower() or 'target size' in error_msg.lower():
+                    error_type = 'size_limit'
+                    logger.error(f"Size limit failure for GIF {os.path.basename(input_file)}: {error_msg}")
+                    logger.info(f"Suggestion: Increase --max-size or reduce video duration")
+                else:
+                    logger.error(f"Failed to create GIF from {os.path.basename(input_file)}: {error_msg}")
+                
+                return {
+                    'success': False, 
+                    'input': input_file, 
+                    'error': error_msg,
+                    'error_type': error_type,
+                    'basename': os.path.basename(input_file)
+                }
         
         # Process files in parallel
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             results = list(executor.map(create_single_gif, input_files))
         
-        # Summary
+        # Enhanced summary with error categorization
         successful = sum(1 for r in results if r['success'])
+        skipped = sum(1 for r in results if r.get('skipped', False))
         failed = len(results) - successful
         
-        logger.info(f"Batch GIF creation completed: {successful} successful, {failed} failed")
+        # Categorize failures
+        bitrate_failures = sum(1 for r in results if not r['success'] and r.get('error_type') == 'bitrate_validation')
+        segmentation_failures = sum(1 for r in results if not r['success'] and r.get('error_type') == 'segmentation')
+        size_limit_failures = sum(1 for r in results if not r['success'] and r.get('error_type') == 'size_limit')
+        other_failures = failed - bitrate_failures - segmentation_failures - size_limit_failures
+        
+        logger.info(f"Batch GIF creation completed: {successful} successful, {skipped} skipped, {failed} failed")
+        
+        if failed > 0:
+            logger.info("Failure breakdown:")
+            if bitrate_failures > 0:
+                logger.info(f"  • Bitrate validation failures: {bitrate_failures}")
+                logger.info(f"    Suggestion: Use --bitrate-floor or --disable-bitrate-validation")
+            if segmentation_failures > 0:
+                logger.info(f"  • Segmentation failures: {segmentation_failures}")
+                logger.info(f"    Suggestion: Check video duration and size limits")
+            if size_limit_failures > 0:
+                logger.info(f"  • Size limit failures: {size_limit_failures}")
+                logger.info(f"    Suggestion: Increase --max-size or reduce video duration")
+            if other_failures > 0:
+                logger.info(f"  • Other failures: {other_failures}")
+        
+        # Log specific failed files for debugging
+        failed_files = [r for r in results if not r['success']]
+        if failed_files:
+            logger.debug("Failed GIF files details:")
+            for failure in failed_files:
+                logger.debug(f"  {failure.get('basename', 'unknown')}: {failure.get('error', 'unknown error')}")
     
     def _optimize_gif(self, args: argparse.Namespace):
         """Handle GIF optimization command"""
@@ -1288,6 +1582,30 @@ class VideoCompressorCLI:
         print("Current Configuration:")
         print("=" * 50)
         print(yaml.dump(self.config.config, default_flow_style=False, indent=2))
+        
+        # Show bitrate validation configuration summary
+        print("\n" + "=" * 50)
+        print("BITRATE VALIDATION SUMMARY:")
+        print("=" * 50)
+        bitrate_config = self.config.get_bitrate_validation_config()
+        
+        print(f"Enabled: {bitrate_config['enabled']}")
+        print(f"Safety Margin: {bitrate_config['safety_margin']}")
+        print(f"Segmentation Threshold: {bitrate_config['segmentation_threshold_mb']} MB")
+        
+        print("\nEncoder Minimum Bitrates (kbps):")
+        for encoder, minimum in bitrate_config['encoder_minimums'].items():
+            print(f"  {encoder}: {minimum}")
+        
+        print(f"\nMinimum Resolution: {bitrate_config['min_resolution']['width']}x{bitrate_config['min_resolution']['height']}")
+        print(f"Minimum FPS: {bitrate_config['min_fps']}")
+        
+        print("\nFallback Resolutions:")
+        for i, res in enumerate(bitrate_config['fallback_resolutions'], 1):
+            print(f"  {i}. {res[0]}x{res[1]}")
+        
+        print(f"\nFPS Reduction Steps: {bitrate_config['fps_reduction_steps']}")
+        print("=" * 50)
     
     def _validate_config(self):
         """Validate configuration"""
