@@ -24,6 +24,7 @@ from .video_compressor import DynamicVideoCompressor
 from .gif_generator import GifGenerator
 from .file_validator import FileValidator
 from .ffmpeg_utils import FFmpegUtils
+from .error_handler import ErrorHandler, ErrorCategory
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,9 @@ class AutomatedWorkflow:
         self.file_validator = FileValidator()
         # Console verbosity (controlled by CLI --debug)
         self.verbose = False
+        
+        # Enhanced error handling for batch processing resilience
+        self.error_handler = ErrorHandler()
         
         # Workflow directories (default under installed package base)
         base_dir = Path(get_app_base_dir())
@@ -348,6 +352,130 @@ class AutomatedWorkflow:
                     self._record_success_cache(input_path, 'single_gif', single_gif)
         except Exception:
             pass
+
+    def _handle_segmentation_fallback_result(self, result: Dict[str, Any], input_file: Path, max_size_mb: float) -> str:
+        """
+        Handle the result of segmentation fallback from video compression
+        
+        Args:
+            result: Compression result dictionary with segmentation information
+            input_file: Original input file path
+            max_size_mb: Target size limit
+            
+        Returns:
+            Processing result status ('success', 'error', 'cancelled')
+        """
+        try:
+            if not result.get('is_segmented_output', False):
+                # Not a segmented output, handle as normal
+                return 'success' if result.get('success', False) else 'error'
+            
+            segments_folder_path = result.get('segments_folder', result.get('output_file'))
+            if not segments_folder_path or not os.path.exists(segments_folder_path):
+                logger.error(f"Segmentation fallback completed but segments folder not found: {segments_folder_path}")
+                return 'error'
+            
+            segments_folder = Path(segments_folder_path)
+            segments = result.get('segments', [])
+            
+            print(f"    ✅ Segmentation fallback successful: {segments_folder.name}")
+            print(f"    📁 Created {len(segments)} segments totaling {result.get('size_mb', 0):.2f}MB")
+            
+            logger.info(f"Segmentation fallback successful for {input_file.name}: "
+                       f"{len(segments)} segments in {segments_folder}")
+            
+            # Validate segments and organize for batch processing
+            organized_result = self._organize_segmented_outputs(
+                segments_folder, segments, input_file, max_size_mb
+            )
+            
+            if organized_result.get('success', False):
+                # Record success for caching
+                self._record_success_cache(input_file, 'segments', segments_folder)
+                
+                # Generate GIFs from segments if needed
+                gif_success = self._generate_gifs_from_segments(segments_folder, max_size_mb)
+                
+                if gif_success:
+                    print(f"    🎨 GIF generation from segments successful")
+                    logger.info(f"GIF generation from segments successful: {segments_folder}")
+                    return 'success'
+                else:
+                    print(f"    ⚠️  Segmentation successful but GIF generation failed")
+                    logger.warning(f"Segmentation successful but GIF generation failed: {segments_folder}")
+                    return 'success'  # Still consider it success since video segmentation worked
+            else:
+                logger.error(f"Failed to organize segmented outputs: {organized_result.get('error', 'Unknown error')}")
+                return 'error'
+                
+        except Exception as e:
+            logger.error(f"Error handling segmentation fallback result: {e}")
+            return 'error'
+
+    def _organize_segmented_outputs(self, segments_folder: Path, segments: List[Dict[str, Any]], 
+                                  input_file: Path, max_size_mb: float) -> Dict[str, Any]:
+        """
+        Organize segmented outputs for batch processing
+        
+        Args:
+            segments_folder: Path to segments folder
+            segments: List of segment information
+            input_file: Original input file
+            max_size_mb: Target size limit
+            
+        Returns:
+            Organization result dictionary
+        """
+        try:
+            # Ensure segments folder exists
+            segments_folder.mkdir(parents=True, exist_ok=True)
+            
+            # Create comprehensive summary for batch processing
+            base_name = input_file.stem
+            summary_data = {
+                'source_file': str(input_file),
+                'creation_time': time.time(),
+                'creation_method': 'segmentation_fallback',
+                'num_segments': len(segments),
+                'total_size_mb': sum(s.get('size_mb', 0) for s in segments),
+                'total_duration': sum(s.get('duration', 0) for s in segments),
+                'target_size_mb': max_size_mb,
+                'segments': segments
+            }
+            
+            # Write summary file for batch processing tools
+            summary_path = segments_folder / f"{base_name}_segments_summary.json"
+            with open(summary_path, 'w', encoding='utf-8') as f:
+                json.dump(summary_data, f, indent=2)
+            
+            # Create a simple text index for easy batch processing
+            index_path = segments_folder / "segments_index.txt"
+            with open(index_path, 'w', encoding='utf-8') as f:
+                f.write(f"# Segments for {input_file.name}\n")
+                f.write(f"# Created: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"# Method: segmentation_fallback\n")
+                f.write(f"# Total segments: {len(segments)}\n")
+                f.write(f"# Total size: {summary_data['total_size_mb']:.2f}MB\n\n")
+                
+                for segment in segments:
+                    f.write(f"{segment.get('filename', '')}\t{segment.get('size_mb', 0):.2f}MB\t{segment.get('duration', 0):.1f}s\n")
+            
+            logger.info(f"Organized {len(segments)} segmented outputs in {segments_folder}")
+            
+            return {
+                'success': True,
+                'segments_folder': segments_folder,
+                'summary_path': summary_path,
+                'index_path': index_path,
+                'num_segments': len(segments)
+            }
+            
+        except Exception as e:
+            logger.error(f"Error organizing segmented outputs: {e}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
 
     def _load_cache_index(self) -> None:
         """Load cache index from disk."""
@@ -947,12 +1075,19 @@ class AutomatedWorkflow:
             
             # Step 2: Convert to MP4 if needed and optimize
             print("  🔄 Convert/optimize to MP4")
-            mp4_file = self._ensure_mp4_format(video_file, max_size_mb)
-            if self.shutdown_requested:
-                return 'cancelled'
-            if not mp4_file:
+            try:
+                mp4_file = self._ensure_mp4_format(video_file, max_size_mb)
+                if self.shutdown_requested:
+                    return 'cancelled'
+                if not mp4_file:
+                    logger.error(f"MP4 optimization failed for {video_file.name}")
+                    print(f"  ❌ MP4 optimization failed - continuing with other files")
+                    return 'error'
+                print(f"  ✅ MP4 optimization complete: {mp4_file.name}")
+            except Exception as mp4_error:
+                logger.error(f"MP4 processing error for {video_file.name}: {mp4_error}")
+                print(f"  ❌ MP4 processing error: {str(mp4_error)[:100]}... - continuing with other files")
                 return 'error'
-            print(f"  ✅ MP4 optimization complete: {mp4_file.name}")
             
             # Check for shutdown before step 3
             if self.shutdown_requested:
@@ -960,21 +1095,49 @@ class AutomatedWorkflow:
             
             # Step 3: Generate and optimize GIF (ALWAYS attempt this step)
             print("  🎨 Generate/optimize GIF")
-            gif_success = self._generate_and_optimize_gif(mp4_file, max_size_mb)
-            
-            if gif_success:
-                print(f"  ✅ GIF generation complete: {mp4_file.stem}.gif")
-                print(f"  🎉 Done: {video_file.name}")
-                logger.info(f"Successfully processed: {video_file.name}")
-                return 'success'
-            else:
-                print(f"  ❌ GIF failed: {video_file.name}")
-                logger.error(f"GIF generation failed for: {video_file.name}")
+            try:
+                gif_success = self._generate_and_optimize_gif(mp4_file, max_size_mb)
+                
+                if gif_success:
+                    print(f"  ✅ GIF generation complete: {mp4_file.stem}.gif")
+                    print(f"  🎉 Done: {video_file.name}")
+                    logger.info(f"Successfully processed: {video_file.name}")
+                    return 'success'
+                else:
+                    print(f"  ❌ GIF generation failed - continuing with other files")
+                    logger.error(f"GIF generation failed for: {video_file.name}")
+                    return 'error'
+            except Exception as gif_error:
+                logger.error(f"GIF processing error for {video_file.name}: {gif_error}")
+                print(f"  ❌ GIF processing error: {str(gif_error)[:100]}... - continuing with other files")
                 return 'error'
             
         except Exception as e:
-            print(f"  ❌ Error processing {video_file.name}: {e}")
-            logger.error(f"Error processing {video_file.name}: {e}")
+            # Use centralized error handler for consistent categorization and logging
+            error = self.error_handler.handle_error(
+                exception=e,
+                file_path=str(video_file),
+                context="automated_workflow_video_processing",
+                continue_processing=True
+            )
+            
+            # User-friendly console output based on error category
+            if error.category == ErrorCategory.BITRATE_VALIDATION:
+                print(f"  ❌ Bitrate validation error - file may be too long for target size")
+                print(f"     Suggestion: Try segmentation or increase target size")
+            elif error.category == ErrorCategory.SEGMENTATION:
+                print(f"  ❌ Segmentation error - unable to split video appropriately")
+                print(f"     Suggestion: Check video duration and complexity")
+            elif error.category == ErrorCategory.ENCODER:
+                print(f"  ❌ Encoder error - video encoding failed")
+                print(f"     Suggestion: Try software encoding or check FFmpeg")
+            elif error.category == ErrorCategory.MEMORY:
+                print(f"  ❌ Memory error - insufficient system resources")
+                print(f"     Suggestion: Reduce resolution or enable segmentation")
+            else:
+                print(f"  ❌ Processing error: {str(e)[:100]}...")
+                print(f"     Continuing with other files...")
+            
             return 'error'
         finally:
             self.current_task = None
@@ -1219,37 +1382,51 @@ class AutomatedWorkflow:
             if result.get('cancelled'):
                 return None
             if result.get('success', False):
-                # Check if segmentation was used
-                if result.get('method') == 'segmentation' or 'segments' in result:
-                    # Video was segmented, check for segments folder
-                    if segments_folder.exists() and segments_folder.is_dir():
-                        print(f"    ✅ Video segmentation successful: {segments_folder.name}")
-                        logger.info(f"Video segmentation successful: {segments_folder.name}")
-                        # Best-effort: create a cover image in the segments folder too
-                        try:
-                            # Use the first segment as thumbnail source if exists, else the original input video
-                            first_seg = None
+                # Check if segmentation was used (including segmentation fallback)
+                if (result.get('method') == 'segmentation' or 
+                    result.get('method') == 'segmentation_fallback' or 
+                    result.get('is_segmented_output', False) or 
+                    'segments' in result):
+                    
+                    # Handle segmentation fallback result
+                    fallback_status = self._handle_segmentation_fallback_result(result, video_file, max_size_mb)
+                    
+                    if fallback_status == 'success':
+                        # Get the segments folder path from result
+                        segments_folder_path = result.get('segments_folder', result.get('output_file'))
+                        if segments_folder_path and os.path.exists(segments_folder_path):
+                            segments_folder = Path(segments_folder_path)
+                            
+                            # Best-effort: create a cover image in the segments folder
                             try:
-                                mp4s = sorted(list(segments_folder.glob('*.mp4')))
-                                if mp4s:
-                                    first_seg = mp4s[0]
-                            except Exception:
+                                # Use the first segment as thumbnail source if exists, else the original input video
                                 first_seg = None
-                            thumb_src = str(first_seg or output_path)
-                            cover_jpg = segments_folder / 'folder.jpg'
-                            if not cover_jpg.exists():
-                                FFmpegUtils.extract_thumbnail_image(
-                                    input_path=thumb_src,
-                                    output_image_path=str(cover_jpg),
-                                    time_position_seconds=1.0,
-                                    width=640
-                                )
-                        except Exception as e:
-                            logger.debug(f"Could not create segments folder cover image: {e}")
-                        return segments_folder
+                                try:
+                                    mp4s = sorted(list(segments_folder.glob('*.mp4')))
+                                    if mp4s:
+                                        first_seg = mp4s[0]
+                                except Exception:
+                                    first_seg = None
+                                thumb_src = str(first_seg or video_file)
+                                cover_jpg = segments_folder / 'folder.jpg'
+                                if not cover_jpg.exists():
+                                    FFmpegUtils.extract_thumbnail_image(
+                                        input_path=thumb_src,
+                                        output_image_path=str(cover_jpg),
+                                        time_position_seconds=1.0,
+                                        width=640
+                                    )
+                            except Exception as e:
+                                logger.debug(f"Could not create segments folder cover image: {e}")
+                            
+                            return segments_folder
+                        else:
+                            print(f"    ❌ Segmentation completed but segments folder not found")
+                            logger.error(f"Segmentation completed but segments folder not found")
+                            return None
                     else:
-                        print(f"    ❌ Segmentation completed but segments folder not found")
-                        logger.error(f"Segmentation completed but segments folder not found: {segments_folder}")
+                        print(f"    ❌ Segmentation fallback handling failed")
+                        logger.error(f"Segmentation fallback handling failed")
                         return None
                 else:
                     # Standard compression was used, validate the single MP4 file
@@ -1283,10 +1460,11 @@ class AutomatedWorkflow:
                         print(f"    ❌ Processed MP4 validation failed: {error_msg}")
                         logger.error(f"Processed MP4 validation failed: {error_msg}")
                         
-                        # Check if the error is about file size being too large
-                        if "too large" in error_msg.lower() or "file size" in error_msg.lower():
-                            print(f"    🔄 Single file optimization exceeded target, falling back to segmentation...")
-                            logger.info(f"Single file optimization exceeded target ({error_msg}), attempting segmentation fallback")
+                        # Check if the error is about file size being too large or file is empty (encoding failure)
+                        if ("too large" in error_msg.lower() or "file size" in error_msg.lower() or 
+                            "file is empty" in error_msg.lower()):
+                            print(f"    🔄 Single file optimization failed ({error_msg}), falling back to segmentation...")
+                            logger.info(f"Single file optimization failed ({error_msg}), attempting segmentation fallback")
                             
                             # Remove the oversized file
                             if output_path.exists():
@@ -1301,14 +1479,22 @@ class AutomatedWorkflow:
                                     force_single_file=False  # Allow segmentation
                                 )
                                 
-                                if result.get('success', False) and (result.get('method') == 'segmentation' or 'segments' in result):
-                                    if segments_folder.exists() and segments_folder.is_dir():
-                                        print(f"    ✅ Segmentation fallback successful: {segments_folder.name}")
-                                        logger.info(f"Segmentation fallback successful: {segments_folder.name}")
-                                        return segments_folder
+                                if result.get('success', False):
+                                    # Handle segmentation fallback result
+                                    fallback_status = self._handle_segmentation_fallback_result(result, video_file, max_size_mb)
+                                    
+                                    if fallback_status == 'success':
+                                        # Get the segments folder path from result
+                                        segments_folder_path = result.get('segments_folder', result.get('output_file'))
+                                        if segments_folder_path and os.path.exists(segments_folder_path):
+                                            return Path(segments_folder_path)
+                                        else:
+                                            print(f"    ❌ Segmentation fallback completed but segments folder not found")
+                                            logger.error(f"Segmentation fallback completed but segments folder not found")
+                                            return None
                                     else:
-                                        print(f"    ❌ Segmentation fallback completed but segments folder not found")
-                                        logger.error(f"Segmentation fallback completed but segments folder not found")
+                                        print(f"    ❌ Segmentation fallback handling failed")
+                                        logger.error(f"Segmentation fallback handling failed")
                                         return None
                                 else:
                                     print(f"    ❌ Segmentation fallback failed")
@@ -3010,26 +3196,57 @@ class AutomatedWorkflow:
             logger.info(f"Cache stats: {stats['current_session_entries']} current, {stats['old_entries']} old entries")
 
     def _print_workflow_summary(self, processing_stats: Dict[str, int], start_time: float) -> None:
-        """Print workflow summary with cache information."""
+        """Print enhanced workflow summary with error analysis and cache information."""
         elapsed = time.time() - start_time
+        total_processed = processing_stats.get('processed', 0)
+        successful = processing_stats.get('successful', 0)
+        failed = processing_stats.get('errors', 0)
+        skipped = processing_stats.get('skipped', 0)
+        
         print(f"\n{'='*60}")
         print(f"🎬 Workflow Complete!")
         print(f"⏱️  Total time: {elapsed:.1f} seconds")
-        print(f"📁 Files processed: {processing_stats.get('processed', 0)}")
-        print(f"✅ Successful: {processing_stats.get('successful', 0)}")
-        print(f"❌ Failed: {processing_stats.get('errors', 0)}")
-        print(f"⚡ Skipped (cached): {processing_stats.get('skipped', 0)}")
-        print(f"🔄 Retries: {processing_stats.get('retries', 0)}")
+        print(f"📁 Files processed: {total_processed}")
+        print(f"✅ Successful: {successful}")
+        print(f"❌ Failed: {failed}")
+        print(f"⚡ Skipped (cached): {skipped}")
+        
+        # Enhanced error analysis if there were failures
+        if failed > 0:
+            print(f"\n📊 Error Analysis:")
+            error_summary = self.error_handler.get_error_summary()
+            
+            if error_summary['categories']:
+                print(f"   Error breakdown:")
+                for category, count in error_summary['categories'].items():
+                    percentage = (count / failed) * 100
+                    print(f"   • {category}: {count} files ({percentage:.1f}%)")
+            
+            # Show success rate with resilience message
+            success_rate = (successful / total_processed * 100) if total_processed > 0 else 0
+            print(f"   🛡️  Batch resilience: {success_rate:.1f}% success rate maintained")
+            
+            # Log comprehensive error analysis
+            self.error_handler.log_batch_summary(total_processed, successful)
         
         # Print cache statistics
         self._print_cache_stats()
         
         print(f"{'='*60}")
-        logger.info(f"Workflow completed in {elapsed:.1f}s. "
-                   f"Processed: {processing_stats.get('processed', 0)}, "
-                   f"Success: {processing_stats.get('successful', 0)}, "
-                   f"Failed: {processing_stats.get('failed', 0)}, "
-                   f"Skipped: {processing_stats.get('skipped', 0)}")
+        
+        # Enhanced logging with error context
+        if failed > 0:
+            logger.info(f"Workflow completed with errors in {elapsed:.1f}s. "
+                       f"Processed: {total_processed}, Success: {successful}, "
+                       f"Failed: {failed}, Skipped: {skipped}")
+            logger.info(f"Batch processing resilience maintained: {(successful/total_processed*100):.1f}% success rate")
+        else:
+            logger.info(f"Workflow completed successfully in {elapsed:.1f}s. "
+                       f"Processed: {total_processed}, Success: {successful}, "
+                       f"Skipped: {skipped}")
+        
+        # Reset error handler for next session
+        self.error_handler.reset()
 
     def _create_comprehensive_segments_summary(self, segments_folder: Path, base_name: str) -> None:
         """
