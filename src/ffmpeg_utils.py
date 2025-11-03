@@ -216,6 +216,79 @@ class FFmpegUtils:
             return 4, 2
 
     @staticmethod
+    def validate_encoder_bitrate_compatibility(encoder: str, bitrate_kbps: int, 
+                                             bitrate_validator=None) -> Tuple[bool, int, str]:
+        """
+        Validate encoder-specific bitrate compatibility and provide adjustment recommendations.
+        
+        Args:
+            encoder: Encoder name (e.g., 'libx264', 'h264_nvenc')
+            bitrate_kbps: Target bitrate in kbps
+            bitrate_validator: Optional BitrateValidator instance
+            
+        Returns:
+            Tuple of (is_valid, recommended_bitrate, message)
+        """
+        if bitrate_validator and bitrate_validator.is_validation_enabled():
+            validation_result = bitrate_validator.validate_bitrate(bitrate_kbps, encoder)
+            return (
+                validation_result.is_valid,
+                validation_result.minimum_required if validation_result.adjustment_needed else bitrate_kbps,
+                validation_result.message
+            )
+        
+        # Fallback validation with detailed encoder-specific checks
+        encoder_info = {
+            'libx264': {
+                'min_bitrate': 3,
+                'description': 'Software x264 encoder',
+                'notes': 'Reliable at low bitrates but CPU intensive'
+            },
+            'libx265': {
+                'min_bitrate': 5,
+                'description': 'Software x265 (HEVC) encoder',
+                'notes': 'Better compression but higher minimum bitrate requirement'
+            },
+            'h264_nvenc': {
+                'min_bitrate': 2,
+                'description': 'NVIDIA NVENC hardware encoder',
+                'notes': 'Fast encoding with good low-bitrate performance'
+            },
+            'h264_amf': {
+                'min_bitrate': 2,
+                'description': 'AMD AMF hardware encoder',
+                'notes': 'Hardware accelerated with decent low-bitrate support'
+            },
+            'h264_qsv': {
+                'min_bitrate': 2,
+                'description': 'Intel QuickSync hardware encoder',
+                'notes': 'Balanced performance and quality at low bitrates'
+            },
+            'h264_videotoolbox': {
+                'min_bitrate': 2,
+                'description': 'Apple VideoToolbox hardware encoder',
+                'notes': 'Optimized for Apple Silicon and Intel Macs'
+            }
+        }
+        
+        info = encoder_info.get(encoder, {
+            'min_bitrate': 3,
+            'description': f'Unknown encoder {encoder}',
+            'notes': 'Using conservative minimum bitrate'
+        })
+        
+        min_bitrate = info['min_bitrate']
+        is_valid = bitrate_kbps >= min_bitrate
+        
+        if is_valid:
+            message = f"{info['description']}: {bitrate_kbps}kbps meets minimum requirement ({min_bitrate}kbps)"
+        else:
+            message = (f"{info['description']}: {bitrate_kbps}kbps below minimum {min_bitrate}kbps. "
+                      f"{info['notes']}")
+        
+        return is_valid, min_bitrate if not is_valid else bitrate_kbps, message
+
+    @staticmethod
     def add_ffmpeg_perf_flags(cmd: List[str], threads: Optional[int] = None, filter_threads: Optional[int] = None,
                               add_probe: bool = True) -> List[str]:
         """Insert common performance and noise-reduction flags into an FFmpeg command list.
@@ -318,13 +391,66 @@ class FFmpegUtils:
         return cmd
     
     @staticmethod
-    def add_bitrate_control(cmd: List[str], params: Dict[str, Any], buffer_multiplier: float = 2.0) -> List[str]:
-        """Add bitrate control settings to FFmpeg command"""
+    def add_bitrate_control(cmd: List[str], params: Dict[str, Any], buffer_multiplier: float = 2.0, 
+                           bitrate_validator=None) -> List[str]:
+        """Add bitrate control settings to FFmpeg command with comprehensive validation"""
         if 'bitrate' in params:
             bitrate = params['bitrate']
+            encoder = params.get('encoder', 'libx264')
+            
+            # Perform comprehensive bitrate validation if validator provided
+            if bitrate_validator and bitrate_validator.is_validation_enabled():
+                validation_result = bitrate_validator.validate_bitrate(bitrate, encoder)
+                
+                # Log validation result with context
+                bitrate_validator.log_validation_result(validation_result, "bitrate control")
+                
+                if validation_result.adjustment_needed:
+                    # Apply minimum bitrate if below floor
+                    min_bitrate = validation_result.minimum_required
+                    original_bitrate = bitrate
+                    
+                    if bitrate < min_bitrate:
+                        bitrate = min_bitrate
+                        
+                        # Log detailed adjustment information
+                        logger.warning(f"Bitrate control adjustment: {original_bitrate}k → {bitrate}k "
+                                     f"(encoder: {encoder}, minimum: {min_bitrate}k)")
+                        
+                        # Provide encoder-specific guidance
+                        if encoder.startswith('h264_nvenc') or encoder.startswith('nvenc'):
+                            logger.info(f"NVIDIA NVENC encoder can typically handle lower bitrates, "
+                                      f"but {min_bitrate}k is the safe minimum for {encoder}")
+                        elif encoder.startswith('h264_amf') or 'amf' in encoder:
+                            logger.info(f"AMD AMF encoder minimum bitrate enforced: {min_bitrate}k for {encoder}")
+                        elif encoder.startswith('h264_qsv') or 'qsv' in encoder:
+                            logger.info(f"Intel QSV encoder minimum bitrate enforced: {min_bitrate}k for {encoder}")
+                        elif encoder == 'libx264':
+                            logger.info(f"Software x264 encoder minimum bitrate enforced: {min_bitrate}k")
+                        elif encoder == 'libx265':
+                            logger.info(f"Software x265 encoder minimum bitrate enforced: {min_bitrate}k")
+                        else:
+                            logger.info(f"Encoder {encoder} minimum bitrate enforced: {min_bitrate}k")
+            else:
+                # Fallback validation for common encoders when no validator available
+                encoder_minimums = {
+                    'libx264': 3,
+                    'libx265': 5,
+                    'h264_nvenc': 2,
+                    'h264_amf': 2,
+                    'h264_qsv': 2,
+                    'h264_videotoolbox': 2
+                }
+                
+                min_bitrate = encoder_minimums.get(encoder, 3)  # Default to 3kbps
+                if bitrate < min_bitrate:
+                    original_bitrate = bitrate
+                    bitrate = min_bitrate
+                    logger.warning(f"Fallback bitrate validation: {encoder} requires minimum "
+                                 f"{min_bitrate}k, adjusted from {original_bitrate}k")
             
             # AMD AMF bitrate: keep within broadly safe bounds but avoid over-restriction
-            if params.get('acceleration_type') == 'amd' and 'amf' in params.get('encoder', ''):
+            if params.get('acceleration_type') == 'amd' and 'amf' in encoder:
                 max_amd_bitrate = 20000  # 20 Mbps cap to avoid extremes
                 if bitrate > max_amd_bitrate:
                     logger.warning(f"Limiting AMD AMF bitrate from {bitrate}k to {max_amd_bitrate}k for compatibility")
@@ -374,11 +500,28 @@ class FFmpegUtils:
         return cmd
     
     @staticmethod
-    def build_standard_ffmpeg_command(input_path: str, output_path: str, params: Dict[str, Any]) -> List[str]:
-        """Build a standard FFmpeg command with common settings"""
+    def build_standard_ffmpeg_command(input_path: str, output_path: str, params: Dict[str, Any], 
+                                    bitrate_validator=None) -> List[str]:
+        """Build a standard FFmpeg command with common settings and bitrate validation"""
+        # Validate encoder and bitrate compatibility before building command
+        encoder = params.get('encoder', 'libx264')
+        bitrate = params.get('bitrate', 1000)
+        
+        if bitrate_validator or bitrate > 0:  # Validate if we have validator or non-zero bitrate
+            is_valid, recommended_bitrate, message = FFmpegUtils.validate_encoder_bitrate_compatibility(
+                encoder, bitrate, bitrate_validator
+            )
+            
+            if not is_valid:
+                logger.warning(f"Standard encoding validation: {message}")
+                if recommended_bitrate != bitrate:
+                    logger.warning(f"Adjusting bitrate for standard encoding: {bitrate}k → {recommended_bitrate}k")
+                    params = params.copy()
+                    params['bitrate'] = recommended_bitrate
+        
         cmd = FFmpegUtils.build_base_ffmpeg_command(input_path, output_path, params)
         cmd = FFmpegUtils.add_video_settings(cmd, params)
-        cmd = FFmpegUtils.add_bitrate_control(cmd, params)
+        cmd = FFmpegUtils.add_bitrate_control(cmd, params, bitrate_validator=bitrate_validator)
         cmd = FFmpegUtils.add_audio_settings(cmd, params)
         cmd = FFmpegUtils.add_output_optimizations(cmd, output_path)
         
@@ -387,8 +530,24 @@ class FFmpegUtils:
     
     @staticmethod
     def build_two_pass_command(input_path: str, output_path: str, params: Dict[str, Any], 
-                              pass_num: int, log_file: str) -> List[str]:
-        """Build two-pass FFmpeg command"""
+                              pass_num: int, log_file: str, bitrate_validator=None) -> List[str]:
+        """Build two-pass FFmpeg command with bitrate validation"""
+        # Validate encoder and bitrate compatibility before building command
+        encoder = params.get('encoder', 'libx264')
+        bitrate = params.get('bitrate', 1000)
+        
+        if bitrate_validator or bitrate > 0:  # Validate if we have validator or non-zero bitrate
+            is_valid, recommended_bitrate, message = FFmpegUtils.validate_encoder_bitrate_compatibility(
+                encoder, bitrate, bitrate_validator
+            )
+            
+            if not is_valid:
+                logger.warning(f"Two-pass encoding validation: {message}")
+                if recommended_bitrate != bitrate:
+                    logger.warning(f"Adjusting bitrate for two-pass encoding: {bitrate}k → {recommended_bitrate}k")
+                    params = params.copy()
+                    params['bitrate'] = recommended_bitrate
+        
         cmd = FFmpegUtils.build_base_ffmpeg_command(input_path, output_path, params)
         cmd = FFmpegUtils.add_video_settings(cmd, params)
         
@@ -396,7 +555,7 @@ class FFmpegUtils:
         cmd.extend(['-pass', str(pass_num)])
         cmd.extend(['-passlogfile', log_file])
         
-        cmd = FFmpegUtils.add_bitrate_control(cmd, params, buffer_multiplier=2.0)
+        cmd = FFmpegUtils.add_bitrate_control(cmd, params, buffer_multiplier=2.0, bitrate_validator=bitrate_validator)
         
         if pass_num == 1:
             # First pass: analysis only
@@ -415,8 +574,8 @@ class FFmpegUtils:
 
     @staticmethod
     def build_two_pass_with_filters(input_path: str, output_path: str, params: Dict[str, Any],
-                                    pass_num: int, log_file: str) -> List[str]:
-        """Build two-pass FFmpeg command with explicit filter chain and optional 10-bit pix_fmt.
+                                    pass_num: int, log_file: str, bitrate_validator=None) -> List[str]:
+        """Build two-pass FFmpeg command with explicit filter chain, optional 10-bit pix_fmt, and bitrate validation.
 
         Honors:
           - params['vf']    : full filter chain string
@@ -424,8 +583,24 @@ class FFmpegUtils:
           - params['fps']   : output frame rate
           - params['preset'], params['tune']
           - params['pix_fmt']: e.g., 'yuv420p10le' for 10-bit
-          - bitrate fields handled via add_bitrate_control
+          - bitrate fields handled via add_bitrate_control with validation
         """
+        # Validate encoder and bitrate compatibility before building command
+        encoder = params.get('encoder', 'libx264')
+        bitrate = params.get('bitrate', 1000)
+        
+        if bitrate_validator or bitrate > 0:  # Validate if we have validator or non-zero bitrate
+            is_valid, recommended_bitrate, message = FFmpegUtils.validate_encoder_bitrate_compatibility(
+                encoder, bitrate, bitrate_validator
+            )
+            
+            if not is_valid:
+                logger.warning(f"Two-pass with filters validation: {message}")
+                if recommended_bitrate != bitrate:
+                    logger.warning(f"Adjusting bitrate for filtered two-pass encoding: {bitrate}k → {recommended_bitrate}k")
+                    params = params.copy()
+                    params['bitrate'] = recommended_bitrate
+        
         cmd = FFmpegUtils.build_base_ffmpeg_command(input_path, output_path, params)
 
         # Filter chain
@@ -455,8 +630,8 @@ class FFmpegUtils:
         cmd.extend(['-pass', str(pass_num)])
         cmd.extend(['-passlogfile', log_file])
 
-        # Bitrate control
-        cmd = FFmpegUtils.add_bitrate_control(cmd, params, buffer_multiplier=2.0)
+        # Bitrate control with validation
+        cmd = FFmpegUtils.add_bitrate_control(cmd, params, buffer_multiplier=2.0, bitrate_validator=bitrate_validator)
 
         if pass_num == 1:
             # First pass: analysis only
@@ -617,8 +792,8 @@ class FFmpegUtils:
     
     @staticmethod
     def build_x264_two_pass_cae(input_path: str, output_path: str, params: Dict[str, Any],
-                                pass_num: int, log_file: str) -> List[str]:
-        """Build x264 two-pass CAE command with VBV, psychovisual tuning, and optional prefilters.
+                                pass_num: int, log_file: str, bitrate_validator=None) -> List[str]:
+        """Build x264 two-pass CAE command with VBV, psychovisual tuning, and bitrate validation.
         
         Args:
             input_path: Source video
@@ -636,10 +811,56 @@ class FFmpegUtils:
                 - maxrate_multiplier, bufsize_multiplier: VBV control
             pass_num: 1 or 2
             log_file: passlogfile base path
+            bitrate_validator: Optional BitrateValidator instance for validation
         
         Returns:
             Command list ready for subprocess
         """
+        # Validate bitrate before building command with comprehensive encoder-specific checks
+        bitrate_kbps = int(params.get('bitrate', 1000))
+        encoder = 'libx264'  # This method is specifically for x264
+        
+        # Perform bitrate validation if validator is available
+        if bitrate_validator and bitrate_validator.is_validation_enabled():
+            validation_result = bitrate_validator.validate_bitrate(bitrate_kbps, encoder)
+            
+            # Log validation result with context
+            bitrate_validator.log_validation_result(validation_result, "x264 two-pass CAE")
+            
+            if validation_result.adjustment_needed:
+                # Apply minimum bitrate if below floor
+                min_bitrate = validation_result.minimum_required
+                original_bitrate = bitrate_kbps
+                
+                if bitrate_kbps < min_bitrate:
+                    bitrate_kbps = min_bitrate
+                    # Update params for consistency
+                    params = params.copy()
+                    params['bitrate'] = bitrate_kbps
+                    
+                    # Log the adjustment with detailed information
+                    logger.warning(f"Bitrate adjustment applied: {original_bitrate}k → {bitrate_kbps}k "
+                                 f"(encoder: {encoder}, minimum: {min_bitrate}k)")
+                    
+                    # Log impact assessment
+                    if validation_result.severity == 'critical':
+                        logger.error(f"Critical bitrate adjustment required for {encoder}. "
+                                   f"Original bitrate {original_bitrate}k was significantly below "
+                                   f"minimum {min_bitrate}k. Quality may be severely impacted.")
+                    else:
+                        logger.warning(f"Bitrate floor enforcement: {encoder} requires minimum "
+                                     f"{min_bitrate}k, adjusted from {original_bitrate}k")
+        else:
+            # Fallback validation when no validator is available
+            min_x264_bitrate = 3  # kbps - known x264 minimum
+            if bitrate_kbps < min_x264_bitrate:
+                original_bitrate = bitrate_kbps
+                bitrate_kbps = min_x264_bitrate
+                params = params.copy()
+                params['bitrate'] = bitrate_kbps
+                logger.warning(f"Fallback bitrate validation: adjusted {original_bitrate}k → "
+                             f"{bitrate_kbps}k to meet x264 minimum requirement")
+        
         cmd = ['ffmpeg', '-y', '-i', input_path]
         
         # Filter chain
@@ -655,15 +876,14 @@ class FFmpegUtils:
         cmd.extend(['-r', str(fps)])
         
         # Video codec and pixel format
-        cmd.extend(['-c:v', 'libx264', '-pix_fmt', 'yuv420p'])
+        cmd.extend(['-c:v', encoder, '-pix_fmt', 'yuv420p'])
         
         # Preset and tune
         preset = params.get('preset', 'slow')
         tune = params.get('tune', 'film')
         cmd.extend(['-preset', preset, '-tune', tune])
         
-        # Bitrate and VBV
-        bitrate_kbps = int(params.get('bitrate', 1000))
+        # Bitrate and VBV (using validated bitrate)
         maxrate_mult = float(params.get('maxrate_multiplier', 1.10))
         bufsize_mult = float(params.get('bufsize_multiplier', 2.0))
         maxrate = int(bitrate_kbps * maxrate_mult)
