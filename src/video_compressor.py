@@ -24,6 +24,8 @@ from .performance_enhancer import PerformanceEnhancer
 from .ffmpeg_utils import FFmpegUtils
 from .video_segmenter import VideoSegmenter
 from .quality_scorer import QualityScorer
+from .bitrate_validator import BitrateValidator, BitrateValidationError
+from .adaptive_parameter_adjuster import AdaptiveParameterAdjuster
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +70,10 @@ class DynamicVideoCompressor:
         self.quality_gates = QualityGates(config_manager)
         self.artifact_detector = ArtifactDetector(config_manager)
         
+        # Initialize bitrate validation components
+        self.bitrate_validator = BitrateValidator(config_manager)
+        self.parameter_adjuster = AdaptiveParameterAdjuster(config_manager, self.bitrate_validator)
+        
         # Optimize system resources
         self.system_optimizations = self.performance_enhancer.optimize_system_resources()
         
@@ -75,6 +81,12 @@ class DynamicVideoCompressor:
         self._resolution_cache = {}
 
     # ===== New helpers for refined final-pass encoding =====
+    def _calculate_target_video_kbps(self, target_size_mb: float, duration_s: float, audio_kbps: int) -> int:
+        """Calculate target video bitrate for given constraints"""
+        total_bits = target_size_mb * 8 * 1024 * 1024
+        video_kbps = int(max((total_bits / max(duration_s, 1.0) / 1000) - audio_kbps, 64))
+        return video_kbps
+
     def _calculate_safe_bitrate_cap(self, width: int, height: int, fps: float, duration: float) -> int:
         """Calculate reasonable bitrate cap based on video characteristics"""
         pixels_per_sec = width * height * fps
@@ -404,12 +416,12 @@ class DynamicVideoCompressor:
         final_id = f"final_refinement_{int(time.time())}"
         log_base = os.path.join(self.temp_dir, f'ffmpeg2pass_{final_id}')
         # Pass 1
-        cmd1 = FFmpegUtils.build_two_pass_with_filters(input_path, output_path, params, pass_num=1, log_file=log_base)
+        cmd1 = FFmpegUtils.build_two_pass_with_filters(input_path, output_path, params, pass_num=1, log_file=log_base, bitrate_validator=self.bitrate_validator)
         ok1 = FFmpegUtils.execute_ffmpeg_with_progress(cmd1, description="Analyzing", duration=None)
         if not ok1:
             return False, 0.0, log_base
         # Pass 2
-        cmd2 = FFmpegUtils.build_two_pass_with_filters(input_path, output_path, params, pass_num=2, log_file=log_base)
+        cmd2 = FFmpegUtils.build_two_pass_with_filters(input_path, output_path, params, pass_num=2, log_file=log_base, bitrate_validator=self.bitrate_validator)
         ok2 = FFmpegUtils.execute_ffmpeg_with_progress(cmd2, description="Encoding", duration=None)
         if not ok2 or not os.path.exists(output_path):
             return False, 0.0, log_base
@@ -432,7 +444,7 @@ class DynamicVideoCompressor:
             params2 = dict(params)
             params2['bitrate'] = int(new_v_kbps)
             params2['audio_bitrate'] = int(a_kbps)
-            cmd2 = FFmpegUtils.build_two_pass_with_filters(input_path, output_path, params2, pass_num=2, log_file=log_base)
+            cmd2 = FFmpegUtils.build_two_pass_with_filters(input_path, output_path, params2, pass_num=2, log_file=log_base, bitrate_validator=self.bitrate_validator)
             return FFmpegUtils.execute_ffmpeg_with_progress(cmd2, description="Refining", duration=None)
         except Exception:
             return False
@@ -647,18 +659,245 @@ class DynamicVideoCompressor:
         
         logger.info(f"Budget: {size_limit_mb}MB = {target_video_bitrate_kbps}k video + {audio_bitrate_kbps}k audio over {duration:.1f}s")
         
-        # Step 3: BPP-driven resolution/FPS selection
+        # Step 2.5: Immediate bitrate validation and emergency adjustment
+        encoder = 'libx264'  # Default encoder for CAE pipeline
+        min_encoder_bitrate = self.bitrate_validator.get_encoder_minimum(encoder)
+        
+        # Immediate validation with enhanced logging
+        validation_result = self.bitrate_validator.validate_bitrate(target_video_bitrate_kbps, encoder)
+        self.bitrate_validator.log_validation_result(
+            validation_result, 
+            context="CAE_immediate_validation", 
+            video_info=video_info
+        )
+        
+        if target_video_bitrate_kbps < min_encoder_bitrate:
+            logger.warning(f"IMMEDIATE VALIDATION FAILURE: Calculated bitrate {target_video_bitrate_kbps}kbps < {encoder} minimum {min_encoder_bitrate}kbps")
+            
+            # Emergency resolution reduction to meet bitrate floor
+            emergency_adjustment_needed = True
+            original_target_bitrate = target_video_bitrate_kbps
+            original_width = video_info['width']
+            original_height = video_info['height']
+            
+            # Calculate deficit for segmentation estimation
+            bitrate_deficit_ratio = min_encoder_bitrate / max(target_video_bitrate_kbps, 1)
+            
+            # Try emergency resolution reduction with enhanced logic
+            emergency_resolutions = self.parameter_adjuster.get_fallback_resolutions((original_width, original_height))
+            
+            # Add ultra-low emergency resolutions if not already present
+            ultra_low_resolutions = [(320, 180), (240, 135), (160, 90)]
+            for ultra_res in ultra_low_resolutions:
+                if ultra_res not in emergency_resolutions:
+                    emergency_resolutions.append(ultra_res)
+            
+            for emergency_width, emergency_height in emergency_resolutions:
+                logger.warning(f"EMERGENCY: Attempting resolution reduction to {emergency_width}x{emergency_height}")
+                
+                # Calculate new bitrate with emergency resolution
+                # Key insight: same file size budget with smaller resolution = higher bitrate per pixel
+                emergency_pixels = emergency_width * emergency_height
+                original_pixels = original_width * original_height
+                pixel_reduction_ratio = emergency_pixels / original_pixels
+                
+                # Estimate bitrate improvement from resolution reduction
+                # Smaller resolution allows higher bitrate for same file size
+                estimated_bitrate_improvement = 1.0 / math.sqrt(pixel_reduction_ratio)
+                adjusted_bitrate = int(original_target_bitrate * estimated_bitrate_improvement)
+                
+                # Apply safety margin
+                safe_adjusted_bitrate = int(adjusted_bitrate * 0.95)  # 5% safety margin
+                
+                logger.info(f"EMERGENCY: Resolution {emergency_width}x{emergency_height} would allow ~{safe_adjusted_bitrate}kbps (need {min_encoder_bitrate}kbps)")
+                
+                if safe_adjusted_bitrate >= min_encoder_bitrate:
+                    # Success - emergency resolution reduction sufficient
+                    target_video_bitrate_kbps = safe_adjusted_bitrate
+                    
+                    # Update video_info for downstream processing
+                    video_info = video_info.copy()
+                    video_info['emergency_width'] = emergency_width
+                    video_info['emergency_height'] = emergency_height
+                    video_info['emergency_adjustment'] = True
+                    
+                    logger.warning(f"EMERGENCY SUCCESS: Resolution reduced to {emergency_width}x{emergency_height}, bitrate adjusted to {safe_adjusted_bitrate}kbps")
+                    
+                    # Log the emergency fallback strategy
+                    emergency_params = {
+                        'width': emergency_width, 'height': emergency_height, 
+                        'bitrate': safe_adjusted_bitrate
+                    }
+                    original_params = {
+                        'width': original_width, 'height': original_height, 
+                        'bitrate': original_target_bitrate
+                    }
+                    self.bitrate_validator.log_fallback_strategy_used(
+                        'emergency_resolution_reduction', original_params, emergency_params,
+                        context="CAE_immediate_validation",
+                        reason=f"bitrate {original_target_bitrate}kbps < minimum {min_encoder_bitrate}kbps"
+                    )
+                    
+                    emergency_adjustment_needed = False
+                    break
+                
+                # If we're at the smallest resolution and still can't meet minimum, force minimum bitrate
+                if emergency_width <= 320 and emergency_height <= 180:
+                    logger.warning(f"EMERGENCY: Even ultra-low resolution insufficient. Forcing minimum bitrate {min_encoder_bitrate}kbps")
+                    target_video_bitrate_kbps = min_encoder_bitrate
+                    
+                    # Update video_info for downstream processing
+                    video_info = video_info.copy()
+                    video_info['emergency_width'] = emergency_width
+                    video_info['emergency_height'] = emergency_height
+                    video_info['emergency_adjustment'] = True
+                    video_info['forced_minimum_bitrate'] = True
+                    
+                    emergency_adjustment_needed = False
+                    break
+            
+            if emergency_adjustment_needed:
+                # Emergency resolution reduction completely insufficient - segmentation required
+                logger.error(f"CRITICAL: Emergency resolution reduction insufficient. Original bitrate: {original_target_bitrate}kbps, Required: {min_encoder_bitrate}kbps")
+                logger.error(f"CRITICAL: Bitrate deficit ratio: {bitrate_deficit_ratio:.1f}x below minimum")
+                
+                # Calculate segmentation parameters
+                estimated_segments = math.ceil(bitrate_deficit_ratio)
+                segment_duration = duration / estimated_segments
+                
+                logger.error(f"SEGMENTATION REQUIRED: Split into ~{estimated_segments} segments of ~{segment_duration:.1f}s each")
+                logger.error("FALLBACK: Attempting segmentation after CAE pipeline failure")
+                
+                # Mark for segmentation fallback
+                video_info = video_info.copy()
+                video_info['requires_segmentation'] = True
+                video_info['segmentation_reason'] = 'emergency_bitrate_failure'
+                video_info['estimated_segments'] = estimated_segments
+                video_info['segment_duration'] = segment_duration
+                
+                # Log segmentation fallback strategy
+                self.bitrate_validator.log_fallback_strategy_used(
+                    'segmentation', 
+                    {'bitrate': original_target_bitrate}, 
+                    {'estimated_segments': estimated_segments, 'segment_duration': segment_duration},
+                    context="CAE_emergency_fallback",
+                    reason=f"emergency resolution reduction insufficient for bitrate floor {min_encoder_bitrate}kbps"
+                )
+                
+                # Continue with minimum bitrate for CAE attempt, but expect failure
+                target_video_bitrate_kbps = min_encoder_bitrate
+                logger.warning(f"PROCEEDING: Using minimum bitrate {min_encoder_bitrate}kbps (CAE likely to fail, segmentation fallback prepared)")
+        
+        # Step 3: BPP-driven resolution/FPS selection (with emergency resolution override)
         bpp_floors = profile_cfg.get('bpp_floor', {})
         bpp_min = bpp_floors.get(motion_level, bpp_floors.get('normal', 0.035))
         
-        initial_params = self._select_resolution_fps_by_bpp(
-            video_info, target_video_bitrate_kbps, bpp_min, profile_cfg
-        )
+        # Use emergency resolution if set during immediate validation
+        if video_info.get('emergency_adjustment'):
+            emergency_width = video_info.get('emergency_width')
+            emergency_height = video_info.get('emergency_height')
+            
+            logger.info(f"Using emergency resolution override: {emergency_width}x{emergency_height}")
+            
+            # Calculate FPS for emergency resolution
+            emergency_video_info = video_info.copy()
+            emergency_video_info['width'] = emergency_width
+            emergency_video_info['height'] = emergency_height
+            
+            initial_params = self._select_resolution_fps_by_bpp(
+                emergency_video_info, target_video_bitrate_kbps, bpp_min, profile_cfg
+            )
+            
+            # Override with emergency resolution (in case BPP selection chose different)
+            initial_params['width'] = emergency_width
+            initial_params['height'] = emergency_height
+            
+        else:
+            # Normal BPP-driven selection
+            initial_params = self._select_resolution_fps_by_bpp(
+                video_info, target_video_bitrate_kbps, bpp_min, profile_cfg
+            )
+        
         initial_params['bitrate'] = target_video_bitrate_kbps
         initial_params['audio_bitrate'] = audio_bitrate_kbps
+        initial_params['encoder'] = 'libx264'  # Default encoder for CAE pipeline
         
         logger.info(f"Initial target: {initial_params['width']}x{initial_params['height']}@{initial_params['fps']}fps, "
                    f"BPP={bpp_min:.3f}, bitrate={target_video_bitrate_kbps}k")
+        
+        # Step 3.5: Pre-encoding bitrate validation and parameter adjustment
+        if self.bitrate_validator.is_validation_enabled():
+            validation_result = self.bitrate_validator.validate_bitrate(
+                target_video_bitrate_kbps, initial_params['encoder']
+            )
+            self.bitrate_validator.log_validation_result(validation_result, "CAE Pre-encoding")
+            
+            if validation_result.adjustment_needed:
+                # Enhanced logging with video context
+                self.bitrate_validator.log_validation_result(
+                    validation_result, 
+                    context="CAE_pipeline", 
+                    video_info=video_info
+                )
+                
+                # Attempt automatic parameter adjustment
+                adjustment_result = self.parameter_adjuster.adjust_for_bitrate_floor(
+                    initial_params, validation_result.minimum_required, video_info, size_limit_mb
+                )
+                self.parameter_adjuster.log_adjustment_result(adjustment_result, "CAE Auto-adjustment")
+                
+                if adjustment_result.success:
+                    # Use adjusted parameters and log the fallback strategy
+                    original_params = initial_params.copy()
+                    initial_params = adjustment_result.adjusted_params
+                    
+                    # Log the fallback strategy used with enhanced details
+                    strategy = adjustment_result.adjustment_type
+                    self.bitrate_validator.log_fallback_strategy_used(
+                        strategy, original_params, initial_params, 
+                        context="CAE_auto_adjustment",
+                        reason="bitrate below encoder minimum"
+                    )
+                    
+                    logger.info(f"Parameters automatically adjusted: {initial_params['width']}x{initial_params['height']}@{initial_params['fps']}fps, "
+                               f"bitrate={initial_params['bitrate']}k")
+                    
+                    # Re-validate adjusted parameters
+                    adjusted_validation = self.bitrate_validator.validate_bitrate(
+                        initial_params['bitrate'], initial_params['encoder']
+                    )
+                    if not adjusted_validation.is_valid:
+                        # Enhanced error logging with context
+                        self.bitrate_validator.log_validation_result(
+                            adjusted_validation,
+                            context="CAE_post_adjustment",
+                            video_info=video_info
+                        )
+                        
+                        # Create detailed error for potential exception handling
+                        validation_error = self.bitrate_validator.create_validation_error(
+                            adjusted_validation,
+                            encoder=initial_params['encoder'],
+                            context="CAE_post_adjustment",
+                            video_info=video_info
+                        )
+                        logger.error(f"Bitrate validation details:\n{validation_error.get_detailed_message()}")
+                        
+                        # Log suggestion for segmentation fallback
+                        logger.error("Automatic parameter adjustment insufficient - segmentation fallback recommended")
+                else:
+                    logger.warning(f"Parameter adjustment failed: {adjustment_result.message}")
+                    logger.warning("Consider enabling segmentation or using a different encoder")
+                    
+                    # Check if segmentation is recommended
+                    if adjustment_result.adjustment_type == 'failed':
+                        logger.info("Bitrate floor cannot be met with single file - segmentation may be required")
+                        self.bitrate_validator.log_fallback_strategy_used(
+                            'segmentation', initial_params, initial_params, 
+                            context="CAE_fallback",
+                            reason="parameter adjustment failed"
+                        )
+                        # Note: We continue with CAE pipeline first, segmentation fallback handled elsewhere
         
         # Step 4: 2-pass encode with refine loop
         x264_cfg = profile_cfg.get('x264', {})
@@ -763,18 +1002,41 @@ class DynamicVideoCompressor:
             logger.warning(f"Quality gates failed on pass {refine_pass + 1}, attempting refinement")
             
             if refine_pass + 1 < max_passes:
+                # Get minimum bitrate requirement for validation
+                min_bitrate = self.bitrate_validator.get_encoder_minimum(initial_params['encoder'])
+                
                 # Try refinements in order: +bitrate, drop FPS, lower resolution
                 if not quality_pass and output_size_mb < size_limit_mb * 0.95:
                     # Room to increase bitrate
                     new_bitrate = int(initial_params['bitrate'] * bitrate_step)
                     headroom_bitrate = int((size_limit_mb * 0.98 - output_size_mb) * 8 * 1024 / duration)
-                    initial_params['bitrate'] = min(new_bitrate, initial_params['bitrate'] + headroom_bitrate)
-                    logger.info(f"Refine: increasing bitrate to {initial_params['bitrate']}k")
+                    proposed_bitrate = min(new_bitrate, initial_params['bitrate'] + headroom_bitrate)
+                    
+                    # Validate proposed bitrate increase
+                    if proposed_bitrate >= min_bitrate:
+                        initial_params['bitrate'] = proposed_bitrate
+                        logger.info(f"Refine: increasing bitrate to {initial_params['bitrate']}k")
+                    else:
+                        logger.warning(f"Cannot increase bitrate to {proposed_bitrate}k (below minimum {min_bitrate}k)")
                     
                 elif initial_params['fps'] > 24:
-                    # Drop FPS to 24
+                    # Drop FPS to 24 and recalculate bitrate if needed
                     initial_params['fps'] = 24
-                    logger.info(f"Refine: dropping FPS to 24")
+                    
+                    # Check if bitrate adjustment is needed with new FPS
+                    if self.bitrate_validator.is_validation_enabled():
+                        validation_result = self.bitrate_validator.validate_bitrate(
+                            initial_params['bitrate'], initial_params['encoder']
+                        )
+                        if validation_result.adjustment_needed:
+                            # Try to adjust parameters with new FPS
+                            adjustment_result = self.parameter_adjuster.adjust_for_bitrate_floor(
+                                initial_params, min_bitrate, video_info, size_limit_mb
+                            )
+                            if adjustment_result.success:
+                                initial_params = adjustment_result.adjusted_params
+                    
+                    logger.info(f"Refine: dropping FPS to {initial_params['fps']}, bitrate={initial_params['bitrate']}k")
                     
                 else:
                     # Scale down resolution
@@ -782,7 +1044,15 @@ class DynamicVideoCompressor:
                     if new_height >= 360:
                         initial_params['width'] = new_width
                         initial_params['height'] = new_height
-                        logger.info(f"Refine: scaling down to {new_width}x{new_height}")
+                        
+                        # Recalculate bitrate for new resolution if needed
+                        if self.bitrate_validator.is_validation_enabled():
+                            # With smaller resolution, we might be able to increase bitrate within size limit
+                            new_bitrate = self._calculate_target_video_kbps(size_limit_mb, duration, audio_bitrate_kbps)
+                            if new_bitrate >= min_bitrate:
+                                initial_params['bitrate'] = new_bitrate
+                        
+                        logger.info(f"Refine: scaling down to {new_width}x{new_height}, bitrate={initial_params['bitrate']}k")
                     else:
                         logger.warning("Cannot refine further (already at minimum resolution)")
                         break
@@ -801,19 +1071,70 @@ class DynamicVideoCompressor:
                 return self._get_compression_results(input_path, output_path, video_info, "cae_discord_10mb_compromised")
         
         logger.error("CAE pipeline failed after all refine passes")
+        
+        # Enhanced segmentation fallback handling
+        encoder = initial_params.get('encoder', 'libx264')
+        
+        # Check if segmentation was already identified as necessary during immediate validation
+        if video_info.get('requires_segmentation'):
+            segmentation_reason = video_info.get('segmentation_reason', 'unknown')
+            estimated_segments = video_info.get('estimated_segments', 2)
+            
+            logger.info(f"Segmentation fallback triggered: {segmentation_reason}")
+            logger.info(f"Estimated segments needed: {estimated_segments}")
+            
+            return self._try_segmentation_fallback(
+                input_path, output_path, size_limit_mb, initial_params, video_info, encoder,
+                f"CAE pipeline failed - {segmentation_reason}"
+            )
+        
+        # Check if segmentation should be used due to bitrate constraints
+        should_segment, reason = self.video_segmenter.should_segment_for_bitrate_constraints(
+            video_info, size_limit_mb, encoder
+        )
+        
+        if should_segment:
+            logger.info(f"CAE failed, trying segmentation fallback: {reason}")
+            return self._try_segmentation_fallback(
+                input_path, output_path, size_limit_mb, initial_params, video_info, encoder,
+                f"CAE pipeline failed - {reason}"
+            )
+        
+        # Final check for emergency cases that might need segmentation
+        if video_info.get('emergency_adjustment') or video_info.get('forced_minimum_bitrate'):
+            logger.warning("Emergency adjustments were made but CAE still failed - attempting segmentation as last resort")
+            return self._try_segmentation_fallback(
+                input_path, output_path, size_limit_mb, initial_params, video_info, encoder,
+                "CAE pipeline failed after emergency adjustments - last resort segmentation"
+            )
+        
         return {'success': False, 'error': 'CAE quality gates failed', 'method': 'cae_failed'}
     
     def _select_resolution_fps_by_bpp(self, video_info: Dict[str, Any], 
                                      target_bitrate_kbps: int, bpp_min: float,
                                      profile_cfg: Dict[str, Any]) -> Dict[str, Any]:
-        """Select highest resolution and FPS that satisfy BPP floor constraint."""
+        """Select highest resolution and FPS that satisfy BPP floor constraint and encoder minimums."""
         orig_w = video_info['width']
         orig_h = video_info['height']
         orig_fps = video_info['fps']
         
-        # Candidate resolutions (maintain aspect ratio)
+        # Get encoder minimum bitrate requirement
+        encoder = 'libx264'  # Default encoder for CAE pipeline
+        min_encoder_bitrate = self.bitrate_validator.get_encoder_minimum(encoder)
+        
+        # Validate initial bitrate against encoder minimum
+        validation_result = self.bitrate_validator.validate_bitrate(target_bitrate_kbps, encoder)
+        self.bitrate_validator.log_validation_result(validation_result, "BPP_calculation", video_info)
+        
+        # If bitrate is critically low, we need progressive resolution reduction
+        if not validation_result.is_valid and validation_result.severity == 'critical':
+            logger.warning(f"Target bitrate {target_bitrate_kbps}kbps critically below {encoder} minimum {min_encoder_bitrate}kbps")
+            logger.warning("Implementing progressive resolution reduction to meet bitrate floor")
+            return self._progressive_resolution_reduction(video_info, target_bitrate_kbps, bpp_min, profile_cfg, encoder)
+        
+        # Candidate resolutions (maintain aspect ratio) - enhanced with more aggressive options
         aspect_ratio = orig_w / orig_h
-        candidate_heights = [1080, 720, 540, 480, 360, 270]
+        candidate_heights = [1080, 720, 540, 480, 360, 270, 240, 180, 144, 120]  # Added ultra-low resolutions
         candidates = []
         
         for h in candidate_heights:
@@ -822,39 +1143,228 @@ class DynamicVideoCompressor:
             w = int(h * aspect_ratio)
             # Ensure even dimensions
             w = w if w % 2 == 0 else w - 1
+            # Ensure minimum width of 64 pixels
+            if w < 64:
+                w = 64
             candidates.append((w, h))
         
         # Add original resolution if not in list
         if orig_h not in candidate_heights:
             candidates.insert(0, (orig_w, orig_h))
         
-        # Candidate FPS values
-        fps_candidates = [30, 24, 20] if orig_fps >= 30 else [24, 20, int(orig_fps)]
+        # Candidate FPS values - expanded for bitrate floor scenarios
+        fps_candidates = [30, 24, 20, 15, 12, 10, 8, 6] if orig_fps >= 30 else [24, 20, 15, 12, 10, 8, 6, int(orig_fps)]
         fps_prefer_24 = profile_cfg.get('fps_policy', {}).get('prefer_24_for_low_motion', True)
         motion_level = video_info.get('motion_level', 'medium')
         
         if fps_prefer_24 and motion_level == 'low':
-            fps_candidates = [24, 20, 30]  # Prefer 24 for low motion
+            fps_candidates = [24, 20, 15, 12, 10, 8, 6, 30]  # Prefer 24 for low motion
         
-        # Find best combo that satisfies BPP
+        # Find best combo that satisfies both BPP and bitrate floor
         target_bits_per_sec = target_bitrate_kbps * 1000
         
+        # First pass: try to satisfy both BPP and bitrate floor
         for w, h in candidates:
             for fps in fps_candidates:
                 pixels_per_sec = w * h * fps
                 actual_bpp = target_bits_per_sec / pixels_per_sec
                 
-                if actual_bpp >= bpp_min:
-                    logger.info(f"Selected {w}x{h}@{fps}fps: BPP={actual_bpp:.4f} >= {bpp_min:.4f}")
-                    return {'width': w, 'height': h, 'fps': fps}
+                # Check both BPP floor and encoder minimum bitrate
+                if actual_bpp >= bpp_min and target_bitrate_kbps >= min_encoder_bitrate:
+                    # Final validation before returning parameters
+                    final_validation = self.bitrate_validator.validate_bitrate(target_bitrate_kbps, encoder)
+                    if final_validation.is_valid:
+                        logger.info(f"Selected {w}x{h}@{fps}fps: BPP={actual_bpp:.4f} >= {bpp_min:.4f}, bitrate={target_bitrate_kbps}kbps >= {min_encoder_bitrate}kbps")
+                        return {'width': w, 'height': h, 'fps': fps}
         
-        # Fallback: use smallest resolution at lowest FPS and reduce BPP floor by 20%
-        w, h = candidates[-1]
-        fps = fps_candidates[-1]
-        pixels_per_sec = w * h * fps
+        # Second pass: prioritize bitrate floor over BPP if necessary
+        logger.warning(f"Cannot satisfy both BPP floor ({bpp_min:.4f}) and bitrate floor ({min_encoder_bitrate}kbps) simultaneously")
+        logger.warning("Prioritizing encoder bitrate minimum over BPP floor")
+        
+        # Progressive resolution reduction until bitrate floor is met
+        for w, h in candidates:
+            for fps in fps_candidates:
+                pixels_per_sec = w * h * fps
+                actual_bpp = target_bits_per_sec / pixels_per_sec
+                
+                # Only check bitrate floor, ignore BPP floor if necessary
+                if target_bitrate_kbps >= min_encoder_bitrate:
+                    # Final validation before returning parameters
+                    final_validation = self.bitrate_validator.validate_bitrate(target_bitrate_kbps, encoder)
+                    if final_validation.is_valid:
+                        logger.warning(f"Bitrate floor priority: {w}x{h}@{fps}fps: BPP={actual_bpp:.4f} (target: {bpp_min:.4f}), bitrate={target_bitrate_kbps}kbps >= {min_encoder_bitrate}kbps")
+                        return {'width': w, 'height': h, 'fps': fps}
+        
+        # Third pass: Calculate minimum viable resolution for the given bitrate
+        logger.error(f"Standard resolution candidates cannot meet bitrate floor {min_encoder_bitrate}kbps")
+        return self._calculate_minimum_viable_resolution(video_info, target_bitrate_kbps, bpp_min, profile_cfg, encoder)
+    
+    def _progressive_resolution_reduction(self, video_info: Dict[str, Any], 
+                                        target_bitrate_kbps: int, bpp_min: float,
+                                        profile_cfg: Dict[str, Any], encoder: str) -> Dict[str, Any]:
+        """Implement progressive resolution reduction until bitrate floor is met."""
+        orig_w = video_info['width']
+        orig_h = video_info['height']
+        orig_fps = video_info['fps']
+        min_encoder_bitrate = self.bitrate_validator.get_encoder_minimum(encoder)
+        
+        logger.info(f"Starting progressive resolution reduction from {orig_w}x{orig_h}")
+        
+        # Get fallback resolutions from bitrate validator
+        fallback_resolutions = self.bitrate_validator.fallback_resolutions
+        aspect_ratio = orig_w / orig_h
+        
+        # Generate progressive candidates based on aspect ratio
+        progressive_candidates = []
+        
+        # Add fallback resolutions maintaining aspect ratio
+        for fallback_w, fallback_h in fallback_resolutions:
+            if fallback_w <= orig_w and fallback_h <= orig_h:
+                # Adjust to maintain aspect ratio
+                if abs(fallback_w / fallback_h - aspect_ratio) > 0.1:  # Significant aspect ratio difference
+                    # Recalculate to maintain aspect ratio
+                    adjusted_w = int(fallback_h * aspect_ratio)
+                    adjusted_w = adjusted_w if adjusted_w % 2 == 0 else adjusted_w - 1
+                    if adjusted_w >= 64:  # Minimum width
+                        progressive_candidates.append((adjusted_w, fallback_h))
+                else:
+                    progressive_candidates.append((fallback_w, fallback_h))
+        
+        # Add ultra-low resolutions if needed
+        ultra_low_heights = [120, 90, 72, 60]
+        for h in ultra_low_heights:
+            if h < orig_h:
+                w = int(h * aspect_ratio)
+                w = max(64, w if w % 2 == 0 else w - 1)  # Ensure minimum width and even dimensions
+                progressive_candidates.append((w, h))
+        
+        # Remove duplicates and sort by resolution (largest first)
+        progressive_candidates = list(set(progressive_candidates))
+        progressive_candidates.sort(key=lambda x: x[0] * x[1], reverse=True)
+        
+        # Progressive FPS reduction candidates
+        fps_candidates = [orig_fps, 24, 20, 15, 12, 10, 8, 6, 5] if orig_fps > 6 else [orig_fps, 5, 4, 3, 2, 1]
+        fps_candidates = [fps for fps in fps_candidates if fps <= orig_fps]
+        
+        target_bits_per_sec = target_bitrate_kbps * 1000
+        
+        logger.info(f"Testing {len(progressive_candidates)} resolution candidates with {len(fps_candidates)} FPS options")
+        
+        # Try each resolution/FPS combination
+        for i, (w, h) in enumerate(progressive_candidates):
+            for fps in fps_candidates:
+                pixels_per_sec = w * h * fps
+                actual_bpp = target_bits_per_sec / pixels_per_sec
+                
+                # Check if this combination meets bitrate floor
+                if target_bitrate_kbps >= min_encoder_bitrate:
+                    # Validate with bitrate validator
+                    validation_result = self.bitrate_validator.validate_bitrate(target_bitrate_kbps, encoder)
+                    if validation_result.is_valid:
+                        reduction_factor = (orig_w * orig_h) / (w * h)
+                        logger.warning(f"Progressive reduction successful: {w}x{h}@{fps}fps")
+                        logger.warning(f"Resolution reduction: {reduction_factor:.1f}x smaller ({orig_w}x{orig_h} → {w}x{h})")
+                        logger.info(f"Final parameters: BPP={actual_bpp:.4f}, bitrate={target_bitrate_kbps}kbps >= {min_encoder_bitrate}kbps")
+                        return {'width': w, 'height': h, 'fps': fps}
+                
+                # Log progress for very aggressive reductions
+                if i % 3 == 0:  # Log every 3rd resolution attempt
+                    logger.debug(f"Testing {w}x{h}@{fps}fps: BPP={actual_bpp:.4f}, bitrate={target_bitrate_kbps}kbps < {min_encoder_bitrate}kbps")
+        
+        # If we reach here, even progressive reduction failed
+        logger.error("Progressive resolution reduction failed to meet bitrate floor")
+        return self._handle_bitrate_floor_failure(video_info, target_bitrate_kbps, encoder)
+    
+    def _calculate_minimum_viable_resolution(self, video_info: Dict[str, Any], 
+                                           target_bitrate_kbps: int, bpp_min: float,
+                                           profile_cfg: Dict[str, Any], encoder: str) -> Dict[str, Any]:
+        """Calculate the minimum viable resolution that can meet bitrate requirements."""
+        min_encoder_bitrate = self.bitrate_validator.get_encoder_minimum(encoder)
+        orig_w = video_info['width']
+        orig_h = video_info['height']
+        aspect_ratio = orig_w / orig_h
+        
+        logger.info("Calculating minimum viable resolution for bitrate floor compliance")
+        
+        # If target bitrate is below minimum, we need to work backwards
+        if target_bitrate_kbps < min_encoder_bitrate:
+            logger.error(f"Target bitrate {target_bitrate_kbps}kbps < minimum {min_encoder_bitrate}kbps")
+            logger.error("Cannot calculate viable resolution - segmentation required")
+            return self._handle_bitrate_floor_failure(video_info, target_bitrate_kbps, encoder)
+        
+        # Calculate minimum pixels per second needed for the given bitrate
+        target_bits_per_sec = target_bitrate_kbps * 1000
+        min_fps = 5  # Absolute minimum FPS
+        max_pixels_per_frame = target_bits_per_sec / (min_fps * bpp_min)
+        
+        # Calculate maximum resolution for this pixel budget
+        max_height = int((max_pixels_per_frame / aspect_ratio) ** 0.5)
+        max_width = int(max_height * aspect_ratio)
+        
+        # Ensure even dimensions and minimum size
+        max_width = max(64, max_width if max_width % 2 == 0 else max_width - 1)
+        max_height = max(48, max_height if max_height % 2 == 0 else max_height - 1)
+        
+        # Validate this calculated resolution
+        pixels_per_sec = max_width * max_height * min_fps
         actual_bpp = target_bits_per_sec / pixels_per_sec
-        logger.warning(f"BPP floor not fully met at {w}x{h}@{fps}fps: BPP={actual_bpp:.4f} < {bpp_min:.4f} (proceeding anyway)")
-        return {'width': w, 'height': h, 'fps': fps}
+        
+        if actual_bpp >= bpp_min and target_bitrate_kbps >= min_encoder_bitrate:
+            logger.warning(f"Calculated minimum viable resolution: {max_width}x{max_height}@{min_fps}fps")
+            logger.warning(f"Parameters: BPP={actual_bpp:.4f} >= {bpp_min:.4f}, bitrate={target_bitrate_kbps}kbps >= {min_encoder_bitrate}kbps")
+            
+            # Final validation
+            validation_result = self.bitrate_validator.validate_bitrate(target_bitrate_kbps, encoder)
+            if validation_result.is_valid:
+                return {'width': max_width, 'height': max_height, 'fps': min_fps}
+        
+        # If calculated resolution still doesn't work, return failure
+        logger.error(f"Calculated resolution {max_width}x{max_height}@{min_fps}fps still insufficient")
+        return self._handle_bitrate_floor_failure(video_info, target_bitrate_kbps, encoder)
+    
+    def _handle_bitrate_floor_failure(self, video_info: Dict[str, Any], 
+                                    target_bitrate_kbps: int, encoder: str) -> Dict[str, Any]:
+        """Handle cases where bitrate floor cannot be met with any resolution/FPS combination."""
+        min_encoder_bitrate = self.bitrate_validator.get_encoder_minimum(encoder)
+        
+        # Use absolute minimum resolution as final fallback
+        min_width, min_height = 64, 48  # Absolute minimum viable resolution
+        min_fps = 1  # Absolute minimum FPS
+        
+        # Calculate final parameters
+        pixels_per_sec = min_width * min_height * min_fps
+        target_bits_per_sec = target_bitrate_kbps * 1000
+        actual_bpp = target_bits_per_sec / pixels_per_sec if pixels_per_sec > 0 else 0
+        
+        # Log comprehensive failure information
+        logger.error(f"CRITICAL: Cannot meet encoder minimum bitrate {min_encoder_bitrate}kbps with any resolution/FPS combination")
+        logger.error(f"Final fallback: {min_width}x{min_height}@{min_fps}fps: BPP={actual_bpp:.4f}, bitrate={target_bitrate_kbps}kbps < {min_encoder_bitrate}kbps")
+        
+        # Calculate segmentation requirements
+        if target_bitrate_kbps < min_encoder_bitrate:
+            bitrate_deficit = min_encoder_bitrate - target_bitrate_kbps
+            deficit_ratio = min_encoder_bitrate / max(target_bitrate_kbps, 1)
+            logger.error(f"Bitrate deficit: {bitrate_deficit}kbps ({deficit_ratio:.1f}x below minimum)")
+            
+            # Suggest segmentation parameters
+            duration = video_info.get('duration', 60)
+            estimated_segments = math.ceil(deficit_ratio)
+            segment_duration = duration / estimated_segments
+            logger.error(f"SEGMENTATION REQUIRED: Estimated {estimated_segments} segments of ~{segment_duration:.1f}s each")
+            
+            # Log fallback strategy
+            self.bitrate_validator.log_fallback_strategy_used(
+                'segmentation',
+                {'bitrate': target_bitrate_kbps, 'encoder': encoder},
+                {'segment_duration': segment_duration, 'estimated_segments': estimated_segments},
+                'bitrate_floor_failure',
+                f'Bitrate {target_bitrate_kbps}kbps < minimum {min_encoder_bitrate}kbps'
+            )
+        
+        logger.warning("Proceeding with absolute minimum resolution/FPS (encoding will likely fail)")
+        logger.warning("Consider enabling segmentation or increasing target file size")
+        
+        return {'width': min_width, 'height': min_height, 'fps': min_fps}
     
     def _build_cae_encode_params(self, base_params: Dict[str, Any], 
                                  x264_cfg: Dict[str, Any],
@@ -879,7 +1389,7 @@ class DynamicVideoCompressor:
     
     def _execute_two_pass_x264(self, input_path: str, output_path: str, 
                                params: Dict[str, Any]) -> bool:
-        """Execute 2-pass x264 encode with given parameters."""
+        """Execute 2-pass x264 encode with given parameters and bitrate validation."""
         from .ffmpeg_utils import FFmpegUtils
         
         log_base = os.path.join(self.temp_dir, f"cae_pass_{int(time.time())}")
@@ -888,7 +1398,8 @@ class DynamicVideoCompressor:
             # Pass 1
             logger.info("Running 2-pass encode: pass 1/2")
             cmd_pass1 = FFmpegUtils.build_x264_two_pass_cae(
-                input_path, output_path, params, pass_num=1, log_file=log_base
+                input_path, output_path, params, pass_num=1, log_file=log_base,
+                bitrate_validator=self.bitrate_validator
             )
             result1 = subprocess.run(
                 cmd_pass1,
@@ -906,7 +1417,8 @@ class DynamicVideoCompressor:
             # Pass 2
             logger.info("Running 2-pass encode: pass 2/2")
             cmd_pass2 = FFmpegUtils.build_x264_two_pass_cae(
-                input_path, output_path, params, pass_num=2, log_file=log_base
+                input_path, output_path, params, pass_num=2, log_file=log_base,
+                bitrate_validator=self.bitrate_validator
             )
             result2 = subprocess.run(
                 cmd_pass2,
@@ -1041,8 +1553,23 @@ class DynamicVideoCompressor:
                 if cae_result.get('success'):
                     return cae_result
                 logger.warning("CAE pipeline failed, falling back to standard compression")
+                
+                # If segmentation is last resort and CAE failed, try segmentation immediately
+                seg_last_resort = bool(self.config.get('video_compression.segmentation.only_if_single_file_unacceptable', False))
+                if seg_last_resort and not force_single_file:
+                    logger.info("CAE pipeline failed; falling back to segmentation as last resort")
+                    return self._compress_with_segmentation(
+                        input_path, output_path, target_size_mb, platform_config, video_info, platform
+                    )
             except Exception as e:
                 logger.error(f"CAE pipeline error: {e}, falling back to standard compression")
+                # If segmentation is last resort and CAE threw exception, try segmentation immediately
+                seg_last_resort = bool(self.config.get('video_compression.segmentation.only_if_single_file_unacceptable', False))
+                if seg_last_resort and not force_single_file:
+                    logger.info("CAE pipeline error; falling back to segmentation as last resort")
+                    return self._compress_with_segmentation(
+                        input_path, output_path, target_size_mb, platform_config, video_info, platform
+                    )
         
         # Check if segmentation should be considered now or deferred to last resort
         logger.info(f"Checking video segmentation: original size {original_size_mb:.1f}MB, target {target_size_mb}MB")
@@ -2090,17 +2617,35 @@ class DynamicVideoCompressor:
     def _compress_with_segmentation(self, input_path: str, output_path: str, target_size_mb: float,
                                   platform_config: Dict[str, Any], video_info: Dict[str, Any], 
                                   platform: str = None) -> Dict[str, Any]:
-        """Compress video using segmentation approach"""
+        """Compress video using segmentation approach with bitrate validation"""
         try:
             logger.info("Starting video segmentation compression")
             
-            # Use video segmenter to handle the segmentation
-            result = self.video_segmenter.segment_video(
-                input_video=input_path,
-                output_base_path=output_path,
-                platform=platform,
-                max_size_mb=target_size_mb
+            # Check if segmentation is needed due to bitrate constraints
+            encoder = self.hardware.get_best_encoder("h264")[0]
+            should_segment_bitrate, bitrate_reason = self.video_segmenter.should_segment_for_bitrate_constraints(
+                video_info, target_size_mb, encoder
             )
+            
+            if should_segment_bitrate:
+                logger.info(f"Using bitrate-constrained segmentation: {bitrate_reason}")
+                # Use bitrate-specific segmentation
+                result = self.video_segmenter.segment_video_for_bitrate_constraints(
+                    input_video=input_path,
+                    output_base_path=output_path,
+                    encoder=encoder,
+                    target_size_mb=target_size_mb,
+                    video_info=video_info
+                )
+            else:
+                logger.info(f"Using standard segmentation: {bitrate_reason}")
+                # Use standard segmentation
+                result = self.video_segmenter.segment_video(
+                    input_video=input_path,
+                    output_base_path=output_path,
+                    platform=platform,
+                    max_size_mb=target_size_mb
+                )
             
             if result.get('success', False):
                 # If segmentation was successful, return the results
@@ -2144,6 +2689,308 @@ class DynamicVideoCompressor:
                 input_path, output_path, target_size_mb, platform_config, video_info
             )
     
+    def _try_segmentation_fallback(self, input_path: str, output_path: str, target_size_mb: float,
+                                 platform_config: Dict[str, Any], video_info: Dict[str, Any],
+                                 encoder: str, failure_reason: str = "") -> Dict[str, Any]:
+        """
+        Try segmentation as fallback when single-file compression fails
+        
+        Args:
+            input_path: Input video path
+            output_path: Output path (will be converted to segments folder)
+            target_size_mb: Target size per segment
+            platform_config: Platform configuration
+            video_info: Video metadata
+            encoder: Encoder that failed
+            failure_reason: Reason for single-file failure
+            
+        Returns:
+            Compression result dictionary with segment information
+        """
+        logger.info(f"Attempting segmentation fallback due to: {failure_reason}")
+        
+        # Check if segmentation is likely to help
+        should_segment, reason = self.video_segmenter.should_segment_for_bitrate_constraints(
+            video_info, target_size_mb, encoder
+        )
+        
+        if not should_segment:
+            logger.warning(f"Segmentation may not resolve the issue: {reason}")
+            # Still try segmentation as last resort
+        
+        try:
+            # Create segments folder path from output path
+            output_dir = os.path.dirname(output_path)
+            base_name = os.path.splitext(os.path.basename(output_path))[0]
+            segments_folder = os.path.join(output_dir, f"{base_name}_segments")
+            
+            # Use bitrate-constrained segmentation since we know there's a bitrate issue
+            result = self.video_segmenter.segment_video_for_bitrate_constraints(
+                input_video=input_path,
+                output_base_path=segments_folder,
+                encoder=encoder,
+                target_size_mb=target_size_mb,
+                video_info=video_info
+            )
+            
+            if result.get('success', False):
+                # Check if all segments passed bitrate validation
+                all_valid = result.get('all_segments_valid', True)
+                segments = result.get('segments', [])
+                
+                if all_valid:
+                    logger.info("Segmentation fallback successful - all segments meet bitrate requirements")
+                else:
+                    logger.warning("Segmentation fallback partially successful - some segments may have bitrate issues")
+                
+                # Organize segments with proper naming
+                organized_result = self._organize_fallback_segments(
+                    segments, segments_folder, base_name, target_size_mb
+                )
+                
+                if organized_result.get('success', False):
+                    total_size = sum(segment.get('size_mb', 0) for segment in organized_result['segments'])
+                    
+                    return {
+                        'success': True,
+                        'input_file': input_path,
+                        'output_file': organized_result['segments_folder'],  # Return folder path for multiple outputs
+                        'method': 'segmentation_fallback',
+                        'original_size_mb': os.path.getsize(input_path) / (1024 * 1024),
+                        'compressed_size_mb': total_size,
+                        'size_mb': total_size,
+                        'compression_ratio': ((os.path.getsize(input_path) - (total_size * 1024 * 1024)) / os.path.getsize(input_path)) * 100,
+                        'space_saved_mb': (os.path.getsize(input_path) - (total_size * 1024 * 1024)) / (1024 * 1024),
+                        'video_info': video_info,
+                        'optimization_strategy': 'segmentation_fallback',
+                        'quality_score': 8.0,  # High quality preserved in segments
+                        'attempts_made': 1,
+                        'encoder_used': encoder,
+                        'segments': organized_result['segments'],
+                        'segments_folder': organized_result['segments_folder'],
+                        'num_segments': len(organized_result['segments']),
+                        'all_segments_valid': all_valid,
+                        'bitrate_validations': result.get('bitrate_validations', []),
+                        'fallback_reason': failure_reason,
+                        'is_segmented_output': True  # Flag to indicate multiple output files
+                    }
+                else:
+                    logger.error(f"Failed to organize segmentation fallback outputs: {organized_result.get('error', 'Unknown error')}")
+                    return {
+                        'success': False,
+                        'error': f"Segmentation organization failed: {organized_result.get('error', 'Unknown error')}",
+                        'method': 'segmentation_fallback_organization_failed',
+                        'fallback_reason': failure_reason
+                    }
+            else:
+                logger.error(f"Segmentation fallback failed: {result.get('error', 'Unknown error')}")
+                return {
+                    'success': False,
+                    'error': f"Segmentation fallback failed: {result.get('error', 'Unknown error')}",
+                    'method': 'segmentation_fallback_failed',
+                    'fallback_reason': failure_reason
+                }
+                
+        except Exception as e:
+            logger.error(f"Exception during segmentation fallback: {e}")
+            return {
+                'success': False,
+                'error': f"Segmentation fallback exception: {str(e)}",
+                'method': 'segmentation_fallback_exception',
+                'fallback_reason': failure_reason
+            }
+
+    def _organize_fallback_segments(self, segments: List[Dict[str, Any]], segments_folder: str, 
+                                  base_name: str, target_size_mb: float) -> Dict[str, Any]:
+        """
+        Organize segmentation fallback outputs with proper naming and validation
+        
+        Args:
+            segments: List of segment information dictionaries
+            segments_folder: Path to segments folder
+            base_name: Base name for segment files
+            target_size_mb: Target size per segment for validation
+            
+        Returns:
+            Dictionary with organization results
+        """
+        try:
+            # Ensure segments folder exists
+            os.makedirs(segments_folder, exist_ok=True)
+            
+            organized_segments = []
+            failed_segments = []
+            
+            for i, segment in enumerate(segments):
+                try:
+                    segment_path = segment.get('path', '')
+                    if not segment_path or not os.path.exists(segment_path):
+                        logger.warning(f"Segment {i+1} path not found: {segment_path}")
+                        failed_segments.append(segment)
+                        continue
+                    
+                    # Generate consistent segment naming for batch processing
+                    segment_filename = f"{base_name}_segment_{i+1:03d}.mp4"
+                    final_segment_path = os.path.join(segments_folder, segment_filename)
+                    
+                    # Move segment to final location if not already there
+                    if segment_path != final_segment_path:
+                        if os.path.exists(final_segment_path):
+                            os.remove(final_segment_path)
+                        shutil.move(segment_path, final_segment_path)
+                    
+                    # Validate segment size
+                    segment_size_mb = os.path.getsize(final_segment_path) / (1024 * 1024)
+                    
+                    # Update segment information
+                    organized_segment = {
+                        'index': i + 1,
+                        'path': final_segment_path,
+                        'filename': segment_filename,
+                        'size_mb': segment_size_mb,
+                        'start_time': segment.get('start_time', 0),
+                        'duration': segment.get('duration', 0),
+                        'method': segment.get('method', 'segmentation_fallback'),
+                        'quality_score': segment.get('quality_score', 8.0),
+                        'bitrate_validated': segment.get('bitrate_validated', True)
+                    }
+                    
+                    organized_segments.append(organized_segment)
+                    logger.info(f"Organized segment {i+1}: {segment_filename} ({segment_size_mb:.2f}MB)")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to organize segment {i+1}: {e}")
+                    failed_segments.append(segment)
+            
+            if not organized_segments:
+                return {
+                    'success': False,
+                    'error': 'No segments could be organized successfully',
+                    'failed_segments': failed_segments
+                }
+            
+            # Create segments summary for batch processing
+            try:
+                self._create_segments_summary(segments_folder, organized_segments, base_name)
+            except Exception as e:
+                logger.warning(f"Failed to create segments summary: {e}")
+            
+            logger.info(f"Successfully organized {len(organized_segments)} segments in {segments_folder}")
+            
+            return {
+                'success': True,
+                'segments': organized_segments,
+                'segments_folder': segments_folder,
+                'num_segments': len(organized_segments),
+                'failed_segments': failed_segments,
+                'total_size_mb': sum(s.get('size_mb', 0) for s in organized_segments)
+            }
+            
+        except Exception as e:
+            logger.error(f"Exception during segment organization: {e}")
+            return {
+                'success': False,
+                'error': f"Segment organization exception: {str(e)}"
+            }
+
+    def _create_segments_summary(self, segments_folder: str, segments: List[Dict[str, Any]], base_name: str):
+        """
+        Create a summary file for segmentation fallback outputs
+        
+        Args:
+            segments_folder: Path to segments folder
+            segments: List of organized segment information
+            base_name: Base name for the summary file
+        """
+        try:
+            summary_path = os.path.join(segments_folder, f"{base_name}_segments_summary.json")
+            
+            summary_data = {
+                'base_name': base_name,
+                'creation_time': time.time(),
+                'creation_method': 'segmentation_fallback',
+                'num_segments': len(segments),
+                'total_size_mb': sum(s.get('size_mb', 0) for s in segments),
+                'total_duration': sum(s.get('duration', 0) for s in segments),
+                'segments': [
+                    {
+                        'index': segment.get('index', 0),
+                        'filename': segment.get('filename', ''),
+                        'size_mb': segment.get('size_mb', 0),
+                        'duration': segment.get('duration', 0),
+                        'start_time': segment.get('start_time', 0),
+                        'method': segment.get('method', 'segmentation_fallback'),
+                        'quality_score': segment.get('quality_score', 8.0),
+                        'bitrate_validated': segment.get('bitrate_validated', True)
+                    }
+                    for segment in segments
+                ]
+            }
+            
+            with open(summary_path, 'w', encoding='utf-8') as f:
+                json.dump(summary_data, f, indent=2)
+            
+            logger.info(f"Created segments summary: {summary_path}")
+            
+        except Exception as e:
+            logger.warning(f"Failed to create segments summary: {e}")
+
+    def _ensure_consistent_segment_naming(self, segments_folder: str, base_name: str) -> bool:
+        """
+        Ensure all segments in the folder follow consistent naming convention for batch processing
+        
+        Args:
+            segments_folder: Path to segments folder
+            base_name: Base name for segment files
+            
+        Returns:
+            True if naming is consistent or was successfully updated
+        """
+        try:
+            if not os.path.exists(segments_folder):
+                return False
+            
+            # Find all video segments
+            segment_files = []
+            for file in os.listdir(segments_folder):
+                if file.endswith('.mp4') and 'segment' in file.lower():
+                    segment_files.append(file)
+            
+            if not segment_files:
+                return True  # No segments to rename
+            
+            # Sort segments by their current names to maintain order
+            segment_files.sort()
+            
+            renamed_count = 0
+            for i, old_filename in enumerate(segment_files):
+                expected_filename = f"{base_name}_segment_{i+1:03d}.mp4"
+                
+                if old_filename != expected_filename:
+                    old_path = os.path.join(segments_folder, old_filename)
+                    new_path = os.path.join(segments_folder, expected_filename)
+                    
+                    # Avoid conflicts by using temporary name if needed
+                    if os.path.exists(new_path):
+                        temp_path = os.path.join(segments_folder, f"temp_{expected_filename}")
+                        shutil.move(old_path, temp_path)
+                        if os.path.exists(new_path):
+                            os.remove(new_path)
+                        shutil.move(temp_path, new_path)
+                    else:
+                        shutil.move(old_path, new_path)
+                    
+                    renamed_count += 1
+                    logger.info(f"Renamed segment: {old_filename} -> {expected_filename}")
+            
+            if renamed_count > 0:
+                logger.info(f"Updated {renamed_count} segment names for consistent batch processing")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error ensuring consistent segment naming: {e}")
+            return False
 
     def _compress_with_aggressive_optimization(self, input_path: str, video_info: Dict[str, Any],
                                              platform_config: Dict[str, Any], target_size_mb: float) -> Optional[Dict[str, Any]]:
@@ -2935,7 +3782,7 @@ class DynamicVideoCompressor:
             logger.info(f"Encoder selected: {params.get('encoder', 'unknown')} ({params.get('acceleration_type', 'software')})")
         except Exception:
             pass
-        return FFmpegUtils.build_standard_ffmpeg_command(input_path, output_path, params)
+        return FFmpegUtils.build_standard_ffmpeg_command(input_path, output_path, params, self.bitrate_validator)
     
     def _build_two_pass_command(self, input_path: str, output_path: str, params: Dict[str, Any], 
                               pass_num: int, log_file: str) -> List[str]:
@@ -2945,7 +3792,7 @@ class DynamicVideoCompressor:
             logger.info(f"Encoder selected: {params.get('encoder', 'unknown')} ({params.get('acceleration_type', 'software')})")
         except Exception:
             pass
-        return FFmpegUtils.build_two_pass_command(input_path, output_path, params, pass_num, log_file)
+        return FFmpegUtils.build_two_pass_command(input_path, output_path, params, pass_num, log_file, self.bitrate_validator)
     
     def _build_adaptive_ffmpeg_command(self, input_path: str, output_path: str, 
                                      params: Dict[str, Any]) -> List[str]:

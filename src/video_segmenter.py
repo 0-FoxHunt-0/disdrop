@@ -21,6 +21,8 @@ import threading
 from .config_manager import ConfigManager
 from .hardware_detector import HardwareDetector
 from .ffmpeg_utils import FFmpegUtils
+from .bitrate_validator import BitrateValidator, ValidationResult
+from .adaptive_parameter_adjuster import AdaptiveParameterAdjuster
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +31,10 @@ class VideoSegmenter:
         self.config = config_manager
         self.hardware = hardware_detector
         self.temp_dir = self.config.get_temp_dir()
+        
+        # Initialize bitrate validation components
+        self.bitrate_validator = BitrateValidator(config_manager)
+        self.parameter_adjuster = AdaptiveParameterAdjuster(config_manager, self.bitrate_validator)
         
         # Shutdown handling
         self.shutdown_requested = False
@@ -570,8 +576,28 @@ class VideoSegmenter:
         complexity = video_info.get('complexity_score', 5.0)
         motion_level = video_info.get('motion_level', 'medium')
 
+        # Check if bitrate constraints should influence segment duration
+        encoder = self.hardware.get_best_encoder("h264")[0]  # Get encoder name
+        should_segment, reason = self.should_segment_for_bitrate_constraints(video_info, target_size_mb, encoder)
+        
+        if should_segment and "Bitrate floor violation" in reason:
+            logger.info(f"Using bitrate-constrained segment duration calculation: {reason}")
+            bitrate_duration = self.calculate_segment_duration_for_bitrate(video_info, target_size_mb, encoder)
+            # Use the more restrictive of bitrate constraint or content-based calculation
+            content_duration = self._calculate_content_based_duration(total_duration, video_info, target_size_mb)
+            optimal_duration = min(bitrate_duration, content_duration)
+            logger.info(f"Bitrate-constrained duration: {bitrate_duration:.1f}s, content-based: {content_duration:.1f}s, using: {optimal_duration:.1f}s")
+            return optimal_duration
+
         # Favor longer segments for better quality and fewer total segments
         logger.info(f"Calculating optimal segment duration for {total_duration:.1f}s video - favoring longer segments")
+        return self._calculate_content_based_duration(total_duration, video_info, target_size_mb)
+    
+    def _calculate_content_based_duration(self, total_duration: float, video_info: Dict[str, Any], target_size_mb: float) -> float:
+        """Calculate segment duration based on content characteristics"""
+        
+        complexity = video_info.get('complexity_score', 5.0)
+        motion_level = video_info.get('motion_level', 'medium')
 
         # Calculate base duration to target 12-15MB segments (increased from 8-9MB)
         # This allows for longer segments while staying under typical file size limits
@@ -930,6 +956,318 @@ class VideoSegmenter:
         
         # Return as string with 'k' suffix for FFmpeg
         return f"{final_bitrate}k"
+    
+    def should_segment_for_bitrate_constraints(self, video_info: Dict[str, Any], 
+                                             target_size_mb: float, encoder: str) -> Tuple[bool, str]:
+        """
+        Determine if video should be segmented due to bitrate constraints
+        
+        Args:
+            video_info: Video metadata including duration, resolution, etc.
+            target_size_mb: Target file size in MB
+            encoder: Target encoder (e.g., 'libx264')
+            
+        Returns:
+            Tuple of (should_segment, reason)
+        """
+        if not self.bitrate_validator.is_validation_enabled():
+            return False, "Bitrate validation disabled"
+        
+        duration = video_info.get('duration_seconds', video_info.get('duration', 60))
+        
+        # Calculate what bitrate we would need for single file
+        audio_bitrate = 64  # Conservative audio bitrate estimate
+        required_bitrate = self.bitrate_validator._calculate_target_bitrate(
+            target_size_mb, duration, audio_bitrate
+        )
+        
+        # Check against encoder minimum
+        min_bitrate = self.bitrate_validator.get_encoder_minimum(encoder)
+        
+        if required_bitrate < min_bitrate:
+            logger.info(f"Bitrate constraint detected: required {required_bitrate}kbps < minimum {min_bitrate}kbps for {encoder}")
+            
+            # Try parameter adjustment first
+            params = {
+                'width': video_info.get('width', 1920),
+                'height': video_info.get('height', 1080),
+                'fps': video_info.get('fps', 30),
+                'bitrate': required_bitrate,
+                'encoder': encoder,
+                'audio_bitrate': audio_bitrate
+            }
+            
+            adjustment_result = self.parameter_adjuster.adjust_for_bitrate_floor(
+                params, min_bitrate, video_info, target_size_mb
+            )
+            
+            if adjustment_result.success:
+                logger.info(f"Parameter adjustment can resolve bitrate constraint: {adjustment_result.message}")
+                return False, f"Resolvable via parameter adjustment: {adjustment_result.adjustment_type}"
+            else:
+                logger.info(f"Parameter adjustment insufficient, segmentation needed: {adjustment_result.message}")
+                return True, f"Bitrate floor violation: {required_bitrate}kbps < {min_bitrate}kbps minimum"
+        
+        return False, f"Bitrate {required_bitrate}kbps meets {encoder} minimum {min_bitrate}kbps"
+    
+    def calculate_segment_duration_for_bitrate(self, video_info: Dict[str, Any], 
+                                             target_size_mb: float, encoder: str) -> float:
+        """
+        Calculate optimal segment duration to meet bitrate constraints
+        
+        Args:
+            video_info: Video metadata
+            target_size_mb: Target size per segment
+            encoder: Target encoder
+            
+        Returns:
+            Optimal segment duration in seconds
+        """
+        min_bitrate = self.bitrate_validator.get_encoder_minimum(encoder)
+        audio_bitrate = 64  # Conservative estimate
+        
+        # Calculate maximum duration that allows minimum bitrate
+        # target_size_mb = (video_bitrate + audio_bitrate) * duration / (8 * 1024)
+        # Solving for duration: duration = target_size_mb * 8 * 1024 / (video_bitrate + audio_bitrate)
+        
+        # Use minimum bitrate as video bitrate for calculation
+        total_bitrate_kbps = min_bitrate + audio_bitrate
+        max_duration = (target_size_mb * 8 * 1024) / total_bitrate_kbps
+        
+        # Apply safety margin
+        safety_margin = self.config.get('video_compression.bitrate_validation.safety_margin', 1.1)
+        safe_duration = max_duration / safety_margin
+        
+        # Ensure reasonable bounds
+        min_segment_duration = self.config.get('video_compression.segmentation.min_segment_duration', 30)
+        max_segment_duration = self.config.get('video_compression.segmentation.max_segment_duration', 240)
+        
+        optimal_duration = max(min_segment_duration, min(max_segment_duration, safe_duration))
+        
+        logger.info(f"Calculated bitrate-constrained segment duration: {optimal_duration:.1f}s "
+                   f"(max possible: {max_duration:.1f}s, with safety margin: {safe_duration:.1f}s)")
+        
+        return optimal_duration
+    
+    def validate_segment_bitrate(self, segment_info: Dict[str, Any], encoder: str) -> ValidationResult:
+        """
+        Validate that a segment meets bitrate requirements
+        
+        Args:
+            segment_info: Segment information including size and duration
+            encoder: Encoder used for segment
+            
+        Returns:
+            ValidationResult with validation status
+        """
+        if not self.bitrate_validator.is_validation_enabled():
+            return ValidationResult(
+                is_valid=True,
+                current_bitrate=0,
+                minimum_required=0,
+                adjustment_needed=False,
+                severity='info',
+                message="Bitrate validation disabled"
+            )
+        
+        # Calculate actual bitrate from segment
+        size_mb = segment_info.get('size_mb', 0)
+        duration = segment_info.get('duration', 1)
+        
+        if duration <= 0:
+            return ValidationResult(
+                is_valid=False,
+                current_bitrate=0,
+                minimum_required=0,
+                adjustment_needed=True,
+                severity='critical',
+                message="Invalid segment duration"
+            )
+        
+        # Estimate video bitrate (assume 15% audio overhead)
+        total_bitrate_kbps = (size_mb * 8 * 1024) / duration
+        estimated_video_bitrate = int(total_bitrate_kbps * 0.85)  # 85% for video
+        
+        # Validate against encoder minimum
+        result = self.bitrate_validator.validate_bitrate(estimated_video_bitrate, encoder)
+        
+        logger.debug(f"Segment bitrate validation: {estimated_video_bitrate}kbps "
+                    f"({'valid' if result.is_valid else 'invalid'}) for {encoder}")
+        
+        return result
+    
+    def segment_video_for_bitrate_constraints(self, input_video: str, output_base_path: str,
+                                            encoder: str, target_size_mb: float,
+                                            video_info: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Segment video specifically to address bitrate constraints
+        
+        Args:
+            input_video: Path to input video
+            output_base_path: Base path for output segments
+            encoder: Target encoder
+            target_size_mb: Target size per segment
+            video_info: Video metadata
+            
+        Returns:
+            Dictionary with segmentation results
+        """
+        logger.info(f"Starting bitrate-constrained segmentation for {encoder} encoder")
+        
+        # Calculate optimal segment duration for bitrate constraints
+        segment_duration = self.calculate_segment_duration_for_bitrate(
+            video_info, target_size_mb, encoder
+        )
+        
+        total_duration = video_info.get('duration_seconds', video_info.get('duration', 60))
+        num_segments = math.ceil(total_duration / segment_duration)
+        
+        logger.info(f"Bitrate-constrained segmentation: {total_duration:.1f}s -> "
+                   f"{num_segments} segments of ~{segment_duration:.1f}s each")
+        
+        # Use existing segmentation infrastructure with bitrate-optimized parameters
+        result = self.segment_video(
+            input_video=input_video,
+            output_base_path=output_base_path,
+            max_size_mb=target_size_mb,
+            duration=total_duration
+        )
+        
+        if result.get('success', False):
+            # Validate each segment meets bitrate requirements
+            segments = result.get('segments', [])
+            validation_results = []
+            
+            for segment in segments:
+                validation = self.validate_segment_bitrate(segment, encoder)
+                validation_results.append({
+                    'segment_index': segment.get('index', 0),
+                    'validation': validation,
+                    'segment_path': segment.get('path', '')
+                })
+                
+                if not validation.is_valid:
+                    logger.warning(f"Segment {segment.get('index', 0)} failed bitrate validation: "
+                                 f"{validation.message}")
+            
+            result['bitrate_validations'] = validation_results
+            result['all_segments_valid'] = all(v['validation'].is_valid for v in validation_results)
+            
+            if result['all_segments_valid']:
+                logger.info("All segments passed bitrate validation")
+            else:
+                failed_count = sum(1 for v in validation_results if not v['validation'].is_valid)
+                logger.warning(f"{failed_count}/{len(validation_results)} segments failed bitrate validation")
+        
+        # Ensure consistent segment naming for batch processing
+        if result.get('success', False) and result.get('segments'):
+            try:
+                output_folder = result.get('output_folder')
+                if output_folder and os.path.exists(output_folder):
+                    base_name = os.path.basename(input_video).split('.')[0]
+                    self._ensure_consistent_segment_naming_for_batch(output_folder, base_name)
+            except Exception as e:
+                logger.warning(f"Failed to ensure consistent segment naming: {e}")
+        
+        return result
+
+    def _ensure_consistent_segment_naming_for_batch(self, segments_folder: str, base_name: str) -> bool:
+        """
+        Ensure all segments follow consistent naming convention for batch processing
+        
+        Args:
+            segments_folder: Path to segments folder
+            base_name: Base name for segment files
+            
+        Returns:
+            True if naming is consistent or was successfully updated
+        """
+        try:
+            if not os.path.exists(segments_folder):
+                return False
+            
+            # Find all video segments
+            segment_files = []
+            for file in os.listdir(segments_folder):
+                if file.endswith('.mp4') and ('segment' in file.lower() or base_name in file):
+                    segment_files.append(file)
+            
+            if not segment_files:
+                return True  # No segments to rename
+            
+            # Sort segments by their current names to maintain order
+            segment_files.sort()
+            
+            renamed_count = 0
+            for i, old_filename in enumerate(segment_files):
+                expected_filename = f"{base_name}_segment_{i+1:03d}.mp4"
+                
+                if old_filename != expected_filename:
+                    old_path = os.path.join(segments_folder, old_filename)
+                    new_path = os.path.join(segments_folder, expected_filename)
+                    
+                    # Avoid conflicts by using temporary name if needed
+                    if os.path.exists(new_path) and old_path != new_path:
+                        temp_path = os.path.join(segments_folder, f"temp_{i+1:03d}_{expected_filename}")
+                        shutil.move(old_path, temp_path)
+                        if os.path.exists(new_path):
+                            os.remove(new_path)
+                        shutil.move(temp_path, new_path)
+                    elif old_path != new_path:
+                        shutil.move(old_path, new_path)
+                    
+                    renamed_count += 1
+                    logger.info(f"Renamed segment for batch processing: {old_filename} -> {expected_filename}")
+            
+            if renamed_count > 0:
+                logger.info(f"Updated {renamed_count} segment names for consistent batch processing")
+                
+                # Update segments index file for batch processing
+                self._create_batch_processing_index(segments_folder, base_name)
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error ensuring consistent segment naming: {e}")
+            return False
+
+    def _create_batch_processing_index(self, segments_folder: str, base_name: str):
+        """
+        Create an index file for batch processing of segments
+        
+        Args:
+            segments_folder: Path to segments folder
+            base_name: Base name for the index file
+        """
+        try:
+            # Find all segments
+            segment_files = []
+            for file in os.listdir(segments_folder):
+                if file.endswith('.mp4') and 'segment' in file:
+                    segment_files.append(file)
+            
+            segment_files.sort()
+            
+            # Create batch processing index
+            index_path = os.path.join(segments_folder, f"{base_name}_batch_index.txt")
+            with open(index_path, 'w', encoding='utf-8') as f:
+                f.write(f"# Batch Processing Index for {base_name}\n")
+                f.write(f"# Created: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"# Total segments: {len(segment_files)}\n")
+                f.write(f"# Segmentation method: bitrate_constrained\n\n")
+                
+                for i, filename in enumerate(segment_files):
+                    file_path = os.path.join(segments_folder, filename)
+                    try:
+                        size_mb = os.path.getsize(file_path) / (1024 * 1024)
+                        f.write(f"{i+1:03d}\t{filename}\t{size_mb:.2f}MB\n")
+                    except Exception:
+                        f.write(f"{i+1:03d}\t{filename}\t0.00MB\n")
+            
+            logger.info(f"Created batch processing index: {index_path}")
+            
+        except Exception as e:
+            logger.warning(f"Failed to create batch processing index: {e}")
     
     def _optimize_oversized_segment(self, segment_path: str, duration: float, 
                                   video_info: Dict[str, Any], platform_config: Dict[str, Any], 
