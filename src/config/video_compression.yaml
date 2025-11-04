@@ -16,12 +16,12 @@ video_compression:
     enabled: true
     # Minimum bitrate requirements per encoder (in kbps)
     encoder_minimums:
-      libx264: 3 # FFmpeg libx264 minimum
-      libx265: 5 # HEVC requires higher minimum
-      h264_nvenc: 2 # NVENC can go lower
-      h264_amf: 2 # AMD AMF similar to NVENC
-      h264_qsv: 2 # Intel QSV similar to NVENC
-      h264_videotoolbox: 2 # Apple VideoToolbox
+      libx264: 10 # FFmpeg libx264 minimum (raised for better audio quality)
+      libx265: 15 # HEVC requires higher minimum (raised for better audio quality)
+      h264_nvenc: 8 # NVENC minimum (raised for better audio quality)
+      h264_amf: 8 # AMD AMF minimum (raised for better audio quality)
+      h264_qsv: 8 # Intel QSV minimum (raised for better audio quality)
+      h264_videotoolbox: 8 # Apple VideoToolbox minimum (raised for better audio quality)
     # Fallback resolutions for extreme compression scenarios
     fallback_resolutions:
       - [320, 180] # Ultra-low for extreme cases
@@ -308,6 +308,11 @@ video_compression:
       h264_10bit: 0.020
       hevc_8bit: 0.018
       hevc_10bit: 0.015
+    # Codec selection strategy
+    prefer_hevc_when:
+      size_savings_threshold: 0.15 # Prefer HEVC when size savings >15%
+      quality_maintained: true # Only if quality is maintained
+      min_bitrate: 500 # Minimum bitrate for HEVC consideration
 
   fps_policy:
     prefer_24fps_for_low_motion: true
@@ -316,6 +321,20 @@ video_compression:
   prefilters:
     denoise: true
     deband: true
+    sharpen: false # Selective sharpening for content that benefits (disabled by default)
+    # Perceptual filter strengths (0.0-1.0)
+    filter_strengths:
+      denoise:
+        high_complexity: 0.8
+        medium_complexity: 0.5
+        low_complexity: 0.3
+      deband:
+        high_complexity: 0.6
+        medium_complexity: 0.4
+        low_complexity: 0.2
+      sharpen:
+        medium_complexity_low_motion: 0.3
+        high_complexity_low_motion: 0.2
 
   quality_controls:
     min_target_utilization: 0.92
@@ -335,8 +354,10 @@ video_compression:
     uplift:
       enabled: true
       max_passes: 3
-      bitrate_step: 1.12
+      bitrate_step: 1.08 # Smaller steps for precision (reduced from 1.12)
       max_multiplier: 1.35
+      quality_aware: true # Enable quality-aware bitrate adjustment based on VMAF/SSIM feedback
+      min_quality_improvement: 2.0 # Minimum quality improvement (VMAF/SSIM points) to continue uplift
     on_fail_segment: true
   # Strict size enforcement and near-limit retry
   size_control:

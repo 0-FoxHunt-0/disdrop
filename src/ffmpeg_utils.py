@@ -434,15 +434,15 @@ class FFmpegUtils:
             else:
                 # Fallback validation for common encoders when no validator available
                 encoder_minimums = {
-                    'libx264': 3,
-                    'libx265': 5,
-                    'h264_nvenc': 2,
-                    'h264_amf': 2,
-                    'h264_qsv': 2,
-                    'h264_videotoolbox': 2
+                    'libx264': 10,
+                    'libx265': 15,
+                    'h264_nvenc': 8,
+                    'h264_amf': 8,
+                    'h264_qsv': 8,
+                    'h264_videotoolbox': 8
                 }
                 
-                min_bitrate = encoder_minimums.get(encoder, 3)  # Default to 3kbps
+                min_bitrate = encoder_minimums.get(encoder, 10)  # Default to 10kbps (libx264 minimum)
                 if bitrate < min_bitrate:
                     original_bitrate = bitrate
                     bitrate = min_bitrate
@@ -903,6 +903,19 @@ class FFmpegUtils:
         rc_lookahead = int(params.get('rc_lookahead', 40))
         cmd.extend(['-aq-mode', str(aq_mode), '-aq-strength', str(aq_strength)])
         cmd.extend(['-qcomp', str(qcomp), '-rc-lookahead', str(rc_lookahead)])
+        
+        # Psy-rd and psy-trellis for perceptual quality (libx264 only)
+        if 'psy_rd' in params:
+            psy_rd = float(params.get('psy_rd', 1.0))
+            cmd.extend(['-psy-rd', f"{psy_rd:.2f}"])
+        
+        if 'psy_trellis' in params:
+            psy_trellis = float(params.get('psy_trellis', 0.0))
+            if psy_trellis > 0:
+                # If psy-rd wasn't explicitly set, set it to a default when using psy-trellis
+                if 'psy_rd' not in params:
+                    cmd.extend(['-psy-rd', '1.0'])
+                cmd.extend(['-psy-trellis', f"{psy_trellis:.2f}"])
         
         # Two-pass flags
         cmd.extend(['-pass', str(pass_num), '-passlogfile', log_file])
