@@ -251,6 +251,16 @@ class VideoCompressorCLI:
         parser.add_argument('--min-fps', type=float, metavar='FPS',
                           help='Override minimum FPS constraint (default: 10)')
         
+        # Quality evaluation debugging options
+        parser.add_argument('--quality-fallback-mode', choices=['conservative', 'permissive', 'strict'],
+                          help='Quality evaluation fallback mode when evaluation fails')
+        parser.add_argument('--quality-debug', action='store_true',
+                          help='Enable detailed quality evaluation debugging (parsing attempts, performance metrics)')
+        parser.add_argument('--quality-timeout', type=int, metavar='SECONDS',
+                          help='Timeout for quality evaluation operations (default: 300)')
+        parser.add_argument('--quality-retry-attempts', type=int, metavar='N',
+                          help='Number of retry attempts for failed quality operations (default: 3)')
+        
         # Create subcommands
         subparsers = parser.add_subparsers(dest='command', help='Available commands')
         
@@ -372,6 +382,30 @@ class VideoCompressorCLI:
         cache_subparsers.add_parser('stats', help='Show cache statistics')
         cache_subparsers.add_parser('validate', help='Validate cache entries and remove invalid ones')
         
+        # Performance monitoring command (with alias: perf)
+        perf_parser = subparsers.add_parser('performance', aliases=['perf', 'p'],
+                                           help='Performance monitoring and analysis')
+        perf_subparsers = perf_parser.add_subparsers(dest='perf_action', help='Performance operations')
+        perf_subparsers.add_parser('summary', help='Show performance summary')
+        perf_subparsers.add_parser('bottlenecks', help='Analyze performance bottlenecks')
+        perf_subparsers.add_parser('trends', help='Show performance trends')
+        perf_subparsers.add_parser('report', help='Generate comprehensive performance report')
+        
+        # Performance profile management
+        profile_parser = perf_subparsers.add_parser('profile', help='Manage performance profiles')
+        profile_subparsers = profile_parser.add_subparsers(dest='profile_action', help='Profile operations')
+        profile_subparsers.add_parser('list', help='List available performance profiles')
+        profile_subparsers.add_parser('show', help='Show current performance profile')
+        set_profile_parser = profile_subparsers.add_parser('set', help='Set performance profile')
+        set_profile_parser.add_argument('profile_name', help='Profile name (fast, balanced, quality)')
+        
+        # Performance metrics management
+        metrics_parser = perf_subparsers.add_parser('metrics', help='Manage performance metrics')
+        metrics_subparsers = metrics_parser.add_subparsers(dest='metrics_action', help='Metrics operations')
+        metrics_subparsers.add_parser('export', help='Export performance metrics')
+        clear_metrics_parser = metrics_subparsers.add_parser('clear', help='Clear old performance metrics')
+        clear_metrics_parser.add_argument('--days', type=int, default=30, help='Clear metrics older than N days')
+        
         # Open folder command
         open_parser = subparsers.add_parser('open',
                                            help='Open application folders in file explorer')
@@ -450,6 +484,14 @@ class VideoCompressorCLI:
                                 logger.warning(f"Unsupported encoder for bitrate override: {encoder}")
                         except ValueError:
                             logger.warning(f"Invalid bitrate value for {encoder}: {bitrate_str}")
+                
+                # Apply quality evaluation specific overrides
+                self.config.apply_quality_evaluation_overrides(args)
+                
+                # Apply debug logging overrides
+                debug_enabled = getattr(args, 'debug', False)
+                quality_debug = getattr(args, 'quality_debug', False)
+                self.config.apply_debug_logging_overrides(debug_enabled, quality_debug)
                 
             except Exception as e:
                 if logger:
@@ -662,6 +704,8 @@ class VideoCompressorCLI:
             command = 'config'
         elif command in ['ch']:
             command = 'cache'
+        elif command in ['perf', 'p']:
+            command = 'performance'
         
         if command == 'compress':
             self._compress_video_smart(args)
@@ -692,6 +736,9 @@ class VideoCompressorCLI:
         
         elif command == 'cache':
             self._handle_cache_command(args)
+        
+        elif command == 'performance':
+            self._handle_performance_command(args)
         
         elif command == 'open':
             self._handle_open_command(args)
@@ -2065,6 +2112,283 @@ class VideoCompressorCLI:
         except Exception as e:
             print(f"❌ Failed to validate cache: {e}")
             logger.error(f"Failed to validate cache: {e}")
+
+    def _handle_performance_command(self, args: argparse.Namespace):
+        """Handle performance monitoring commands"""
+        from .performance_controls import PerformanceController
+        
+        # Initialize performance controller if not already done
+        if not hasattr(self, 'performance_controller'):
+            self.performance_controller = PerformanceController(self.config)
+        
+        if args.perf_action == 'summary':
+            self._show_performance_summary()
+        elif args.perf_action == 'bottlenecks':
+            self._show_performance_bottlenecks()
+        elif args.perf_action == 'trends':
+            self._show_performance_trends()
+        elif args.perf_action == 'report':
+            self._generate_performance_report()
+        elif args.perf_action == 'profile':
+            self._handle_performance_profile_command(args)
+        elif args.perf_action == 'metrics':
+            self._handle_performance_metrics_command(args)
+        else:
+            logger.error("Performance command requires an action (summary|bottlenecks|trends|report|profile|metrics)")
+
+    def _show_performance_summary(self):
+        """Show performance summary."""
+        try:
+            summary = self.performance_controller.get_performance_summary()
+            
+            print("\n📊 Performance Summary:")
+            print("=" * 60)
+            print(f"Current Profile:      {summary['current_profile']}")
+            print()
+            
+            recent = summary['recent_performance']
+            print("Recent Performance:")
+            print(f"  Total Sessions:     {recent['total_sessions']}")
+            print(f"  Success Rate:       {recent['success_rate']}")
+            print(f"  Avg Processing:     {recent['average_processing_time']}")
+            print()
+            
+            cache = summary['cache_performance']
+            print("Cache Performance:")
+            print(f"  Hit Rate:           {cache['hit_rate']}")
+            print(f"  Total Lookups:      {cache['total_lookups']}")
+            print(f"  Efficiency:         {cache['efficiency_status']}")
+            print()
+            
+            system = summary['system_status']
+            print("System Status:")
+            print(f"  Memory Usage:       {system['memory_usage']}")
+            print(f"  Memory Status:      {system['memory_status']}")
+            print(f"  Available Memory:   {system['available_memory']}")
+            print()
+            
+            print("Recommendations:")
+            for i, rec in enumerate(summary['recommendations'], 1):
+                print(f"  {i}. {rec}")
+            
+            print("=" * 60)
+            
+        except Exception as e:
+            print(f"❌ Failed to get performance summary: {e}")
+            logger.error(f"Failed to get performance summary: {e}")
+
+    def _show_performance_bottlenecks(self):
+        """Show performance bottleneck analysis."""
+        try:
+            report = self.performance_controller.get_bottleneck_report()
+            
+            print("\n🔍 Performance Bottleneck Analysis:")
+            print("=" * 60)
+            print(f"Status: {report['status']}")
+            
+            if report['total_issues'] > 0:
+                print(f"Total Issues: {report['total_issues']}")
+                if report['critical_issues'] > 0:
+                    print(f"Critical Issues: {report['critical_issues']}")
+                if report['high_priority_issues'] > 0:
+                    print(f"High Priority: {report['high_priority_issues']}")
+                print()
+                
+                print("Top Recommendations:")
+                for i, rec in enumerate(report['top_recommendations'], 1):
+                    print(f"  {i}. {rec}")
+                print()
+                
+                print("Detailed Issues:")
+                for issue in report['detailed_bottlenecks']:
+                    print(f"  • {issue['type']} ({issue['severity']})")
+                    print(f"    {issue['description']}")
+                    print(f"    Impact: {issue['impact']}")
+                    print()
+            else:
+                print("✅ No performance bottlenecks detected")
+            
+            print("=" * 60)
+            
+        except Exception as e:
+            print(f"❌ Failed to analyze bottlenecks: {e}")
+            logger.error(f"Failed to analyze bottlenecks: {e}")
+
+    def _show_performance_trends(self):
+        """Show performance trends analysis."""
+        try:
+            trends = self.performance_controller.analyzer.analyze_performance_trends(days=7)
+            
+            print("\n📈 Performance Trends (Last 7 Days):")
+            print("=" * 60)
+            
+            summary = trends.get('session_summary', {})
+            print(f"Total Sessions:       {summary.get('total_sessions', 0)}")
+            print(f"Successful Sessions:  {summary.get('successful_sessions', 0)}")
+            print(f"Success Rate:         {summary.get('success_rate', 0):.1f}%")
+            print(f"Average Duration:     {summary.get('avg_duration', 0):.1f}s")
+            print()
+            
+            perf_trends = trends.get('performance_trends', {})
+            duration_trend = perf_trends.get('duration_trend', {})
+            print("Performance Trends:")
+            print(f"  Duration Trend:     {duration_trend.get('direction', 'unknown')}")
+            print(f"  Trend Significance: {duration_trend.get('significance', 'unknown')}")
+            
+            utilization_trend = perf_trends.get('utilization_trend', {})
+            print(f"  Size Utilization:   {utilization_trend.get('avg_utilization', 0):.1f}%")
+            
+            quality_trend = perf_trends.get('quality_trend', {})
+            if quality_trend.get('avg_quality'):
+                print(f"  Average Quality:    {quality_trend.get('avg_quality', 0):.1f}")
+            print()
+            
+            # Platform analysis
+            platform_analysis = trends.get('platform_analysis', {})
+            if platform_analysis:
+                print("Platform Performance:")
+                for platform, stats in platform_analysis.items():
+                    print(f"  {platform}:")
+                    print(f"    Sessions: {stats['session_count']}")
+                    print(f"    Avg Duration: {stats['avg_duration']:.1f}s")
+                    print(f"    Success Rate: {stats['success_rate']:.1f}%")
+                print()
+            
+            print("=" * 60)
+            
+        except Exception as e:
+            print(f"❌ Failed to analyze trends: {e}")
+            logger.error(f"Failed to analyze trends: {e}")
+
+    def _generate_performance_report(self):
+        """Generate comprehensive performance report."""
+        try:
+            report = self.performance_controller.export_performance_report()
+            
+            print("\n📋 Comprehensive Performance Report:")
+            print("=" * 60)
+            print(f"Report Generated: {report['report_timestamp']}")
+            print()
+            
+            # Executive summary
+            user_summary = report['user_summary']
+            print(f"Current Profile: {user_summary['current_profile']}")
+            print()
+            
+            recent = user_summary['recent_performance']
+            print("Recent Performance:")
+            print(f"  Sessions: {recent['total_sessions']}")
+            print(f"  Success Rate: {recent['success_rate']}")
+            print(f"  Avg Time: {recent['average_processing_time']}")
+            print()
+            
+            # Optimization potential
+            optimization = report['optimization_potential']
+            print(f"Optimization Potential: {optimization}")
+            print()
+            
+            # Key recommendations
+            print("Key Recommendations:")
+            for i, rec in enumerate(report['key_recommendations'], 1):
+                print(f"  {i}. {rec}")
+            print()
+            
+            # Save detailed report to file
+            import json
+            from datetime import datetime
+            
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            report_file = f"performance_report_{timestamp}.json"
+            
+            with open(report_file, 'w') as f:
+                json.dump(report, f, indent=2, default=str)
+            
+            print(f"📄 Detailed report saved to: {report_file}")
+            print("=" * 60)
+            
+        except Exception as e:
+            print(f"❌ Failed to generate performance report: {e}")
+            logger.error(f"Failed to generate performance report: {e}")
+
+    def _handle_performance_profile_command(self, args: argparse.Namespace):
+        """Handle performance profile commands."""
+        try:
+            if args.profile_action == 'list':
+                profiles = self.performance_controller.get_available_profiles()
+                
+                print("\n⚙️  Available Performance Profiles:")
+                print("=" * 60)
+                
+                for profile in profiles:
+                    print(f"Profile: {profile['name']}")
+                    print(f"  Description: {profile['description']}")
+                    print(f"  Recommended for:")
+                    for rec in profile['recommended_for']:
+                        print(f"    • {rec}")
+                    print()
+                
+                print("=" * 60)
+                
+            elif args.profile_action == 'show':
+                current_profile = self.performance_controller.monitor.get_performance_profile()
+                
+                if current_profile:
+                    print(f"\n⚙️  Current Performance Profile: {current_profile.name}")
+                    print("=" * 50)
+                    print(f"Max Quality Eval Time: {current_profile.max_quality_evaluation_time}s")
+                    print(f"Max Iterations:        {current_profile.max_compression_iterations}")
+                    print(f"Fast Estimation:       {'Enabled' if current_profile.enable_fast_estimation else 'Disabled'}")
+                    print(f"Cache Enabled:         {'Yes' if current_profile.cache_enabled else 'No'}")
+                    print(f"Parallel Processing:   {'Yes' if current_profile.parallel_processing else 'No'}")
+                    print(f"Memory Optimization:   {'Yes' if current_profile.memory_optimization else 'No'}")
+                    print("=" * 50)
+                else:
+                    print("❌ No performance profile is currently set")
+                    
+            elif args.profile_action == 'set':
+                success = self.performance_controller.set_performance_profile(args.profile_name)
+                
+                if success:
+                    print(f"✅ Performance profile set to: {args.profile_name}")
+                else:
+                    print(f"❌ Failed to set performance profile: {args.profile_name}")
+                    print("Available profiles: fast, balanced, quality")
+            
+        except Exception as e:
+            print(f"❌ Failed to handle profile command: {e}")
+            logger.error(f"Failed to handle profile command: {e}")
+
+    def _handle_performance_metrics_command(self, args: argparse.Namespace):
+        """Handle performance metrics commands."""
+        try:
+            if args.metrics_action == 'export':
+                from datetime import datetime, timedelta
+                
+                # Export last 30 days by default
+                end_date = datetime.now()
+                start_date = end_date - timedelta(days=30)
+                
+                metrics = self.performance_controller.monitor.export_metrics(start_date, end_date)
+                
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                metrics_file = f"performance_metrics_{timestamp}.json"
+                
+                import json
+                with open(metrics_file, 'w') as f:
+                    json.dump(metrics, f, indent=2, default=str)
+                
+                print(f"📊 Performance metrics exported to: {metrics_file}")
+                print(f"Sessions exported: {len(metrics.get('sessions', []))}")
+                
+            elif args.metrics_action == 'clear':
+                days = args.days
+                removed_count = self.performance_controller.monitor.clear_metrics(days)
+                
+                print(f"🗑️  Cleared {removed_count} metrics files older than {days} days")
+            
+        except Exception as e:
+            print(f"❌ Failed to handle metrics command: {e}")
+            logger.error(f"Failed to handle metrics command: {e}")
 
     def _handle_open_command(self, args: argparse.Namespace):
         """Handle open folder command"""

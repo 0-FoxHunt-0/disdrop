@@ -263,8 +263,12 @@ class BitrateValidator:
                     )
         
         # Try FPS reduction if resolution reduction isn't sufficient
-        for fps_reduction in [0.8, 0.6, 0.5]:  # 80%, 60%, 50% of original FPS
-            new_fps = max(10, current_fps * fps_reduction)  # Don't go below 10fps
+        # Use configured FPS reduction steps and minimum FPS
+        fps_reduction_steps = self.config.get('video_compression.bitrate_validation.fps_reduction_steps', [0.8, 0.6, 0.5])
+        min_fps_config = self.config.get('video_compression.bitrate_validation.min_fps', 20)
+        
+        for fps_reduction in fps_reduction_steps:
+            new_fps = max(min_fps_config, current_fps * fps_reduction)  # Respect configured minimum FPS
             
             # Recalculate bitrate with reduced FPS (proportional reduction)
             fps_ratio = new_fps / current_fps

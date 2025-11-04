@@ -26,6 +26,11 @@ from .video_segmenter import VideoSegmenter
 from .quality_scorer import QualityScorer
 from .bitrate_validator import BitrateValidator, BitrateValidationError
 from .adaptive_parameter_adjuster import AdaptiveParameterAdjuster
+from .compression_strategy import SmartCompressionStrategy, CompressionStrategy, CompressionConstraints
+from .quality_improvement_engine import QualityImprovementEngine, FailureAnalysis, ImprovementPlan, CompressionParams as QICompressionParams
+from .fast_quality_estimator import FastQualityEstimator, QualityEstimate
+from .performance_monitor import PerformanceMonitor
+from .performance_controls import PerformanceController
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +45,10 @@ class DynamicVideoCompressor:
         self.hardware = hardware_detector
         self.temp_dir = self.config.get_temp_dir()
         
-        # Performance enhancement
+        # Performance enhancement and monitoring
         self.performance_enhancer = PerformanceEnhancer(config_manager)
+        self.performance_controller = PerformanceController(config_manager)
+        self.performance_monitor = self.performance_controller.monitor
         
         # Shutdown handling
         self.shutdown_requested = False
@@ -74,11 +81,22 @@ class DynamicVideoCompressor:
         self.bitrate_validator = BitrateValidator(config_manager)
         self.parameter_adjuster = AdaptiveParameterAdjuster(config_manager, self.bitrate_validator)
         
+        # Initialize smart compression strategy
+        self.compression_strategy = SmartCompressionStrategy(config_manager)
+        
         # Optimize system resources
         self.system_optimizations = self.performance_enhancer.optimize_system_resources()
         
         # Cache for expensive calculations
         self._resolution_cache = {}
+        
+        # Enhanced debug logging configuration
+        self.debug_logging_enabled = self._is_debug_logging_enabled()
+        self.performance_logging_enabled = self._is_performance_logging_enabled()
+        
+        # Compression session tracking for detailed logging
+        self._current_session = None
+        self._session_counter = 0
 
     # ===== New helpers for refined final-pass encoding =====
     def _calculate_target_video_kbps(self, target_size_mb: float, duration_s: float, audio_kbps: int) -> int:
@@ -95,6 +113,371 @@ class DynamicVideoCompressor:
         cap = int(pixels_per_sec * max_bpp / 1000)
         # Absolute bounds: 500k-8000k
         return max(500, min(cap, 8000))
+    
+    def _is_debug_logging_enabled(self) -> bool:
+        """Check if comprehensive debug logging is enabled."""
+        if self.config:
+            # Check if explicitly enabled in config or if logger is at DEBUG level
+            config_enabled = self.config.get('video_compression.debug_logging.enabled', False)
+            logger_debug = logger.isEnabledFor(logging.DEBUG)
+            return config_enabled or logger_debug
+        return logger.isEnabledFor(logging.DEBUG)
+    
+    def _is_performance_logging_enabled(self) -> bool:
+        """Check if performance metrics logging is enabled."""
+        if self.config:
+            # Check both general performance metrics and specific performance logging settings
+            general_enabled = self.config.get('video_compression.debug_logging.performance_metrics', False)
+            specific_enabled = self.config.get('video_compression.debug_logging.performance_logging.operation_timing', False)
+            return general_enabled or specific_enabled
+        return False
+    
+    def _start_compression_session(self, input_path: str, target_size_mb: float, 
+                                  platform: str = None) -> Dict[str, Any]:
+        """Start a new compression session with detailed logging context."""
+        self._session_counter += 1
+        session_id = f"session_{self._session_counter}_{int(time.time())}"
+        
+        session_info = {
+            'session_id': session_id,
+            'input_path': input_path,
+            'input_filename': os.path.basename(input_path),
+            'target_size_mb': target_size_mb,
+            'platform': platform,
+            'start_time': time.time(),
+            'parameters_history': [],
+            'decisions_log': [],
+            'performance_metrics': {},
+            'quality_evaluations': [],
+            'fallback_attempts': []
+        }
+        
+        self._current_session = session_info
+        
+        if self.debug_logging_enabled:
+            logger.info(f"=== COMPRESSION SESSION STARTED ===")
+            logger.info(f"Session ID: {session_id}")
+            logger.info(f"Input: {os.path.basename(input_path)}")
+            logger.info(f"Target size: {target_size_mb:.2f}MB")
+            logger.info(f"Platform: {platform or 'generic'}")
+            logger.info(f"Debug logging: enabled")
+        
+        return session_info
+    
+    def _log_compression_decision(self, decision_type: str, decision: str, 
+                                 context: Dict[str, Any] = None, 
+                                 justification: str = None) -> None:
+        """Log a compression parameter decision with detailed context and justification."""
+        if not self.debug_logging_enabled or not self._current_session:
+            return
+        
+        decision_entry = {
+            'timestamp': time.time(),
+            'decision_type': decision_type,
+            'decision': decision,
+            'context': context or {},
+            'justification': justification
+        }
+        
+        self._current_session['decisions_log'].append(decision_entry)
+        
+        # Log the decision
+        logger.info(f"DECISION [{decision_type}]: {decision}")
+        if justification:
+            logger.info(f"  Justification: {justification}")
+        
+        if context and logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"  Context: {context}")
+    
+    def _log_parameter_change(self, parameter_name: str, old_value: Any, 
+                             new_value: Any, reason: str) -> None:
+        """Log parameter changes with detailed reasoning."""
+        if not self.debug_logging_enabled or not self._current_session:
+            return
+        
+        change_entry = {
+            'timestamp': time.time(),
+            'parameter': parameter_name,
+            'old_value': old_value,
+            'new_value': new_value,
+            'reason': reason
+        }
+        
+        self._current_session['parameters_history'].append(change_entry)
+        
+        logger.info(f"PARAMETER CHANGE [{parameter_name}]: {old_value} → {new_value}")
+        logger.info(f"  Reason: {reason}")
+    
+    def _log_fps_reduction_justification(self, original_fps: float, new_fps: float, 
+                                        video_info: Dict[str, Any], 
+                                        strategy_analysis: Dict[str, Any]) -> None:
+        """Log detailed FPS reduction justification with comprehensive analysis."""
+        if not self.debug_logging_enabled:
+            return
+        
+        reduction_percent = ((original_fps - new_fps) / original_fps) * 100
+        
+        logger.info(f"=== FPS REDUCTION ANALYSIS ===")
+        logger.info(f"FPS change: {original_fps:.1f} → {new_fps:.1f} fps ({reduction_percent:.1f}% reduction)")
+        
+        # Log video characteristics that influenced the decision
+        motion_level = video_info.get('motion_level', 'unknown')
+        duration = video_info.get('duration', 0)
+        original_size_mb = video_info.get('size_bytes', 0) / (1024 * 1024) if video_info.get('size_bytes') else 0
+        
+        logger.info(f"Video characteristics:")
+        logger.info(f"  Motion level: {motion_level}")
+        logger.info(f"  Duration: {duration:.1f}s")
+        logger.info(f"  Original size: {original_size_mb:.2f}MB")
+        
+        # Log strategy analysis
+        if strategy_analysis:
+            fps_impact = strategy_analysis.get('fps_impact', {})
+            logger.info(f"Impact assessment:")
+            logger.info(f"  Impact level: {fps_impact.get('impact_level', 'unknown')}")
+            logger.info(f"  Impact score: {fps_impact.get('impact_score', 0)}")
+            logger.info(f"  Recommendation: {fps_impact.get('recommendation', 'none')}")
+            
+            if strategy_analysis.get('prefer_bitrate_reduction'):
+                logger.info(f"Alternative strategy analysis:")
+                logger.info(f"  Bitrate headroom: {strategy_analysis.get('bitrate_headroom', 0)}kbps")
+                logger.info(f"  Potential size reduction: {strategy_analysis.get('potential_size_reduction_mb', 0):.2f}MB")
+                logger.info(f"  Strategy reason: {strategy_analysis.get('strategy_reason', 'none')}")
+        
+        # Log configuration constraints
+        config_min_fps = self.config.get('video_compression.bitrate_validation.min_fps', 20)
+        fps_reduction_steps = self.config.get('video_compression.bitrate_validation.fps_reduction_steps', [])
+        
+        logger.info(f"Configuration constraints:")
+        logger.info(f"  Minimum FPS (config): {config_min_fps}")
+        logger.info(f"  FPS reduction steps: {fps_reduction_steps}")
+        logger.info(f"  Respects minimum: {new_fps >= config_min_fps}")
+        
+        # Log FPS reduction strategy and reasoning
+        if reduction_percent > 0:
+            if reduction_percent <= 20:
+                impact_level = "minimal"
+                quality_impact = "negligible quality impact expected"
+            elif reduction_percent <= 40:
+                impact_level = "moderate"
+                quality_impact = "slight quality impact, should maintain smoothness"
+            elif reduction_percent <= 60:
+                impact_level = "significant"
+                quality_impact = "noticeable quality impact, may affect smoothness"
+            else:
+                impact_level = "aggressive"
+                quality_impact = "substantial quality impact, choppy playback likely"
+            
+            logger.info(f"FPS reduction strategy:")
+            logger.info(f"  Impact level: {impact_level}")
+            logger.info(f"  Quality impact: {quality_impact}")
+            
+            # Log alternative strategies considered
+            if strategy_analysis and strategy_analysis.get('alternatives_considered'):
+                alternatives = strategy_analysis['alternatives_considered']
+                logger.info(f"Alternative strategies considered:")
+                for alt in alternatives:
+                    logger.info(f"  - {alt.get('strategy', 'unknown')}: {alt.get('reason', 'no reason given')}")
+        
+        logger.info(f"=== END FPS REDUCTION ANALYSIS ===")
+    
+    def _log_configuration_loading(self, config_section: str, loaded_values: Dict[str, Any]) -> None:
+        """Log configuration loading and application steps."""
+        if not self.debug_logging_enabled:
+            return
+        
+        logger.debug(f"=== CONFIGURATION LOADING [{config_section}] ===")
+        for key, value in loaded_values.items():
+            logger.debug(f"  {key}: {value}")
+        logger.debug(f"=== END CONFIGURATION LOADING ===")
+    
+    def _log_performance_metrics(self, operation: str, metrics: Dict[str, Any]) -> None:
+        """Log performance metrics for compression operations."""
+        if not self.performance_logging_enabled or not self._current_session:
+            return
+        
+        # Add to session metrics
+        if operation not in self._current_session['performance_metrics']:
+            self._current_session['performance_metrics'][operation] = []
+        
+        metrics_entry = {
+            'timestamp': time.time(),
+            'metrics': metrics.copy()
+        }
+        self._current_session['performance_metrics'][operation].append(metrics_entry)
+        
+        # Log the metrics
+        logger.info(f"PERFORMANCE [{operation}]:")
+        for key, value in metrics.items():
+            if isinstance(value, float):
+                logger.info(f"  {key}: {value:.3f}")
+            else:
+                logger.info(f"  {key}: {value}")
+    
+    def _measure_operation_performance(self, operation_name: str):
+        """Context manager to measure and log operation performance."""
+        class PerformanceMeasurer:
+            def __init__(self, compressor, operation_name):
+                self.compressor = compressor
+                self.operation_name = operation_name
+                self.start_time = None
+                self.start_memory = None
+                
+            def __enter__(self):
+                self.start_time = time.time()
+                try:
+                    import psutil
+                    process = psutil.Process()
+                    self.start_memory = process.memory_info().rss / (1024 * 1024)  # MB
+                except ImportError:
+                    self.start_memory = None
+                return self
+                
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                end_time = time.time()
+                duration = end_time - self.start_time
+                
+                metrics = {
+                    'duration': duration,
+                    'start_time': self.start_time,
+                    'end_time': end_time
+                }
+                
+                if self.start_memory is not None:
+                    try:
+                        import psutil
+                        process = psutil.Process()
+                        end_memory = process.memory_info().rss / (1024 * 1024)  # MB
+                        metrics['memory_start_mb'] = self.start_memory
+                        metrics['memory_end_mb'] = end_memory
+                        metrics['memory_delta_mb'] = end_memory - self.start_memory
+                    except ImportError:
+                        pass
+                
+                if exc_type is not None:
+                    metrics['error'] = str(exc_val) if exc_val else 'Unknown error'
+                    metrics['success'] = False
+                else:
+                    metrics['success'] = True
+                
+                self.compressor._log_performance_metrics(self.operation_name, metrics)
+        
+        return PerformanceMeasurer(self, operation_name)
+    
+    def _extract_encoder_info_from_cmd(self, cmd: List[str]) -> Dict[str, str]:
+        """Extract encoder information from FFmpeg command for logging."""
+        info = {}
+        
+        try:
+            # Find encoder
+            if '-c:v' in cmd:
+                encoder_idx = cmd.index('-c:v') + 1
+                if encoder_idx < len(cmd):
+                    info['encoder'] = cmd[encoder_idx]
+            
+            # Find preset
+            if '-preset' in cmd:
+                preset_idx = cmd.index('-preset') + 1
+                if preset_idx < len(cmd):
+                    info['preset'] = cmd[preset_idx]
+            
+            # Determine acceleration type
+            encoder = info.get('encoder', '')
+            if 'nvenc' in encoder:
+                info['acceleration'] = 'NVIDIA NVENC'
+            elif 'amf' in encoder:
+                info['acceleration'] = 'AMD AMF'
+            elif 'qsv' in encoder:
+                info['acceleration'] = 'Intel QSV'
+            elif 'videotoolbox' in encoder:
+                info['acceleration'] = 'Apple VideoToolbox'
+            elif encoder in ['libx264', 'libx265']:
+                info['acceleration'] = 'software'
+            else:
+                info['acceleration'] = 'unknown'
+                
+        except (ValueError, IndexError):
+            pass
+        
+        return info
+    
+    def _end_compression_session(self, success: bool, output_path: str = None, 
+                                final_size_mb: float = None, error: str = None) -> None:
+        """End compression session and log comprehensive summary."""
+        if not self._current_session:
+            return
+        
+        session_duration = time.time() - self._current_session['start_time']
+        self._current_session['end_time'] = time.time()
+        self._current_session['duration'] = session_duration
+        self._current_session['success'] = success
+        self._current_session['final_size_mb'] = final_size_mb
+        self._current_session['error'] = error
+        
+        if self.debug_logging_enabled:
+            logger.info(f"=== COMPRESSION SESSION COMPLETED ===")
+            logger.info(f"Session ID: {self._current_session['session_id']}")
+            logger.info(f"Duration: {session_duration:.2f}s")
+            logger.info(f"Success: {success}")
+            
+            if success and final_size_mb:
+                target_size = self._current_session['target_size_mb']
+                utilization = (final_size_mb / target_size) * 100
+                logger.info(f"Final size: {final_size_mb:.2f}MB (target: {target_size:.2f}MB, {utilization:.1f}% utilization)")
+            
+            if error:
+                logger.info(f"Error: {error}")
+            
+            # Log decision summary
+            decisions_count = len(self._current_session['decisions_log'])
+            parameter_changes = len(self._current_session['parameters_history'])
+            logger.info(f"Decisions made: {decisions_count}")
+            logger.info(f"Parameter changes: {parameter_changes}")
+            
+            # Log performance summary if enabled
+            if self.performance_logging_enabled:
+                perf_metrics = self._current_session['performance_metrics']
+                logger.info(f"Performance operations logged: {len(perf_metrics)}")
+                
+                total_operation_time = 0
+                for operation, metrics_list in perf_metrics.items():
+                    if metrics_list:
+                        durations = [m['metrics'].get('duration', 0) for m in metrics_list]
+                        avg_duration = sum(durations) / len(durations)
+                        max_duration = max(durations)
+                        min_duration = min(durations)
+                        total_duration = sum(durations)
+                        total_operation_time += total_duration
+                        
+                        logger.info(f"  {operation}: {len(metrics_list)} operations")
+                        logger.info(f"    Total time: {total_duration:.2f}s")
+                        logger.info(f"    Average: {avg_duration:.2f}s")
+                        logger.info(f"    Range: {min_duration:.2f}s - {max_duration:.2f}s")
+                        
+                        # Log memory usage if available
+                        memory_deltas = [m['metrics'].get('memory_delta_mb', 0) for m in metrics_list if 'memory_delta_mb' in m['metrics']]
+                        if memory_deltas:
+                            avg_memory_delta = sum(memory_deltas) / len(memory_deltas)
+                            max_memory_delta = max(memory_deltas)
+                            logger.info(f"    Memory usage: avg {avg_memory_delta:+.1f}MB, peak {max_memory_delta:+.1f}MB")
+                
+                # Log overall performance metrics
+                if total_operation_time > 0:
+                    efficiency = (session_duration / total_operation_time) * 100 if total_operation_time > 0 else 0
+                    logger.info(f"Performance summary:")
+                    logger.info(f"  Total session time: {session_duration:.2f}s")
+                    logger.info(f"  Total operation time: {total_operation_time:.2f}s")
+                    logger.info(f"  Efficiency: {efficiency:.1f}% (operation time / session time)")
+                    
+                    if efficiency < 50:
+                        logger.info(f"  Note: Low efficiency may indicate overhead or waiting time")
+                    elif efficiency > 90:
+                        logger.info(f"  Note: High efficiency indicates optimal resource utilization")
+            
+            logger.info(f"=== END SESSION SUMMARY ===")
+        
+        # Clear current session
+        self._current_session = None
     
     def _cleanup_two_pass_logs(self, log_base: str):
         """Clean up all two-pass log files reliably"""
@@ -167,9 +550,45 @@ class DynamicVideoCompressor:
         return None
     
     def _calculate_target_video_kbps(self, target_size_mb: float, duration_s: float, audio_kbps: int) -> int:
+        """Calculate target video bitrate for given constraints with detailed logging"""
         total_bits = target_size_mb * 8 * 1024 * 1024
-        kbps = int(max((total_bits / max(duration_s, 1.0) / 1000) - audio_kbps, 64))
-        return kbps
+        total_kbps = total_bits / max(duration_s, 1.0) / 1000
+        video_kbps = int(max(total_kbps - audio_kbps, 64))
+        
+        if self.debug_logging_enabled:
+            logger.info(f"=== VIDEO BITRATE CALCULATION ===")
+            logger.info(f"Input parameters:")
+            logger.info(f"  Target size: {target_size_mb:.2f}MB")
+            logger.info(f"  Duration: {duration_s:.1f}s")
+            logger.info(f"  Audio bitrate: {audio_kbps}kbps")
+            logger.info(f"Calculation:")
+            logger.info(f"  Total bits: {total_bits:,.0f} bits")
+            logger.info(f"  Total bitrate: {total_kbps:.1f}kbps")
+            logger.info(f"  Video bitrate: {total_kbps:.1f} - {audio_kbps} = {video_kbps}kbps")
+            
+            # Log bitrate allocation
+            audio_percentage = (audio_kbps / total_kbps) * 100 if total_kbps > 0 else 0
+            video_percentage = (video_kbps / total_kbps) * 100 if total_kbps > 0 else 0
+            logger.info(f"Bitrate allocation:")
+            logger.info(f"  Audio: {audio_percentage:.1f}% ({audio_kbps}kbps)")
+            logger.info(f"  Video: {video_percentage:.1f}% ({video_kbps}kbps)")
+            
+            # Log quality assessment
+            if video_kbps < 200:
+                quality_assessment = "very low quality expected, severe compression artifacts likely"
+            elif video_kbps < 500:
+                quality_assessment = "low quality expected, noticeable compression artifacts"
+            elif video_kbps < 1000:
+                quality_assessment = "medium quality expected, acceptable for most content"
+            elif video_kbps < 2000:
+                quality_assessment = "good quality expected, minimal compression artifacts"
+            else:
+                quality_assessment = "high quality expected, excellent visual fidelity"
+            
+            logger.info(f"Quality assessment: {quality_assessment}")
+            logger.info(f"=== END VIDEO BITRATE CALCULATION ===")
+        
+        return video_kbps
     
     def _calculate_optimal_fps(self, video_info: Dict[str, Any], target_size_mb: float, strategy: str = 'balanced') -> float:
         """Determine best FPS based on motion, size constraints, and strategy"""
@@ -181,38 +600,113 @@ class DynamicVideoCompressor:
         # Calculate compression ratio to gauge difficulty
         compression_ratio = original_size_mb / max(target_size_mb, 0.1) if original_size_mb > 0 else 1.0
         
+        if self.debug_logging_enabled:
+            logger.info(f"=== FPS CALCULATION ===")
+            logger.info(f"Input parameters:")
+            logger.info(f"  Original FPS: {original_fps:.1f}")
+            logger.info(f"  Motion level: {motion_level}")
+            logger.info(f"  Duration: {duration:.1f}s")
+            logger.info(f"  Original size: {original_size_mb:.2f}MB")
+            logger.info(f"  Target size: {target_size_mb:.2f}MB")
+            logger.info(f"  Compression ratio: {compression_ratio:.1f}x")
+            logger.info(f"  Strategy: {strategy}")
+        
         # Base FPS selection based on motion level
         if motion_level == 'high':
             base_fps = min(original_fps, 60)  # Keep high FPS for motion
+            fps_reasoning = "High motion detected, preserving higher FPS for smoothness"
         elif motion_level == 'low':
             base_fps = 24  # Low motion can use 24fps
+            fps_reasoning = "Low motion detected, can reduce to cinematic 24fps"
         else:
             base_fps = 30  # Medium motion uses 30fps
+            fps_reasoning = "Medium motion detected, using standard 30fps"
+        
+        if self.debug_logging_enabled:
+            logger.info(f"Base FPS selection:")
+            logger.info(f"  Base FPS: {base_fps:.1f}")
+            logger.info(f"  Reasoning: {fps_reasoning}")
         
         # Adjust based on strategy
+        strategy_adjustment = ""
         if strategy == 'aggressive':
             # Reduce FPS more aggressively
             if compression_ratio > 10:
+                old_fps = base_fps
                 base_fps = min(base_fps * 0.5, 24)
+                strategy_adjustment = f"Aggressive strategy with extreme compression ratio ({compression_ratio:.1f}x): reduced FPS by 50% ({old_fps:.1f} → {base_fps:.1f})"
             elif compression_ratio > 5:
+                old_fps = base_fps
                 base_fps = min(base_fps * 0.7, 30)
+                strategy_adjustment = f"Aggressive strategy with high compression ratio ({compression_ratio:.1f}x): reduced FPS by 30% ({old_fps:.1f} → {base_fps:.1f})"
+            else:
+                strategy_adjustment = "Aggressive strategy but compression ratio manageable, no additional FPS reduction"
         elif strategy == 'quality':
             # Try to preserve FPS
             base_fps = min(original_fps, 60)
+            strategy_adjustment = f"Quality strategy: preserving original FPS ({base_fps:.1f})"
+        else:
+            strategy_adjustment = f"Balanced strategy: using motion-based FPS ({base_fps:.1f})"
         
         # Further reduce if extreme compression is needed
+        extreme_compression_adjustment = ""
         if compression_ratio > 15:
+            old_fps = base_fps
             base_fps = max(base_fps * 0.6, 15)
+            extreme_compression_adjustment = f"Extreme compression ratio ({compression_ratio:.1f}x): additional 40% FPS reduction ({old_fps:.1f} → {base_fps:.1f})"
         
         # Always cap at 60 and floor at 10
-        return max(10, min(base_fps, 60))
+        final_fps = max(10, min(base_fps, 60))
+        
+        # Check against configuration constraints
+        config_min_fps = self.config.get('video_compression.bitrate_validation.min_fps', 20)
+        if final_fps < config_min_fps:
+            constraint_adjustment = f"FPS {final_fps:.1f} below configured minimum {config_min_fps}, clamping to minimum"
+            final_fps = config_min_fps
+        else:
+            constraint_adjustment = f"FPS {final_fps:.1f} meets configured minimum {config_min_fps}"
+        
+        if self.debug_logging_enabled:
+            logger.info(f"FPS adjustments:")
+            if strategy_adjustment:
+                logger.info(f"  Strategy: {strategy_adjustment}")
+            if extreme_compression_adjustment:
+                logger.info(f"  Extreme compression: {extreme_compression_adjustment}")
+            logger.info(f"  Configuration constraint: {constraint_adjustment}")
+            logger.info(f"Final FPS: {final_fps:.1f}")
+            
+            # Log FPS reduction impact assessment
+            fps_reduction_percent = ((original_fps - final_fps) / original_fps) * 100 if original_fps > 0 else 0
+            if fps_reduction_percent > 0:
+                if fps_reduction_percent <= 20:
+                    impact_assessment = "minimal impact on perceived quality"
+                elif fps_reduction_percent <= 40:
+                    impact_assessment = "moderate impact, should maintain acceptable smoothness"
+                elif fps_reduction_percent <= 60:
+                    impact_assessment = "significant impact, may affect smoothness"
+                else:
+                    impact_assessment = "severe impact, choppy playback likely"
+                
+                logger.info(f"FPS reduction impact: {fps_reduction_percent:.1f}% reduction, {impact_assessment}")
+            
+            logger.info(f"=== END FPS CALCULATION ===")
+        
+        return final_fps
     
     def _calculate_optimal_audio_bitrate(self, input_path: str, video_info: Dict[str, Any], 
                                         target_size_mb: float) -> int:
         """Choose audio bitrate based on input quality and size budget"""
         duration = video_info.get('duration', 0)
         
+        if self.debug_logging_enabled:
+            logger.info(f"=== AUDIO BITRATE CALCULATION ===")
+            logger.info(f"Input parameters:")
+            logger.info(f"  Duration: {duration:.1f}s")
+            logger.info(f"  Target size: {target_size_mb:.2f}MB")
+        
         # Try to probe input audio bitrate
+        input_audio_bitrate = 128  # Default
+        probe_success = False
         try:
             cmd = [
                 'ffprobe', '-v', 'quiet', '-select_streams', 'a:0',
@@ -223,33 +717,86 @@ class DynamicVideoCompressor:
                 probe_data = json.loads(result.stdout)
                 if probe_data.get('streams') and len(probe_data['streams']) > 0:
                     input_audio_bitrate = int(probe_data['streams'][0].get('bit_rate', 0)) // 1000
+                    probe_success = True
+                    if self.debug_logging_enabled:
+                        logger.info(f"Probed input audio bitrate: {input_audio_bitrate}kbps")
                 else:
-                    input_audio_bitrate = 128  # Default if no audio stream
+                    if self.debug_logging_enabled:
+                        logger.info("No audio stream found in input, using default 128kbps")
             else:
-                input_audio_bitrate = 128
-        except Exception:
-            input_audio_bitrate = 128  # Default on error
+                if self.debug_logging_enabled:
+                    logger.info(f"FFprobe failed (return code {result.returncode}), using default 128kbps")
+        except Exception as e:
+            if self.debug_logging_enabled:
+                logger.info(f"Audio probing failed ({e}), using default 128kbps")
+        
+        if not probe_success:
+            input_audio_bitrate = 128
         
         # Calculate what we can afford (reserve 10-15% of budget for audio)
         total_bitrate = (target_size_mb * 8 * 1024) / max(duration, 1)  # kbps
         audio_budget = total_bitrate * 0.12  # 12% for audio
         
+        if self.debug_logging_enabled:
+            logger.info(f"Budget calculation:")
+            logger.info(f"  Total bitrate budget: {total_bitrate:.1f}kbps")
+            logger.info(f"  Audio budget (12%): {audio_budget:.1f}kbps")
+            logger.info(f"  Input audio bitrate: {input_audio_bitrate}kbps")
+        
         # Scale down from input quality, never exceed it
         target_audio = min(input_audio_bitrate, audio_budget)
         
+        if self.debug_logging_enabled:
+            logger.info(f"Target calculation:")
+            logger.info(f"  Target audio (min of input/budget): {target_audio:.1f}kbps")
+        
         # Quantize to standard bitrates
+        final_bitrate = 32  # Default minimum
+        quantization_reasoning = ""
+        
         if target_audio >= 160:
-            return min(192, input_audio_bitrate)
+            final_bitrate = min(192, input_audio_bitrate)
+            quantization_reasoning = f"High quality target ({target_audio:.1f}kbps) → 192kbps (capped by input: {input_audio_bitrate}kbps)"
         elif target_audio >= 112:
-            return min(128, input_audio_bitrate)
+            final_bitrate = min(128, input_audio_bitrate)
+            quantization_reasoning = f"Good quality target ({target_audio:.1f}kbps) → 128kbps (capped by input: {input_audio_bitrate}kbps)"
         elif target_audio >= 80:
-            return min(96, input_audio_bitrate)
+            final_bitrate = min(96, input_audio_bitrate)
+            quantization_reasoning = f"Medium quality target ({target_audio:.1f}kbps) → 96kbps (capped by input: {input_audio_bitrate}kbps)"
         elif target_audio >= 56:
-            return 64
+            final_bitrate = 64
+            quantization_reasoning = f"Low-medium quality target ({target_audio:.1f}kbps) → 64kbps"
         elif target_audio >= 40:
-            return 48
+            final_bitrate = 48
+            quantization_reasoning = f"Low quality target ({target_audio:.1f}kbps) → 48kbps"
         else:
-            return 32  # Minimum acceptable quality
+            final_bitrate = 32
+            quantization_reasoning = f"Very low quality target ({target_audio:.1f}kbps) → 32kbps (minimum acceptable)"
+        
+        if self.debug_logging_enabled:
+            logger.info(f"Quantization:")
+            logger.info(f"  {quantization_reasoning}")
+            logger.info(f"Final audio bitrate: {final_bitrate}kbps")
+            
+            # Log quality impact assessment
+            quality_reduction = ((input_audio_bitrate - final_bitrate) / input_audio_bitrate) * 100 if input_audio_bitrate > 0 else 0
+            if quality_reduction > 0:
+                if quality_reduction <= 25:
+                    quality_impact = "minimal audio quality impact"
+                elif quality_reduction <= 50:
+                    quality_impact = "moderate audio quality reduction"
+                elif quality_reduction <= 75:
+                    quality_impact = "significant audio quality reduction"
+                else:
+                    quality_impact = "severe audio quality reduction"
+                
+                logger.info(f"Quality impact: {quality_reduction:.1f}% reduction, {quality_impact}")
+            else:
+                logger.info("Quality impact: no reduction (using input bitrate or higher)")
+            
+            logger.info(f"=== END AUDIO BITRATE CALCULATION ===")
+        
+        return final_bitrate
 
     def _utilization_ratio(self, actual_bytes: int, target_mb: float) -> float:
         return float(actual_bytes) / max(target_mb * 1024 * 1024, 1.0)
@@ -1507,157 +2054,328 @@ class DynamicVideoCompressor:
         if not os.path.exists(input_path):
             raise FileNotFoundError(f"Input video file not found: {input_path}")
         
-        logger.info(f"Starting enhanced video compression: {input_path} -> {output_path}")
+        # Determine target file size early for session logging
+        target_size_mb = max_size_mb or self.config.get('video_compression.max_file_size_mb', 10)
         
-        # Get platform configuration
-        platform_config = {}
-        if platform:
-            platform_config = self.config.get_platform_config(platform, 'video_compression')
-            logger.info(f"Using platform configuration for: {platform}")
+        # Start comprehensive compression session logging
+        session_info = self._start_compression_session(input_path, target_size_mb, platform)
         
-        # Determine target file size
-        target_size_mb = max_size_mb or platform_config.get('max_file_size_mb') or self.config.get('video_compression.max_file_size_mb', 10)
-        
-        # Check cache for similar operations
-        @self.performance_enhancer.cached_operation(ttl_hours=6)
-        def cached_analysis(file_path, file_size, target_size):
-            return self._analyze_video_content(file_path)
-        
-        # Early-cancel before analysis if shutdown requested
-        if self.shutdown_requested:
-            return {'success': False, 'cancelled': True}
-
-        # Get comprehensive video analysis (cached), but handle graceful cancellation
-        file_size = os.path.getsize(input_path)
         try:
-            video_info = cached_analysis(input_path, file_size, target_size_mb)
-        except GracefulCancellation:
-            return {'success': False, 'cancelled': True}
-        original_size_mb = file_size / (1024 * 1024)
-        
-        logger.info(f"Original video: {video_info['width']}x{video_info['height']}, "
-                   f"{video_info['duration']:.2f}s, {original_size_mb:.2f}MB, "
-                   f"complexity: {video_info['complexity_score']:.2f}")
-        
-        # Route to Discord 10MB CAE pipeline if target is exactly 10MB (or close)
-        # and no specific platform is set or platform is discord
-        use_cae = False
-        if 9.5 <= target_size_mb <= 10.5:
-            if platform is None or platform == 'discord':
-                use_cae = True
-                logger.info("Routing to Discord 10MB CAE pipeline")
-        
-        if use_cae:
-            try:
-                cae_result = self._compress_with_cae_discord_10mb(input_path, output_path, video_info)
-                if cae_result.get('success'):
-                    return cae_result
-                logger.warning("CAE pipeline failed, falling back to standard compression")
+            # Check for configuration changes and reload if necessary
+            if self.config.reload_config_if_changed():
+                logger.info("Configuration reloaded due to file changes")
+                self._log_compression_decision(
+                    'config_reload',
+                    'Configuration reloaded due to file changes',
+                    {'config_file_changed': True},
+                    'Configuration file was modified during execution'
+                )
+            
+            # Log active configuration for debugging
+            if self.debug_logging_enabled:
+                logger.info("=== CONFIGURATION LOADING AND APPLICATION ===")
                 
-                # If segmentation is last resort and CAE failed, try segmentation immediately
-                seg_last_resort = bool(self.config.get('video_compression.segmentation.only_if_single_file_unacceptable', False))
-                if seg_last_resort and not force_single_file:
-                    logger.info("CAE pipeline failed; falling back to segmentation as last resort")
-                    return self._compress_with_segmentation(
-                        input_path, output_path, target_size_mb, platform_config, video_info, platform
-                    )
-            except Exception as e:
-                logger.error(f"CAE pipeline error: {e}, falling back to standard compression")
-                # If segmentation is last resort and CAE threw exception, try segmentation immediately
-                seg_last_resort = bool(self.config.get('video_compression.segmentation.only_if_single_file_unacceptable', False))
-                if seg_last_resort and not force_single_file:
-                    logger.info("CAE pipeline error; falling back to segmentation as last resort")
-                    return self._compress_with_segmentation(
-                        input_path, output_path, target_size_mb, platform_config, video_info, platform
-                    )
+                # Log configuration source information
+                config_dir = getattr(self.config, 'config_dir', 'unknown')
+                logger.info(f"Configuration directory: {config_dir}")
+                
+                # Log configuration file timestamps if available
+                if hasattr(self.config, '_config_file_timestamps') and self.config._config_file_timestamps:
+                    logger.info("Configuration file timestamps:")
+                    for config_file, timestamp in self.config._config_file_timestamps.items():
+                        import datetime
+                        dt = datetime.datetime.fromtimestamp(timestamp)
+                        logger.info(f"  {config_file}: {dt.strftime('%Y-%m-%d %H:%M:%S')}")
+                
+                self.config.log_active_configuration()
+                
+                # Log configuration loading details with enhanced context
+                config_sections = {
+                    'video_compression': {
+                        'max_file_size_mb': self.config.get('video_compression.max_file_size_mb'),
+                        'min_fps': self.config.get('video_compression.bitrate_validation.min_fps'),
+                        'fps_reduction_steps': self.config.get('video_compression.bitrate_validation.fps_reduction_steps'),
+                        'min_resolution': self.config.get('video_compression.bitrate_validation.min_resolution'),
+                        'safety_margin': self.config.get('video_compression.bitrate_validation.safety_margin'),
+                        'encoder_minimums': self.config.get('video_compression.bitrate_validation.encoder_minimums'),
+                        'segmentation_threshold_mb': self.config.get('video_compression.bitrate_validation.segmentation_threshold_mb')
+                    },
+                    'hardware_acceleration': {
+                        'nvidia': self.config.get('video_compression.hardware_acceleration.nvidia'),
+                        'amd': self.config.get('video_compression.hardware_acceleration.amd'),
+                        'fallback': self.config.get('video_compression.hardware_acceleration.fallback')
+                    },
+                    'quality_settings': {
+                        'crf': self.config.get('video_compression.quality.crf'),
+                        'preset': self.config.get('video_compression.quality.preset'),
+                        'tune': self.config.get('video_compression.quality.tune')
+                    },
+                    'debug_logging': {
+                        'enabled': self.config.get('video_compression.debug_logging.enabled'),
+                        'performance_metrics': self.config.get('video_compression.debug_logging.performance_metrics'),
+                        'compression_decisions': self.config.get('video_compression.debug_logging.compression_decisions'),
+                        'fps_reduction_analysis': self.config.get('video_compression.debug_logging.fps_reduction_analysis'),
+                        'configuration_loading': self.config.get('video_compression.debug_logging.configuration_loading')
+                    },
+                    'codec_settings': {
+                        'allow_hevc': self.config.get('video_compression.codec.allow_hevc'),
+                        'allow_h264_high10': self.config.get('video_compression.codec.allow_h264_high10'),
+                        'priority': self.config.get('video_compression.codec.priority'),
+                        'min_bpp': self.config.get('video_compression.codec.min_bpp')
+                    }
+                }
+                
+                for section_name, section_config in config_sections.items():
+                    self._log_configuration_loading(section_name, section_config)
+                
+                # Log configuration validation status
+                logger.info("Configuration validation:")
+                config_issues = self.config.validate_configuration_values()
+                if config_issues:
+                    logger.info(f"  Found {len(config_issues)} validation issues")
+                    for issue in config_issues:
+                        logger.info(f"    - {issue}")
+                else:
+                    logger.info("  All configuration values valid")
+                
+                logger.info("=== END CONFIGURATION LOADING ===")
+            
+            # Validate configuration values
+            config_issues = self.config.validate_configuration_values()
+            if config_issues:
+                logger.warning("Configuration validation issues found:")
+                for issue in config_issues:
+                    logger.warning(f"  - {issue}")
+                
+                self._log_compression_decision(
+                    'config_validation_issues',
+                    f'Found {len(config_issues)} configuration validation issues',
+                    {'issues': config_issues},
+                    'Configuration validation detected potential problems'
+                )
+            
+            logger.info(f"Starting enhanced video compression: {input_path} -> {output_path}")
+            
+            # Get platform configuration
+            platform_config = {}
+            if platform:
+                platform_config = self.config.get_platform_config(platform, 'video_compression')
+                logger.info(f"Using platform configuration for: {platform}")
+                
+                self._log_compression_decision(
+                    'platform_config',
+                    f'Applied platform configuration for {platform}',
+                    {'platform': platform, 'platform_config': platform_config},
+                    f'Using platform-specific settings for {platform} optimization'
+                )
+            
+            # Update target size with platform config if available
+            target_size_mb = max_size_mb or platform_config.get('max_file_size_mb') or self.config.get('video_compression.max_file_size_mb', 10)
+            
+            if target_size_mb != session_info['target_size_mb']:
+                self._log_parameter_change('target_size_mb', session_info['target_size_mb'], target_size_mb,
+                                         'Updated target size based on platform configuration')
+                session_info['target_size_mb'] = target_size_mb
         
-        # Check if segmentation should be considered now or deferred to last resort
-        logger.info(f"Checking video segmentation: original size {original_size_mb:.1f}MB, target {target_size_mb}MB")
-        logger.info(f"Video info keys: {list(video_info.keys())}")
-        logger.info(f"Video info size_bytes: {video_info.get('size_bytes', 'NOT FOUND')}")
+            # Check cache for similar operations
+            @self.performance_enhancer.cached_operation(ttl_hours=6)
+            def cached_analysis(file_path, file_size, target_size):
+                return self._analyze_video_content(file_path)
+            
+            # Early-cancel before analysis if shutdown requested
+            if self.shutdown_requested:
+                self._end_compression_session(False, output_path, error="Shutdown requested")
+                return {'success': False, 'cancelled': True}
 
-        # If forced single-file, skip segmentation entirely
-        if force_single_file:
-            logger.info("Segmentation disabled via --no-segmentation flag, forcing single-file processing")
-            return self._compress_with_aggressive_single_file(
-                input_path, output_path, target_size_mb, platform_config, video_info
+            # Get comprehensive video analysis (cached), but handle graceful cancellation
+            file_size = os.path.getsize(input_path)
+            try:
+                with self._measure_operation_performance('video_analysis'):
+                    video_info = cached_analysis(input_path, file_size, target_size_mb)
+            except GracefulCancellation:
+                self._end_compression_session(False, output_path, error="Graceful cancellation")
+                return {'success': False, 'cancelled': True}
+            original_size_mb = file_size / (1024 * 1024)
+            
+            # Log video analysis results
+            self._log_compression_decision(
+                'video_analysis_complete',
+                f'Video analysis completed: {video_info["width"]}x{video_info["height"]}, {video_info["duration"]:.2f}s',
+                {
+                    'width': video_info.get('width'),
+                    'height': video_info.get('height'),
+                    'duration': video_info.get('duration'),
+                    'fps': video_info.get('fps'),
+                    'complexity_score': video_info.get('complexity_score'),
+                    'motion_level': video_info.get('motion_level'),
+                    'original_size_mb': original_size_mb
+                },
+                f'Analyzed video characteristics for compression planning'
             )
-
-        seg_last_resort = bool(self.config.get('video_compression.segmentation.only_if_single_file_unacceptable', False))
-        if not seg_last_resort:
-            if self.video_segmenter.should_segment_video(video_info['duration'], video_info, target_size_mb):
-                logger.info("Video will be segmented instead of compressed as single file")
-                return self._compress_with_segmentation(
-                    input_path, output_path, target_size_mb, platform_config, video_info, platform
-                )
-        
-        # If already under target size and no platform specified, just copy
-        if original_size_mb <= target_size_mb and not platform:
-            shutil.copy2(input_path, output_path)
-            logger.info("Video already meets size requirements, copied without compression")
-            return self._get_compression_results(input_path, output_path, video_info, "copy")
-        
-        # Choose optimization strategy based on file size and system resources
-        if use_advanced_optimization and (original_size_mb > 50 or target_size_mb < 5):
-            logger.info("Using advanced optimization for challenging compression requirements")
-            try:
-                adv_result = self._compress_with_advanced_optimization(
-                    input_path, output_path, target_size_mb, platform_config, video_info
-                )
-            except Exception:
-                adv_result = None
-            if adv_result and adv_result.get('success'):
-                return adv_result
-            # Fallback to standard pipeline or segmentation as last resort
-            try:
-                std_result = self._compress_with_standard_optimization(
-                    input_path, output_path, target_size_mb, platform_config, video_info
-                )
-                # Attempt refinement
+            
+            logger.info(f"Original video: {video_info['width']}x{video_info['height']}, "
+                       f"{video_info['duration']:.2f}s, {original_size_mb:.2f}MB, "
+                       f"complexity: {video_info['complexity_score']:.2f}")
+            
+            # Route to Discord 10MB CAE pipeline if target is exactly 10MB (or close)
+            # and no specific platform is set or platform is discord
+            use_cae = False
+            if 9.5 <= target_size_mb <= 10.5:
+                if platform is None or platform == 'discord':
+                    use_cae = True
+                    logger.info("Routing to Discord 10MB CAE pipeline")
+            
+            if use_cae:
                 try:
-                    refined_result = self._final_single_file_refinement(input_path, output_path, target_size_mb, video_info)
-                    if refined_result and refined_result.get('success'):
-                        return refined_result
-                except Exception:
-                    pass
-                return std_result
-            except Exception:
-                if seg_last_resort:
-                    logger.info("Standard/advanced pipelines failed; falling back to segmentation as last resort")
-                    return self._compress_with_segmentation(
+                    cae_result = self._compress_with_cae_discord_10mb(input_path, output_path, video_info)
+                    if cae_result.get('success'):
+                        final_size_mb = cae_result.get('compressed_size_mb') or cae_result.get('size_mb')
+                        self._end_compression_session(True, output_path, final_size_mb)
+                        return cae_result
+                    logger.warning("CAE pipeline failed, falling back to standard compression")
+                    
+                    # If segmentation is last resort and CAE failed, try segmentation immediately
+                    seg_last_resort = bool(self.config.get('video_compression.segmentation.only_if_single_file_unacceptable', False))
+                    if seg_last_resort and not force_single_file:
+                        logger.info("CAE pipeline failed; falling back to segmentation as last resort")
+                        result = self._compress_with_segmentation(
+                            input_path, output_path, target_size_mb, platform_config, video_info, platform
+                        )
+                        final_size_mb = result.get('compressed_size_mb') or result.get('size_mb')
+                        self._end_compression_session(result.get('success', False), output_path, final_size_mb)
+                        return result
+                except Exception as e:
+                    logger.error(f"CAE pipeline error: {e}, falling back to standard compression")
+                    # If segmentation is last resort and CAE threw exception, try segmentation immediately
+                    seg_last_resort = bool(self.config.get('video_compression.segmentation.only_if_single_file_unacceptable', False))
+                    if seg_last_resort and not force_single_file:
+                        logger.info("CAE pipeline error; falling back to segmentation as last resort")
+                        result = self._compress_with_segmentation(
+                            input_path, output_path, target_size_mb, platform_config, video_info, platform
+                        )
+                        final_size_mb = result.get('compressed_size_mb') or result.get('size_mb')
+                        self._end_compression_session(result.get('success', False), output_path, final_size_mb)
+                        return result
+            
+            # Check if segmentation should be considered now or deferred to last resort
+            logger.info(f"Checking video segmentation: original size {original_size_mb:.1f}MB, target {target_size_mb}MB")
+            logger.info(f"Video info keys: {list(video_info.keys())}")
+            logger.info(f"Video info size_bytes: {video_info.get('size_bytes', 'NOT FOUND')}")
+
+            # If forced single-file, skip segmentation entirely
+            if force_single_file:
+                logger.info("Segmentation disabled via --no-segmentation flag, forcing single-file processing")
+                result = self._compress_with_aggressive_single_file(
+                    input_path, output_path, target_size_mb, platform_config, video_info
+                )
+                final_size_mb = result.get('compressed_size_mb') or result.get('size_mb')
+                self._end_compression_session(result.get('success', False), output_path, final_size_mb)
+                return result
+
+            seg_last_resort = bool(self.config.get('video_compression.segmentation.only_if_single_file_unacceptable', False))
+            if not seg_last_resort:
+                if self.video_segmenter.should_segment_video(video_info['duration'], video_info, target_size_mb):
+                    logger.info("Video will be segmented instead of compressed as single file")
+                    result = self._compress_with_segmentation(
                         input_path, output_path, target_size_mb, platform_config, video_info, platform
                     )
-                raise
-        
-        
-        # Use adaptive quality processing for medium complexity files
-        elif original_size_mb > 20:
-            logger.info("Using adaptive quality processing for medium complexity file")
-            return self._compress_with_adaptive_quality(
-                input_path, output_path, target_size_mb, platform_config, video_info
-            )
-
-        # Use standard dynamic optimization for simpler cases
-        else:
-            try:
-                std_result = self._compress_with_standard_optimization(
+                    final_size_mb = result.get('compressed_size_mb') or result.get('size_mb')
+                    self._end_compression_session(result.get('success', False), output_path, final_size_mb)
+                    return result
+            
+            # If already under target size and no platform specified, just copy
+            if original_size_mb <= target_size_mb and not platform:
+                shutil.copy2(input_path, output_path)
+                logger.info("Video already meets size requirements, copied without compression")
+                result = self._get_compression_results(input_path, output_path, video_info, "copy")
+                self._end_compression_session(True, output_path, original_size_mb)
+                return result
+            
+            # Choose optimization strategy based on file size and system resources
+            if use_advanced_optimization and (original_size_mb > 50 or target_size_mb < 5):
+                logger.info("Using advanced optimization for challenging compression requirements")
+                try:
+                    adv_result = self._compress_with_advanced_optimization(
+                        input_path, output_path, target_size_mb, platform_config, video_info
+                    )
+                except Exception:
+                    adv_result = None
+                if adv_result and adv_result.get('success'):
+                    final_size_mb = adv_result.get('compressed_size_mb') or adv_result.get('size_mb')
+                    self._end_compression_session(True, output_path, final_size_mb)
+                    return adv_result
+                # Fallback to standard pipeline or segmentation as last resort
+                try:
+                    std_result = self._compress_with_standard_optimization(
+                        input_path, output_path, target_size_mb, platform_config, video_info
+                    )
+                    # Attempt refinement
+                    try:
+                        refined_result = self._final_single_file_refinement(input_path, output_path, target_size_mb, video_info)
+                        if refined_result and refined_result.get('success'):
+                            final_size_mb = refined_result.get('compressed_size_mb') or refined_result.get('size_mb')
+                            self._end_compression_session(True, output_path, final_size_mb)
+                            return refined_result
+                    except Exception:
+                        pass
+                    final_size_mb = std_result.get('compressed_size_mb') or std_result.get('size_mb')
+                    self._end_compression_session(std_result.get('success', False), output_path, final_size_mb)
+                    return std_result
+                except Exception:
+                    if seg_last_resort:
+                        logger.info("Standard/advanced pipelines failed; falling back to segmentation as last resort")
+                        result = self._compress_with_segmentation(
+                            input_path, output_path, target_size_mb, platform_config, video_info, platform
+                        )
+                        final_size_mb = result.get('compressed_size_mb') or result.get('size_mb')
+                        self._end_compression_session(result.get('success', False), output_path, final_size_mb)
+                        return result
+                    raise
+            
+            
+            # Use adaptive quality processing for medium complexity files
+            elif original_size_mb > 20:
+                logger.info("Using adaptive quality processing for medium complexity file")
+                result = self._compress_with_adaptive_quality(
                     input_path, output_path, target_size_mb, platform_config, video_info
                 )
-                # Attempt refinement
+                final_size_mb = result.get('compressed_size_mb') or result.get('size_mb')
+                self._end_compression_session(result.get('success', False), output_path, final_size_mb)
+                return result
+
+            # Use standard dynamic optimization for simpler cases
+            else:
                 try:
-                    refined_result = self._final_single_file_refinement(input_path, output_path, target_size_mb, video_info)
-                    if refined_result and refined_result.get('success'):
-                        return refined_result
-                except Exception:
-                    pass
-                return std_result
-            except Exception:
-                if seg_last_resort:
-                    logger.info("Standard pipeline failed; falling back to segmentation as last resort")
-                    return self._compress_with_segmentation(
-                        input_path, output_path, target_size_mb, platform_config, video_info, platform
+                    std_result = self._compress_with_standard_optimization(
+                        input_path, output_path, target_size_mb, platform_config, video_info
                     )
-                raise
+                    # Attempt refinement
+                    try:
+                        refined_result = self._final_single_file_refinement(input_path, output_path, target_size_mb, video_info)
+                        if refined_result and refined_result.get('success'):
+                            final_size_mb = refined_result.get('compressed_size_mb') or refined_result.get('size_mb')
+                            self._end_compression_session(True, output_path, final_size_mb)
+                            return refined_result
+                    except Exception:
+                        pass
+                    final_size_mb = std_result.get('compressed_size_mb') or std_result.get('size_mb')
+                    self._end_compression_session(std_result.get('success', False), output_path, final_size_mb)
+                    return std_result
+                except Exception:
+                    if seg_last_resort:
+                        logger.info("Standard pipeline failed; falling back to segmentation as last resort")
+                        result = self._compress_with_segmentation(
+                            input_path, output_path, target_size_mb, platform_config, video_info, platform
+                        )
+                        final_size_mb = result.get('compressed_size_mb') or result.get('size_mb')
+                        self._end_compression_session(result.get('success', False), output_path, final_size_mb)
+                        return result
+                    raise
+        
+        except Exception as e:
+            # Ensure session is always completed even on error
+            self._end_compression_session(False, output_path, error=str(e))
+            raise
     
     def _compress_with_advanced_optimization(self, input_path: str, output_path: str,
                                            target_size_mb: float, platform_config: Dict[str, Any],
@@ -2157,7 +2875,25 @@ class DynamicVideoCompressor:
         try:
             # Determine if we should use parallel execution
             # Use parallel for medium-high complexity videos
-            use_parallel = video_info.get('complexity_score', 5.0) >= 5.0 and self.hardware.has_hardware_acceleration()
+            complexity_score = video_info.get('complexity_score', 5.0)
+            has_hw_accel = self.hardware.has_hardware_acceleration()
+            use_parallel = complexity_score >= 5.0 and has_hw_accel
+            
+            if self.debug_logging_enabled:
+                logger.info(f"=== COMPRESSION STRATEGY SELECTION ===")
+                logger.info(f"Strategy selection factors:")
+                logger.info(f"  Complexity score: {complexity_score:.2f}")
+                logger.info(f"  Hardware acceleration available: {has_hw_accel}")
+                logger.info(f"  Parallel execution threshold: 5.0")
+                logger.info(f"  Use parallel execution: {use_parallel}")
+                
+                if use_parallel:
+                    logger.info(f"Parallel execution selected: high complexity video with hardware acceleration")
+                else:
+                    if complexity_score < 5.0:
+                        logger.info(f"Sequential execution selected: complexity score {complexity_score:.2f} below threshold")
+                    if not has_hw_accel:
+                        logger.info(f"Sequential execution selected: no hardware acceleration available")
             
             if use_parallel:
                 logger.info("Using parallel strategy execution for better performance")
@@ -2195,10 +2931,29 @@ class DynamicVideoCompressor:
                 # Sequential execution (original behavior)
                 # Strategy 1: Content-aware optimal compression
                 logger.info("Attempting Strategy 1: Content-aware optimal compression")
-                strategy1_result = self._compress_with_content_awareness(
-                    input_path, video_info, platform_config, target_size_mb
-                )
+                
+                if self.debug_logging_enabled:
+                    self._log_compression_decision(
+                        'strategy_selection',
+                        'Strategy 1: Content-aware optimal compression',
+                        {
+                            'strategy_name': 'content_aware',
+                            'reasoning': 'First attempt using content-aware analysis for optimal parameters',
+                            'complexity_score': complexity_score,
+                            'target_size_mb': target_size_mb
+                        },
+                        'Content-aware compression analyzes video characteristics to select optimal encoding parameters'
+                    )
+                
+                with self._measure_operation_performance('strategy_1_content_aware'):
+                    strategy1_result = self._compress_with_content_awareness(
+                        input_path, video_info, platform_config, target_size_mb
+                    )
+                
                 if strategy1_result:
+                    if self.debug_logging_enabled:
+                        logger.info(f"Strategy 1 initial result: {strategy1_result['size_mb']:.2f}MB")
+                    
                     # Refine if under-utilizing target
                     strategy1_result = self._refine_strategy_result(strategy1_result, input_path, video_info, target_size_mb)
                     # Validate quality and attempt uplift if needed
@@ -2208,14 +2963,78 @@ class DynamicVideoCompressor:
                         if strategy1_result['size_mb'] <= target_size_mb:
                             best_result = strategy1_result
                             logger.info(f"Strategy 1 successful: {strategy1_result['size_mb']:.2f}MB")
+                            
+                            if self.debug_logging_enabled:
+                                self._log_compression_decision(
+                                    'strategy_success',
+                                    'Strategy 1 succeeded within target size',
+                                    {
+                                        'final_size_mb': strategy1_result['size_mb'],
+                                        'target_size_mb': target_size_mb,
+                                        'utilization': (strategy1_result['size_mb'] / target_size_mb) * 100,
+                                        'quality_score': strategy1_result.get('quality_score', 'unknown')
+                                    },
+                                    'Content-aware compression achieved target size with acceptable quality'
+                                )
+                        else:
+                            if self.debug_logging_enabled:
+                                self._log_compression_decision(
+                                    'strategy_partial_success',
+                                    'Strategy 1 completed but exceeded target size',
+                                    {
+                                        'actual_size_mb': strategy1_result['size_mb'],
+                                        'target_size_mb': target_size_mb,
+                                        'overage_mb': strategy1_result['size_mb'] - target_size_mb,
+                                        'overage_percent': ((strategy1_result['size_mb'] / target_size_mb) - 1) * 100
+                                    },
+                                    'Content-aware compression completed but requires additional optimization'
+                                )
+                else:
+                    if self.debug_logging_enabled:
+                        self._log_compression_decision(
+                            'strategy_failure',
+                            'Strategy 1 failed to produce valid result',
+                            {'strategy_name': 'content_aware'},
+                            'Content-aware compression failed, will try alternative strategies'
+                        )
                 
                 # Strategy 2: Two-pass encoding if Strategy 1 didn't work perfectly
-                if not best_result or (strategy1_result and strategy1_result.get('size_mb', 0) > target_size_mb * 0.95):
+                strategy1_size = strategy1_result.get('size_mb', 0) if strategy1_result else 0
+                target_threshold = target_size_mb * 0.95
+                should_try_strategy2 = not best_result or strategy1_size > target_threshold
+                
+                if should_try_strategy2:
                     logger.info("Attempting Strategy 2: Two-pass precision encoding")
-                    strategy2_result = self._compress_with_two_pass(
-                        input_path, video_info, platform_config, target_size_mb, best_result
-                    )
+                    
+                    if self.debug_logging_enabled:
+                        strategy2_reasoning = []
+                        if not best_result:
+                            strategy2_reasoning.append("No successful result from Strategy 1")
+                        if strategy1_size > target_threshold:
+                            strategy2_reasoning.append(f"Strategy 1 result ({strategy1_size:.2f}MB) exceeds 95% threshold ({target_threshold:.2f}MB)")
+                        
+                        self._log_compression_decision(
+                            'strategy_selection',
+                            'Strategy 2: Two-pass precision encoding',
+                            {
+                                'strategy_name': 'two_pass',
+                                'reasoning': '; '.join(strategy2_reasoning),
+                                'strategy1_size_mb': strategy1_size,
+                                'target_threshold_mb': target_threshold,
+                                'has_previous_result': best_result is not None
+                            },
+                            'Two-pass encoding provides more precise bitrate control for better size targeting'
+                        )
+                    
+                    with self._measure_operation_performance('strategy_2_two_pass'):
+                        strategy2_result = self._compress_with_two_pass(
+                            input_path, video_info, platform_config, target_size_mb, best_result
+                        )
+                    
                     if strategy2_result:
+                        if self.debug_logging_enabled:
+                            logger.info(f"Strategy 2 initial result: {strategy2_result['size_mb']:.2f}MB")
+                        
                         # Refine if under-utilizing target
                         strategy2_result = self._refine_strategy_result(strategy2_result, input_path, video_info, target_size_mb)
                         # Validate quality and attempt uplift if needed
@@ -2223,9 +3042,57 @@ class DynamicVideoCompressor:
                         if strategy2_result:  # Only process validated results
                             compression_attempts.append(strategy2_result)
                             if strategy2_result['size_mb'] <= target_size_mb:
-                                if not best_result or strategy2_result['quality_score'] > best_result.get('quality_score', 0):
+                                strategy2_quality = strategy2_result.get('quality_score', 0)
+                                best_quality = best_result.get('quality_score', 0) if best_result else 0
+                                
+                                if not best_result or strategy2_quality > best_quality:
                                     best_result = strategy2_result
                                     logger.info(f"Strategy 2 improved result: {strategy2_result['size_mb']:.2f}MB")
+                                    
+                                    if self.debug_logging_enabled:
+                                        self._log_compression_decision(
+                                            'strategy_improvement',
+                                            'Strategy 2 improved upon previous result',
+                                            {
+                                                'new_size_mb': strategy2_result['size_mb'],
+                                                'new_quality_score': strategy2_quality,
+                                                'previous_quality_score': best_quality,
+                                                'quality_improvement': strategy2_quality - best_quality
+                                            },
+                                            'Two-pass encoding achieved better quality while meeting size constraints'
+                                        )
+                                else:
+                                    if self.debug_logging_enabled:
+                                        self._log_compression_decision(
+                                            'strategy_no_improvement',
+                                            'Strategy 2 met size target but did not improve quality',
+                                            {
+                                                'strategy2_size_mb': strategy2_result['size_mb'],
+                                                'strategy2_quality': strategy2_quality,
+                                                'best_quality': best_quality
+                                            },
+                                            'Two-pass result acceptable but previous result had better quality'
+                                        )
+                            else:
+                                if self.debug_logging_enabled:
+                                    self._log_compression_decision(
+                                        'strategy_failure',
+                                        'Strategy 2 exceeded target size',
+                                        {
+                                            'actual_size_mb': strategy2_result['size_mb'],
+                                            'target_size_mb': target_size_mb,
+                                            'overage_mb': strategy2_result['size_mb'] - target_size_mb
+                                        },
+                                        'Two-pass encoding could not achieve target size'
+                                    )
+                    else:
+                        if self.debug_logging_enabled:
+                            self._log_compression_decision(
+                                'strategy_failure',
+                                'Strategy 2 failed to produce valid result',
+                                {'strategy_name': 'two_pass'},
+                                'Two-pass encoding failed, will try alternative strategies'
+                            )
             
             # Strategy 3: Adaptive resolution and quality optimization
             if not best_result:
@@ -2258,6 +3125,48 @@ class DynamicVideoCompressor:
                         if strategy4_result['size_mb'] <= target_size_mb:
                             best_result = strategy4_result
                             logger.info(f"Strategy 4 successful: {strategy4_result['size_mb']:.2f}MB")
+            
+            # Strategy 5: Try alternative strategies if no good result yet
+            if not best_result or best_result.get('size_mb', 0) > target_size_mb:
+                logger.info("Attempting Strategy 5: Alternative compression strategies")
+                
+                if self.debug_logging_enabled:
+                    self._log_compression_decision(
+                        'strategy_selection',
+                        'Strategy 5: Alternative compression strategies',
+                        {
+                            'strategy_name': 'alternative_strategies',
+                            'reasoning': 'Previous strategies failed to meet target size, trying alternatives to FPS reduction',
+                            'has_previous_result': best_result is not None,
+                            'previous_size_mb': best_result.get('size_mb', 0) if best_result else 0
+                        },
+                        'Alternative strategies avoid aggressive FPS reduction by using resolution/quality adjustments'
+                    )
+                
+                with self._measure_operation_performance('strategy_5_alternatives'):
+                    alternative_result = self._try_alternative_strategies_when_fps_insufficient(
+                        input_path, output_path, video_info, target_size_mb, best_result
+                    )
+                
+                if alternative_result and alternative_result.get('success'):
+                    if alternative_result.get('size_mb', 0) <= target_size_mb:
+                        best_result = alternative_result
+                        logger.info(f"Alternative strategy successful: {alternative_result['size_mb']:.2f}MB")
+                        
+                        if self.debug_logging_enabled:
+                            self._log_compression_decision(
+                                'strategy_success',
+                                'Alternative strategy succeeded',
+                                {
+                                    'strategy_used': alternative_result.get('strategy', 'unknown'),
+                                    'final_size_mb': alternative_result['size_mb'],
+                                    'target_size_mb': target_size_mb,
+                                    'alternative_strategy_used': True
+                                },
+                                'Alternative compression strategy achieved target size while preserving motion quality'
+                            )
+                    else:
+                        logger.info(f"Alternative strategy completed but exceeded target: {alternative_result['size_mb']:.2f}MB")
             
             if not best_result:
                 # Check if segmentation fallback is enabled
@@ -2457,12 +3366,14 @@ class DynamicVideoCompressor:
     
     def _compress_with_content_awareness(self, input_path: str, video_info: Dict[str, Any], 
                                        platform_config: Dict[str, Any], target_size_mb: float) -> Optional[Dict[str, Any]]:
-        """Content-aware compression strategy"""
+        """Content-aware compression strategy using smart compression strategy"""
         try:
             temp_output = os.path.join(self.temp_dir, "content_aware_output.mp4")
             
-            # Calculate optimal parameters based on content analysis
-            params = self._calculate_intelligent_params(video_info, platform_config, target_size_mb)
+            # Use smart compression strategy to calculate optimal parameters
+            params = self._calculate_compression_params_with_smart_strategy(
+                video_info, platform_config, target_size_mb, CompressionStrategy.BALANCED
+            )
             
             # Validate parameters before encoding
             if not self._validate_encoding_parameters(
@@ -2485,7 +3396,7 @@ class DynamicVideoCompressor:
                 return {
                     'temp_file': temp_output,
                     'size_mb': size_mb,
-                    'strategy': 'content_aware',
+                    'strategy': 'content_aware_smart',
                     'quality_score': quality_score,
                     'params': params
                 }
@@ -3949,16 +4860,76 @@ class DynamicVideoCompressor:
     def _execute_ffmpeg_with_progress(self, cmd: List[str], duration: float):
         """Execute FFmpeg command with progress bar and hardware fallback"""
         
+        if self.debug_logging_enabled:
+            logger.info("=== FFMPEG EXECUTION ===")
+            logger.info(f"Command length: {len(cmd)} arguments")
+            logger.info(f"Expected duration: {duration:.2f}s")
+            
+            # Log command with sensitive information masked
+            masked_cmd = []
+            for arg in cmd:
+                if any(sensitive in arg.lower() for sensitive in ['password', 'key', 'token']):
+                    masked_cmd.append('[MASKED]')
+                else:
+                    masked_cmd.append(arg)
+            logger.info(f"FFmpeg command: {' '.join(masked_cmd)}")
+            
+            # Log encoder and acceleration info
+            encoder_info = self._extract_encoder_info_from_cmd(cmd)
+            if encoder_info:
+                logger.info(f"Encoder: {encoder_info.get('encoder', 'unknown')}")
+                logger.info(f"Acceleration: {encoder_info.get('acceleration', 'software')}")
+                logger.info(f"Preset: {encoder_info.get('preset', 'default')}")
+        
+        execution_start_time = time.time()
+        
         logger.debug("Starting FFmpeg compression...")
         logger.debug(f"FFmpeg command: {' '.join(cmd)}")
         
         # Try original command first
         try:
-            self._execute_ffmpeg_command(cmd, duration)
+            with self._measure_operation_performance('ffmpeg_execution'):
+                self._execute_ffmpeg_command(cmd, duration)
+            
+            execution_time = time.time() - execution_start_time
             logger.info("FFmpeg compression completed")
+            
+            if self.debug_logging_enabled:
+                logger.info(f"Execution time: {execution_time:.2f}s")
+                if duration > 0:
+                    speed_ratio = duration / execution_time
+                    logger.info(f"Processing speed: {speed_ratio:.2f}x realtime")
+                    
+                    if speed_ratio < 0.5:
+                        logger.info("Note: Processing slower than 0.5x realtime, consider hardware acceleration")
+                    elif speed_ratio > 2.0:
+                        logger.info("Note: Excellent processing speed, hardware acceleration working well")
+                
+                logger.info("=== END FFMPEG EXECUTION ===")
+        
         except subprocess.CalledProcessError as e:
             # Check if it's a hardware acceleration error
             error_output = str(e.stderr) if e.stderr else str(e)
+            execution_time = time.time() - execution_start_time
+            
+            if self.debug_logging_enabled:
+                logger.error("=== FFMPEG EXECUTION FAILED ===")
+                logger.error(f"Execution time before failure: {execution_time:.2f}s")
+                logger.error(f"Return code: {getattr(e, 'returncode', 'unknown')}")
+                logger.error(f"Error output (first 500 chars): {error_output[:500]}")
+                
+                # Log error classification
+                if "No such file or directory" in error_output:
+                    logger.error("Error type: File not found")
+                elif "Permission denied" in error_output:
+                    logger.error("Error type: Permission denied")
+                elif "Invalid data found" in error_output:
+                    logger.error("Error type: Invalid input data")
+                elif "Conversion failed" in error_output:
+                    logger.error("Error type: Conversion failure")
+                else:
+                    logger.error("Error type: Unknown")
+            
             logger.error(f"FFmpeg command failed with error: {error_output[:500]}...")  # Limit error output length
             
             # Use consolidated hardware error detection
@@ -3968,19 +4939,69 @@ class DynamicVideoCompressor:
             if is_hardware_error:
                 logger.warning(f"{encoder_type} hardware acceleration failed, trying software fallback...")
                 
+                if self.debug_logging_enabled:
+                    self._log_compression_decision(
+                        'hardware_fallback',
+                        f'{encoder_type} hardware acceleration failed',
+                        {
+                            'original_encoder': encoder_type,
+                            'error_snippet': error_output[:200],
+                            'return_code': return_code
+                        },
+                        'Hardware acceleration error detected, falling back to software encoding'
+                    )
+                
                 # Replace hardware encoder with software encoder
                 fallback_cmd = self._create_software_fallback_command(cmd)
                 if fallback_cmd:
                     logger.debug(f"Fallback command: {' '.join(fallback_cmd)}")
                     try:
-                        self._execute_ffmpeg_command(fallback_cmd, duration)
+                        with self._measure_operation_performance('ffmpeg_fallback_execution'):
+                            self._execute_ffmpeg_command(fallback_cmd, duration)
+                        
+                        fallback_time = time.time() - execution_start_time
                         logger.info("FFmpeg compression completed with software fallback")
+                        
+                        if self.debug_logging_enabled:
+                            logger.info(f"Fallback execution time: {fallback_time:.2f}s")
+                            self._log_compression_decision(
+                                'hardware_fallback_success',
+                                'Software fallback succeeded',
+                                {
+                                    'fallback_time': fallback_time,
+                                    'total_time_with_retry': fallback_time
+                                },
+                                'Software encoding successfully completed after hardware failure'
+                            )
                         return
                     except subprocess.CalledProcessError as fallback_error:
-                        logger.error(f"Software fallback also failed: {str(fallback_error)[:200]}...")
+                        fallback_error_output = str(fallback_error.stderr) if fallback_error.stderr else str(fallback_error)
+                        logger.error(f"Software fallback also failed: {fallback_error_output[:200]}...")
+                        
+                        if self.debug_logging_enabled:
+                            self._log_compression_decision(
+                                'hardware_fallback_failed',
+                                'Software fallback also failed',
+                                {
+                                    'fallback_error': fallback_error_output[:200],
+                                    'fallback_return_code': getattr(fallback_error, 'returncode', 'unknown')
+                                },
+                                'Both hardware and software encoding failed'
+                            )
                         pass  # Fall through to original error
                 else:
                     logger.error("Failed to create software fallback command")
+                    
+                    if self.debug_logging_enabled:
+                        self._log_compression_decision(
+                            'fallback_creation_failed',
+                            'Could not create software fallback command',
+                            {'original_cmd_length': len(cmd)},
+                            'Unable to generate software fallback from hardware command'
+                        )
+            
+            if self.debug_logging_enabled:
+                logger.error("=== END FFMPEG EXECUTION FAILED ===")
             
             # Re-raise original error if fallback didn't work or wasn't attempted
             raise e
@@ -4285,6 +5306,484 @@ class DynamicVideoCompressor:
             params.update(self._apply_platform_constraints(params, platform_config))
         
         return params
+    
+    def _calculate_compression_params_with_smart_strategy(self, video_info: Dict[str, Any],
+                                                        platform_config: Dict[str, Any],
+                                                        target_size_mb: float,
+                                                        strategy: CompressionStrategy = CompressionStrategy.BALANCED) -> Dict[str, Any]:
+        """
+        Calculate compression parameters using smart strategy with FPS constraint validation
+        and alternative strategies when needed.
+        """
+        self.logger.info("=== SMART COMPRESSION PARAMETER CALCULATION ===")
+        
+        # Use smart compression strategy to select parameters
+        compression_params = self.compression_strategy.select_compression_parameters(
+            video_info, target_size_mb, strategy
+        )
+        
+        # Validate parameters against constraints
+        constraints = self.compression_strategy.get_compression_constraints()
+        validation_issues = self.compression_strategy.validate_compression_parameters(
+            compression_params, constraints
+        )
+        
+        if validation_issues:
+            self.logger.warning("Compression parameter validation issues:")
+            for issue in validation_issues:
+                self.logger.warning(f"  - {issue}")
+        
+        # Assess FPS reduction impact
+        impact = self.compression_strategy.assess_fps_reduction_impact(
+            video_info.get('fps', 30.0), compression_params.target_fps, constraints
+        )
+        
+        # Log FPS reduction justification with smart strategy analysis
+        strategy_analysis = {
+            'fps_impact': {
+                'impact_level': impact.impact_level.value,
+                'impact_score': impact.reduction_percent,
+                'recommendation': impact.recommendation
+            },
+            'prefer_bitrate_reduction': constraints.prefer_quality_over_fps,
+            'strategy_reason': compression_params.strategy_reason,
+            'alternatives_considered': []
+        }
+        
+        # If FPS reduction is significant, consider alternative strategies
+        if impact.impact_level in [impact.impact_level.SIGNIFICANT, impact.impact_level.SEVERE]:
+            alternatives = self.compression_strategy.get_alternative_strategies(
+                video_info, target_size_mb, compression_params
+            )
+            
+            strategy_analysis['alternatives_considered'] = [
+                {
+                    'strategy': alt.strategy_type,
+                    'reason': alt.description
+                }
+                for alt in alternatives
+            ]
+            
+            # Notify user about aggressive compression
+            if alternatives:
+                self.compression_strategy.notify_aggressive_compression_required(
+                    video_info, target_size_mb, alternatives
+                )
+        
+        # Log detailed FPS reduction justification
+        self._log_fps_reduction_justification(
+            video_info.get('fps', 30.0),
+            compression_params.target_fps,
+            video_info,
+            strategy_analysis
+        )
+        
+        # Get best encoder
+        encoder, accel_type = self.hardware.get_best_encoder("h264")
+        
+        # Build final parameters
+        params = {
+            'encoder': encoder,
+            'acceleration_type': accel_type,
+            'width': compression_params.resolution[0],
+            'height': compression_params.resolution[1],
+            'fps': compression_params.target_fps,
+            'bitrate': compression_params.target_bitrate,
+            'quality_factor': compression_params.quality_factor,
+            'fps_reduction_applied': compression_params.fps_reduction_applied,
+            'alternative_strategy_used': compression_params.alternative_strategy_used,
+            'strategy_reason': compression_params.strategy_reason
+        }
+        
+        # Apply quality-specific settings based on quality factor
+        if accel_type == 'software':
+            # Adjust CRF based on quality factor (lower factor = higher CRF = lower quality)
+            base_crf = 23
+            crf_adjustment = int((1.0 - compression_params.quality_factor) * 10)
+            params['crf'] = min(max(base_crf + crf_adjustment, 18), 35)
+            
+            # Adjust preset based on strategy
+            if strategy == CompressionStrategy.QUALITY_FIRST:
+                params['preset'] = 'slower'
+            elif strategy == CompressionStrategy.SIZE_FIRST:
+                params['preset'] = 'fast'
+            else:
+                params['preset'] = 'medium'
+        
+        # Platform-specific adjustments
+        if platform_config:
+            params.update(self._apply_platform_constraints(params, platform_config))
+        
+        # Log final parameters
+        self.logger.info(f"Final compression parameters:")
+        self.logger.info(f"  Resolution: {params['width']}x{params['height']}")
+        self.logger.info(f"  FPS: {params['fps']:.1f}")
+        self.logger.info(f"  Bitrate: {params['bitrate']}kbps")
+        self.logger.info(f"  Quality factor: {params['quality_factor']:.2f}")
+        if 'crf' in params:
+            self.logger.info(f"  CRF: {params['crf']}")
+        if 'preset' in params:
+            self.logger.info(f"  Preset: {params['preset']}")
+        self.logger.info(f"  Encoder: {params['encoder']} ({params['acceleration_type']})")
+        
+        return params
+    
+    def _apply_alternative_compression_strategy(self, input_path: str, output_path: str,
+                                              video_info: Dict[str, Any], target_size_mb: float,
+                                              alternative_strategy) -> Optional[Dict[str, Any]]:
+        """
+        Apply an alternative compression strategy when FPS reduction is insufficient
+        """
+        from .compression_strategy import AlternativeStrategy
+        
+        self.logger.info(f"=== APPLYING ALTERNATIVE STRATEGY: {alternative_strategy.strategy_type} ===")
+        self.logger.info(f"Description: {alternative_strategy.description}")
+        self.logger.info(f"Expected impact: {alternative_strategy.expected_impact}")
+        
+        try:
+            if alternative_strategy.strategy_type == "resolution_reduction":
+                return self._apply_resolution_reduction_strategy(
+                    input_path, output_path, video_info, target_size_mb, alternative_strategy
+                )
+            elif alternative_strategy.strategy_type == "quality_adjustment":
+                return self._apply_quality_adjustment_strategy(
+                    input_path, output_path, video_info, target_size_mb, alternative_strategy
+                )
+            elif alternative_strategy.strategy_type == "bitrate_optimization":
+                return self._apply_bitrate_optimization_strategy(
+                    input_path, output_path, video_info, target_size_mb, alternative_strategy
+                )
+            elif alternative_strategy.strategy_type == "segmentation":
+                return self._apply_segmentation_strategy(
+                    input_path, output_path, video_info, target_size_mb, alternative_strategy
+                )
+            else:
+                self.logger.warning(f"Unknown alternative strategy type: {alternative_strategy.strategy_type}")
+                return None
+                
+        except Exception as e:
+            self.logger.error(f"Alternative strategy {alternative_strategy.strategy_type} failed: {e}")
+            return None
+    
+    def _apply_resolution_reduction_strategy(self, input_path: str, output_path: str,
+                                           video_info: Dict[str, Any], target_size_mb: float,
+                                           strategy) -> Optional[Dict[str, Any]]:
+        """Apply resolution reduction as alternative to FPS reduction"""
+        try:
+            temp_output = os.path.join(self.temp_dir, "resolution_reduced_output.mp4")
+            
+            # Get parameters from strategy
+            new_width = strategy.parameters['width']
+            new_height = strategy.parameters['height']
+            fps = strategy.parameters['fps']  # Restored original FPS
+            
+            # Calculate bitrate for new resolution
+            duration = video_info.get('duration', 0)
+            audio_bitrate = 96
+            total_bits = target_size_mb * 8 * 1024 * 1024
+            video_bits = total_bits - (audio_bitrate * 1000 * duration)
+            video_bitrate = max(int(video_bits / duration / 1000), 64)
+            
+            # Get best encoder
+            encoder, accel_type = self.hardware.get_best_encoder("h264")
+            
+            # Build parameters
+            params = {
+                'encoder': encoder,
+                'acceleration_type': accel_type,
+                'width': new_width,
+                'height': new_height,
+                'fps': fps,
+                'bitrate': video_bitrate,
+                'audio_bitrate': audio_bitrate
+            }
+            
+            # Apply quality settings
+            if accel_type == 'software':
+                params['crf'] = 23  # Standard quality
+                params['preset'] = 'medium'
+            
+            self.logger.info(f"Resolution reduction: {video_info['width']}x{video_info['height']} → {new_width}x{new_height}")
+            self.logger.info(f"FPS preserved: {fps:.1f} (original: {video_info.get('fps', 30):.1f})")
+            self.logger.info(f"Bitrate: {video_bitrate}kbps video + {audio_bitrate}kbps audio")
+            
+            # Build and execute FFmpeg command
+            ffmpeg_cmd = self._build_intelligent_ffmpeg_command(input_path, temp_output, params)
+            success = self._execute_ffmpeg_with_progress(ffmpeg_cmd, video_info['duration'])
+            
+            if success and os.path.exists(temp_output):
+                # Move to final output
+                if os.path.exists(output_path):
+                    os.remove(output_path)
+                shutil.move(temp_output, output_path)
+                
+                size_mb = os.path.getsize(output_path) / (1024 * 1024)
+                
+                self.logger.info(f"Resolution reduction successful: {size_mb:.2f}MB")
+                
+                return {
+                    'success': True,
+                    'size_mb': size_mb,
+                    'strategy': 'resolution_reduction',
+                    'alternative_strategy_used': True,
+                    'params': params,
+                    'quality_score': 7.5  # Estimate - resolution reduction typically maintains good quality
+                }
+            else:
+                self.logger.warning("Resolution reduction strategy failed")
+                return None
+                
+        except Exception as e:
+            self.logger.error(f"Resolution reduction strategy failed: {e}")
+            return None
+    
+    def _apply_quality_adjustment_strategy(self, input_path: str, output_path: str,
+                                         video_info: Dict[str, Any], target_size_mb: float,
+                                         strategy) -> Optional[Dict[str, Any]]:
+        """Apply quality parameter adjustment as alternative to FPS reduction"""
+        try:
+            temp_output = os.path.join(self.temp_dir, "quality_adjusted_output.mp4")
+            
+            # Get parameters from strategy
+            crf = strategy.parameters['crf']
+            preset = strategy.parameters['preset']
+            fps = strategy.parameters['fps']  # Restored original FPS
+            
+            # Calculate bitrate
+            duration = video_info.get('duration', 0)
+            audio_bitrate = 96
+            total_bits = target_size_mb * 8 * 1024 * 1024
+            video_bits = total_bits - (audio_bitrate * 1000 * duration)
+            video_bitrate = max(int(video_bits / duration / 1000), 64)
+            
+            # Get best encoder
+            encoder, accel_type = self.hardware.get_best_encoder("h264")
+            
+            # Build parameters
+            params = {
+                'encoder': encoder,
+                'acceleration_type': accel_type,
+                'width': video_info['width'],
+                'height': video_info['height'],
+                'fps': fps,
+                'bitrate': video_bitrate,
+                'audio_bitrate': audio_bitrate
+            }
+            
+            # Apply quality settings
+            if accel_type == 'software':
+                params['crf'] = crf
+                params['preset'] = preset
+            
+            self.logger.info(f"Quality adjustment: CRF={crf}, preset={preset}")
+            self.logger.info(f"FPS preserved: {fps:.1f} (original: {video_info.get('fps', 30):.1f})")
+            self.logger.info(f"Bitrate: {video_bitrate}kbps video + {audio_bitrate}kbps audio")
+            
+            # Build and execute FFmpeg command
+            ffmpeg_cmd = self._build_intelligent_ffmpeg_command(input_path, temp_output, params)
+            success = self._execute_ffmpeg_with_progress(ffmpeg_cmd, video_info['duration'])
+            
+            if success and os.path.exists(temp_output):
+                # Move to final output
+                if os.path.exists(output_path):
+                    os.remove(output_path)
+                shutil.move(temp_output, output_path)
+                
+                size_mb = os.path.getsize(output_path) / (1024 * 1024)
+                
+                self.logger.info(f"Quality adjustment successful: {size_mb:.2f}MB")
+                
+                return {
+                    'success': True,
+                    'size_mb': size_mb,
+                    'strategy': 'quality_adjustment',
+                    'alternative_strategy_used': True,
+                    'params': params,
+                    'quality_score': 7.0  # Estimate - quality adjustment may reduce quality slightly
+                }
+            else:
+                self.logger.warning("Quality adjustment strategy failed")
+                return None
+                
+        except Exception as e:
+            self.logger.error(f"Quality adjustment strategy failed: {e}")
+            return None
+    
+    def _apply_bitrate_optimization_strategy(self, input_path: str, output_path: str,
+                                           video_info: Dict[str, Any], target_size_mb: float,
+                                           strategy) -> Optional[Dict[str, Any]]:
+        """Apply bitrate optimization as alternative to FPS reduction"""
+        try:
+            temp_output = os.path.join(self.temp_dir, "bitrate_optimized_output.mp4")
+            
+            # Get parameters from strategy
+            video_bitrate = strategy.parameters['video_bitrate']
+            audio_bitrate = strategy.parameters['audio_bitrate']
+            fps = strategy.parameters['fps']  # Restored original FPS
+            
+            # Get best encoder
+            encoder, accel_type = self.hardware.get_best_encoder("h264")
+            
+            # Build parameters
+            params = {
+                'encoder': encoder,
+                'acceleration_type': accel_type,
+                'width': video_info['width'],
+                'height': video_info['height'],
+                'fps': fps,
+                'bitrate': video_bitrate,
+                'audio_bitrate': audio_bitrate
+            }
+            
+            # Apply quality settings
+            if accel_type == 'software':
+                params['crf'] = 25  # Slightly higher CRF for better compression
+                params['preset'] = 'slower'  # Slower preset for better efficiency
+            
+            self.logger.info(f"Bitrate optimization: {video_bitrate}kbps video + {audio_bitrate}kbps audio")
+            self.logger.info(f"FPS preserved: {fps:.1f} (original: {video_info.get('fps', 30):.1f})")
+            
+            # Build and execute FFmpeg command
+            ffmpeg_cmd = self._build_intelligent_ffmpeg_command(input_path, temp_output, params)
+            success = self._execute_ffmpeg_with_progress(ffmpeg_cmd, video_info['duration'])
+            
+            if success and os.path.exists(temp_output):
+                # Move to final output
+                if os.path.exists(output_path):
+                    os.remove(output_path)
+                shutil.move(temp_output, output_path)
+                
+                size_mb = os.path.getsize(output_path) / (1024 * 1024)
+                
+                self.logger.info(f"Bitrate optimization successful: {size_mb:.2f}MB")
+                
+                return {
+                    'success': True,
+                    'size_mb': size_mb,
+                    'strategy': 'bitrate_optimization',
+                    'alternative_strategy_used': True,
+                    'params': params,
+                    'quality_score': 7.2  # Estimate - bitrate optimization usually maintains good quality
+                }
+            else:
+                self.logger.warning("Bitrate optimization strategy failed")
+                return None
+                
+        except Exception as e:
+            self.logger.error(f"Bitrate optimization strategy failed: {e}")
+            return None
+    
+    def _apply_segmentation_strategy(self, input_path: str, output_path: str,
+                                   video_info: Dict[str, Any], target_size_mb: float,
+                                   strategy) -> Optional[Dict[str, Any]]:
+        """Apply video segmentation as alternative to aggressive compression"""
+        try:
+            # Get parameters from strategy
+            num_segments = strategy.parameters['num_segments']
+            segment_duration = strategy.parameters['segment_duration']
+            fps = strategy.parameters['fps']  # Restored original FPS
+            
+            self.logger.info(f"Segmentation strategy: {num_segments} segments of ~{segment_duration}s each")
+            self.logger.info(f"FPS preserved: {fps:.1f} (original: {video_info.get('fps', 30):.1f})")
+            
+            # Use the video segmenter
+            platform_config = {}  # Use default platform config for segmentation
+            result = self._compress_with_segmentation(
+                input_path, output_path, target_size_mb, platform_config, video_info
+            )
+            
+            if result and result.get('success'):
+                result['alternative_strategy_used'] = True
+                result['strategy'] = 'segmentation'
+                self.logger.info(f"Segmentation strategy successful")
+                return result
+            else:
+                self.logger.warning("Segmentation strategy failed")
+                return None
+                
+        except Exception as e:
+            self.logger.error(f"Segmentation strategy failed: {e}")
+            return None
+    
+    def _try_alternative_strategies_when_fps_insufficient(self, input_path: str, output_path: str,
+                                                        video_info: Dict[str, Any], target_size_mb: float,
+                                                        current_result: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """
+        Try alternative compression strategies when FPS reduction alone is insufficient
+        """
+        self.logger.info("=== TRYING ALTERNATIVE STRATEGIES ===")
+        
+        # Create compression parameters for analysis
+        from .compression_strategy import CompressionParams
+        
+        if current_result:
+            # Analyze current result to determine if alternatives are needed
+            current_size = current_result.get('size_mb', 0)
+            if current_size <= target_size_mb:
+                self.logger.info("Current result meets target size, no alternatives needed")
+                return current_result
+        
+        # Get alternative strategies from smart compression strategy
+        # Create a mock compression params for analysis
+        mock_params = CompressionParams(
+            target_fps=video_info.get('fps', 30.0),
+            target_bitrate=1000,  # Mock bitrate
+            resolution=(video_info.get('width', 1920), video_info.get('height', 1080)),
+            quality_factor=0.8,
+            fps_reduction_applied=True  # Assume FPS reduction was attempted
+        )
+        
+        alternatives = self.compression_strategy.get_alternative_strategies(
+            video_info, target_size_mb, mock_params
+        )
+        
+        if not alternatives:
+            self.logger.info("No feasible alternative strategies available")
+            return current_result
+        
+        # Notify user about aggressive compression requirement
+        self.compression_strategy.notify_aggressive_compression_required(
+            video_info, target_size_mb, alternatives
+        )
+        
+        # Try each alternative strategy in order of preference
+        best_result = current_result
+        
+        for alternative in alternatives:
+            self.logger.info(f"Trying alternative strategy: {alternative.strategy_type}")
+            
+            try:
+                alt_result = self._apply_alternative_compression_strategy(
+                    input_path, output_path, video_info, target_size_mb, alternative
+                )
+                
+                if alt_result and alt_result.get('success'):
+                    alt_size = alt_result.get('size_mb', 0)
+                    
+                    # Check if this alternative is better
+                    if alt_size <= target_size_mb:
+                        if not best_result or alt_size > best_result.get('size_mb', 0):
+                            best_result = alt_result
+                            self.logger.info(f"Alternative strategy {alternative.strategy_type} successful: {alt_size:.2f}MB")
+                            
+                            # If we found a good solution, we can stop trying more alternatives
+                            if alt_size >= target_size_mb * 0.9:  # Within 90% of target
+                                break
+                    else:
+                        self.logger.info(f"Alternative strategy {alternative.strategy_type} exceeded target: {alt_size:.2f}MB > {target_size_mb:.2f}MB")
+                else:
+                    self.logger.warning(f"Alternative strategy {alternative.strategy_type} failed")
+                    
+            except Exception as e:
+                self.logger.error(f"Alternative strategy {alternative.strategy_type} error: {e}")
+                continue
+        
+        if best_result and best_result.get('alternative_strategy_used'):
+            self.logger.info(f"Best alternative strategy: {best_result.get('strategy', 'unknown')}")
+        else:
+            self.logger.info("No alternative strategies improved the result")
+        
+        return best_result
     
     def batch_compress_videos(self, video_list: List[str], output_dir: str, 
                             platform: str = None, max_size_mb: float = None) -> Dict[str, Any]:

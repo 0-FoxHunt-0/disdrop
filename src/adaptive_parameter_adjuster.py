@@ -51,9 +51,13 @@ class AdaptiveParameterAdjuster:
         self.min_resolution_width = self.config.get('video_compression.bitrate_validation.min_resolution.width', 320)
         self.min_resolution_height = self.config.get('video_compression.bitrate_validation.min_resolution.height', 180)
         
-        # FPS adjustment settings
-        self.min_fps = self.config.get('video_compression.bitrate_validation.min_fps', 10)
+        # FPS adjustment settings - use config default of 20 to match video_compression.yaml
+        self.min_fps = self.config.get('video_compression.bitrate_validation.min_fps', 20)
         self.fps_reduction_steps = self.config.get('video_compression.bitrate_validation.fps_reduction_steps', [0.8, 0.6, 0.5])
+        
+        # Log the loaded configuration values for debugging
+        logger.debug(f"Adaptive Parameter Adjuster initialized with min_fps: {self.min_fps}")
+        logger.debug(f"FPS reduction steps: {self.fps_reduction_steps}")
         
         # Quality thresholds
         self.quality_thresholds = {
@@ -63,6 +67,29 @@ class AdaptiveParameterAdjuster:
         }
         
         # Fallback resolution cascade
+        self.fallback_resolutions = self._get_fallback_resolution_cascade()
+    
+    def reload_configuration(self):
+        """Reload configuration values - useful when config files change"""
+        logger.info("Reloading adaptive parameter adjuster configuration")
+        
+        # Store old values for comparison
+        old_min_fps = self.min_fps
+        old_fps_steps = self.fps_reduction_steps.copy()
+        
+        # Reload values
+        self.min_fps = self.config.get('video_compression.bitrate_validation.min_fps', 20)
+        self.fps_reduction_steps = self.config.get('video_compression.bitrate_validation.fps_reduction_steps', [0.8, 0.6, 0.5])
+        self.min_resolution_width = self.config.get('video_compression.bitrate_validation.min_resolution.width', 320)
+        self.min_resolution_height = self.config.get('video_compression.bitrate_validation.min_resolution.height', 180)
+        
+        # Log changes
+        if old_min_fps != self.min_fps:
+            logger.info(f"Min FPS configuration changed: {old_min_fps} → {self.min_fps}")
+        if old_fps_steps != self.fps_reduction_steps:
+            logger.info(f"FPS reduction steps changed: {old_fps_steps} → {self.fps_reduction_steps}")
+        
+        # Reload fallback resolutions in case they changed
         self.fallback_resolutions = self._get_fallback_resolution_cascade()
     
     def _get_fallback_resolution_cascade(self) -> List[Tuple[int, int]]:
