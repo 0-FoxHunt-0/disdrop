@@ -1225,18 +1225,63 @@ class DynamicVideoCompressor:
         
         # Step 2: Budget calculation (reserve audio)
         audio_range = profile_cfg.get('audio_kbps_range', [64, 96])
-        audio_bitrate_kbps = audio_range[1] if motion_level == 'low' else audio_range[0]  # More audio for low-motion
         duration = video_info['duration']
-        audio_bits = audio_bitrate_kbps * 1000 * duration
+        encoder = 'libx264'  # Default encoder for CAE pipeline
+        min_encoder_bitrate = self.bitrate_validator.get_encoder_minimum(encoder)
+        min_audio_bitrate = 64  # Minimum acceptable audio bitrate (prevents audio corruption)
+        
+        # Initial audio bitrate selection (motion-based)
+        initial_audio_bitrate = audio_range[1] if motion_level == 'low' else audio_range[0]  # More audio for low-motion
+        
+        # Calculate resulting video bitrate with initial audio selection
+        audio_bits = initial_audio_bitrate * 1000 * duration
         total_bits_budget = size_limit_mb * 8 * 1024 * 1024
         video_bits_budget = int(total_bits_budget - audio_bits)
-        target_video_bitrate_kbps = int(video_bits_budget / duration / 1000)
+        initial_video_bitrate = int(video_bits_budget / duration / 1000) if duration > 0 else 0
+        
+        # Duration-aware audio adjustment: reduce audio if video bitrate would be below minimum
+        # For very long videos, high audio bitrate consumes too much of the budget
+        audio_bitrate_kbps = initial_audio_bitrate
+        target_video_bitrate_kbps = initial_video_bitrate
+        
+        if target_video_bitrate_kbps < min_encoder_bitrate and initial_audio_bitrate > min_audio_bitrate:
+            # Try reducing audio bitrate to meet video bitrate minimum
+            # Calculate maximum audio bitrate that still allows video bitrate >= minimum
+            required_video_bitrate = min_encoder_bitrate
+            required_video_bits = required_video_bitrate * 1000 * duration
+            max_audio_bits = total_bits_budget - required_video_bits
+            max_audio_bitrate = int(max_audio_bits / duration / 1000) if duration > 0 else min_audio_bitrate
+            
+            # Use the lower of: calculated max, or initial audio (but not below minimum)
+            adjusted_audio_bitrate = max(min_audio_bitrate, min(max_audio_bitrate, initial_audio_bitrate))
+            
+            if adjusted_audio_bitrate < initial_audio_bitrate:
+                # Recalculate with reduced audio
+                audio_bitrate_kbps = adjusted_audio_bitrate
+                audio_bits = audio_bitrate_kbps * 1000 * duration
+                video_bits_budget = int(total_bits_budget - audio_bits)
+                target_video_bitrate_kbps = int(video_bits_budget / duration / 1000) if duration > 0 else 0
+                
+                # Ensure we actually meet the minimum (handle rounding errors)
+                if target_video_bitrate_kbps < min_encoder_bitrate:
+                    # If still below minimum, reduce audio bitrate further
+                    # This can happen due to integer truncation
+                    remaining_bits = total_bits_budget - audio_bits
+                    required_bits = min_encoder_bitrate * 1000 * duration
+                    if remaining_bits < required_bits:
+                        # Need to reduce audio more
+                        additional_audio_reduction = int((required_bits - remaining_bits) / duration / 1000) + 1
+                        audio_bitrate_kbps = max(min_audio_bitrate, audio_bitrate_kbps - additional_audio_reduction)
+                        audio_bits = audio_bitrate_kbps * 1000 * duration
+                        video_bits_budget = int(total_bits_budget - audio_bits)
+                        target_video_bitrate_kbps = int(video_bits_budget / duration / 1000) if duration > 0 else 0
+                
+                logger.info(f"Duration-aware audio adjustment: reduced audio from {initial_audio_bitrate}k to {audio_bitrate_kbps}k "
+                          f"to meet video bitrate minimum ({target_video_bitrate_kbps}k >= {min_encoder_bitrate}k)")
         
         logger.info(f"Budget: {size_limit_mb}MB = {target_video_bitrate_kbps}k video + {audio_bitrate_kbps}k audio over {duration:.1f}s")
         
         # Step 2.5: Immediate bitrate validation and emergency adjustment
-        encoder = 'libx264'  # Default encoder for CAE pipeline
-        min_encoder_bitrate = self.bitrate_validator.get_encoder_minimum(encoder)
         
         # Immediate validation with enhanced logging
         validation_result = self.bitrate_validator.validate_bitrate(target_video_bitrate_kbps, encoder)
@@ -2089,7 +2134,8 @@ class DynamicVideoCompressor:
         headroom_bitrate_kbps = int(headroom_bits / duration / 1000) if duration > 0 else 0
         
         # Try to reduce audio bitrate to free up space for video bitrate
-        min_audio_bitrate = 32  # Minimum acceptable audio bitrate
+        # Never reduce audio below 64kbps to prevent muffled/underwater sound
+        min_audio_bitrate = 64  # Minimum acceptable audio bitrate (prevents audio corruption)
         current_audio = initial_params.get('audio_bitrate', audio_bitrate_kbps)
         audio_reduction_possible = current_audio > min_audio_bitrate
         
