@@ -1,0 +1,77 @@
+# Performance Monitoring Configuration
+
+performance_monitoring:
+  # System monitoring settings
+  system_monitoring:
+    enabled: true
+    memory_threshold_mb: 500
+    cpu_monitoring: true
+
+  # Logging configuration
+  logging:
+    operation_timing: true
+    parameter_changes: true
+    quality_evaluations: true
+    cache_operations: true
+
+  # Analysis thresholds
+  thresholds:
+    slow_operation_seconds: 30.0
+    high_memory_mb: 500.0
+    low_cache_hit_rate: 30.0
+    poor_success_rate: 80.0
+
+  # Performance profiles
+  profiles:
+    fast:
+      max_quality_evaluation_time: 10.0
+      max_compression_iterations: 2
+      enable_fast_estimation: true
+      cache_enabled: true
+      parallel_processing: true
+      memory_optimization: true
+
+    balanced:
+      max_quality_evaluation_time: 30.0
+      max_compression_iterations: 3
+      enable_fast_estimation: true
+      cache_enabled: true
+      parallel_processing: true
+      memory_optimization: false
+
+    quality:
+      max_quality_evaluation_time: 120.0
+      max_compression_iterations: 5
+      enable_fast_estimation: false
+      cache_enabled: true
+      parallel_processing: false
+      memory_optimization: false
+
+# Performance controls for users
+performance_controls:
+  preferred_profile: "balanced"
+  show_progress: true
+  show_time_estimates: true
+  enable_cancellation: true
+  performance_notifications: true
+
+# Performance analysis settings
+performance_analysis:
+  thresholds:
+    slow_operation_seconds: 30.0
+    high_memory_mb: 500.0
+    low_cache_hit_rate: 30.0
+    poor_success_rate: 80.0
+
+  trend_analysis:
+    enabled: true
+    analysis_period_days: 7
+    minimum_sessions_for_analysis: 5
+
+  bottleneck_detection:
+    enabled: true
+    auto_recommendations: true
+    severity_thresholds:
+      critical_multiplier: 3.0
+      high_multiplier: 2.0
+      medium_multiplier: 1.5
