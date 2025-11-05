@@ -35,12 +35,12 @@ except ImportError:
     schedule = MockSchedule()
 try:
     from .performance_cache import PerformanceCache, QualityResult, CompressionResult
-    from .video_fingerprinter import CompressionParams
-    from .logger_setup import get_logger
+    from .video_fingerprinter import CompressionParams, VideoFingerprinter, CacheKeyGenerator
+    from ..logger_setup import get_logger
 except ImportError:
     # Fallback for direct execution
     from performance_cache import PerformanceCache, QualityResult, CompressionResult
-    from video_fingerprinter import CompressionParams
+    from video_fingerprinter import CompressionParams, VideoFingerprinter, CacheKeyGenerator
     from logger_setup import get_logger
 
 logger = get_logger(__name__)
@@ -84,15 +84,29 @@ class CacheManager:
     """Advanced cache management and optimization system."""
     
     def __init__(self, cache: Optional[PerformanceCache] = None, 
-                 config_dir: Optional[str] = None):
+                 config_dir: Optional[str] = None,
+                 max_cache_size_mb: int = 500,
+                 config: Optional[Dict[str, Any]] = None):
         """
         Initialize the cache manager.
         
         Args:
-            cache: Performance cache instance
+            cache: Performance cache instance (creates new one if None)
             config_dir: Configuration directory path
+            max_cache_size_mb: Maximum cache size in megabytes (only used if cache is None)
+            config: Cache configuration dictionary
         """
-        self.cache = cache or PerformanceCache()
+        # Initialize cache if not provided
+        if cache is None:
+            cache_dir = str(config_dir) if config_dir else None
+            self.cache = PerformanceCache(cache_dir, max_cache_size_mb)
+        else:
+            self.cache = cache
+        
+        # Initialize video fingerprinting components
+        self.fingerprinter = VideoFingerprinter()
+        self.key_generator = CacheKeyGenerator(self.fingerprinter)
+        
         self.config_dir = Path(config_dir) if config_dir else Path.home() / '.disdrop' / 'cache'
         self.config_dir.mkdir(parents=True, exist_ok=True)
         
@@ -111,6 +125,11 @@ class CacheManager:
         
         # Load configuration
         self.config = self._load_configuration()
+        
+        # Apply custom configuration if provided
+        if config:
+            self._deep_merge(self.config, config)
+            self.update_configuration(config)
         
         # Initialize monitoring
         self._start_monitoring()
@@ -599,3 +618,269 @@ class CacheManager:
             
         except Exception as e:
             logger.error(f"Error during cache manager shutdown: {e}")
+    
+    # Methods from PerformanceCacheSystem (unified interface)
+    
+    def get_quality_result(self, video_path: str, params: CompressionParams) -> Tuple[Optional[QualityResult], bool, float]:
+        """
+        Get quality result from cache or predict from similar videos.
+        
+        Args:
+            video_path: Path to the video file
+            params: Compression parameters
+            
+        Returns:
+            Tuple of (quality_result, is_cache_hit, response_time)
+        """
+        try:
+            # Try exact cache match first
+            result, response_time = self.get_cached_result_with_metrics(video_path, params)
+            
+            if result is not None:
+                logger.debug(f"Exact cache hit for {video_path}")
+                return result, True, response_time
+            
+            # Try prediction from similar videos
+            predicted_result = self.cache.predict_quality_from_cache(video_path, params)
+            
+            if predicted_result is not None:
+                logger.debug(f"Quality predicted from similar videos for {video_path}")
+                return predicted_result, False, response_time
+            
+            logger.debug(f"No cached or predicted result for {video_path}")
+            return None, False, response_time
+            
+        except Exception as e:
+            logger.error(f"Error getting quality result from cache: {e}")
+            return None, False, 0.0
+    
+    def cache_quality_result(self, video_path: str, params: CompressionParams, 
+                           result: QualityResult) -> None:
+        """
+        Cache quality result with automatic optimization.
+        
+        Args:
+            video_path: Path to the video file
+            params: Compression parameters
+            result: Quality result to cache
+        """
+        try:
+            self.cache_result_with_optimization(video_path, params, result)
+            logger.debug(f"Cached quality result for {video_path}")
+            
+        except Exception as e:
+            logger.error(f"Error caching quality result: {e}")
+    
+    def get_compression_result(self, video_path: str, params: CompressionParams) -> Optional[CompressionResult]:
+        """
+        Get compression result from cache.
+        
+        Args:
+            video_path: Path to the video file
+            params: Compression parameters
+            
+        Returns:
+            Cached compression result if found
+        """
+        try:
+            return self.cache.get_cached_compression_result(video_path, params)
+            
+        except Exception as e:
+            logger.error(f"Error getting compression result from cache: {e}")
+            return None
+    
+    def cache_compression_result(self, video_path: str, params: CompressionParams, 
+                               result: CompressionResult) -> None:
+        """
+        Cache compression result.
+        
+        Args:
+            video_path: Path to the video file
+            params: Compression parameters
+            result: Compression result to cache
+        """
+        try:
+            self.cache.cache_compression_result(video_path, params, result)
+            logger.debug(f"Cached compression result for {video_path}")
+            
+        except Exception as e:
+            logger.error(f"Error caching compression result: {e}")
+    
+    def find_similar_results(self, video_path: str, similarity_threshold: float = 0.8) -> List[Tuple[float, CompressionResult]]:
+        """
+        Find cached results from similar videos.
+        
+        Args:
+            video_path: Path to the video file
+            similarity_threshold: Minimum similarity score
+            
+        Returns:
+            List of (similarity_score, result) tuples
+        """
+        try:
+            return self.cache.get_similar_video_results(video_path, similarity_threshold)
+            
+        except Exception as e:
+            logger.error(f"Error finding similar results: {e}")
+            return []
+    
+    def get_cache_statistics(self) -> Dict[str, Any]:
+        """
+        Get comprehensive cache statistics.
+        
+        Returns:
+            Dictionary containing cache statistics and metrics
+        """
+        try:
+            base_stats = self.cache.get_cache_stats()
+            performance_metrics = self.get_performance_metrics()
+            
+            return {
+                'cache_stats': base_stats,
+                'performance_metrics': performance_metrics.to_dict(),
+                'system_info': {
+                    'cache_dir': str(self.cache.cache_dir),
+                    'max_size_mb': self.cache.max_size_bytes / (1024 * 1024),
+                    'database_path': str(self.cache.db_path)
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting cache statistics: {e}")
+            return {}
+    
+    def cleanup_cache(self, max_age_hours: int = 24) -> int:
+        """
+        Clean up expired cache entries.
+        
+        Args:
+            max_age_hours: Maximum age for cache entries
+            
+        Returns:
+            Number of entries removed
+        """
+        try:
+            return self.cache.cleanup_expired_entries(max_age_hours)
+            
+        except Exception as e:
+            logger.error(f"Error cleaning up cache: {e}")
+            return 0
+    
+    def clear_cache(self) -> None:
+        """Clear all cache entries."""
+        try:
+            self.cache.clear_cache()
+            logger.info("Cache cleared successfully")
+            
+        except Exception as e:
+            logger.error(f"Error clearing cache: {e}")
+    
+    def configure_cache_warming(self, enabled: bool = True, 
+                              video_patterns: Optional[List[str]] = None,
+                              compression_params: Optional[List[Dict[str, Any]]] = None) -> None:
+        """
+        Configure cache warming settings.
+        
+        Args:
+            enabled: Whether to enable cache warming
+            video_patterns: File patterns for videos to warm
+            compression_params: Common compression parameters to warm
+        """
+        try:
+            warming_config = {
+                'warming': {
+                    'enabled': enabled
+                }
+            }
+            
+            if video_patterns:
+                warming_config['warming']['common_video_patterns'] = video_patterns
+            
+            if compression_params:
+                warming_config['warming']['common_compression_params'] = compression_params
+            
+            self.update_configuration(warming_config)
+            logger.info(f"Cache warming configured: enabled={enabled}")
+            
+        except Exception as e:
+            logger.error(f"Error configuring cache warming: {e}")
+    
+    def optimize_cache_performance(self) -> None:
+        """Manually trigger cache performance optimization."""
+        try:
+            self._check_and_optimize_cache()
+            logger.info("Cache performance optimization completed")
+            
+        except Exception as e:
+            logger.error(f"Error optimizing cache performance: {e}")
+    
+    def get_video_fingerprint(self, video_path: str) -> Optional[str]:
+        """
+        Get video fingerprint for debugging or analysis.
+        
+        Args:
+            video_path: Path to the video file
+            
+        Returns:
+            Video content hash if successful
+        """
+        try:
+            fingerprint = self.fingerprinter.generate_fingerprint(video_path)
+            return fingerprint.content_hash
+            
+        except Exception as e:
+            logger.error(f"Error getting video fingerprint: {e}")
+            return None
+    
+    def calculate_video_similarity(self, video_path1: str, video_path2: str) -> float:
+        """
+        Calculate similarity between two videos.
+        
+        Args:
+            video_path1: Path to first video
+            video_path2: Path to second video
+            
+        Returns:
+            Similarity score between 0.0 and 1.0
+        """
+        try:
+            fp1 = self.fingerprinter.generate_fingerprint(video_path1)
+            fp2 = self.fingerprinter.generate_fingerprint(video_path2)
+            
+            return self.fingerprinter.calculate_similarity(fp1.perceptual_hash, fp2.perceptual_hash)
+            
+        except Exception as e:
+            logger.error(f"Error calculating video similarity: {e}")
+            return 0.0
+
+
+# Convenience function for easy integration (replaces create_performance_cache_system)
+def create_cache_manager(cache_dir: Optional[str] = None,
+                        max_size_mb: int = 500,
+                        enable_warming: bool = False) -> CacheManager:
+    """
+    Create a cache manager with sensible defaults.
+    
+    Args:
+        cache_dir: Directory for cache storage
+        max_size_mb: Maximum cache size in megabytes
+        enable_warming: Whether to enable cache warming
+        
+    Returns:
+        Configured CacheManager instance
+    """
+    config = {
+        'warming': {
+            'enabled': enable_warming
+        },
+        'auto_cleanup': {
+            'enabled': True,
+            'interval_hours': 6
+        },
+        'optimization': {
+            'auto_size_management': True,
+            'target_hit_rate': 0.7
+        }
+    }
+    
+    return CacheManager(config_dir=cache_dir, max_cache_size_mb=max_size_mb, config=config)

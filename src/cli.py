@@ -17,12 +17,12 @@ import time
 from .logger_setup import setup_logging, get_logger, _cleanup_old_logs, get_package_base_dir
 from .config_manager import ConfigManager
 from .hardware_detector import HardwareDetector
-from .video_compressor import DynamicVideoCompressor
-from .gif_generator import GifGenerator
-from .gif_optimizer_advanced import AdvancedGifOptimizer
+from .video_processing.video_compressor import DynamicVideoCompressor
+from .gif_processing.gif_generator import GifGenerator
+from .gif_processing.gif_optimizer_advanced import AdvancedGifOptimizer
 from .automated_workflow import AutomatedWorkflow
 from .file_validator import FileValidator
-from .bitrate_validator import BitrateValidationError
+from .video_processing.bitrate_validator import BitrateValidationError
 
 logger = None  # Will be initialized after logging setup
 
@@ -175,14 +175,30 @@ class VideoCompressorCLI:
                                 logger.warning(f"Could not clean up {item}: {e}")
 
                     # Also check for any .tmp files that might be missed
+                    import time as time_module
                     for root, dirs, files in os.walk(temp_dir):
                         for file in files:
                             if file.endswith('.tmp'):
                                 file_path = os.path.join(root, file)
                                 try:
-                                    os.remove(file_path)
-                                    if logger:
-                                        logger.debug(f"Cleaned up .tmp file: {file}")
+                                    # On Windows, files may be locked briefly after subprocess closes
+                                    # Retry with small delays to handle file locking
+                                    max_retries = 3
+                                    retry_delay = 0.1  # 100ms
+                                    
+                                    for attempt in range(max_retries):
+                                        try:
+                                            os.remove(file_path)
+                                            if logger:
+                                                logger.debug(f"Cleaned up .tmp file: {file}")
+                                            break
+                                        except (OSError, PermissionError) as e:
+                                            if attempt < max_retries - 1:
+                                                time_module.sleep(retry_delay * (attempt + 1))
+                                            else:
+                                                # Last attempt failed, log but don't raise
+                                                if logger:
+                                                    logger.warning(f"Could not clean up .tmp file {file}: {e}")
                                 except Exception as e:
                                     if logger:
                                         logger.warning(f"Could not clean up .tmp file {file}: {e}")
@@ -511,7 +527,10 @@ class VideoCompressorCLI:
             self.gif_generator = GifGenerator(self.config)
             self.advanced_optimizer = AdvancedGifOptimizer(self.config)
             self.file_validator = FileValidator()
-            self.automated_workflow = AutomatedWorkflow(self.config, self.hardware)
+            # Pass shared video_compressor and gif_generator instances to avoid duplicate initialization
+            self.automated_workflow = AutomatedWorkflow(self.config, self.hardware, 
+                                                       video_compressor=self.video_compressor,
+                                                       gif_generator=self.gif_generator)
             # Thread max input size through to workflow
             try:
                 self.automated_workflow.max_input_size_bytes = self._parse_max_input_size_to_bytes(getattr(args, 'max_input_size', None))
@@ -648,19 +667,19 @@ class VideoCompressorCLI:
         if hasattr(args, 'encoder_bitrate_floor') and args.encoder_bitrate_floor:
             # Get current encoder minimums from config or use defaults
             current_minimums = self.config.get('video_compression.bitrate_validation.encoder_minimums', {
-                'libx264': 3,
-                'libx265': 5,
-                'h264_nvenc': 2,
-                'h264_amf': 2,
-                'h264_qsv': 2,
-                'h264_videotoolbox': 2
+                'libx264': 10,
+                'libx265': 15,
+                'h264_nvenc': 8,
+                'h264_amf': 8,
+                'h264_qsv': 8,
+                'h264_videotoolbox': 8
             }) if hasattr(self, 'config') and self.config else {
-                'libx264': 3,
-                'libx265': 5,
-                'h264_nvenc': 2,
-                'h264_amf': 2,
-                'h264_qsv': 2,
-                'h264_videotoolbox': 2
+                'libx264': 10,
+                'libx265': 15,
+                'h264_nvenc': 8,
+                'h264_amf': 8,
+                'h264_qsv': 8,
+                'h264_videotoolbox': 8
             }
             
             # Apply encoder-specific overrides

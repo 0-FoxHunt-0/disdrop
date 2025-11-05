@@ -13,7 +13,7 @@ from typing import Dict, Any, List, Tuple, Optional
 import logging
 import numpy as np
 import shutil
-from .ffmpeg_utils import FFmpegUtils
+from ..ffmpeg_utils import FFmpegUtils
 
 logger = logging.getLogger(__name__)
 
@@ -891,7 +891,7 @@ class AdvancedVideoOptimizer:
         
         # Log detailed file specifications
         try:
-            from .ffmpeg_utils import FFmpegUtils
+            from ..ffmpeg_utils import FFmpegUtils
             specs = FFmpegUtils.get_detailed_file_specifications(output_path)
             specs_log = FFmpegUtils.format_file_specifications_for_logging(specs)
             logger.info(f"Advanced optimization final file specifications - {specs_log}")

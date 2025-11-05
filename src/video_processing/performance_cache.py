@@ -17,7 +17,7 @@ from typing import Dict, List, Optional, Tuple, Any, Union
 import threading
 try:
     from .video_fingerprinter import VideoFingerprinter, CompressionParams, CacheKeyGenerator
-    from .logger_setup import get_logger
+    from ..logger_setup import get_logger
 except ImportError:
     # Fallback for direct execution
     from video_fingerprinter import VideoFingerprinter, CompressionParams, CacheKeyGenerator

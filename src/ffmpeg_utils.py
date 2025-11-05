@@ -472,10 +472,12 @@ class FFmpegUtils:
     @staticmethod
     def add_audio_settings(cmd: List[str], params: Dict[str, Any] = None) -> List[str]:
         """Add audio encoding settings to FFmpeg command"""
+        # Ensure minimum audio bitrate of 64kbps to prevent muffled/underwater sound
         if params and params.get('audio_bitrate'):
-            cmd.extend(['-c:a', 'aac', '-b:a', f"{params['audio_bitrate']}k"])
+            audio_bitrate = max(int(params['audio_bitrate']), 64)  # Enforce minimum
+            cmd.extend(['-c:a', 'aac', '-b:a', f"{audio_bitrate}k"])
         else:
-            cmd.extend(['-c:a', 'aac', '-b:a', '96k'])
+            cmd.extend(['-c:a', 'aac', '-b:a', '64k'])  # Default to 64kbps
         
         # Audio channels
         if params and params.get('audio_channels'):
@@ -929,7 +931,8 @@ class FFmpegUtils:
                 cmd.append('/dev/null')
         else:
             # Second pass: add audio and output settings
-            audio_bitrate = int(params.get('audio_bitrate', 64))
+            # Ensure minimum audio bitrate of 64kbps to prevent muffled/underwater sound
+            audio_bitrate = max(int(params.get('audio_bitrate', 64)), 64)
             cmd.extend(['-c:a', 'aac', '-b:a', f"{audio_bitrate}k", '-ac', '2'])
             cmd.extend(['-movflags', '+faststart'])
             cmd.append(output_path)

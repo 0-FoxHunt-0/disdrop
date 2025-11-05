@@ -368,7 +368,7 @@ video_compression:
   profiles:
     discord_10mb:
       size_limit_mb: 10
-      audio_kbps_range: [64, 96]
+      audio_kbps_range: [64, 64]
       vmaf_threshold: 80
       vmaf_threshold_low_res: 78 # when eval height <= 480p
       ssim_threshold: 0.94 # Y-channel

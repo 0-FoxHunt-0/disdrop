@@ -480,14 +480,31 @@ class DynamicVideoCompressor:
         self._current_session = None
     
     def _cleanup_two_pass_logs(self, log_base: str):
-        """Clean up all two-pass log files reliably"""
+        """Clean up all two-pass log files reliably with retry logic"""
+        import time
         for ext in ['-0.log', '-0.log.mbtree', '-0.log.temp', '-0.log.mbtree.temp']:
-            try:
-                log_path = f"{log_base}{ext}"
-                if os.path.exists(log_path):
+            log_path = f"{log_base}{ext}"
+            if not os.path.exists(log_path):
+                continue
+            
+            # Retry logic with exponential backoff for locked files
+            max_retries = 3
+            retry_delay = 0.1  # Start with 100ms
+            for attempt in range(max_retries):
+                try:
                     os.remove(log_path)
-            except Exception as e:
-                logger.debug(f"Could not remove {log_path}: {e}")
+                    logger.debug(f"Cleaned up temp file: {os.path.basename(log_path)}")
+                    break
+                except (OSError, PermissionError) as e:
+                    if attempt < max_retries - 1:
+                        # Wait before retrying with exponential backoff
+                        time.sleep(retry_delay * (attempt + 1))
+                    else:
+                        # Last attempt failed, log but don't raise
+                        logger.debug(f"Could not remove {log_path} after {max_retries} attempts: {e}")
+                except Exception as e:
+                    logger.debug(f"Could not remove {log_path}: {e}")
+                    break
     
     def _binary_search_bitrate(self, input_path: str, output_path: str, params: Dict[str, Any],
                                video_info: Dict[str, Any], target_mb: float,
@@ -1532,8 +1549,23 @@ class DynamicVideoCompressor:
         # Track quality history for early termination
         quality_history = []  # List of (pass, vmaf_score) tuples
         
+        # Track previous passes for progress detection
+        previous_sizes = []  # List of (pass, size_mb, bitrate_kbps) tuples
+        encoder = initial_params.get('encoder', 'libx264')
+        min_encoder_bitrate = self.bitrate_validator.get_encoder_minimum(encoder)
+        same_size_count = 0  # Count consecutive passes with same size
+        max_same_size_retries = 2  # Maximum retries when stuck at same size
+        
         for refine_pass in range(max_passes):
             logger.info(f"--- CAE Refine Pass {refine_pass + 1}/{max_passes} ---")
+            
+            # Check if bitrate is already at minimum
+            current_bitrate = initial_params.get('bitrate', target_video_bitrate_kbps)
+            at_bitrate_minimum = current_bitrate <= min_encoder_bitrate
+            
+            if at_bitrate_minimum:
+                logger.warning(f"Bitrate already at encoder minimum ({current_bitrate}kbps <= {min_encoder_bitrate}kbps). "
+                             f"Will use resolution/FPS reduction instead of bitrate reduction.")
             
             # Encode with current params
             encode_params = self._build_cae_encode_params(initial_params, x264_cfg, profile_cfg)
@@ -1547,28 +1579,127 @@ class DynamicVideoCompressor:
             output_size_mb = os.path.getsize(output_path) / (1024 * 1024)
             logger.info(f"Encoded size: {output_size_mb:.2f}MB (target: {size_limit_mb}MB)")
             
-            if output_size_mb > size_limit_mb:
-                logger.warning(f"Output exceeds size limit: {output_size_mb:.2f} > {size_limit_mb}MB")
-                # Calculate how much we need to reduce
-                overage_ratio = output_size_mb / size_limit_mb
+            # Track this pass for progress detection
+            previous_sizes.append((refine_pass + 1, output_size_mb, current_bitrate))
+            
+            # Detect if stuck at same size (within 0.1MB tolerance)
+            # But allow one more pass if close to target (within 0.1MB over limit)
+            close_to_target_threshold = 0.1  # MB over target to consider "close enough" for one more pass
+            is_close_to_target = (size_limit_mb < output_size_mb <= size_limit_mb + close_to_target_threshold)
+            
+            if len(previous_sizes) >= 2:
+                prev_size = previous_sizes[-2][1]
+                size_diff = abs(output_size_mb - prev_size)
+                size_is_decreasing = output_size_mb < prev_size  # Moving toward target
                 
-                # More aggressive reduction based on overage
-                if overage_ratio > 1.10:
-                    # More than 10% over: reduce bitrate significantly AND consider scaling down
-                    initial_params['bitrate'] = int(initial_params['bitrate'] * 0.85)
-                    
-                    # Also try scaling down if we're still at high resolution
+                if size_diff < 0.1:  # Less than 0.1MB difference
+                    # If we're close to target and size is decreasing, reset counter (one more pass might succeed)
+                    if is_close_to_target and size_is_decreasing:
+                        logger.info(f"Output size close to target ({output_size_mb:.2f}MB, target: {size_limit_mb}MB) "
+                                   f"and decreasing (prev: {prev_size:.2f}MB). Allowing one more pass.")
+                        same_size_count = 0  # Reset counter to allow one more pass
+                    else:
+                        same_size_count += 1
+                        logger.warning(f"Output size unchanged: {output_size_mb:.2f}MB (prev: {prev_size:.2f}MB, diff: {size_diff:.3f}MB)")
+                        # Only break if we're stuck AND not close to target
+                        if same_size_count >= max_same_size_retries and not is_close_to_target:
+                            logger.error(f"Stuck at same output size after {same_size_count} consecutive passes. "
+                                       f"Bitrate: {current_bitrate}kbps (min: {min_encoder_bitrate}kbps). "
+                                       f"Terminating refinement loop early.")
+                            break
+                        elif same_size_count >= max_same_size_retries and is_close_to_target:
+                            logger.warning(f"Stuck at same size but close to target ({output_size_mb:.2f}MB). "
+                                         f"Allowing one final pass with reduced parameters.")
+                            same_size_count = max_same_size_retries - 1  # Reset to allow one more pass
+                else:
+                    same_size_count = 0  # Reset counter when size changes
+            
+            # Add small tolerance (0.01MB) for size limit to handle floating point precision
+            size_tolerance_mb = 0.01
+            effective_limit = size_limit_mb + size_tolerance_mb
+            
+            # Log actual byte size for debugging
+            if os.path.exists(output_path):
+                actual_bytes = os.path.getsize(output_path)
+                actual_mb = actual_bytes / (1024 * 1024)
+                limit_bytes = size_limit_mb * 1024 * 1024
+                logger.debug(f"Size check (overage): {actual_mb:.6f}MB ({actual_bytes} bytes) vs limit {size_limit_mb:.6f}MB ({limit_bytes:.0f} bytes), tolerance={size_tolerance_mb:.6f}MB")
+            else:
+                actual_mb = output_size_mb
+            
+            if actual_mb > effective_limit:
+                logger.warning(f"Output exceeds size limit: {actual_mb:.6f}MB > {effective_limit:.6f}MB (limit={size_limit_mb:.6f}MB + tolerance={size_tolerance_mb:.6f}MB)")
+                # Calculate how much we need to reduce
+                overage_ratio = actual_mb / size_limit_mb
+                
+                # Check if bitrate is at minimum - if so, use resolution/FPS reduction instead
+                if at_bitrate_minimum or current_bitrate <= min_encoder_bitrate:
+                    logger.warning(f"Bitrate at minimum ({current_bitrate}kbps <= {min_encoder_bitrate}kbps). "
+                                 f"Switching to resolution/FPS reduction instead of bitrate reduction.")
+                    # Use resolution reduction
                     if initial_params['height'] > 480:
                         new_width, new_height = self._scale_down_one_step(initial_params['width'], initial_params['height'])
                         initial_params['width'] = new_width
                         initial_params['height'] = new_height
-                        logger.info(f"Refine (overage): scaling down to {new_width}x{new_height}")
+                        logger.info(f"Refine (overage, bitrate at min): scaling down to {new_width}x{new_height}")
+                    else:
+                        # Try FPS reduction as last resort
+                        min_fps = self.config.get('video_compression.bitrate_validation.min_fps', 20)
+                        current_fps = initial_params.get('fps', 30)
+                        if current_fps > min_fps:
+                            # Reduce FPS by one step
+                            fps_reduction_steps = self.config.get('video_compression.bitrate_validation.fps_reduction_steps', [0.8, 0.6, 0.5])
+                            if fps_reduction_steps:
+                                new_fps = int(current_fps * fps_reduction_steps[-1])  # Use most aggressive step
+                                new_fps = max(min_fps, new_fps)
+                                initial_params['fps'] = new_fps
+                                logger.info(f"Refine (overage, bitrate at min): reducing FPS to {new_fps}")
+                            else:
+                                logger.error("Cannot reduce further - bitrate at minimum, resolution at minimum, and FPS at minimum")
+                                break
+                        else:
+                            logger.error("Cannot reduce further - all parameters at minimum")
+                            break
                 else:
-                    # Less than 10% over: just reduce bitrate proportionally
-                    reduction_factor = 0.98 / overage_ratio  # Target 98% of limit
-                    initial_params['bitrate'] = int(initial_params['bitrate'] * reduction_factor)
+                    # More aggressive reduction based on overage
+                    if overage_ratio > 1.10:
+                        # More than 10% over: reduce bitrate significantly AND consider scaling down
+                        new_bitrate = int(current_bitrate * 0.85)
+                        # Ensure we don't go below minimum
+                        if new_bitrate < min_encoder_bitrate:
+                            new_bitrate = min_encoder_bitrate
+                            logger.warning(f"Bitrate reduction would go below minimum. Clamping to {min_encoder_bitrate}kbps")
+                            # Also scale down resolution
+                            if initial_params['height'] > 480:
+                                new_width, new_height = self._scale_down_one_step(initial_params['width'], initial_params['height'])
+                                initial_params['width'] = new_width
+                                initial_params['height'] = new_height
+                                logger.info(f"Refine (overage): scaling down to {new_width}x{new_height}")
+                        initial_params['bitrate'] = new_bitrate
+                    else:
+                        # Less than 10% over: just reduce bitrate proportionally
+                        reduction_factor = 0.98 / overage_ratio  # Target 98% of limit
+                        new_bitrate = int(current_bitrate * reduction_factor)
+                        # Ensure we don't go below minimum
+                        if new_bitrate < min_encoder_bitrate:
+                            new_bitrate = min_encoder_bitrate
+                            logger.warning(f"Bitrate reduction would go below minimum. Clamping to {min_encoder_bitrate}kbps")
+                            # Also try scaling down
+                            if initial_params['height'] > 480:
+                                new_width, new_height = self._scale_down_one_step(initial_params['width'], initial_params['height'])
+                                initial_params['width'] = new_width
+                                initial_params['height'] = new_height
+                                logger.info(f"Refine (overage): scaling down to {new_width}x{new_height}")
+                        initial_params['bitrate'] = new_bitrate
                 
                 logger.info(f"Refine (overage): reducing bitrate to {initial_params['bitrate']}k")
+                
+                # Check if we're stuck (bitrate at minimum and can't reduce further)
+                if initial_params['bitrate'] <= min_encoder_bitrate and initial_params['height'] <= 480:
+                    min_fps = self.config.get('video_compression.bitrate_validation.min_fps', 20)
+                    if initial_params.get('fps', 30) <= min_fps:
+                        logger.error("Cannot reduce further - all parameters at minimum. Terminating refinement.")
+                        break
                 
                 try:
                     os.remove(output_path)
@@ -1608,18 +1739,37 @@ class DynamicVideoCompressor:
             if quality_pass and artifact_pass:
                 logger.info(f"✓ All quality gates passed on refine pass {refine_pass + 1}")
                 
-                # Log structured metrics
-                self._log_cae_metrics({
-                    'input_path': input_path,
-                    'output_path': output_path,
-                    'params': encode_params,
-                    'size_mb': output_size_mb,
-                    'quality': quality_result,
-                    'artifacts': artifact_result,
-                    'refine_pass': refine_pass + 1
-                })
+                # Add small tolerance (0.01MB) for size limit to handle floating point precision
+                # This prevents loops where 10.00MB is slightly over 10MB due to precision
+                size_tolerance_mb = 0.01
+                effective_limit = size_limit_mb + size_tolerance_mb
                 
-                return self._get_compression_results(input_path, output_path, video_info, "cae_discord_10mb")
+                # Log actual byte size for debugging
+                if os.path.exists(output_path):
+                    actual_bytes = os.path.getsize(output_path)
+                    actual_mb = actual_bytes / (1024 * 1024)
+                    limit_bytes = size_limit_mb * 1024 * 1024
+                    logger.debug(f"Size check: {actual_mb:.6f}MB ({actual_bytes} bytes) vs limit {size_limit_mb:.6f}MB ({limit_bytes:.0f} bytes), tolerance={size_tolerance_mb:.6f}MB")
+                else:
+                    actual_mb = output_size_mb
+                
+                if actual_mb > effective_limit:
+                    logger.warning(f"Quality gates passed but output exceeds size limit: {actual_mb:.6f}MB > {effective_limit:.6f}MB (limit={size_limit_mb:.6f}MB + tolerance={size_tolerance_mb:.6f}MB). "
+                                 f"Continuing refinement to reduce size.")
+                    # Continue to refinement instead of returning
+                else:
+                    # Log structured metrics
+                    self._log_cae_metrics({
+                        'input_path': input_path,
+                        'output_path': output_path,
+                        'params': encode_params,
+                        'size_mb': actual_mb,
+                        'quality': quality_result,
+                        'artifacts': artifact_result,
+                        'refine_pass': refine_pass + 1
+                    })
+                    
+                    return self._get_compression_results(input_path, output_path, video_info, "cae_discord_10mb")
             
             # Step 7: Refine strategy if gates failed
             logger.warning(f"Quality gates failed on pass {refine_pass + 1}, attempting refinement")
@@ -1684,8 +1834,15 @@ class DynamicVideoCompressor:
         
         # If we exhausted refine passes, return best attempt or fail to segmentation
         if os.path.exists(output_path):
-            output_size_mb = os.path.getsize(output_path) / (1024 * 1024)
-            if output_size_mb <= size_limit_mb:
+            output_size_bytes = os.path.getsize(output_path)
+            output_size_mb = output_size_bytes / (1024 * 1024)
+            # Add small tolerance (0.01MB) for size limit to handle floating point precision
+            size_tolerance_mb = 0.01
+            effective_limit = size_limit_mb + size_tolerance_mb
+            limit_bytes = size_limit_mb * 1024 * 1024
+            logger.debug(f"Final size check: {output_size_mb:.6f}MB ({output_size_bytes} bytes) vs limit {size_limit_mb:.6f}MB ({limit_bytes:.0f} bytes), tolerance={size_tolerance_mb:.6f}MB")
+            
+            if output_size_mb <= effective_limit:
                 logger.warning("CAE completed with compromised quality (some gates failed)")
                 return self._get_compression_results(input_path, output_path, video_info, "cae_discord_10mb_compromised")
         
@@ -3860,6 +4017,29 @@ class DynamicVideoCompressor:
                 if 'segments' in result:
                     # Multiple segments were created
                     total_size = sum(segment.get('size_mb', 0) for segment in result['segments'])
+                    
+                    # Get output_folder from result, with fallback construction
+                    output_folder = result.get('output_folder')
+                    if not output_folder:
+                        # Fallback: construct path from output_path
+                        output_dir = os.path.dirname(output_path)
+                        base_name = os.path.splitext(os.path.basename(output_path))[0]
+                        output_folder = os.path.join(output_dir, f"{base_name}_segments")
+                        logger.info(f"output_folder missing from result, constructed fallback: {output_folder}")
+                    
+                    # Convert to absolute path and validate
+                    output_folder = os.path.abspath(output_folder)
+                    if not os.path.exists(output_folder):
+                        logger.error(f"Segments folder does not exist: {output_folder}")
+                        # Try to create it if it doesn't exist
+                        try:
+                            os.makedirs(output_folder, exist_ok=True)
+                            logger.info(f"Created missing segments folder: {output_folder}")
+                        except Exception as e:
+                            logger.error(f"Failed to create segments folder {output_folder}: {e}")
+                    else:
+                        logger.debug(f"Segments folder validated: {output_folder}")
+                    
                     return {
                         'success': True,
                         'input_file': input_path,
@@ -3877,8 +4057,9 @@ class DynamicVideoCompressor:
                         'encoder_used': 'segmentation',
                         'segments': result['segments'],
                         'num_segments': result['num_segments'],
-                        'output_folder': result.get('output_folder', ''),
-                        'segment_duration': result.get('segment_duration', 0)
+                        'output_folder': output_folder,
+                        'segment_duration': result.get('segment_duration', 0),
+                        'is_segmented_output': True  # Flag to indicate multiple output files
                     }
                 else:
                     # Single file was processed
@@ -3959,10 +4140,38 @@ class DynamicVideoCompressor:
                 if organized_result.get('success', False):
                     total_size = sum(segment.get('size_mb', 0) for segment in organized_result['segments'])
                     
+                    # Get segments_folder and ensure it's absolute and validated
+                    # Save original path as fallback
+                    original_segments_folder = segments_folder
+                    segments_folder = organized_result.get('segments_folder')
+                    if not segments_folder:
+                        # Fallback: use the constructed path
+                        segments_folder = original_segments_folder
+                        logger.warning(f"segments_folder missing from organized_result, using fallback: {segments_folder}")
+                    
+                    # Convert to absolute path and validate
+                    segments_folder = os.path.abspath(segments_folder)
+                    if not os.path.exists(segments_folder):
+                        logger.error(f"Segments folder does not exist: {segments_folder}")
+                        # Try to create it if it doesn't exist
+                        try:
+                            os.makedirs(segments_folder, exist_ok=True)
+                            logger.info(f"Created missing segments folder: {segments_folder}")
+                        except Exception as e:
+                            logger.error(f"Failed to create segments folder {segments_folder}: {e}")
+                            # Return error if we can't create the folder
+                            return {
+                                'success': False,
+                                'error': f"Segments folder does not exist and could not be created: {segments_folder}",
+                                'input_file': input_path
+                            }
+                    else:
+                        logger.debug(f"Segments folder validated: {segments_folder}")
+                    
                     return {
                         'success': True,
                         'input_file': input_path,
-                        'output_file': organized_result['segments_folder'],  # Return folder path for multiple outputs
+                        'output_file': segments_folder,  # Return folder path for multiple outputs
                         'method': 'segmentation_fallback',
                         'original_size_mb': os.path.getsize(input_path) / (1024 * 1024),
                         'compressed_size_mb': total_size,
@@ -3975,7 +4184,7 @@ class DynamicVideoCompressor:
                         'attempts_made': 1,
                         'encoder_used': encoder,
                         'segments': organized_result['segments'],
-                        'segments_folder': organized_result['segments_folder'],
+                        'segments_folder': segments_folder,
                         'num_segments': len(organized_result['segments']),
                         'all_segments_valid': all_valid,
                         'bitrate_validations': result.get('bitrate_validations', []),
@@ -6092,7 +6301,7 @@ class DynamicVideoCompressor:
             
             # Calculate bitrate for new resolution
             duration = video_info.get('duration', 0)
-            audio_bitrate = 96
+            audio_bitrate = 64
             total_bits = target_size_mb * 8 * 1024 * 1024
             video_bits = total_bits - (audio_bitrate * 1000 * duration)
             video_bitrate = max(int(video_bits / duration / 1000), 64)
@@ -6164,7 +6373,7 @@ class DynamicVideoCompressor:
             
             # Calculate bitrate
             duration = video_info.get('duration', 0)
-            audio_bitrate = 96
+            audio_bitrate = 64
             total_bits = target_size_mb * 8 * 1024 * 1024
             video_bits = total_bits - (audio_bitrate * 1000 * duration)
             video_bitrate = max(int(video_bits / duration / 1000), 64)

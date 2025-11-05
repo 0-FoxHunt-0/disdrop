@@ -38,6 +38,16 @@ logging:
       level: DEBUG
       handlers: [console, file, error_file]
       propagate: false
+    
+    PIL:
+      level: WARNING
+      handlers: []
+      propagate: false
+    
+    Pillow:
+      level: WARNING
+      handlers: []
+      propagate: false
 
   root:
     level: DEBUG

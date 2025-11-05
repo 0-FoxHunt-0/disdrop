@@ -18,9 +18,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
-from .config_manager import ConfigManager
-from .hardware_detector import HardwareDetector
-from .ffmpeg_utils import FFmpegUtils
+from ..config_manager import ConfigManager
+from ..hardware_detector import HardwareDetector
+from ..ffmpeg_utils import FFmpegUtils
 from .bitrate_validator import BitrateValidator, ValidationResult
 from .adaptive_parameter_adjuster import AdaptiveParameterAdjuster
 
@@ -1627,7 +1627,7 @@ class VideoSegmenter:
             height = int(video_stream.get('height', 0))
             duration = float(probe_data['format'].get('duration', 0))
             bitrate = int(probe_data['format'].get('bit_rate', 0))
-            from .ffmpeg_utils import FFmpegUtils
+            from ..ffmpeg_utils import FFmpegUtils
             fps = FFmpegUtils.parse_fps(video_stream.get('r_frame_rate', '30/1'))
             
             # Content complexity analysis
@@ -1689,7 +1689,7 @@ class VideoSegmenter:
     
     def _estimate_motion_level(self, video_stream: Dict, duration: float) -> str:
         """Estimate motion level in video"""
-        from .ffmpeg_utils import FFmpegUtils
+        from ..ffmpeg_utils import FFmpegUtils
         fps = FFmpegUtils.parse_fps(video_stream.get('r_frame_rate', '30/1'))
         
         if fps >= 50:
@@ -1866,11 +1866,36 @@ class VideoSegmenter:
             
             if not final_segments:
                 logger.error("All segments exceeded size limit; no outputs written")
+                # Ensure folder exists even if empty (for consistency)
+                try:
+                    if not os.path.exists(final_segments_folder):
+                        os.makedirs(final_segments_folder, exist_ok=True)
+                        logger.debug(f"Created empty segments folder: {final_segments_folder}")
+                except Exception as e:
+                    logger.warning(f"Failed to create empty segments folder: {e}")
+                
                 return {
                     'success': False,
                     'error': 'All segments exceeded size limit; no outputs written',
-                    'temp_files': results.get('temp_files', [])
+                    'temp_files': results.get('temp_files', []),
+                    'output_folder': os.path.abspath(final_segments_folder) if final_segments_folder else None
                 }
+
+            # Ensure folder exists and convert to absolute path
+            final_segments_folder = os.path.abspath(final_segments_folder)
+            if not os.path.exists(final_segments_folder):
+                try:
+                    os.makedirs(final_segments_folder, exist_ok=True)
+                    logger.info(f"Created segments folder: {final_segments_folder}")
+                except Exception as e:
+                    logger.error(f"Failed to create segments folder {final_segments_folder}: {e}")
+                    return {
+                        'success': False,
+                        'error': f"Failed to create segments folder: {e}",
+                        'temp_files': results.get('temp_files', [])
+                    }
+            else:
+                logger.debug(f"Segments folder validated: {final_segments_folder}")
 
             return {
                 'success': True,
@@ -2024,7 +2049,7 @@ class VideoSegmenter:
         """
         try:
             import time
-            from .ffmpeg_utils import FFmpegUtils
+            from ..ffmpeg_utils import FFmpegUtils
             
             # Find all MP4 and GIF files in the segments folder
             mp4_files = [f for f in os.listdir(segments_folder) if f.lower().endswith('.mp4')]

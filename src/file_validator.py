@@ -519,6 +519,27 @@ class FileValidator:
             Tuple of (is_valid, error_message)
         """
         try:
+            # Skip duration comparison if original_path is None (per memory: segmented GIFs should not compare)
+            if original_path is None:
+                return True, None
+            
+            # Check if processed file is a segmented GIF (by filename or path)
+            # Segmented GIFs should not be compared against original duration
+            import os
+            import re
+            processed_path_lower = processed_path.lower()
+            is_segmented_gif = (
+                processed_path_lower.endswith('.gif') and (
+                    '_segment_' in processed_path_lower or
+                    '_segments' in os.path.dirname(processed_path).lower() or
+                    re.search(r'_segment_\d+\.gif$', processed_path, re.IGNORECASE) is not None
+                )
+            )
+            
+            # Skip duration comparison for segmented GIFs (per memory)
+            if is_segmented_gif:
+                return True, None
+            
             # Get durations using ffprobe
             original_duration = FileValidator._get_video_duration(original_path)
             processed_duration = FileValidator._get_video_duration(processed_path)

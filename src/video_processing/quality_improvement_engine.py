@@ -98,6 +98,7 @@ class CompressionParams:
     tune: Optional[str]
     gop_size: Optional[int]
     b_frames: Optional[int]
+    audio_bitrate: int = 64  # Default to 64kbps (acceptable minimum for AAC)
 
 
 class QualityImprovementEngine:
@@ -126,6 +127,53 @@ class QualityImprovementEngine:
         }
         
         logger.info("Quality Improvement Engine initialized")
+    
+    @staticmethod
+    def params_dict_to_compression_params(params_dict: Dict[str, Any]) -> CompressionParams:
+        """Convert params dictionary to CompressionParams, preserving audio_bitrate."""
+        # Extract audio_bitrate, defaulting to 64kbps if not present
+        audio_bitrate = params_dict.get('audio_bitrate', 64)
+        # Ensure minimum of 64kbps
+        audio_bitrate = max(int(audio_bitrate), 64)
+        
+        return CompressionParams(
+            bitrate=int(params_dict.get('bitrate', 1000)),
+            width=int(params_dict.get('width', 1920)),
+            height=int(params_dict.get('height', 1080)),
+            fps=float(params_dict.get('fps', 30.0)),
+            encoder=str(params_dict.get('encoder', 'libx264')),
+            preset=str(params_dict.get('preset', 'medium')),
+            crf=params_dict.get('crf'),
+            tune=params_dict.get('tune'),
+            gop_size=params_dict.get('gop_size'),
+            b_frames=params_dict.get('b_frames'),
+            audio_bitrate=audio_bitrate
+        )
+    
+    @staticmethod
+    def compression_params_to_params_dict(params: CompressionParams) -> Dict[str, Any]:
+        """Convert CompressionParams to params dictionary, including audio_bitrate."""
+        result = {
+            'bitrate': params.bitrate,
+            'width': params.width,
+            'height': params.height,
+            'fps': params.fps,
+            'encoder': params.encoder,
+            'preset': params.preset,
+            'audio_bitrate': max(params.audio_bitrate, 64)  # Ensure minimum
+        }
+        
+        # Add optional fields if present
+        if params.crf is not None:
+            result['crf'] = params.crf
+        if params.tune is not None:
+            result['tune'] = params.tune
+        if params.gop_size is not None:
+            result['gop_size'] = params.gop_size
+        if params.b_frames is not None:
+            result['b_frames'] = params.b_frames
+        
+        return result
     
     def _get_config(self, key: str, default: Any) -> Any:
         """Get configuration value with fallback to default."""
@@ -976,7 +1024,8 @@ class QualityImprovementEngine:
             crf=params.crf,
             tune=params.tune,
             gop_size=params.gop_size,
-            b_frames=params.b_frames
+            b_frames=params.b_frames,
+            audio_bitrate=max(params.audio_bitrate, 64)  # Preserve audio_bitrate, ensure minimum
         )
         
         # If still too high, try additional adjustments
@@ -1973,6 +2022,9 @@ class QualityImprovementEngine:
         logger.info(f"Applying improvement plan: {plan.justification}")
         
         # Create new parameters based on current ones
+        # Preserve audio_bitrate, ensuring minimum of 64kbps
+        preserved_audio_bitrate = max(current_params.audio_bitrate, 64)
+        
         new_params = CompressionParams(
             bitrate=int(current_params.bitrate * plan.bitrate_increase_factor),
             width=current_params.width,
@@ -1983,7 +2035,8 @@ class QualityImprovementEngine:
             crf=current_params.crf,
             tune=current_params.tune,
             gop_size=current_params.gop_size,
-            b_frames=current_params.b_frames
+            b_frames=current_params.b_frames,
+            audio_bitrate=preserved_audio_bitrate
         )
         
         # Apply temporal parameters
@@ -2197,5 +2250,6 @@ class QualityImprovementEngine:
             crf=point.crf,
             tune=base_params.tune,
             gop_size=base_params.gop_size,
-            b_frames=base_params.b_frames
+            b_frames=base_params.b_frames,
+            audio_bitrate=max(base_params.audio_bitrate, 64)  # Preserve audio_bitrate, ensure minimum
         )

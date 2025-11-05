@@ -56,6 +56,16 @@ class UTF8StreamHandler(logging.StreamHandler):
         except Exception:
             self.handleError(record)
 
+class PILDebugFilter(logging.Filter):
+    """Filter to exclude PIL/Pillow DEBUG messages from file logs"""
+    
+    def filter(self, record):
+        # Filter out PIL/Pillow DEBUG messages
+        if record.name.startswith('PIL') or record.name.startswith('Pillow'):
+            if record.levelno == logging.DEBUG:
+                return False
+        return True
+
 class TeeStream:
     """A stream that writes to the original stream and a log file."""
 
@@ -332,6 +342,23 @@ def setup_logging(config_path: str = "config/logging.yaml", log_level: Optional[
                 'mode': 'a'
             }
         },
+        'loggers': {
+            'video_compressor': {
+                'level': 'DEBUG',
+                'handlers': ['console', 'file', 'error_file'],
+                'propagate': False
+            },
+            'PIL': {
+                'level': 'WARNING',
+                'handlers': [],
+                'propagate': False
+            },
+            'Pillow': {
+                'level': 'WARNING',
+                'handlers': [],
+                'propagate': False
+            }
+        },
         'root': {
             'level': 'DEBUG',
             'handlers': ['console', 'file', 'error_file']
@@ -446,6 +473,16 @@ def setup_logging(config_path: str = "config/logging.yaml", log_level: Optional[
         
         # Get the main logger and add colored formatter to console handler
         logger = logging.getLogger('video_compressor')
+        
+        # Add PIL debug filter to file handler to prevent verbose PIL logs
+        try:
+            root_logger = logging.getLogger()
+            for handler in root_logger.handlers:
+                if isinstance(handler, logging.FileHandler) and 'video_compressor.log' in handler.baseFilename:
+                    pil_filter = PILDebugFilter()
+                    handler.addFilter(pil_filter)
+        except Exception as filter_error:
+            logger.debug(f"Could not add PIL filter to file handler: {filter_error}")
         
         # Find console handler and apply colored formatter
         try:

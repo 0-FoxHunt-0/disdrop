@@ -15,8 +15,8 @@ from typing import Dict, List, Optional, Tuple, Any
 import cv2
 import numpy as np
 try:
-    from .ffmpeg_utils import FFmpegUtils
-    from .logger_setup import get_logger
+    from ..ffmpeg_utils import FFmpegUtils
+    from ..logger_setup import get_logger
 except ImportError:
     # Fallback for direct execution
     try:

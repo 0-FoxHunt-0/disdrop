@@ -1,0 +1,6 @@
+"""GIF processing module."""
+
+
+
+
+

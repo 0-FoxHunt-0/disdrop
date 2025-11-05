@@ -16,8 +16,8 @@ import logging
 
 try:
     from .performance_monitor import CompressionSessionMetrics, OperationMetrics, PerformanceMonitor
-    from .logger_setup import get_logger
-    from .config_manager import ConfigManager
+    from ..logger_setup import get_logger
+    from ..config_manager import ConfigManager
 except ImportError:
     # Fallback for direct execution
     from performance_monitor import CompressionSessionMetrics, OperationMetrics, PerformanceMonitor

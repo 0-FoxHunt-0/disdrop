@@ -20,8 +20,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COM
 from .config_manager import ConfigManager
 from .logger_setup import get_app_base_dir
 from .hardware_detector import HardwareDetector
-from .video_compressor import DynamicVideoCompressor
-from .gif_generator import GifGenerator
+from .video_processing.video_compressor import DynamicVideoCompressor
+from .gif_processing.gif_generator import GifGenerator
 from .file_validator import FileValidator
 from .ffmpeg_utils import FFmpegUtils
 from .error_handler import ErrorHandler, ErrorCategory
@@ -370,9 +370,28 @@ class AutomatedWorkflow:
                 # Not a segmented output, handle as normal
                 return 'success' if result.get('success', False) else 'error'
             
-            segments_folder_path = result.get('segments_folder', result.get('output_file'))
+            # Check multiple possible keys: segments_folder (fallback), output_folder (regular), output_file (fallback)
+            segments_folder_path = result.get('segments_folder') or result.get('output_folder') or result.get('output_file')
+            
+            # Fallback: construct path from input file if all keys missing
+            if not segments_folder_path:
+                input_dir = os.path.dirname(str(input_file))
+                base_name = os.path.splitext(os.path.basename(str(input_file)))[0]
+                segments_folder_path = os.path.join(input_dir, f"{base_name}_segments")
+                logger.info(f"segments_folder_path missing from result, constructed fallback from input: {segments_folder_path}")
+            
+            # Convert to absolute path before checking existence
+            segments_folder_path = os.path.abspath(segments_folder_path)
+            logger.debug(f"Checking segments folder at: {segments_folder_path}")
+            
             if not segments_folder_path or not os.path.exists(segments_folder_path):
-                logger.error(f"Segmentation fallback completed but segments folder not found: {segments_folder_path}")
+                logger.error(f"Segmentation fallback completed but segments folder not found")
+                logger.error(f"Expected path: {segments_folder_path}")
+                logger.error(f"Result keys: {list(result.keys())}")
+                logger.error(f"Result output_folder: {result.get('output_folder')}")
+                logger.error(f"Result segments_folder: {result.get('segments_folder')}")
+                logger.error(f"Result output_file: {result.get('output_file')}")
+                logger.error(f"Input file: {input_file}")
                 return 'error'
             
             segments_folder = Path(segments_folder_path)
@@ -1393,9 +1412,33 @@ class AutomatedWorkflow:
                     
                     if fallback_status == 'success':
                         # Get the segments folder path from result
-                        segments_folder_path = result.get('segments_folder', result.get('output_file'))
+                        # Check multiple possible keys: segments_folder (fallback), output_folder (regular), output_file (fallback)
+                        segments_folder_path = result.get('segments_folder') or result.get('output_folder') or result.get('output_file')
+                        
+                        # Fallback: construct path from output_path if all keys missing
+                        if not segments_folder_path:
+                            output_dir = os.path.dirname(str(output_path))
+                            base_name = os.path.splitext(os.path.basename(str(output_path)))[0]
+                            segments_folder_path = os.path.join(output_dir, f"{base_name}_segments")
+                            logger.info(f"segments_folder_path missing from result, constructed fallback: {segments_folder_path}")
+                        
+                        # Convert to absolute path and validate
+                        segments_folder_path = os.path.abspath(segments_folder_path)
+                        logger.debug(f"Checking segments folder at: {segments_folder_path}")
+                        
                         if segments_folder_path and os.path.exists(segments_folder_path):
                             segments_folder = Path(segments_folder_path)
+                            
+                            # Verify folder contains segments before returning
+                            try:
+                                mp4s = list(segments_folder.glob('*.mp4'))
+                                if not mp4s:
+                                    logger.warning(f"Segments folder exists but contains no MP4 files: {segments_folder_path}")
+                                    # Don't fail - folder exists, segments might be processing
+                                else:
+                                    logger.debug(f"Segments folder validated: {len(mp4s)} MP4 files found in {segments_folder_path}")
+                            except Exception as e:
+                                logger.warning(f"Could not verify segments in folder {segments_folder_path}: {e}")
                             
                             # Best-effort: create a cover image in the segments folder
                             try:
@@ -1421,8 +1464,13 @@ class AutomatedWorkflow:
                             
                             return segments_folder
                         else:
+                            logger.error(f"Segmentation completed but segments folder not found. Expected path: {segments_folder_path}")
+                            logger.error(f"Result keys: {list(result.keys())}")
+                            logger.error(f"Result output_folder: {result.get('output_folder')}")
+                            logger.error(f"Result segments_folder: {result.get('segments_folder')}")
+                            logger.error(f"Result output_file: {result.get('output_file')}")
                             print(f"    ❌ Segmentation completed but segments folder not found")
-                            logger.error(f"Segmentation completed but segments folder not found")
+                            print(f"    Expected: {segments_folder_path}")
                             return None
                     else:
                         print(f"    ❌ Segmentation fallback handling failed")
@@ -1485,7 +1533,8 @@ class AutomatedWorkflow:
                                     
                                     if fallback_status == 'success':
                                         # Get the segments folder path from result
-                                        segments_folder_path = result.get('segments_folder', result.get('output_file'))
+                                        # Check multiple possible keys: segments_folder (fallback), output_folder (regular), output_file (fallback)
+                                        segments_folder_path = result.get('segments_folder') or result.get('output_folder') or result.get('output_file')
                                         if segments_folder_path and os.path.exists(segments_folder_path):
                                             return Path(segments_folder_path)
                                         else:
@@ -1702,27 +1751,105 @@ class AutomatedWorkflow:
 
                     try:
                         if temp_segments_dir.exists():
+                            # Track files that should be moved
+                            temp_files_before = set()
+                            if temp_segments_dir.exists() and temp_segments_dir.is_dir():
+                                temp_files_before = {item.name for item in temp_segments_dir.iterdir() if item.is_file()}
+                            
                             if final_segments_dir.exists() and final_segments_dir.is_dir():
                                 # Merge/move files into existing folder
                                 for item in temp_segments_dir.iterdir():
                                     if item.is_file():
-                                        shutil.move(str(item), str(final_segments_dir / item.name))
+                                        final_path = final_segments_dir / item.name
+                                        shutil.move(str(item), str(final_path))
+                                        # Verify file was moved
+                                        if not final_path.exists():
+                                            logger.error(f"File move failed: {item.name} not found in final location")
+                                        elif item.exists():
+                                            logger.warning(f"File still exists in temp after move: {item.name}, attempting cleanup")
+                                            try:
+                                                item.unlink()
+                                            except Exception:
+                                                pass
                             else:
+                                # Track files before move to ensure all are moved
+                                temp_files_before_move = []
+                                try:
+                                    for item in temp_segments_dir.iterdir():
+                                        if item.is_file():
+                                            temp_files_before_move.append(item.name)
+                                except Exception:
+                                    pass
+                                
                                 shutil.move(str(temp_segments_dir), str(final_segments_dir))
+                                
+                                # Verify folder was moved (not copied) and all files are present
+                                if temp_segments_dir.exists():
+                                    logger.warning(f"Temp segments folder still exists after move: {temp_segments_dir}, attempting cleanup")
+                                    try:
+                                        # Try to remove if empty or contains only metadata
+                                        remaining = list(temp_segments_dir.iterdir())
+                                        if not remaining:
+                                            temp_segments_dir.rmdir()
+                                        else:
+                                            logger.warning(f"Temp segments folder not empty after move: {[str(f) for f in remaining]}")
+                                            # Check if any segment files are still in temp
+                                            remaining_files = [f for f in remaining if f.is_file() and f.suffix.lower() in ['.gif', '.mp4'] and not f.name.startswith('~')]
+                                            if remaining_files:
+                                                logger.error(f"Segment files still in temp folder after move: {[f.name for f in remaining_files]}")
+                                                # Try to move remaining files to final location
+                                                for remaining_file in remaining_files:
+                                                    try:
+                                                        target = final_segments_dir / remaining_file.name
+                                                        if not target.exists():
+                                                            shutil.move(str(remaining_file), str(target))
+                                                            logger.info(f"Moved remaining segment file to final location: {remaining_file.name}")
+                                                    except Exception as e:
+                                                        logger.warning(f"Could not move remaining file {remaining_file.name}: {e}")
+                                    except Exception as e:
+                                        logger.debug(f"Could not clean up temp segments folder: {e}")
+                                
+                                # Verify all files are in final location
+                                if final_segments_dir.exists():
+                                    final_files = {item.name for item in final_segments_dir.iterdir() if item.is_file()}
+                                    missing_files = [f for f in temp_files_before_move if f not in final_files]
+                                    if missing_files:
+                                        logger.warning(f"Some files missing from final segments folder after move: {missing_files}")
+                                    else:
+                                        logger.debug(f"All {len(temp_files_before_move)} files successfully moved to final segments folder")
+
+                            # Validate that final segments folder contains the expected files
+                            if final_segments_dir.exists():
+                                final_files = {item.name for item in final_segments_dir.iterdir() if item.is_file() and not item.name.startswith('~')}
+                                # Check for segment files in parent directory that should have been moved
+                                parent_dir = final_segments_dir.parent
+                                parent_segment_files = []
+                                try:
+                                    for item in parent_dir.iterdir():
+                                        if item.is_file() and item.name.startswith(mp4_file.stem) and item.suffix.lower() in ['.gif', '.mp4']:
+                                            # Check if this looks like a segment file that should be in segments folder
+                                            if '_segment_' in item.name.lower() or '_part_' in item.name.lower():
+                                                parent_segment_files.append(item)
+                                except Exception:
+                                    pass
+                                
+                                if parent_segment_files:
+                                    logger.warning(f"Found segment files in parent directory that should be in segments folder: {[f.name for f in parent_segment_files]}")
+                                    # Move any orphaned segment files to segments folder
+                                    for orphan_file in parent_segment_files:
+                                        try:
+                                            target = final_segments_dir / orphan_file.name
+                                            if not target.exists():
+                                                shutil.move(str(orphan_file), str(target))
+                                                logger.info(f"Moved orphaned segment file to segments folder: {orphan_file.name}")
+                                            else:
+                                                logger.debug(f"Orphaned segment file already exists in segments folder, removing from parent: {orphan_file.name}")
+                                                orphan_file.unlink()
+                                        except Exception as e:
+                                            logger.warning(f"Could not move orphaned segment file {orphan_file.name}: {e}")
 
                             # Validate moved GIFs and ensure all are under size
                             valid_segments, invalid_segments = self._validate_segment_folder_gifs(final_segments_dir, max_size_mb)
-
-                            # Create comprehensive summary for both MP4 and GIF segments regardless of validity
-                            try:
-                                # Always use sanitized base name (without '_segments')
-                                try:
-                                    sanitized_base = final_segments_dir.name.replace('_segments', '')
-                                except Exception:
-                                    sanitized_base = final_segments_dir.name
-                                self._create_comprehensive_segments_summary(final_segments_dir, sanitized_base)
-                            except Exception as e:
-                                logger.debug(f"Could not create comprehensive summary: {e}")
 
                             if valid_segments and not invalid_segments:
                                 print(f"    ✨ Segment GIFs generated: {final_segments_dir.name} ({len(valid_segments)} valid)")
@@ -1778,6 +1905,15 @@ class AutomatedWorkflow:
                                     logger.info(f"Keeping invalid segment artifacts in folder: {final_segments_dir}")
                                 except Exception:
                                     pass
+                                # Create summary for invalid segments case so incomplete segments still have a summary
+                                try:
+                                    try:
+                                        sanitized_base = final_segments_dir.name.replace('_segments', '')
+                                    except Exception:
+                                        sanitized_base = final_segments_dir.name
+                                    self._create_comprehensive_segments_summary(final_segments_dir, sanitized_base)
+                                except Exception as e:
+                                    logger.debug(f"Could not create comprehensive summary for invalid segments: {e}")
                                 return False
                         else:
                             print(f"    ❌ Expected temp segments not found: {temp_segments_dir}")
@@ -2057,12 +2193,29 @@ class AutomatedWorkflow:
             if present_count < expected:
                 try:
                     missing = expected - present_count
-                    print(f"    ⚠️  Segment completeness check: expected {expected}, found {present_count} (missing {missing})")
+                    # Identify which segments are missing
+                    present_indices = set()
+                    for f in gif_files:
+                        m = re.search(r"_segment_(\d+)\.gif$", f.name)
+                        if m:
+                            try:
+                                present_indices.add(int(m.group(1)))
+                            except Exception:
+                                pass
+                    missing_indices = [i for i in range(1, expected + 1) if i not in present_indices]
+                    missing_list = ", ".join([f"segment_{i:02d}" for i in missing_indices])
+                    
+                    print(f"    ⚠️  Segment completeness check: expected {expected}, found {present_count} (missing {missing}: {missing_list})")
+                    logger.warning(
+                        f"Segment completeness check failed for {segments_folder.name}: expected {expected}, found {present_count}, "
+                        f"missing segments: {missing_list}"
+                    )
+                except Exception as e:
+                    logger.warning(f"Error identifying missing segments: {e}")
+                    print(f"    ⚠️  Segment completeness check: expected {expected}, found {present_count} (missing {expected - present_count})")
                     logger.warning(
                         f"Segment completeness check failed for {segments_folder.name}: expected {expected}, found {present_count}"
                     )
-                except Exception:
-                    pass
                 # Consider folder invalid if incomplete; treat all as invalid to trigger regeneration
                 return [], gif_files
 
@@ -2168,22 +2321,53 @@ class AutomatedWorkflow:
             target = segments_folder / mp4_file.name
             if target.exists():
                 logger.debug(f"MP4 already exists in segments folder: {target.name}")
+                # Verify that source MP4 is not still in parent directory (should have been moved)
+                if mp4_file.parent.resolve() == self.output_dir.resolve() and mp4_file.exists():
+                    logger.warning(f"MP4 still exists in parent directory after being moved to segments folder: {mp4_file.name}")
+                    # Remove duplicate from parent directory
+                    try:
+                        mp4_file.unlink()
+                        logger.info(f"Removed duplicate MP4 from parent directory: {mp4_file.name}")
+                    except Exception as e:
+                        logger.warning(f"Could not remove duplicate MP4 from parent directory: {e}")
                 return
             
             # If mp4 is in output dir, move it. Otherwise, copy it (e.g., original input still in input/).
             try:
-                if mp4_file.parent.resolve() == self.output_dir.resolve() and mp4_file.exists():
+                should_move = mp4_file.parent.resolve() == self.output_dir.resolve() and mp4_file.exists()
+                if should_move:
                     shutil.move(str(mp4_file), str(target))
                     logger.info(f"Moved MP4 to segments folder: {mp4_file.name} -> {target}")
+                    
+                    # Validate that MP4 was moved correctly
+                    if not target.exists():
+                        logger.error(f"MP4 move failed: {target.name} does not exist in segments folder")
+                    elif mp4_file.exists():
+                        logger.warning(f"MP4 still exists in parent directory after move: {mp4_file.name}, attempting cleanup")
+                        try:
+                            mp4_file.unlink()
+                            logger.info(f"Removed leftover MP4 from parent directory: {mp4_file.name}")
+                        except Exception as e:
+                            logger.warning(f"Could not remove leftover MP4 from parent directory: {e}")
+                    else:
+                        logger.debug(f"MP4 successfully moved from parent to segments folder: {mp4_file.name}")
                 else:
                     shutil.copy2(str(mp4_file), str(target))
                     logger.info(f"Copied MP4 to segments folder: {mp4_file.name} -> {target}")
+                    
+                    # Validate copy operation
+                    if not target.exists():
+                        logger.error(f"MP4 copy failed: {target.name} does not exist in segments folder")
             except Exception as e:
                 logger.warning(f"Failed to move/copy MP4 to segments folder: {e}")
                 # As a last resort, try copying
                 try:
                     shutil.copy2(str(mp4_file), str(target))
                     logger.info(f"Fallback copy MP4 to segments folder: {mp4_file.name} -> {target}")
+                    
+                    # Validate fallback copy
+                    if not target.exists():
+                        logger.error(f"Fallback MP4 copy failed: {target.name} does not exist in segments folder")
                 except Exception as copy_e:
                     logger.error(f"Failed to copy MP4 to segments folder: {copy_e}")
         except Exception as e:
@@ -2437,6 +2621,11 @@ class AutomatedWorkflow:
             print(f"    🎯 Optimizing GIF: {gif_file.name}")
             logger.info(f"Optimizing GIF file: {gif_file.name}")
             
+            # Log initial file size
+            initial_size = self.file_validator.get_file_size_mb(str(gif_file))
+            logger.debug(f"[Workflow] Initial file size: {initial_size:.2f}MB, target: {max_size_mb:.2f}MB")
+            logger.info(f"Starting GIF optimization: {gif_file.name} ({initial_size:.2f}MB -> target: {max_size_mb:.2f}MB)")
+            
             # Create output path (preserve folder structure)
             relative_path = self._get_relative_path(gif_file)
             output_category_dir = self.output_dir / relative_path.parent
@@ -2458,6 +2647,8 @@ class AutomatedWorkflow:
                 # Try to copy the file, but handle corruption gracefully
                 try:
                     shutil.copy2(gif_file, working_path)
+                    working_size = self.file_validator.get_file_size_mb(str(working_path))
+                    logger.debug(f"[Workflow] Working copy created: {working_size:.2f}MB")
                 except Exception as copy_error:
                     logger.warning(f"Failed to copy corrupted GIF {gif_file.name}: {copy_error}")
                     # Try to read and rewrite the file to potentially fix corruption
@@ -2466,7 +2657,8 @@ class AutomatedWorkflow:
                         with Image.open(gif_file) as img:
                             # Save as new GIF to potentially fix corruption
                             img.save(working_path, 'GIF', save_all=True, loop=0)
-                        logger.info(f"Successfully repaired corrupted GIF {gif_file.name} using PIL")
+                        working_size = self.file_validator.get_file_size_mb(str(working_path))
+                        logger.info(f"Successfully repaired corrupted GIF {gif_file.name} using PIL, size: {working_size:.2f}MB")
                     except Exception as repair_error:
                         logger.error(f"Failed to repair corrupted GIF {gif_file.name}: {repair_error}")
                         return 'error'
@@ -2476,25 +2668,30 @@ class AutomatedWorkflow:
                 return 'error'
 
             # Use the advanced GIF optimizer with quality targeting on the working copy
-            from .gif_optimizer_advanced import AdvancedGifOptimizer
+            from .gif_processing.gif_optimizer_advanced import AdvancedGifOptimizer
             optimizer = AdvancedGifOptimizer(self.config)
 
+            logger.debug(f"[Workflow] Calling optimizer.optimize_gif() with target: {max_size_mb:.2f}MB")
             result = optimizer.optimize_gif(
                 gif_path=str(working_path),
                 max_size_mb=max_size_mb
             )
+            logger.debug(f"[Workflow] Optimizer returned: {result}, working file exists: {working_path.exists()}")
 
             if result and working_path.exists():
                 optimized_size = self.file_validator.get_file_size_mb(str(working_path))
+                reduction_pct = ((initial_size - optimized_size) / initial_size * 100) if initial_size > 0 else 0
+                logger.debug(f"[Workflow] Optimization successful: {optimized_size:.2f}MB (reduction: {reduction_pct:.1f}% from {initial_size:.2f}MB)")
                 
                 # Validate size before copying to output
                 if optimized_size > max_size_mb:
                     print(f"    ❌ Optimized GIF still exceeds size limit: {optimized_size:.2f}MB > {max_size_mb:.2f}MB")
                     logger.warning(f"Optimized GIF exceeds size limit: {gif_file.name} ({optimized_size:.2f}MB > {max_size_mb:.2f}MB)")
+                    logger.debug(f"[Workflow] Optimization failed reason: size exceeded (optimized: {optimized_size:.2f}MB > target: {max_size_mb:.2f}MB)")
                     return 'error'
                 
                 print(f"    ✅ GIF optimized successfully: {optimized_size:.2f}MB")
-                logger.info(f"GIF optimized successfully (copy): {gif_file.name} -> {optimized_size:.2f}MB")
+                logger.info(f"GIF optimized successfully (copy): {gif_file.name} -> {optimized_size:.2f}MB (reduced from {initial_size:.2f}MB by {reduction_pct:.1f}%)")
 
                 # Copy optimized working copy to output directory
                 try:
@@ -2532,50 +2729,101 @@ class AutomatedWorkflow:
                 print(f"    ⚠️  Optimization failed, attempting fallback strategies...")
                 logger.info(f"Optimization failed for {gif_file.name}, attempting fallback strategies")
                 
-                # Strategy 1: Try to repair the corrupted input file
-                try:
-                    from PIL import Image
-                    repaired_path = self.temp_dir / f"{gif_file.stem}.repaired.gif"
-                    
-                    with Image.open(gif_file) as img:
-                        # Save as new GIF to potentially fix corruption
-                        img.save(repaired_path, 'GIF', save_all=True, loop=0)
-                    
-                    # Validate the repaired file
-                    is_valid, error_msg = self.file_validator.is_valid_gif_with_enhanced_checks(
-                        str(repaired_path),
+                # Log why optimization failed
+                if not result:
+                    logger.debug(f"[Workflow] Optimization failed: optimizer returned False")
+                elif not working_path.exists():
+                    logger.debug(f"[Workflow] Optimization failed: working file does not exist after optimization")
+                else:
+                    working_size = self.file_validator.get_file_size_mb(str(working_path))
+                    logger.debug(f"[Workflow] Optimization failed: working file exists but size is {working_size:.2f}MB (target: {max_size_mb:.2f}MB)")
+                
+                # Check if working file exists and is valid (excluding size) before attempting repair
+                # This helps distinguish between size failures and actual corruption
+                needs_repair = False
+                if working_path.exists():
+                    working_size = self.file_validator.get_file_size_mb(str(working_path))
+                    logger.debug(f"[Workflow] Working file exists: {working_size:.2f}MB, validating for corruption...")
+                    # Validate working file without size check to see if it's actually corrupted
+                    is_valid_no_size, error_msg_no_size = self.file_validator.is_valid_gif_with_enhanced_checks(
+                        str(working_path),
                         original_path=str(gif_file),
-                        max_size_mb=max_size_mb
+                        max_size_mb=None  # Skip size validation
                     )
-                    
-                    if is_valid:
-                        current_size = self.file_validator.get_file_size_mb(str(repaired_path))
-                        print(f"    ✅ Successfully repaired corrupted GIF ({current_size:.2f}MB)")
-                        logger.info(f"Successfully repaired corrupted GIF {gif_file.name}")
-                        
-                        # Copy repaired file to output
-                        if output_path.exists():
-                            output_path.unlink()
-                        shutil.copy2(repaired_path, output_path)
-                        print(f"    📁 Saved repaired GIF to output: {output_path.name}")
-                        logger.info(f"Saved repaired GIF to output: {output_path}")
-                        
-                        # Clean up
-                        try:
-                            repaired_path.unlink()
-                        except Exception:
-                            pass
-                        
-                        return 'success'
+                    if not is_valid_no_size:
+                        # File exists but is corrupted - needs repair
+                        needs_repair = True
+                        logger.info(f"Working file exists but is corrupted: {error_msg_no_size}")
+                        logger.debug(f"[Workflow] Optimization failed reason: corruption detected ({error_msg_no_size})")
                     else:
-                        logger.warning(f"Repaired GIF still invalid: {error_msg}")
-                        try:
-                            repaired_path.unlink()
-                        except Exception:
-                            pass
+                        # File is valid but just over size limit - don't repair
+                        logger.info(f"Working file is valid but exceeds size limit ({working_size:.2f}MB > {max_size_mb:.2f}MB) - skipping repair")
+                        logger.debug(f"[Workflow] Optimization failed reason: size limit exceeded (valid file but {working_size:.2f}MB > {max_size_mb:.2f}MB)")
+                else:
+                    # File doesn't exist - might be corruption issue
+                    needs_repair = True
+                    logger.info(f"Working file does not exist after optimization - attempting repair")
+                    logger.debug(f"[Workflow] Optimization failed reason: working file missing after optimization")
+                
+                # Strategy 1: Try to repair the corrupted input file (only if corruption detected)
+                if needs_repair:
+                    try:
+                        from PIL import Image
+                        repaired_path = self.temp_dir / f"{gif_file.stem}.repaired.gif"
                         
-                except Exception as repair_error:
-                    logger.warning(f"Failed to repair corrupted GIF {gif_file.name}: {repair_error}")
+                        # Get original file size for comparison
+                        original_size = self.file_validator.get_file_size_mb(str(gif_file))
+                        logger.info(f"Original file size: {original_size:.2f}MB")
+                        
+                        with Image.open(gif_file) as img:
+                            # Save as new GIF to potentially fix corruption
+                            img.save(repaired_path, 'GIF', save_all=True, loop=0)
+                        
+                        # Check if repaired file is larger than original - if so, skip it
+                        repaired_size = self.file_validator.get_file_size_mb(str(repaired_path))
+                        if repaired_size > original_size:
+                            logger.warning(f"Repair increased file size ({repaired_size:.2f}MB > {original_size:.2f}MB) - skipping repair result")
+                            try:
+                                repaired_path.unlink()
+                            except Exception:
+                                pass
+                        else:
+                            # Validate the repaired file
+                            is_valid, error_msg = self.file_validator.is_valid_gif_with_enhanced_checks(
+                                str(repaired_path),
+                                original_path=str(gif_file),
+                                max_size_mb=max_size_mb
+                            )
+                            
+                            if is_valid:
+                                current_size = self.file_validator.get_file_size_mb(str(repaired_path))
+                                print(f"    ✅ Successfully repaired corrupted GIF ({current_size:.2f}MB)")
+                                logger.info(f"Successfully repaired corrupted GIF {gif_file.name}")
+                                
+                                # Copy repaired file to output
+                                if output_path.exists():
+                                    output_path.unlink()
+                                shutil.copy2(repaired_path, output_path)
+                                print(f"    📁 Saved repaired GIF to output: {output_path.name}")
+                                logger.info(f"Saved repaired GIF to output: {output_path}")
+                                
+                                # Clean up
+                                try:
+                                    repaired_path.unlink()
+                                except Exception:
+                                    pass
+                                
+                                return 'success'
+                            else:
+                                logger.warning(f"Repaired GIF still invalid: {error_msg}")
+                                try:
+                                    repaired_path.unlink()
+                                except Exception:
+                                    pass
+                    except Exception as repair_error:
+                        logger.warning(f"Failed to repair corrupted GIF {gif_file.name}: {repair_error}")
+                else:
+                    logger.info(f"Skipping repair - optimization failed due to size limit, not corruption")
                 
                 # Strategy 2: Check if original is valid and within size
                 is_valid, error_msg = self.file_validator.is_valid_gif_with_enhanced_checks(
@@ -2598,11 +2846,22 @@ class AutomatedWorkflow:
                 # Strategy 3: All attempts failed
                 print(f"    ❌ All optimization and repair strategies failed for {gif_file.name}")
                 logger.error(f"All optimization and repair strategies failed for {gif_file.name}")
+                
+                # Log final summary of why optimization failed
+                final_summary = f"[Workflow] Optimization failure summary: initial={initial_size:.2f}MB, target={max_size_mb:.2f}MB"
+                if working_path.exists():
+                    working_size = self.file_validator.get_file_size_mb(str(working_path))
+                    final_summary += f", working_file={working_size:.2f}MB"
+                else:
+                    final_summary += ", working_file=missing"
+                logger.debug(final_summary)
+                logger.debug(f"[Workflow] All strategies attempted: optimizer returned {result}, needs_repair={needs_repair if 'needs_repair' in locals() else 'unknown'}")
                 return 'error'
                 
         except Exception as e:
             print(f"    ❌ Error optimizing GIF {gif_file.name}: {e}")
             logger.error(f"Error optimizing GIF {gif_file.name}: {e}")
+            logger.exception(f"[Workflow] Exception during optimization: {e}")
             return 'error' 
 
     def _segment_input_gif(self, gif_file: Path, max_size_mb: float, preferred_segments: Optional[int] = None) -> bool:
@@ -2761,7 +3020,7 @@ class AutomatedWorkflow:
                     pass
                 segments_dir_created = True
 
-            from .gif_optimizer_advanced import AdvancedGifOptimizer
+            from .gif_processing.gif_optimizer_advanced import AdvancedGifOptimizer
             optimizer = AdvancedGifOptimizer(self.config, shutdown_checker=lambda: self.shutdown_requested)
 
             def _process_segment(index: int) -> Optional[Tuple[int, Path, float]]:
@@ -2835,17 +3094,37 @@ class AutomatedWorkflow:
                     ]
                     FFmpegUtils.add_ffmpeg_perf_flags(cmd)
                     # Run with shutdown-aware subprocess to allow fast termination
+                    logger.debug(f"Creating segment {index+1}/{num_segments}: start={seg_start:.2f}s, duration={seg_len:.2f}s")
                     result = optimizer._run_subprocess_with_shutdown_check(cmd, timeout=180)
                     if result.returncode != 0 or not temp_seg.exists():
                         err_excerpt = getattr(result, 'stderr', '')
-                        logger.warning(f"Failed to create segment {index+1}: {err_excerpt[:200] if err_excerpt else 'unknown error'}")
+                        # Detect timeout by checking stderr for 'TimeoutExpired' string
+                        # (the _run_subprocess_with_shutdown_check returns TimeoutResult with stderr='TimeoutExpired')
+                        error_type = "timeout" if (err_excerpt and 'TimeoutExpired' in str(err_excerpt)) else "ffmpeg_error"
+                        logger.error(f"Segment {index+1}/{num_segments} creation failed ({error_type}): FFmpeg returncode={result.returncode}, "
+                                   f"file_exists={temp_seg.exists()}")
+                        if err_excerpt:
+                            logger.error(f"Segment {index+1} FFmpeg stderr: {err_excerpt[:500]}")
+                        if hasattr(result, 'stdout') and result.stdout:
+                            logger.debug(f"Segment {index+1} FFmpeg stdout: {result.stdout[:200]}")
                         return None
                     # Optimize with quality target for stronger convergence
+                    logger.debug(f"Optimizing segment {index+1}/{num_segments}")
                     opt_ok = optimizer.optimize_gif(
                         gif_path=str(temp_seg),
                         max_size_mb=max_size_mb
                     )
                     if not opt_ok:
+                        # Check if file exists and get its size to understand why optimization failed
+                        if temp_seg.exists():
+                            try:
+                                seg_size_mb = temp_seg.stat().st_size / (1024 * 1024)
+                                logger.error(f"Segment {index+1}/{num_segments} optimization failed: "
+                                           f"file size {seg_size_mb:.2f}MB exceeds limit {max_size_mb:.2f}MB")
+                            except Exception:
+                                logger.error(f"Segment {index+1}/{num_segments} optimization failed: unable to get file size")
+                        else:
+                            logger.error(f"Segment {index+1}/{num_segments} optimization failed: file does not exist")
                         try:
                             temp_seg.unlink()
                         except Exception:
@@ -2853,8 +3132,17 @@ class AutomatedWorkflow:
                         return None
                     # Validate and move
                     final_seg = (segments_dir / f"{base_name}_segment_{index+1:02d}.gif") if use_segments_folder else single_output_path
-                    is_valid, _ = self.file_validator.is_valid_gif_with_enhanced_checks(str(temp_seg), original_path=None, max_size_mb=max_size_mb)
+                    logger.debug(f"Validating segment {index+1}/{num_segments} before final move")
+                    is_valid, validation_error = self.file_validator.is_valid_gif_with_enhanced_checks(str(temp_seg), original_path=None, max_size_mb=max_size_mb)
                     if not is_valid:
+                        logger.error(f"Segment {index+1}/{num_segments} validation failed: {validation_error or 'unknown validation error'}")
+                        # Log file details for debugging
+                        if temp_seg.exists():
+                            try:
+                                seg_size_mb = temp_seg.stat().st_size / (1024 * 1024)
+                                logger.debug(f"Segment {index+1} file size: {seg_size_mb:.2f}MB, limit: {max_size_mb:.2f}MB")
+                            except Exception:
+                                pass
                         try:
                             temp_seg.unlink()
                         except Exception:
@@ -2864,12 +3152,41 @@ class AutomatedWorkflow:
                         if not use_segments_folder and final_seg.exists():
                             final_seg.unlink()
                         shutil.move(str(temp_seg), str(final_seg))
-                    except Exception:
+                        
+                        # Validate that file was moved correctly
+                        if not final_seg.exists():
+                            logger.error(f"File move failed: {final_seg} does not exist after move from {temp_seg}")
+                            return None
+                        
+                        # Verify temp file is gone (unless it's a copy operation)
+                        if temp_seg.exists():
+                            logger.warning(f"Temp file still exists after move: {temp_seg}. This may indicate a copy operation.")
+                            # Try to remove the temp file if it still exists
+                            try:
+                                temp_seg.unlink()
+                                logger.debug(f"Removed leftover temp file: {temp_seg}")
+                            except Exception:
+                                pass
+                        
+                    except Exception as e:
+                        logger.warning(f"Error moving segment file from {temp_seg} to {final_seg}: {e}")
                         try:
                             shutil.copy2(str(temp_seg), str(final_seg))
                             temp_seg.unlink(missing_ok=True)  # type: ignore[arg-type]
-                        except Exception:
+                            
+                            # Validate copy operation
+                            if not final_seg.exists():
+                                logger.error(f"File copy failed: {final_seg} does not exist after copy from {temp_seg}")
+                                return None
+                        except Exception as copy_err:
+                            logger.error(f"Both move and copy failed for segment {index+1}: {copy_err}")
                             return None
+                    
+                    # Final validation: ensure file exists in expected location
+                    if not final_seg.exists():
+                        logger.error(f"Segment file validation failed: {final_seg} does not exist")
+                        return None
+                    
                     sz = self.file_validator.get_file_size_mb(str(final_seg))
                     logger.info(f"Created GIF segment {index+1}/{num_segments}: {final_seg} ({sz:.2f}MB)")
                     return (index, final_seg, sz)
@@ -3000,10 +3317,18 @@ class AutomatedWorkflow:
                             pass
                     print(f"    📂 Segmented GIFs saved to: {segments_dir.name} ({successful} segment(s), {total_size_mb:.2f}MB total)")
                     logger.info(f"GIF segmentation complete: {successful} segments at {segments_dir}")
+                    
+                    # Create comprehensive summary for the segments folder
+                    try:
+                        self._create_comprehensive_segments_summary(segments_dir, base_name)
+                        logger.debug(f"Created comprehensive summary for segments folder: {segments_dir.name}")
+                    except Exception as e:
+                        logger.warning(f"Could not create comprehensive summary for segments folder: {e}")
+                    
                     # Record cache for segments-based success (source = base MP4 if present)
                     try:
                         src_input = segments_dir.parent / f"{base_name}.mp4"
-                        cache_input = src_input if src_input.exists() else segments_folder
+                        cache_input = src_input if src_input.exists() else segments_dir
                         self._record_success_cache(cache_input, 'segments', segments_dir)
                     except Exception:
                         pass
@@ -3014,7 +3339,7 @@ class AutomatedWorkflow:
                     # Record cache for single GIF success (source = base MP4 if present)
                     try:
                         src_input = single_output_path.parent / f"{base_name}.mp4"
-                        cache_input = src_input if src_input.exists() else segments_folder
+                        cache_input = src_input if src_input.exists() else single_output_path.parent
                         self._record_success_cache(cache_input, 'single_gif', single_output_path)
                     except Exception:
                         pass
@@ -3527,6 +3852,30 @@ class AutomatedWorkflow:
     def _ensure_segments_summary_exists(self, segments_folder: Path) -> None:
         """Ensure a comprehensive summary exists for the segments folder"""
         try:
+            # Check if segments folder contains any actual segment files before creating summary
+            if not segments_folder.exists() or not segments_folder.is_dir():
+                logger.debug(f"Segments folder does not exist or is not a directory: {segments_folder}")
+                return
+            
+            # Check for segment files (MP4 or GIF) - exclude summary files and other metadata
+            segment_files = []
+            try:
+                for item in segments_folder.iterdir():
+                    if item.is_file():
+                        # Check if it's a segment file (MP4 or GIF), not a summary or metadata file
+                        if item.suffix.lower() in ['.mp4', '.gif']:
+                            # Exclude summary files and other metadata
+                            if not item.name.startswith('~') and not item.name.startswith('folder.'):
+                                segment_files.append(item)
+            except Exception as e:
+                logger.warning(f"Error checking for segment files in {segments_folder}: {e}")
+                return
+            
+            # Only create summary if there are actual segment files
+            if not segment_files:
+                logger.warning(f"Segments folder is empty (no segment files found): {segments_folder.name}, skipping summary creation")
+                return
+            
             # Prefer sanitized base name (without '_segments')
             base_name = segments_folder.stem.replace('_segments', '')
             sanitized = segments_folder / f"~{base_name}_comprehensive_summary.txt"

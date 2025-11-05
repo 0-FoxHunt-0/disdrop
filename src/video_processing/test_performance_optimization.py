@@ -16,7 +16,10 @@ def test_frequency_limiter():
     logger.info("Testing Evaluation Frequency Limiter...")
     
     try:
-        from evaluation_frequency_limiter import EvaluationFrequencyLimiter, EvaluationResult
+        try:
+            from src.evaluation_frequency_limiter import EvaluationFrequencyLimiter, EvaluationResult
+        except ImportError:
+            from evaluation_frequency_limiter import EvaluationFrequencyLimiter, EvaluationResult
         
         limiter = EvaluationFrequencyLimiter()
         
@@ -49,7 +52,10 @@ def test_time_budget():
     logger.info("Testing Computation Time Budget...")
     
     try:
-        from computation_time_budget import ComputationTimeBudget, BudgetStatus
+        try:
+            from src.computation_time_budget import ComputationTimeBudget, BudgetStatus
+        except ImportError:
+            from computation_time_budget import ComputationTimeBudget, BudgetStatus
         
         budget = ComputationTimeBudget()
         
@@ -82,13 +88,16 @@ def test_time_budget():
         return False
 
 def test_result_predictor():
-    """Test evaluation result predictor."""
-    logger.info("Testing Evaluation Result Predictor...")
+    """Test unified quality predictor."""
+    logger.info("Testing Unified Quality Predictor...")
     
     try:
-        from evaluation_result_predictor import EvaluationResultPredictor, VideoCharacteristics
+        try:
+            from src.quality_predictor import QualityPredictor, VideoCharacteristics, PredictionStrategy
+        except ImportError:
+            from quality_predictor import QualityPredictor, VideoCharacteristics, PredictionStrategy
         
-        predictor = EvaluationResultPredictor()
+        predictor = QualityPredictor()
         
         # Create test video characteristics
         test_chars = VideoCharacteristics(
@@ -104,11 +113,15 @@ def test_result_predictor():
             scene_changes=6
         )
         
-        # Test prediction
-        prediction = predictor.predict_quality_scores(test_chars)
+        # Test prediction from characteristics
+        prediction = predictor.predict_quality(
+            "test_video.mp4",
+            strategy=PredictionStrategy.CHARACTERISTICS_BASED,
+            video_characteristics=test_chars
+        )
         assert prediction.predicted_vmaf is not None
         assert prediction.predicted_ssim is not None
-        assert 0 <= prediction.confidence_score <= 1
+        assert 0 <= prediction.overall_confidence <= 1
         assert prediction.estimated_evaluation_time > 0
         
         # Test historical result recording
@@ -120,11 +133,11 @@ def test_result_predictor():
         accuracy = predictor.get_prediction_accuracy()
         assert accuracy['total_predictions'] == 1
         
-        logger.info("✓ Result predictor tests passed")
+        logger.info("✓ Quality predictor tests passed")
         return True
         
     except Exception as e:
-        logger.error(f"✗ Result predictor test failed: {e}")
+        logger.error(f"✗ Quality predictor test failed: {e}")
         return False
 
 def test_integrated_optimizer():
@@ -132,7 +145,10 @@ def test_integrated_optimizer():
     logger.info("Testing Integrated Performance Optimizer...")
     
     try:
-        from quality_evaluation_performance_optimizer import QualityEvaluationPerformanceOptimizer
+        try:
+            from src.quality_evaluation_performance_optimizer import QualityEvaluationPerformanceOptimizer
+        except ImportError:
+            from quality_evaluation_performance_optimizer import QualityEvaluationPerformanceOptimizer
         
         optimizer = QualityEvaluationPerformanceOptimizer()
         
@@ -149,7 +165,7 @@ def test_integrated_optimizer():
         stats = optimizer.get_optimization_statistics()
         assert 'frequency_limiter' in stats
         assert 'time_budget' in stats
-        assert 'result_predictor' in stats
+        assert 'quality_predictor' in stats
         
         # Test session reset
         optimizer.reset_session()

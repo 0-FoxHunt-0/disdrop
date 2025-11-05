@@ -19,8 +19,8 @@ import psutil
 from contextlib import contextmanager
 
 try:
-    from .logger_setup import get_logger
-    from .config_manager import ConfigManager
+    from ..logger_setup import get_logger
+    from ..config_manager import ConfigManager
 except ImportError:
     # Fallback for direct execution
     from logger_setup import get_logger

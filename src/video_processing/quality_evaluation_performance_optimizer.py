@@ -8,9 +8,15 @@ import time
 from typing import Dict, Any, Optional, Callable, List
 from dataclasses import dataclass
 
-from evaluation_frequency_limiter import EvaluationFrequencyLimiter, EvaluationResult
-from computation_time_budget import ComputationTimeBudget, BudgetStatus, ProgressUpdate
-from evaluation_result_predictor import EvaluationResultPredictor, VideoCharacteristics, QualityPrediction
+try:
+    from .evaluation_frequency_limiter import EvaluationFrequencyLimiter, EvaluationResult
+    from .computation_time_budget import ComputationTimeBudget, BudgetStatus, ProgressUpdate
+    from .quality_predictor import QualityPredictor, PredictionStrategy, VideoCharacteristics, QualityPrediction
+except ImportError:
+    # Fallback for direct execution
+    from evaluation_frequency_limiter import EvaluationFrequencyLimiter, EvaluationResult
+    from computation_time_budget import ComputationTimeBudget, BudgetStatus, ProgressUpdate
+    from quality_predictor import QualityPredictor, PredictionStrategy, VideoCharacteristics, QualityPrediction
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +44,7 @@ class QualityEvaluationPerformanceOptimizer:
         # Initialize component modules
         self.frequency_limiter = EvaluationFrequencyLimiter(config_manager)
         self.time_budget = ComputationTimeBudget(config_manager)
-        self.result_predictor = EvaluationResultPredictor(config_manager)
+        self.quality_predictor = QualityPredictor(config_manager)
         
         # Configuration
         self.enable_prediction = self._get_config('enable_prediction', True)
@@ -86,16 +92,18 @@ class QualityEvaluationPerformanceOptimizer:
         
         # Use prediction to determine if evaluation should be skipped
         if self.enable_prediction:
-            video_chars = self.result_predictor.analyze_video_characteristics(video_path)
-            if video_chars:
-                prediction_result = self.result_predictor.predict_quality_scores(video_chars)
-                
-                if prediction_result.should_skip_evaluation:
-                    return True, f"prediction_skip_{prediction_result.prediction_basis}", prediction_result
-                
-                # Check if prediction indicates likely failure
-                if len(prediction_result.risk_factors) >= 3:
-                    return True, f"high_risk_prediction_{len(prediction_result.risk_factors)}_factors", prediction_result
+            # Use unified predictor with automatic strategy selection
+            prediction_result = self.quality_predictor.predict_quality(
+                video_path,
+                strategy=PredictionStrategy.AUTO
+            )
+            
+            if prediction_result.should_skip_evaluation:
+                return True, f"prediction_skip_{prediction_result.prediction_basis}", prediction_result
+            
+            # Check if prediction indicates likely failure
+            if len(prediction_result.risk_factors) >= 3:
+                return True, f"high_risk_prediction_{len(prediction_result.risk_factors)}_factors", prediction_result
         
         return False, "", prediction_result
     
@@ -217,9 +225,9 @@ class QualityEvaluationPerformanceOptimizer:
             
             # Record result for prediction learning
             if self.enable_prediction and prediction:
-                video_chars = self.result_predictor.analyze_video_characteristics(compressed_path)
+                video_chars = self.quality_predictor._analyze_video_characteristics(compressed_path)
                 if video_chars:
-                    self.result_predictor.record_evaluation_result(
+                    self.quality_predictor.record_evaluation_result(
                         video_chars, result.vmaf_score, result.ssim_score,
                         time.time() - (self.time_budget.operation_start_time or time.time()),
                         result.evaluation_success
@@ -263,7 +271,7 @@ class QualityEvaluationPerformanceOptimizer:
         # Use prediction to optimize method selection
         if prediction and self.enable_prediction:
             # If prediction confidence is high, use faster method
-            if prediction.confidence_score > 0.8:
+            if prediction.overall_confidence > 0.8:
                 if prediction.estimated_evaluation_time > 120:  # 2 minutes
                     return 'ssim_only'  # Faster method for high confidence
         
@@ -280,7 +288,10 @@ class QualityEvaluationPerformanceOptimizer:
         """Execute VMAF-only evaluation with optimizations."""
         
         # Import quality gates for actual evaluation
-        from quality_gates import QualityGates
+        try:
+            from .quality_gates import QualityGates
+        except ImportError:
+            from quality_gates import QualityGates
         
         quality_gates = QualityGates(self.config)
         
@@ -388,7 +399,7 @@ class QualityEvaluationPerformanceOptimizer:
         
         passes = vmaf_passes and ssim_passes
         
-        optimization_details['prediction_confidence'] = prediction.confidence_score
+        optimization_details['prediction_confidence'] = prediction.overall_confidence
         optimization_details['prediction_basis'] = prediction.prediction_basis
         optimization_details['risk_factors'] = prediction.risk_factors
         
@@ -397,7 +408,7 @@ class QualityEvaluationPerformanceOptimizer:
             ssim_score=prediction.predicted_ssim,
             passes=passes,
             method='prediction',
-            confidence=prediction.confidence_score,
+            confidence=prediction.overall_confidence,
             evaluation_success=True,
             optimization_applied=True,
             optimization_details=optimization_details,
@@ -420,33 +431,36 @@ class QualityEvaluationPerformanceOptimizer:
         """Use fast quality estimation as fallback."""
         
         try:
-            # Use existing fast quality estimator
-            from fast_quality_estimator import FastQualityEstimator
+            # Use unified quality predictor with fast estimation strategy
+            estimate_result = self.quality_predictor.predict_quality(
+                video_path,
+                strategy=PredictionStrategy.FAST_ESTIMATION,
+                target_duration=10.0
+            )
             
-            estimator = FastQualityEstimator(self.config)
-            estimate = estimator.estimate_quality_fast(video_path, target_duration=10.0)
-            
-            # Determine if estimated scores pass thresholds
-            vmaf_passes = estimate.predicted_vmaf >= vmaf_threshold
-            ssim_passes = estimate.predicted_ssim >= ssim_threshold
+            # Convert unified prediction to OptimizedEvaluationResult format
+            # (No need for intermediate QualityEstimate format)
+            vmaf_passes = estimate_result.predicted_vmaf is not None and estimate_result.predicted_vmaf >= vmaf_threshold
+            ssim_passes = estimate_result.predicted_ssim is not None and estimate_result.predicted_ssim >= ssim_threshold
             passes = vmaf_passes and ssim_passes
             
-            optimization_details['fast_estimation_confidence'] = estimate.confidence
-            optimization_details['fast_estimation_time'] = estimate.computation_time
+            optimization_details['fast_estimation_confidence'] = estimate_result.overall_confidence
+            optimization_details['fast_estimation_time'] = estimate_result.prediction_time
             
             return OptimizedEvaluationResult(
-                vmaf_score=estimate.predicted_vmaf,
-                ssim_score=estimate.predicted_ssim,
+                vmaf_score=estimate_result.predicted_vmaf,
+                ssim_score=estimate_result.predicted_ssim,
                 passes=passes,
                 method='fast_estimation',
-                confidence=estimate.confidence,
+                confidence=estimate_result.overall_confidence,
                 evaluation_success=True,
                 optimization_applied=True,
                 optimization_details=optimization_details,
                 details={
                     'fast_estimation': True,
-                    'sample_coverage': estimate.sample_coverage,
-                    'computation_time': estimate.computation_time
+                    'strategy': estimate_result.strategy.value,
+                    'prediction_basis': estimate_result.prediction_basis,
+                    'computation_time': estimate_result.prediction_time
                 }
             )
         
@@ -516,7 +530,7 @@ class QualityEvaluationPerformanceOptimizer:
         stats = {
             'frequency_limiter': self.frequency_limiter.get_session_statistics(),
             'time_budget': self.time_budget.get_budget_configuration(),
-            'result_predictor': self.result_predictor.get_prediction_accuracy(),
+            'quality_predictor': self.quality_predictor.get_prediction_accuracy(),
             'optimization_enabled': {
                 'prediction': self.enable_prediction,
                 'frequency_limits': self.enable_frequency_limits,

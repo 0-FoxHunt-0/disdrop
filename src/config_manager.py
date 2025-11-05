@@ -249,12 +249,12 @@ class ConfigManager:
         
         # Get current encoder minimums or use defaults
         encoder_minimums = self.get('video_compression.bitrate_validation.encoder_minimums', {
-            'libx264': 3,
-            'libx265': 5,
-            'h264_nvenc': 2,
-            'h264_amf': 2,
-            'h264_qsv': 2,
-            'h264_videotoolbox': 2
+            'libx264': 10,
+            'libx265': 15,
+            'h264_nvenc': 8,
+            'h264_amf': 8,
+            'h264_qsv': 8,
+            'h264_videotoolbox': 8
         })
         
         # Override all encoder minimums with the specified floor
