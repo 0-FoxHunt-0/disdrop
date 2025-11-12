@@ -10,7 +10,9 @@ import sys
 import shutil
 import signal
 import traceback
-from typing import Dict, Any, Optional
+import threading
+import subprocess
+from typing import Dict, Any, Optional, List, Set
 import logging
 import time
 
@@ -19,7 +21,7 @@ from .config_manager import ConfigManager
 from .hardware_detector import HardwareDetector
 from .video_processing.video_compressor import DynamicVideoCompressor
 from .gif_processing.gif_generator import GifGenerator
-from .gif_processing.gif_optimizer_advanced import AdvancedGifOptimizer
+from .gif_processing.gif_optimizer import GifOptimizer
 from .automated_workflow import AutomatedWorkflow
 from .file_validator import FileValidator
 from .video_processing.bitrate_validator import BitrateValidationError
@@ -33,6 +35,11 @@ class VideoCompressorCLI:
         self.video_compressor = None
         self.gif_generator = None
         self.automated_workflow = None
+        # Shutdown tracking
+        self.shutdown_requested = False
+        self.shutdown_lock = threading.Lock()
+        self.graceful_shutdown_timeout = 5.0  # seconds - reduced for faster response
+        self.graceful_shutdown_start_time = None
         
     def main(self):
         """Main entry point"""
@@ -79,6 +86,8 @@ class VideoCompressorCLI:
         """Setup signal handlers for graceful cleanup"""
         # Track signal count for force exit
         signal_count = {'count': 0}
+        # Track if monitoring thread is running
+        monitoring_active = {'active': False}
         
         def signal_handler(signum, frame):
             signal_count['count'] += 1
@@ -89,55 +98,257 @@ class VideoCompressorCLI:
             except Exception:
                 signal_name = str(signum)
             
-            # Force exit on second signal
+            # Force kill all processes on second signal (or if already shutting down)
             if signal_count['count'] >= 2:
-                print(f"\n{signal_name} received {signal_count['count']} times. Force exiting...")
+                print(f"\n{signal_name} received {signal_count['count']} times. Force killing all processes and exiting...")
                 if logger:
-                    logger.warning(f"{signal_name} received {signal_count['count']} times. Force exiting without cleanup.")
+                    logger.warning(f"{signal_name} received {signal_count['count']} times. Force killing all processes and exiting.")
+                # Kill all processes instantly
+                self._kill_all_processes_instantly()
                 sys.exit(1)
             
-            if logger:
-                logger.info(f"Received {signal_name} signal (attempt {signal_count['count']}), initiating graceful shutdown...")
-            else:
-                print(f"\nReceived {signal_name} signal, cleaning up... (Press Ctrl+C again to force quit)")
+            # On first signal, initiate graceful shutdown with immediate process termination
+            with self.shutdown_lock:
+                if not self.shutdown_requested:
+                    self.shutdown_requested = True
+                    self.graceful_shutdown_start_time = time.time()
+                    
+                    if logger:
+                        logger.info(f"Received {signal_name} signal, initiating graceful shutdown...")
+                    else:
+                        print(f"\nReceived {signal_name} signal, cleaning up... (Press Ctrl+C again to force quit)")
 
-            # Request shutdown for all components (idempotent)
-            try:
-                if hasattr(self, 'gif_generator') and self.gif_generator:
-                    self.gif_generator.request_shutdown()
-                    if hasattr(self.gif_generator, 'optimizer') and hasattr(self.gif_generator.optimizer, 'request_shutdown'):
-                        self.gif_generator.optimizer.request_shutdown()
-            except Exception:
-                pass
-            try:
-                if hasattr(self, 'video_compressor') and self.video_compressor:
-                    self.video_compressor.request_shutdown()
-            except Exception:
-                pass
+                    # Immediately terminate all processes for faster shutdown
+                    try:
+                        self._kill_all_processes_instantly()
+                    except Exception as e:
+                        if logger:
+                            logger.debug(f"Error during immediate process termination: {e}")
 
-            # Set shutdown flag for automated workflow if it exists
-            if hasattr(self, 'automated_workflow') and self.automated_workflow:
-                self.automated_workflow.shutdown_requested = True
+                    # Request shutdown for all components (idempotent)
+                    try:
+                        if hasattr(self, 'gif_generator') and self.gif_generator:
+                            self.gif_generator.request_shutdown()
+                            if hasattr(self.gif_generator, 'optimizer') and hasattr(self.gif_generator.optimizer, 'request_shutdown'):
+                                self.gif_generator.optimizer.request_shutdown()
+                    except Exception:
+                        pass
+                    try:
+                        if hasattr(self, 'video_compressor') and self.video_compressor:
+                            self.video_compressor.request_shutdown()
+                            # Also request shutdown for video_segmenter if it exists
+                            if hasattr(self.video_compressor, 'video_segmenter') and self.video_compressor.video_segmenter:
+                                if hasattr(self.video_compressor.video_segmenter, 'request_shutdown'):
+                                    self.video_compressor.video_segmenter.request_shutdown()
+                    except Exception:
+                        pass
 
-            # Clean up any remaining temp files immediately
-            try:
-                self._cleanup_temp_files_on_exit()
-                if logger:
-                    logger.info("Temporary files cleaned up during shutdown")
-            except Exception as e:
-                if logger:
-                    logger.warning(f"Error during temp file cleanup: {e}")
+                    # Set shutdown flag for automated workflow if it exists
+                    if hasattr(self, 'automated_workflow') and self.automated_workflow:
+                        self.automated_workflow.shutdown_requested = True
 
-            if logger:
-                logger.info("Graceful shutdown sequence requested. Components will exit after current task...")
-            
-            # Exit after cleanup - don't wait indefinitely
-            sys.exit(0)
+                    if logger:
+                        logger.info("Graceful shutdown sequence initiated. Waiting for components to finish...")
+                    
+                    # Start graceful shutdown timeout monitoring thread
+                    def monitor_graceful_shutdown():
+                        """Monitor graceful shutdown and exit when complete or timeout exceeded"""
+                        monitoring_active['active'] = True
+                        try:
+                            while True:
+                                time.sleep(0.2)  # Check every 200ms for faster response
+                                
+                                # Check shutdown state and timeout
+                                with self.shutdown_lock:
+                                    if not self.shutdown_requested:
+                                        break
+                                    if self.graceful_shutdown_start_time is None:
+                                        break
+                                    elapsed = time.time() - self.graceful_shutdown_start_time
+                                    if elapsed > self.graceful_shutdown_timeout:
+                                        # Timeout exceeded, force kill all processes
+                                        if logger:
+                                            logger.warning(f"Graceful shutdown timeout ({self.graceful_shutdown_timeout}s) exceeded. Force killing all processes...")
+                                        print(f"\nGraceful shutdown timeout exceeded. Force killing all processes...")
+                                        self._kill_all_processes_instantly()
+                                        # Use os._exit to force exit from background thread
+                                        os._exit(1)
+                                
+                                # Check if all processes have terminated (outside lock for thread safety)
+                                # This is safe because _collect_all_processes() is read-only
+                                processes = self._collect_all_processes()
+                                if not processes:
+                                    # All processes terminated, graceful shutdown complete
+                                    # Exit the program now
+                                    if logger:
+                                        logger.info("All processes terminated, graceful shutdown complete. Exiting...")
+                                    print("\n✅ Graceful shutdown complete. Exiting...")
+                                    # Use os._exit to ensure immediate exit
+                                    os._exit(0)
+                        finally:
+                            monitoring_active['active'] = False
+                    
+                    # Start monitoring thread
+                    if not monitoring_active['active']:
+                        monitor_thread = threading.Thread(target=monitor_graceful_shutdown, daemon=False)
+                        monitor_thread.start()
+                else:
+                    # Already shutting down, second signal means force quit
+                    print(f"\n{signal_name} received again. Force killing all processes and exiting...")
+                    if logger:
+                        logger.warning(f"{signal_name} received again during shutdown. Force killing all processes...")
+                    self._kill_all_processes_instantly()
+                    sys.exit(1)
 
         # Register handlers for common termination signals
         signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
         if hasattr(signal, 'SIGTERM'):
             signal.signal(signal.SIGTERM, signal_handler)  # Termination request
+    
+    def _collect_all_processes(self) -> Set[subprocess.Popen]:
+        """Collect all subprocess.Popen objects from all components"""
+        processes: Set[subprocess.Popen] = set()
+        
+        try:
+            # Collect from video_compressor
+            if hasattr(self, 'video_compressor') and self.video_compressor:
+                # Main video compressor processes
+                if hasattr(self.video_compressor, '_ffmpeg_processes'):
+                    for proc in self.video_compressor._ffmpeg_processes:
+                        if proc and proc.poll() is None:
+                            processes.add(proc)
+                if hasattr(self.video_compressor, 'current_ffmpeg_process'):
+                    proc = self.video_compressor.current_ffmpeg_process
+                    if proc and proc.poll() is None:
+                        processes.add(proc)
+                
+                # Video segmenter processes
+                if hasattr(self.video_compressor, 'video_segmenter') and self.video_compressor.video_segmenter:
+                    segmenter = self.video_compressor.video_segmenter
+                    if hasattr(segmenter, '_active_processes'):
+                        for proc in segmenter._active_processes:
+                            if proc and proc.poll() is None:
+                                processes.add(proc)
+                    if hasattr(segmenter, 'current_ffmpeg_process'):
+                        proc = segmenter.current_ffmpeg_process
+                        if proc and proc.poll() is None:
+                            processes.add(proc)
+                
+                # Advanced optimizer processes (if accessible)
+                if hasattr(self.video_compressor, 'advanced_optimizer') and self.video_compressor.advanced_optimizer:
+                    optimizer = self.video_compressor.advanced_optimizer
+                    if hasattr(optimizer, 'time_budget') and optimizer.time_budget:
+                        time_budget = optimizer.time_budget
+                        if hasattr(time_budget, 'current_process'):
+                            proc = time_budget.current_process
+                            if proc and proc.poll() is None:
+                                processes.add(proc)
+        except Exception as e:
+            if logger:
+                logger.debug(f"Error collecting processes from video_compressor: {e}")
+        
+        try:
+            # Collect from gif_generator
+            if hasattr(self, 'gif_generator') and self.gif_generator:
+                # Main GIF generator processes
+                if hasattr(self.gif_generator, '_ffmpeg_processes'):
+                    for proc in self.gif_generator._ffmpeg_processes:
+                        if proc and proc.poll() is None:
+                            processes.add(proc)
+                if hasattr(self.gif_generator, 'current_ffmpeg_process'):
+                    proc = self.gif_generator.current_ffmpeg_process
+                    if proc and proc.poll() is None:
+                        processes.add(proc)
+                
+                # GIF optimizer processes
+                if hasattr(self.gif_generator, 'optimizer') and self.gif_generator.optimizer:
+                    optimizer = self.gif_generator.optimizer
+                    if hasattr(optimizer, 'current_ffmpeg_process'):
+                        proc = optimizer.current_ffmpeg_process
+                        if proc and proc.poll() is None:
+                            processes.add(proc)
+        except Exception as e:
+            if logger:
+                logger.debug(f"Error collecting processes from gif_generator: {e}")
+        
+        try:
+            # Collect from automated_workflow (if it has its own instances)
+            if hasattr(self, 'automated_workflow') and self.automated_workflow:
+                # Workflow's video_compressor
+                if hasattr(self.automated_workflow, 'video_compressor') and self.automated_workflow.video_compressor:
+                    vc = self.automated_workflow.video_compressor
+                    if hasattr(vc, '_ffmpeg_processes'):
+                        for proc in vc._ffmpeg_processes:
+                            if proc and proc.poll() is None:
+                                processes.add(proc)
+                    if hasattr(vc, 'current_ffmpeg_process'):
+                        proc = vc.current_ffmpeg_process
+                        if proc and proc.poll() is None:
+                            processes.add(proc)
+                    # Workflow's video_compressor's video_segmenter
+                    if hasattr(vc, 'video_segmenter') and vc.video_segmenter:
+                        segmenter = vc.video_segmenter
+                        if hasattr(segmenter, '_active_processes'):
+                            for proc in segmenter._active_processes:
+                                if proc and proc.poll() is None:
+                                    processes.add(proc)
+                        if hasattr(segmenter, 'current_ffmpeg_process'):
+                            proc = segmenter.current_ffmpeg_process
+                            if proc and proc.poll() is None:
+                                processes.add(proc)
+                
+                # Workflow's gif_generator
+                if hasattr(self.automated_workflow, 'gif_generator') and self.automated_workflow.gif_generator:
+                    gg = self.automated_workflow.gif_generator
+                    if hasattr(gg, '_ffmpeg_processes'):
+                        for proc in gg._ffmpeg_processes:
+                            if proc and proc.poll() is None:
+                                processes.add(proc)
+                    if hasattr(gg, 'current_ffmpeg_process'):
+                        proc = gg.current_ffmpeg_process
+                        if proc and proc.poll() is None:
+                            processes.add(proc)
+                    if hasattr(gg, 'optimizer') and gg.optimizer:
+                        optimizer = gg.optimizer
+                        if hasattr(optimizer, 'current_ffmpeg_process'):
+                            proc = optimizer.current_ffmpeg_process
+                            if proc and proc.poll() is None:
+                                processes.add(proc)
+        except Exception as e:
+            if logger:
+                logger.debug(f"Error collecting processes from automated_workflow: {e}")
+        
+        return processes
+    
+    def _kill_all_processes_instantly(self):
+        """Kill all collected processes instantly without graceful termination"""
+        processes = self._collect_all_processes()
+        
+        if not processes:
+            if logger:
+                logger.debug("No active processes to kill")
+            return
+        
+        if logger:
+            logger.warning(f"Force killing {len(processes)} process(es) instantly...")
+        
+        killed_count = 0
+        for proc in processes:
+            try:
+                if proc and proc.poll() is None:
+                    proc.kill()
+                    killed_count += 1
+                    # Wait briefly to ensure kill signal is sent
+                    try:
+                        proc.wait(timeout=0.5)
+                    except (subprocess.TimeoutExpired, OSError):
+                        pass
+            except (OSError, subprocess.SubprocessError) as e:
+                if logger:
+                    logger.debug(f"Error killing process {proc}: {e}")
+        
+        if logger:
+            logger.warning(f"Force killed {killed_count} process(es)")
     
     def _cleanup_temp_files_on_exit(self):
         """Clean up temporary files on program exit"""
@@ -525,7 +736,8 @@ class VideoCompressorCLI:
             
             # Initialize GIF components
             self.gif_generator = GifGenerator(self.config)
-            self.advanced_optimizer = AdvancedGifOptimizer(self.config)
+            # Note: GifGenerator now has optimizer built-in, but we keep a separate instance for direct optimization
+            self.gif_optimizer = GifOptimizer(self.config)
             self.file_validator = FileValidator()
             # Pass shared video_compressor and gif_generator instances to avoid duplicate initialization
             self.automated_workflow = AutomatedWorkflow(self.config, self.hardware, 
@@ -1611,15 +1823,15 @@ class VideoCompressorCLI:
             if output_dir and not os.path.exists(output_dir):
                 os.makedirs(output_dir)
             
-            # Create quality-optimized GIF
-            results = self.advanced_optimizer.optimize_gif_with_quality_target(
+            # Create quality-optimized GIF using GifGenerator (which includes optimization)
+            # Note: quality_preference is not directly supported, but GifGenerator will optimize to target size
+            results = self.gif_generator.create_gif(
                 input_video=args.input,
                 output_path=args.output,
-                max_size_mb=args.target_size,
                 platform=args.platform,
+                max_size_mb=args.target_size,
                 start_time=args.start,
-                duration=args.duration,
-                quality_preference=args.quality_preference
+                duration=args.duration
             )
             
             # Display results
