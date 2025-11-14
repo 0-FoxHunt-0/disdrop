@@ -22,6 +22,7 @@ from .gif_analysis import (
     analyze_motion_segments
 )
 from .optimization_strategies import get_strategy, OptimizationStrategy
+from .pil_compression import PILCompressor
 
 logger = logging.getLogger(__name__)
 
@@ -356,19 +357,72 @@ class GifOptimizer:
             return False
         
         logger.info(f"Stage 3: Attempting gifsicle lossy compression ({current_size_mb:.2f}MB -> {target_size_mb:.2f}MB target)...")
-        if not self._is_tool_available("gifsicle"):
-            logger.error("Stage 3: gifsicle not available! Cannot compress GIF. Install gifsicle to enable compression.")
-            return False
+        gifsicle_available = self._is_tool_available("gifsicle")
+        gifsicle_success = False
         
-        if self._stage_gifsicle_lossy_compression(gif_path, target_bytes, target_size_mb):
+        if gifsicle_available:
+            if self._stage_gifsicle_lossy_compression(gif_path, target_bytes, target_size_mb):
+                current_bytes = os.path.getsize(gif_path)
+                current_size_mb = current_bytes / 1024 / 1024
+                logger.info(f"Stage 3 (gifsicle) completed: {current_size_mb:.2f}MB")
+                if current_bytes <= target_bytes:
+                    logger.info("Target met after Stage 3 (gifsicle)")
+                    return True
+                gifsicle_success = True
+            else:
+                logger.warning("Stage 3: Gifsicle lossy compression failed or did not reduce size sufficiently")
+        else:
+            logger.warning("Stage 3: gifsicle not available, will try FFmpeg fallback")
+        
+        # Stage 3b: FFmpeg fallback when gifsicle fails or unavailable
+        if not gifsicle_success:
             current_bytes = os.path.getsize(gif_path)
             current_size_mb = current_bytes / 1024 / 1024
-            logger.info(f"Stage 3 completed: {current_size_mb:.2f}MB")
-            if current_bytes <= target_bytes:
-                logger.info("Target met after Stage 3")
-                return True
-        else:
-            logger.warning("Stage 3: Gifsicle lossy compression failed or did not reduce size sufficiently")
+            if current_size_mb > target_size_mb:
+                logger.info(f"Stage 3b: Attempting FFmpeg fallback compression ({current_size_mb:.2f}MB -> {target_size_mb:.2f}MB target)...")
+                if self._stage_ffmpeg_fallback_compression(gif_path, target_bytes, target_size_mb):
+                    current_bytes = os.path.getsize(gif_path)
+                    current_size_mb = current_bytes / 1024 / 1024
+                    logger.info(f"Stage 3b (FFmpeg fallback) completed: {current_size_mb:.2f}MB")
+                    if current_bytes <= target_bytes:
+                        logger.info("Target met after Stage 3b (FFmpeg fallback)")
+                        return True
+                else:
+                    logger.warning("Stage 3b: FFmpeg fallback compression failed")
+                    # Try progressive resolution reduction as additional fallback
+                    current_bytes = os.path.getsize(gif_path)
+                    current_size_mb = current_bytes / 1024 / 1024
+                    if current_size_mb > target_size_mb:
+                        logger.info(f"Stage 3b.1: Attempting progressive resolution reduction ({current_size_mb:.2f}MB -> {target_size_mb:.2f}MB target)...")
+                        if self._progressive_resolution_reduction(gif_path, target_bytes, target_size_mb):
+                            current_bytes = os.path.getsize(gif_path)
+                            current_size_mb = current_bytes / 1024 / 1024
+                            logger.info(f"Stage 3b.1 (progressive resolution) completed: {current_size_mb:.2f}MB")
+                            if current_bytes <= target_bytes:
+                                logger.info("Target met after Stage 3b.1 (progressive resolution)")
+                                return True
+        
+        # Stage 3c: PIL-based compression (when still over target)
+        if self._shutdown_checker():
+            return False
+        
+        current_bytes = os.path.getsize(gif_path)
+        if current_bytes > target_bytes:
+            current_size_mb = current_bytes / 1024 / 1024
+            over_ratio = (current_bytes - target_bytes) / float(target_bytes) if target_bytes > 0 else 1.0
+            
+            # Try PIL compression if still significantly over target
+            if over_ratio > 0.05:  # More than 5% over
+                logger.info(f"Stage 3c: Attempting PIL-based compression ({current_size_mb:.2f}MB -> {target_size_mb:.2f}MB target)...")
+                if self._stage_pil_compression(gif_path, target_bytes, target_size_mb):
+                    current_bytes = os.path.getsize(gif_path)
+                    current_size_mb = current_bytes / 1024 / 1024
+                    logger.info(f"Stage 3c (PIL compression) completed: {current_size_mb:.2f}MB")
+                    if current_bytes <= target_bytes:
+                        logger.info("Target met after Stage 3c (PIL compression)")
+                        return True
+                else:
+                    logger.debug("Stage 3c: PIL compression failed or did not reduce size sufficiently")
         
         # Stage 4: Final polish (only if within 5% of target)
         if self._shutdown_checker():
@@ -710,6 +764,290 @@ class GifOptimizer:
         
         return False
     
+    def _progressive_resolution_reduction(self, gif_path: str, target_bytes: int, target_size_mb: float,
+                                         source_video: Optional[str] = None) -> bool:
+        """
+        Progressive resolution reduction: try multiple resolution steps to find optimal size.
+        
+        Returns:
+            True if a better result was found and applied
+        """
+        try:
+            if self._shutdown_checker():
+                return False
+            
+            current_bytes = os.path.getsize(gif_path)
+            current_size_mb = current_bytes / 1024 / 1024
+            
+            if current_size_mb <= target_size_mb:
+                return True
+            
+            # Get current GIF info
+            try:
+                gif_info = get_gif_info(gif_path)
+            except Exception:
+                return False
+            
+            current_width = gif_info.get('width', 360)
+            current_fps = gif_info.get('fps', 20)
+            current_colors = 256
+            
+            # Calculate progressive resolution steps
+            # Try: 100%, 90%, 80%, 70%, 60%, 50% of current width
+            resolution_steps = [1.0, 0.9, 0.8, 0.7, 0.6, 0.5]
+            quality_floors = self.config_helper.get_quality_floors()
+            min_width = quality_floors.get('min_width_aggressive', 240)
+            
+            best_result = None
+            best_size = current_bytes
+            temp_files_to_cleanup = []
+            
+            try:
+                for scale in resolution_steps:
+                    if self._shutdown_checker():
+                        break
+                    
+                    new_width = max(min_width, int(current_width * scale))
+                    new_width = (new_width // 2) * 2  # Ensure even
+                    
+                    if new_width >= current_width:
+                        continue  # Skip if not reducing
+                    
+                    # Calculate corresponding FPS reduction to maintain quality
+                    # More aggressive resolution = slightly more aggressive FPS
+                    fps_scale = 0.95 if scale < 0.7 else 0.98
+                    new_fps = max(6, int(current_fps * fps_scale))
+                    
+                    # Create unique temp file for this iteration
+                    temp_output = create_unique_temp_filename("progressive_res", ".gif", self.temp_dir)
+                    temp_files_to_cleanup.append(temp_output)
+                    
+                    # Try this resolution
+                    success = self._ffmpeg_palette_reencode(
+                        gif_path, temp_output,
+                        new_width=new_width,
+                        fps=new_fps,
+                        max_colors=current_colors,
+                        mpdecimate_frac=0.4,
+                        stats_mode='diff',
+                        dither='sierra2_4a'
+                    )
+                    
+                    if success and os.path.exists(temp_output):
+                        temp_size = os.path.getsize(temp_output)
+                        if temp_size < best_size:
+                            # Remove previous best from cleanup list
+                            if best_result and best_result in temp_files_to_cleanup:
+                                temp_files_to_cleanup.remove(best_result)
+                                try:
+                                    if os.path.exists(best_result):
+                                        os.remove(best_result)
+                                except Exception:
+                                    pass
+                            best_size = temp_size
+                            best_result = temp_output
+                            # If we've met target, stop early
+                            if temp_size <= target_bytes:
+                                break
+                
+                # Apply best result
+                if best_result and os.path.exists(best_result) and best_size < current_bytes:
+                    try:
+                        safe_file_operation(os.replace, best_result, gif_path)
+                        best_size_mb = best_size / 1024 / 1024
+                        reduction_mb = (current_bytes - best_size) / 1024 / 1024
+                        logger.info(
+                            f"Progressive resolution reduction applied: {best_size_mb:.2f}MB "
+                            f"(reduced by {reduction_mb:.2f}MB)"
+                        )
+                        return True
+                    except Exception as e:
+                        logger.debug(f"Failed to apply progressive resolution result: {e}")
+            finally:
+                # Cleanup remaining temp files
+                for temp_file in temp_files_to_cleanup:
+                    if temp_file != best_result:
+                        try:
+                            if os.path.exists(temp_file):
+                                os.remove(temp_file)
+                        except Exception:
+                            pass
+            
+            return False
+        except Exception as e:
+            logger.debug(f"Progressive resolution reduction exception: {e}")
+            return False
+    
+    def _stage_ffmpeg_fallback_compression(self, gif_path: str, target_bytes: int, target_size_mb: float) -> bool:
+        """
+        Stage 3b: FFmpeg fallback compression when gifsicle fails or is unavailable.
+        Uses aggressive re-encoding with calculated parameters to meet target size.
+        
+        Returns:
+            True if compression was applied and file size reduced
+        """
+        try:
+            if self._shutdown_checker():
+                return False
+            
+            current_bytes = os.path.getsize(gif_path)
+            current_size_mb = current_bytes / 1024 / 1024
+            
+            if current_size_mb <= target_size_mb:
+                return True
+            
+            # Get GIF info to calculate parameters
+            try:
+                gif_info = get_gif_info(gif_path)
+            except Exception as e:
+                logger.debug(f"Could not get GIF info for FFmpeg fallback: {e}")
+                return False
+            
+            # Calculate required parameters for aggressive compression
+            current_params = {
+                'width': gif_info.get('width', 360),
+                'height': gif_info.get('height', 360),
+                'fps': gif_info.get('fps', 20),
+                'colors': 256,
+                'lossy': 0
+            }
+            
+            # Use motion analysis for adaptive FPS reduction
+            original_fps = current_params['fps']
+            try:
+                motion_analysis = analyze_motion(gif_path, original_fps, self.temp_dir)
+                motion_level = motion_analysis.get('motion_level', 'medium')
+                optimal_fps = motion_analysis.get('optimal_fps', original_fps)
+                
+                # Adjust FPS based on motion level for better compression
+                # Low motion = can reduce FPS more aggressively
+                if motion_level == 'low':
+                    # Static scenes: reduce FPS more
+                    fps_adjustment = 0.7
+                elif motion_level == 'medium':
+                    # Moderate motion: moderate FPS reduction
+                    fps_adjustment = 0.85
+                else:
+                    # High motion: minimal FPS reduction to preserve quality
+                    fps_adjustment = 0.95
+                
+                # Apply motion-aware FPS adjustment
+                current_params['fps'] = max(6, int(original_fps * fps_adjustment))
+                logger.debug(f"Motion-aware FPS adjustment: {original_fps} -> {current_params['fps']} (motion: {motion_level})")
+            except Exception as e:
+                logger.debug(f"Motion analysis failed, using default FPS: {e}")
+            
+            required_params = self._calculate_required_parameters(
+                current_size_mb, target_size_mb, current_params, gif_info
+            )
+            
+            # Use aggressive mpdecimate for better compression
+            mpdecimate_frac = 0.4  # More aggressive duplicate removal
+            if current_size_mb / target_size_mb > 3.0:
+                mpdecimate_frac = 0.5  # Very aggressive for large files
+            
+            # Use simpler dithering for better compression
+            dither = 'bayer' if required_params['colors'] < 128 else 'sierra2_4a'
+            
+            # Create temp output
+            with temp_file_context("ffmpeg_fallback", ".gif", self.temp_dir) as temp_output:
+                success = self._ffmpeg_palette_reencode(
+                    gif_path, temp_output,
+                    new_width=required_params['width'],
+                    fps=required_params['fps'],
+                    max_colors=required_params['colors'],
+                    mpdecimate_frac=mpdecimate_frac,
+                    stats_mode='diff',
+                    dither=dither
+                )
+                
+                if success and os.path.exists(temp_output):
+                    temp_size = os.path.getsize(temp_output)
+                    temp_size_mb = temp_size / 1024 / 1024
+                    
+                    # Only apply if it's better than current
+                    if temp_size < current_bytes:
+                        try:
+                            safe_file_operation(os.replace, temp_output, gif_path)
+                            reduction_mb = (current_bytes - temp_size) / 1024 / 1024
+                            reduction_pct = ((current_bytes - temp_size) / current_bytes * 100) if current_bytes > 0 else 0
+                            logger.info(
+                                f"FFmpeg fallback compression applied: {temp_size_mb:.2f}MB "
+                                f"(reduced by {reduction_mb:.2f}MB, {reduction_pct:.1f}%)"
+                            )
+                            return True
+                        except Exception as e:
+                            logger.warning(f"Failed to apply FFmpeg fallback result: {e}")
+                    else:
+                        logger.debug(f"FFmpeg fallback result ({temp_size_mb:.2f}MB) not better than current ({current_size_mb:.2f}MB)")
+            
+            return False
+        except Exception as e:
+            logger.debug(f"FFmpeg fallback compression exception: {e}")
+            return False
+    
+    def _stage_pil_compression(self, gif_path: str, target_bytes: int, target_size_mb: float) -> bool:
+        """
+        Stage 3c: PIL-based compression using adaptive palette quantization and frame optimization.
+        
+        Returns:
+            True if compression was applied and file size reduced
+        """
+        try:
+            if self._shutdown_checker():
+                return False
+            
+            current_bytes = os.path.getsize(gif_path)
+            current_size_mb = current_bytes / 1024 / 1024
+            
+            if current_size_mb <= target_size_mb:
+                return True
+            
+            # Calculate target colors based on size reduction needed
+            size_ratio = target_size_mb / current_size_mb
+            # Estimate colors needed: more aggressive reduction = fewer colors
+            if size_ratio < 0.3:
+                target_colors = 64  # Very aggressive
+            elif size_ratio < 0.5:
+                target_colors = 128  # Aggressive
+            elif size_ratio < 0.7:
+                target_colors = 192  # Moderate
+            else:
+                target_colors = 224  # Conservative
+            
+            # Try PIL compression with calculated colors
+            with temp_file_context("pil_compress", ".gif", self.temp_dir) as temp_output:
+                success, reduction_pct = PILCompressor.compress_gif(
+                    gif_path, temp_output,
+                    max_colors=target_colors,
+                    remove_duplicates=True,
+                    optimize_disposal=True
+                )
+                
+                if success and os.path.exists(temp_output):
+                    temp_size = os.path.getsize(temp_output)
+                    temp_size_mb = temp_size / 1024 / 1024
+                    
+                    # Only apply if it's better than current
+                    if temp_size < current_bytes:
+                        try:
+                            safe_file_operation(os.replace, temp_output, gif_path)
+                            reduction_mb = (current_bytes - temp_size) / 1024 / 1024
+                            logger.info(
+                                f"PIL compression applied: {temp_size_mb:.2f}MB "
+                                f"(reduced by {reduction_mb:.2f}MB, {reduction_pct:.1f}%)"
+                            )
+                            return True
+                        except Exception as e:
+                            logger.warning(f"Failed to apply PIL compression result: {e}")
+                    else:
+                        logger.debug(f"PIL compression result ({temp_size_mb:.2f}MB) not better than current ({current_size_mb:.2f}MB)")
+            
+            return False
+        except Exception as e:
+            logger.debug(f"PIL compression exception: {e}")
+            return False
+    
     def _stage_final_polish(self, gif_path: str, target_bytes: int) -> bool:
         """
         Stage 4: Final polish with gifsicle squeeze for small overages.
@@ -948,7 +1286,18 @@ class GifOptimizer:
     
     def _run_gifsicle(self, input_path: str, output_path: str, colors: int, lossy: int, scale: float) -> bool:
         """Execute gifsicle with given parameters"""
+        timeout_sec = 45 if self.fast_mode else 120
         try:
+            # Verify input file exists
+            if not os.path.exists(input_path):
+                logger.warning(f"gifsicle: Input file does not exist: {input_path}")
+                return False
+            
+            # Check gifsicle availability
+            if not self._is_tool_available("gifsicle"):
+                logger.warning("gifsicle: Tool not available or not working")
+                return False
+            
             cmd = [
                 "gifsicle",
                 f"--optimize={max(1, min(3, self.gifsicle_optimize_level))}",
@@ -965,7 +1314,8 @@ class GifOptimizer:
                 cmd.extend(["--lossy", str(max(1, min(150, int(lossy))))])
             cmd.extend([input_path, "--output", output_path])
             
-            timeout_sec = 45 if self.fast_mode else 120
+            logger.debug(f"gifsicle command: {' '.join(cmd)}")
+            
             result = subprocess.run(
                 cmd,
                 capture_output=True,
@@ -974,9 +1324,37 @@ class GifOptimizer:
                 errors='replace',
                 timeout=timeout_sec
             )
-            return result.returncode == 0 and os.path.exists(output_path)
+            
+            # Detailed error logging
+            if result.returncode != 0:
+                stderr_preview = result.stderr[:500] if result.stderr else "No stderr output"
+                stdout_preview = result.stdout[:500] if result.stdout else "No stdout output"
+                logger.warning(
+                    f"gifsicle failed with return code {result.returncode}\n"
+                    f"  stderr: {stderr_preview}\n"
+                    f"  stdout: {stdout_preview}"
+                )
+                return False
+            
+            if not os.path.exists(output_path):
+                logger.warning(f"gifsicle: Output file was not created: {output_path}")
+                return False
+            
+            # Verify output file is valid and not empty
+            output_size = os.path.getsize(output_path)
+            if output_size == 0:
+                logger.warning(f"gifsicle: Output file is empty: {output_path}")
+                return False
+            
+            return True
+        except subprocess.TimeoutExpired:
+            logger.warning(f"gifsicle: Command timed out after {timeout_sec}s")
+            return False
+        except FileNotFoundError:
+            logger.warning("gifsicle: Command not found. Is gifsicle installed?")
+            return False
         except Exception as e:
-            logger.debug(f"gifsicle run failed: {e}")
+            logger.warning(f"gifsicle run failed: {e}", exc_info=True)
             return False
     
     def _gifsicle_squeeze_small_overage(self, gif_path: str, output_path: str) -> bool:

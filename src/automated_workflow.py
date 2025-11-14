@@ -2033,6 +2033,55 @@ class AutomatedWorkflow:
                         max_size_mb=max_size_mb,
                         disable_segmentation=True
                     )
+                    
+                    # If first attempt failed, retry with reduced duration
+                    if not result.get('success', False):
+                        error_msg = result.get('error', 'Unknown error')
+                        logger.warning(f"Segment {segment_file.name} initial attempt failed: {error_msg}")
+                        
+                        # Check if failure was due to size limit - if so, try reducing duration
+                        if 'exceeds limit' in str(error_msg).lower() or 'size' in str(error_msg).lower():
+                            # Get segment duration and try with reduced duration
+                            try:
+                                segment_duration = FFmpegUtils.get_video_duration(str(segment_file))
+                                # Reduce duration by 20% or 2 seconds, whichever is larger
+                                reduced_duration = max(5.0, segment_duration * 0.8)
+                                if reduced_duration < segment_duration:
+                                    logger.info(f"Retrying segment {segment_file.name} with reduced duration: {reduced_duration:.2f}s (was {segment_duration:.2f}s)")
+                                    
+                                    # Clean up failed attempt if it exists
+                                    if gif_path.exists():
+                                        try:
+                                            gif_path.unlink()
+                                        except Exception:
+                                            pass
+                                    
+                                    # Retry with reduced duration by using start_time and duration
+                                    result = shared_generator.create_gif(
+                                        input_video=str(segment_file),
+                                        output_path=str(gif_path),
+                                        max_size_mb=max_size_mb,
+                                        start_time=0,
+                                        duration=reduced_duration,
+                                        disable_segmentation=True
+                                    )
+                                    
+                                    if result.get('success', False):
+                                        is_valid, validation_error = self.file_validator.is_valid_gif_with_enhanced_checks(
+                                            str(gif_path), original_path=None, max_size_mb=max_size_mb
+                                        )
+                                        if is_valid:
+                                            size_mb = result.get('size_mb', 0)
+                                            print(f"    ✅ Segment GIF successful (retry with reduced duration): {size_mb:.2f}MB")
+                                            logger.info(f"Segment {segment_file.name} succeeded on retry with reduced duration")
+                                            return (True, None)
+                                        else:
+                                            logger.warning(f"Segment {segment_file.name} retry validation failed: {validation_error}")
+                                    else:
+                                        logger.warning(f"Segment {segment_file.name} retry with reduced duration also failed: {result.get('error', 'Unknown error')}")
+                            except Exception as retry_e:
+                                logger.warning(f"Exception during segment {segment_file.name} retry: {retry_e}")
+                    
                     if result.get('success', False):
                         is_valid, error_msg = self.file_validator.is_valid_gif_with_enhanced_checks(
                             str(gif_path), original_path=None, max_size_mb=max_size_mb
@@ -2667,14 +2716,32 @@ class AutomatedWorkflow:
                 logger.error(f"Failed to prepare working copy for {gif_file.name}: {e}")
                 return 'error'
 
-            # Use the advanced GIF optimizer with quality targeting on the working copy
-            from .gif_processing.gif_optimizer_advanced import AdvancedGifOptimizer
-            optimizer = AdvancedGifOptimizer(self.config)
+            # Try to find source video (MP4) in the same directory
+            source_video = None
+            try:
+                # Look for MP4 with same base name in same directory
+                potential_mp4 = gif_file.parent / f"{gif_file.stem}.mp4"
+                if potential_mp4.exists():
+                    source_video = str(potential_mp4)
+                    logger.debug(f"[Workflow] Found source video for re-encoding: {source_video}")
+                else:
+                    # Also check in parent directory (for segments)
+                    potential_mp4_parent = gif_file.parent.parent / f"{gif_file.stem}.mp4"
+                    if potential_mp4_parent.exists():
+                        source_video = str(potential_mp4_parent)
+                        logger.debug(f"[Workflow] Found source video in parent directory: {source_video}")
+            except Exception as e:
+                logger.debug(f"[Workflow] Could not find source video: {e}")
 
-            logger.debug(f"[Workflow] Calling optimizer.optimize_gif() with target: {max_size_mb:.2f}MB")
+            # Use the GIF optimizer on the working copy
+            from .gif_processing.gif_optimizer import GifOptimizer
+            optimizer = GifOptimizer(self.config)
+
+            logger.debug(f"[Workflow] Calling optimizer.optimize_gif() with target: {max_size_mb:.2f}MB, source_video: {source_video}")
             result = optimizer.optimize_gif(
                 gif_path=str(working_path),
-                max_size_mb=max_size_mb
+                max_size_mb=max_size_mb,
+                source_video=source_video
             )
             logger.debug(f"[Workflow] Optimizer returned: {result}, working file exists: {working_path.exists()}")
 
@@ -2843,7 +2910,33 @@ class AutomatedWorkflow:
                         print(f"    📁 Already exists in output directory: {output_path.name}")
                     return 'success'
                 
-                # Strategy 3: All attempts failed
+                # Strategy 3: Try segmentation as fallback if file is valid but over size limit
+                # Only attempt segmentation if the file is valid (not corrupted) but exceeds size
+                file_is_valid, file_error = self.file_validator.is_valid_gif_with_enhanced_checks(
+                    str(gif_file),
+                    original_path=str(gif_file),
+                    max_size_mb=None  # Don't check size, just validate integrity
+                )
+                if file_is_valid:
+                    file_size = self.file_validator.get_file_size_mb(str(gif_file))
+                    if file_size > max_size_mb:
+                        print(f"    ✂️  Attempting segmentation as fallback strategy...")
+                        logger.info(f"Attempting segmentation fallback for {gif_file.name} (size: {file_size:.2f}MB > target: {max_size_mb:.2f}MB)")
+                        try:
+                            # Skip single-file optimization since we already tried it and it failed
+                            seg_result = self._segment_input_gif(gif_file, max_size_mb, skip_single_optimization=True)
+                            if seg_result:
+                                print(f"    ✅ Segmentation fallback succeeded for {gif_file.name}")
+                                logger.info(f"Segmentation fallback succeeded for {gif_file.name}")
+                                return 'success'
+                            else:
+                                print(f"    ⚠️  Segmentation fallback failed for {gif_file.name}")
+                                logger.warning(f"Segmentation fallback failed for {gif_file.name}")
+                        except Exception as seg_error:
+                            logger.warning(f"Segmentation fallback error for {gif_file.name}: {seg_error}")
+                            print(f"    ⚠️  Segmentation fallback error: {seg_error}")
+                
+                # Strategy 4: All attempts failed
                 print(f"    ❌ All optimization and repair strategies failed for {gif_file.name}")
                 logger.error(f"All optimization and repair strategies failed for {gif_file.name}")
                 
@@ -2864,7 +2957,7 @@ class AutomatedWorkflow:
             logger.exception(f"[Workflow] Exception during optimization: {e}")
             return 'error' 
 
-    def _segment_input_gif(self, gif_file: Path, max_size_mb: float, preferred_segments: Optional[int] = None) -> bool:
+    def _segment_input_gif(self, gif_file: Path, max_size_mb: float, preferred_segments: Optional[int] = None, skip_single_optimization: bool = False) -> bool:
         """Segment an input GIF into smaller GIF parts and optimize each.
 
         This provides a resilience path for very large/long input GIFs by
@@ -2917,21 +3010,25 @@ class AutomatedWorkflow:
                 return False
 
             # Prefer single file before splitting: try optimizing whole GIF first
-            try:
-                prefer_single_first = bool(self.config.get('gif_settings.segmentation.prefer_single_file_first', True))
-            except Exception:
-                prefer_single_first = True
-            if prefer_single_first and (preferred_segments is None or int(preferred_segments) == 1):
-                print("    🧪 Trying single-file optimization before segmentation...")
-                logger.info("Attempting single-file optimization before segmentation")
-                single_attempt = self._optimize_gif_file(gif_file, max_size_mb)
-                if single_attempt == 'success':
-                    print("    ✅ Single-file optimization succeeded; skipping segmentation")
-                    logger.info("Single-file optimization succeeded; segmentation skipped")
-                    return True
-                else:
-                    print("    ↪️  Single-file attempt did not meet target; proceeding with segmentation")
-                    logger.info("Single-file attempt failed to meet target; proceeding with segmentation")
+            # Skip if we're already in a segmentation fallback (optimization already tried and failed)
+            if not skip_single_optimization:
+                try:
+                    prefer_single_first = bool(self.config.get('gif_settings.segmentation.prefer_single_file_first', True))
+                except Exception:
+                    prefer_single_first = True
+                if prefer_single_first and (preferred_segments is None or int(preferred_segments) == 1):
+                    print("    🧪 Trying single-file optimization before segmentation...")
+                    logger.info("Attempting single-file optimization before segmentation")
+                    single_attempt = self._optimize_gif_file(gif_file, max_size_mb)
+                    if single_attempt == 'success':
+                        print("    ✅ Single-file optimization succeeded; skipping segmentation")
+                        logger.info("Single-file optimization succeeded; segmentation skipped")
+                        return True
+                    else:
+                        print("    ↪️  Single-file attempt did not meet target; proceeding with segmentation")
+                        logger.info("Single-file attempt failed to meet target; proceeding with segmentation")
+            else:
+                logger.debug("Skipping single-file optimization (already attempted in fallback path)")
 
             # Decide target segment duration using base durations if provided
             def pick_segment_duration(total_duration: float) -> float:
@@ -3006,6 +3103,36 @@ class AutomatedWorkflow:
             # Read target fps from config; fallback to 20
             target_fps = int(self.config.get('gif_settings.fps', 20) or 20)
 
+            # Pre-calculate required scale factor for segments based on target size
+            # Estimate expected segment size (original_size / num_segments, with some overhead)
+            estimated_segment_size_mb = (original_size_mb / num_segments) * 1.2  # 20% overhead for safety
+            scale_factor = 1.0
+            if estimated_segment_size_mb > max_size_mb and max_size_mb > 0:
+                # Calculate scale factor: area scales as width^2, so scale = sqrt(size_ratio)
+                size_ratio = max_size_mb / estimated_segment_size_mb
+                scale_factor = max(0.3, min(1.0, size_ratio ** 0.5))  # Clamp between 0.3 and 1.0
+                logger.debug(f"Pre-calculated segment scale factor: {scale_factor:.3f} (estimated {estimated_segment_size_mb:.2f}MB -> target {max_size_mb:.2f}MB)")
+            
+            # Calculate target width based on scale factor
+            try:
+                from .ffmpeg_utils import FFmpegUtils
+                video_info = FFmpegUtils.get_video_info(str(gif_file))
+                if video_info and 'width' in video_info:
+                    original_width = video_info['width']
+                    base_width = int(self.config.get('gif_settings.width', 360) or 360)
+                    # Apply scale factor to base width, but don't go below quality floors
+                    quality_floors = self.config.get('gif_settings.quality_floors', {}) or {}
+                    min_width = int(quality_floors.get('min_width_aggressive', 240) or 240)
+                    target_segment_width = max(min_width, int(base_width * scale_factor))
+                    # Ensure even
+                    target_segment_width = (target_segment_width // 2) * 2
+                    logger.info(f"Segment target width: {target_segment_width}px (from {base_width}px, scale={scale_factor:.3f})")
+                else:
+                    target_segment_width = None
+            except Exception as e:
+                logger.debug(f"Could not pre-calculate segment width: {e}")
+                target_segment_width = None
+
             # Limit parallelism based on configuration and system analysis
             max_workers = self._calculate_optimal_segmentation_workers()
 
@@ -3020,8 +3147,8 @@ class AutomatedWorkflow:
                     pass
                 segments_dir_created = True
 
-            from .gif_processing.gif_optimizer_advanced import AdvancedGifOptimizer
-            optimizer = AdvancedGifOptimizer(self.config, shutdown_checker=lambda: self.shutdown_requested)
+            from .gif_processing.gif_optimizer import GifOptimizer
+            optimizer = GifOptimizer(self.config, shutdown_checker=lambda: self.shutdown_requested)
 
             def _process_segment(index: int) -> Optional[Tuple[int, Path, float]]:
                 try:
@@ -3041,95 +3168,187 @@ class AutomatedWorkflow:
                             temp_seg.unlink()
                     except Exception:
                         pass
-                    # Downscale segments to configured max width while preserving AR to keep sizes under target
-                    try:
-                        max_width = int(self.config.get('gif_settings.width', 360) or 360)
-                        # Get height setting - if -1, we'll calculate it to preserve aspect ratio
-                        height_setting = self.config.get('gif_settings.height', -1)
-                    except Exception:
-                        max_width = 360
-                        height_setting = -1
                     
-                    # Get video info to calculate proper scaling that preserves aspect ratio
+                    # Try to find source video for segment creation (preferred over GIF)
+                    segment_source_video = None
                     try:
-                        from .ffmpeg_utils import FFmpegUtils
-                        video_info = FFmpegUtils.get_video_info(str(gif_file))
-                        if video_info and 'width' in video_info and 'height' in video_info:
-                            original_width = video_info['width']
-                            original_height = video_info['height']
-                            aspect_ratio = original_width / original_height
+                        # Check for source video in same directory or parent
+                        potential_video = gif_file.parent / f"{base_name}.mp4"
+                        if not potential_video.exists():
+                            potential_video = output_dir / f"{base_name}.mp4"
+                        if potential_video.exists():
+                            segment_source_video = str(potential_video)
+                            logger.debug(f"[Workflow] Found source video for segment creation: {segment_source_video}")
+                    except Exception:
+                        pass
+                    
+                    # Use GifGenerator to create segments with proper compression if source video available
+                    # Otherwise, create from GIF but with aggressive settings
+                    if segment_source_video and os.path.exists(segment_source_video):
+                        # Use GifGenerator to create segment from source video with proper compression
+                        logger.debug(f"Creating segment {index+1}/{num_segments} from source video: start={seg_start:.2f}s, duration={seg_len:.2f}s")
+                        try:
+                            # Get settings for segment creation
+                            from .gif_processing.gif_generator import GifGenerator
+                            segment_generator = GifGenerator(self.config, shutdown_checker=lambda: self.shutdown_requested)
                             
-                            # Calculate height that maintains aspect ratio
-                            calculated_height = int(max_width / aspect_ratio)
+                            # Create settings with aggressive compression for segments
+                            # Use pre-calculated target width if available, otherwise use config default
+                            segment_width = target_segment_width if target_segment_width is not None else int(self.config.get('gif_settings.width', 360) or 360)
+                            segment_settings = {
+                                'max_size_mb': max_size_mb,
+                                'width': segment_width,
+                                'height': int(self.config.get('gif_settings.height', -1) or -1),
+                                'fps': target_fps,
+                                'colors': int(self.config.get('gif_settings.colors', 256) or 256),
+                                'dither': str(self.config.get('gif_settings.dither', 'bayer') or 'bayer'),
+                                'lossy': int(self.config.get('gif_settings.lossy', 100) or 100),  # More aggressive for segments
+                                'max_duration': seg_len
+                            }
                             
-                            # Ensure height is even (required for some codecs)
-                            if calculated_height % 2 != 0:
-                                calculated_height = calculated_height + 1
+                            # Create segment using GifGenerator
+                            result = segment_generator._create_single_gif(
+                                input_video=segment_source_video,
+                                output_path=str(temp_seg),
+                                settings=segment_settings,
+                                start_time=seg_start,
+                                duration=seg_len
+                            )
                             
-                            # Use calculated dimensions to preserve aspect ratio
-                            scale_filter = f"scale={max_width}:{calculated_height}:flags=lanczos"
-                            logger.info(f"GIF segment scaling: original {original_width}x{original_height} -> {max_width}x{calculated_height} (AR: {aspect_ratio:.3f})")
-                        else:
+                            if not result.get('success', False) or not temp_seg.exists():
+                                logger.error(f"Segment {index+1}/{num_segments} creation from source video failed")
+                                return None
+                            
+                            # Check if segment is already under target
+                            seg_size_mb = os.path.getsize(temp_seg) / (1024 * 1024)
+                            if seg_size_mb > max_size_mb:
+                                # Try to optimize it
+                                logger.debug(f"Segment {index+1}/{num_segments} from source is {seg_size_mb:.2f}MB, optimizing...")
+                                opt_ok = optimizer.optimize_gif(
+                                    gif_path=str(temp_seg),
+                                    max_size_mb=max_size_mb,
+                                    source_video=segment_source_video  # Pass source for re-encoding
+                                )
+                                if not opt_ok:
+                                    seg_size_mb = os.path.getsize(temp_seg) / (1024 * 1024) if temp_seg.exists() else max_size_mb + 1
+                                    logger.error(f"Segment {index+1}/{num_segments} optimization failed: "
+                                               f"file size {seg_size_mb:.2f}MB exceeds limit {max_size_mb:.2f}MB")
+                                    try:
+                                        temp_seg.unlink()
+                                    except Exception:
+                                        pass
+                                    return None
+                        except Exception as e:
+                            logger.warning(f"Failed to create segment from source video, falling back to GIF: {e}")
+                            segment_source_video = None  # Fall back to GIF method
+                    
+                    # Fallback: create segment from GIF file (less efficient but works)
+                    if not segment_source_video or not temp_seg.exists():
+                        logger.debug(f"Creating segment {index+1}/{num_segments} from GIF: start={seg_start:.2f}s, duration={seg_len:.2f}s")
+                        # Downscale segments to pre-calculated target width or configured max width
+                        try:
+                            # Use pre-calculated target width if available, otherwise use config default
+                            max_width = target_segment_width if target_segment_width is not None else int(self.config.get('gif_settings.width', 360) or 360)
+                            # Get height setting - if -1, we'll calculate it to preserve aspect ratio
+                            height_setting = self.config.get('gif_settings.height', -1)
+                        except Exception:
+                            max_width = target_segment_width if target_segment_width is not None else 360
+                            height_setting = -1
+                        
+                        # Get video info to calculate proper scaling that preserves aspect ratio
+                        try:
+                            from .ffmpeg_utils import FFmpegUtils
+                            video_info = FFmpegUtils.get_video_info(str(gif_file))
+                            if video_info and 'width' in video_info and 'height' in video_info:
+                                original_width = video_info['width']
+                                original_height = video_info['height']
+                                aspect_ratio = original_width / original_height
+                                
+                                # Calculate height that maintains aspect ratio
+                                calculated_height = int(max_width / aspect_ratio)
+                                
+                                # Ensure height is even (required for some codecs)
+                                if calculated_height % 2 != 0:
+                                    calculated_height = calculated_height + 1
+                                
+                                # Use calculated dimensions to preserve aspect ratio
+                                scale_filter = f"scale={max_width}:{calculated_height}:flags=lanczos"
+                                logger.info(f"GIF segment scaling: original {original_width}x{original_height} -> {max_width}x{calculated_height} (AR: {aspect_ratio:.3f})")
+                            else:
+                                # Fallback to aspect ratio preservation
+                                scale_filter = f"scale={max_width}:-2:flags=lanczos"
+                                logger.info(f"GIF segment scaling: using fallback AR preservation {max_width}:-2")
+                        except Exception as e:
+                            logger.warning(f"Could not calculate proper scaling, using fallback: {e}")
                             # Fallback to aspect ratio preservation
                             scale_filter = f"scale={max_width}:-2:flags=lanczos"
-                            logger.info(f"GIF segment scaling: using fallback AR preservation {max_width}:-2")
-                    except Exception as e:
-                        logger.warning(f"Could not calculate proper scaling, using fallback: {e}")
-                        # Fallback to aspect ratio preservation
-                        scale_filter = f"scale={max_width}:-2:flags=lanczos"
-                    
-                    vf = (
-                        f"mpdecimate=hi=512:lo=256:frac=0.3,"
-                        f"fps={target_fps},"
-                        f"{scale_filter}"
-                    )
-                    cmd = [
-                        'ffmpeg', '-y',
-                        '-ss', str(seg_start),
-                        '-t', str(seg_len),
-                        '-i', str(gif_file),
-                        '-vf', vf,
-                        '-loop', '0',
-                        str(temp_seg)
-                    ]
-                    FFmpegUtils.add_ffmpeg_perf_flags(cmd)
-                    # Run with shutdown-aware subprocess to allow fast termination
-                    logger.debug(f"Creating segment {index+1}/{num_segments}: start={seg_start:.2f}s, duration={seg_len:.2f}s")
-                    result = optimizer._run_subprocess_with_shutdown_check(cmd, timeout=180)
-                    if result.returncode != 0 or not temp_seg.exists():
-                        err_excerpt = getattr(result, 'stderr', '')
-                        # Detect timeout by checking stderr for 'TimeoutExpired' string
-                        # (the _run_subprocess_with_shutdown_check returns TimeoutResult with stderr='TimeoutExpired')
-                        error_type = "timeout" if (err_excerpt and 'TimeoutExpired' in str(err_excerpt)) else "ffmpeg_error"
-                        logger.error(f"Segment {index+1}/{num_segments} creation failed ({error_type}): FFmpeg returncode={result.returncode}, "
-                                   f"file_exists={temp_seg.exists()}")
-                        if err_excerpt:
-                            logger.error(f"Segment {index+1} FFmpeg stderr: {err_excerpt[:500]}")
-                        if hasattr(result, 'stdout') and result.stdout:
-                            logger.debug(f"Segment {index+1} FFmpeg stdout: {result.stdout[:200]}")
-                        return None
-                    # Optimize with quality target for stronger convergence
-                    logger.debug(f"Optimizing segment {index+1}/{num_segments}")
-                    opt_ok = optimizer.optimize_gif(
-                        gif_path=str(temp_seg),
-                        max_size_mb=max_size_mb
-                    )
-                    if not opt_ok:
-                        # Check if file exists and get its size to understand why optimization failed
-                        if temp_seg.exists():
-                            try:
-                                seg_size_mb = temp_seg.stat().st_size / (1024 * 1024)
-                                logger.error(f"Segment {index+1}/{num_segments} optimization failed: "
-                                           f"file size {seg_size_mb:.2f}MB exceeds limit {max_size_mb:.2f}MB")
-                            except Exception:
-                                logger.error(f"Segment {index+1}/{num_segments} optimization failed: unable to get file size")
-                        else:
-                            logger.error(f"Segment {index+1}/{num_segments} optimization failed: file does not exist")
+                        
+                        vf = (
+                            f"mpdecimate=hi=512:lo=256:frac=0.3,"
+                            f"fps={target_fps},"
+                            f"{scale_filter}"
+                        )
+                        cmd = [
+                            'ffmpeg', '-y',
+                            '-ss', str(seg_start),
+                            '-t', str(seg_len),
+                            '-i', str(gif_file),
+                            '-vf', vf,
+                            '-loop', '0',
+                            str(temp_seg)
+                        ]
+                        FFmpegUtils.add_ffmpeg_perf_flags(cmd)
+                        # Run with shutdown-aware subprocess to allow fast termination
+                        result = optimizer._run_subprocess_with_shutdown_check(cmd, timeout=180)
+                        if result.returncode != 0 or not temp_seg.exists():
+                            err_excerpt = getattr(result, 'stderr', '')
+                            # Detect timeout by checking stderr for 'TimeoutExpired' string
+                            # (the _run_subprocess_with_shutdown_check returns TimeoutResult with stderr='TimeoutExpired')
+                            error_type = "timeout" if (err_excerpt and 'TimeoutExpired' in str(err_excerpt)) else "ffmpeg_error"
+                            logger.error(f"Segment {index+1}/{num_segments} creation failed ({error_type}): FFmpeg returncode={result.returncode}, "
+                                       f"file_exists={temp_seg.exists()}")
+                            if err_excerpt:
+                                logger.error(f"Segment {index+1} FFmpeg stderr: {err_excerpt[:500]}")
+                            if hasattr(result, 'stdout') and result.stdout:
+                                logger.debug(f"Segment {index+1} FFmpeg stdout: {result.stdout[:200]}")
+                            return None
+                        
+                        # Try to find source video for segment re-encoding
                         try:
-                            temp_seg.unlink()
+                            # For segments, the source is the original GIF file (which may have come from a video)
+                            # But ideally we'd have the original video - check if it exists
+                            potential_video = gif_file.parent / f"{base_name}.mp4"
+                            if not potential_video.exists():
+                                potential_video = output_dir / f"{base_name}.mp4"
+                            if potential_video.exists():
+                                segment_source_video = str(potential_video)
+                                logger.debug(f"[Workflow] Found source video for segment re-encoding: {segment_source_video}")
                         except Exception:
                             pass
-                        return None
+                        
+                        # Optimize with quality target for stronger convergence
+                        logger.debug(f"Optimizing segment {index+1}/{num_segments}")
+                        opt_ok = optimizer.optimize_gif(
+                            gif_path=str(temp_seg),
+                            max_size_mb=max_size_mb,
+                            source_video=segment_source_video
+                        )
+                        if not opt_ok:
+                            # Check if file exists and get its size to understand why optimization failed
+                            if temp_seg.exists():
+                                try:
+                                    seg_size_mb = temp_seg.stat().st_size / (1024 * 1024)
+                                    logger.error(f"Segment {index+1}/{num_segments} optimization failed: "
+                                               f"file size {seg_size_mb:.2f}MB exceeds limit {max_size_mb:.2f}MB")
+                                except Exception:
+                                    logger.error(f"Segment {index+1}/{num_segments} optimization failed: unable to get file size")
+                            else:
+                                logger.error(f"Segment {index+1}/{num_segments} optimization failed: file does not exist")
+                            try:
+                                temp_seg.unlink()
+                            except Exception:
+                                pass
+                            return None
                     # Validate and move
                     final_seg = (segments_dir / f"{base_name}_segment_{index+1:02d}.gif") if use_segments_folder else single_output_path
                     logger.debug(f"Validating segment {index+1}/{num_segments} before final move")
