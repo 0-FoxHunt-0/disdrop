@@ -3840,7 +3840,12 @@ class AutomatedWorkflow:
                 if mp4_files:
                     f.write("MP4 Segments Details:\n")
                     f.write("--------------------\n")
+                    # Only add separators between batches if there are more than 10 files
+                    add_separators = len(mp4_files) > 10
                     for idx, mp4_file in enumerate(mp4_files, 1):
+                        # Add separator between batches of 10 (but not before the first batch)
+                        if add_separators and idx > 1 and (idx - 1) % 10 == 0:
+                            f.write("--------------------\n")
                         try:
                             info = FFmpegUtils.get_video_info(str(mp4_file))
                             size_mb = mp4_file.stat().st_size / (1024 * 1024)
@@ -3886,7 +3891,12 @@ class AutomatedWorkflow:
                 if gif_files:
                     f.write("GIF Segments Details:\n")
                     f.write("--------------------\n")
+                    # Only add separators between batches if there are more than 10 files
+                    add_separators = len(gif_files) > 10
                     for idx, gif_file in enumerate(gif_files, 1):
+                        # Add separator between batches of 10 (but not before the first batch)
+                        if add_separators and idx > 1 and (idx - 1) % 10 == 0:
+                            f.write("--------------------\n")
                         try:
                             # Get comprehensive GIF information using the existing method
                             gif_info = self._get_gif_info_for_summary(str(gif_file))
