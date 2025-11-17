@@ -436,6 +436,7 @@ class GifGenerator:
             palette_tmp_path: Optional[str] = None
             palette_cancel_event: Optional[threading.Event] = None
             palette_generator: Optional[GifGenerator] = None
+            success = False
 
             if enable_parallel_palette:
                 try:
@@ -727,11 +728,11 @@ class GifGenerator:
                 'width': optimal_width,
                 'height': optimal_height,
                 'colors': colors_normalized,
-                'mpdecimate_aggressive': settings.get('mpdecimate_aggressive', False),
                 # Include mpdecimate settings for cache precision (avoid false cache hits)
-                'mpdecimate_hi': 768 if settings.get('mpdecimate_aggressive') else 512,
-                'mpdecimate_lo': 64 if settings.get('mpdecimate_aggressive') else 256,
-                'mpdecimate_frac': 0.4 if settings.get('mpdecimate_aggressive') else 0.3,
+                # These values must match the actual filter settings used on line 665
+                'mpdecimate_hi': 640,
+                'mpdecimate_lo': 320,
+                'mpdecimate_frac': 0.25,
             }
             key_str = json.dumps(key_payload, sort_keys=True, separators=(',', ':'))
             digest = hashlib.sha1(key_str.encode('utf-8')).hexdigest()

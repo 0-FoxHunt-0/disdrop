@@ -405,77 +405,162 @@ class GifOptimizer:
         if self._shutdown_checker():
             return False
         
-        logger.info(f"Stage 3: Attempting gifsicle lossy compression ({current_size_mb:.2f}MB -> {target_size_mb:.2f}MB target)...")
+        logger.info(
+            "Stage 3: Attempting gifsicle lossy compression (%.2fMB -> %.2fMB target)...",
+            current_size_mb,
+            target_size_mb,
+        )
         gifsicle_available = self._is_tool_available("gifsicle")
-        gifsicle_success = False
+        gifsicle_attempted = False
+        gifsicle_improved = False
         
         if gifsicle_available:
-            if self._stage_gifsicle_lossy_compression(gif_path, target_bytes, target_size_mb):
+            size_before_gifsicle = current_bytes
+            # _stage_gifsicle_lossy_compression returns True only when it managed to get under
+            # the target, but it may still reduce size even when it returns False. We therefore
+            # treat the boolean as \"made a successful under-target attempt\" and always re-stat
+            # the file afterwards to determine actual size and improvement.
+            self._stage_gifsicle_lossy_compression(gif_path, target_bytes, target_size_mb)
+            gifsicle_attempted = True
+            
+            if os.path.exists(gif_path):
                 current_bytes = os.path.getsize(gif_path)
                 current_size_mb = current_bytes / 1024 / 1024
-                logger.info(f"Stage 3 (gifsicle) completed: {current_size_mb:.2f}MB")
+                gifsicle_improved = current_bytes < size_before_gifsicle
+                
+                if gifsicle_improved:
+                    logger.info(
+                        "Stage 3 (gifsicle) completed: %.2fMB (was %.2fMB)",
+                        current_size_mb,
+                        size_before_gifsicle / 1024 / 1024,
+                    )
+                else:
+                    logger.warning(
+                        "Stage 3: Gifsicle lossy compression did not reduce size (still %.2fMB)",
+                        current_size_mb,
+                    )
+                
                 if current_bytes <= target_bytes:
                     logger.info("Target met after Stage 3 (gifsicle)")
                     return True
-                gifsicle_success = True
             else:
-                logger.warning("Stage 3: Gifsicle lossy compression failed or did not reduce size sufficiently")
+                logger.warning("Stage 3: GIF file missing after gifsicle compression")
+                return False
         else:
-            logger.warning("Stage 3: gifsicle not available, will try FFmpeg fallback")
+            logger.warning("Stage 3: gifsicle not available, will try FFmpeg and other fallbacks")
         
         # Stage 3b: Near-target bounded search (when gifsicle got close but not under)
-        if gifsicle_success:
-            current_bytes = os.path.getsize(gif_path)
-            current_size_mb = current_bytes / 1024 / 1024
+        current_bytes = os.path.getsize(gif_path)
+        current_size_mb = current_bytes / 1024 / 1024
+        over_ratio = (current_bytes - target_bytes) / float(target_bytes) if target_bytes > 0 else 1.0
+        
+        # Get near-target config (shared with later stages)
+        near_target_config = self.config_helper.get_optimization_config().get('near_target', {})
+        near_threshold = near_target_config.get('threshold_percent', 15) / 100.0
+        mode = near_target_config.get('mode', 'both')
+        
+        gifsicle_near_target = gifsicle_attempted and gifsicle_improved and 0 < over_ratio <= near_threshold
+        
+        if gifsicle_near_target and self._is_tool_available("gifsicle") and mode in ['bounded_search', 'both']:
+            logger.info(
+                "Stage 3b: Gifsicle got close (over by %.1f%%), attempting bounded search...",
+                over_ratio * 100,
+            )
+            if self._stage_adaptive_search(gif_path, target_bytes):
+                current_bytes = os.path.getsize(gif_path)
+                current_size_mb = current_bytes / 1024 / 1024
+                logger.info("Stage 3b (bounded search) completed: %.2fMB", current_size_mb)
+                if current_bytes <= target_bytes:
+                    logger.info("Target met after Stage 3b (bounded search)")
+                    return True
+        
+        # Stage 3c: FFmpeg fallback when gifsicle fails, makes no progress, or file is still far over target
+        if self._shutdown_checker():
+            return False
+        
+        current_bytes = os.path.getsize(gif_path)
+        current_size_mb = current_bytes / 1024 / 1024
+        
+        if current_bytes > target_bytes:
             over_ratio = (current_bytes - target_bytes) / float(target_bytes) if target_bytes > 0 else 1.0
             
-            # Get near-target config
-            near_target_config = self.config_helper.get_optimization_config().get('near_target', {})
-            near_threshold = near_target_config.get('threshold_percent', 15) / 100.0
-            mode = near_target_config.get('mode', 'both')
+            # Decide whether FFmpeg fallback should be attempted
+            use_ffmpeg = False
+            if not gifsicle_available or not gifsicle_attempted:
+                # Never ran gifsicle: FFmpeg is our main option
+                use_ffmpeg = True
+            elif not gifsicle_improved:
+                # Gifsicle couldn't make any progress; try FFmpeg
+                use_ffmpeg = True
+            else:
+                # Gifsicle improved the file but it is still over target. Only use FFmpeg
+                # if we are still significantly over the target (beyond near-threshold band).
+                if over_ratio > near_threshold:
+                    use_ffmpeg = True
+                else:
+                    logger.info(
+                        "Stage 3c: Skipping FFmpeg fallback for near-target gifsicle result "
+                        "(over by %.1f%%, threshold %.0f%%)",
+                        over_ratio * 100,
+                        near_threshold * 100,
+                    )
             
-            if 0 < over_ratio <= near_threshold and mode in ['bounded_search', 'both']:
-                logger.info(f"Stage 3b: Gifsicle got close ({over_ratio*100:.1f}% over), attempting bounded search...")
-                if self._stage_adaptive_search(gif_path, target_bytes):
-                    current_bytes = os.path.getsize(gif_path)
-                    current_size_mb = current_bytes / 1024 / 1024
-                    logger.info(f"Stage 3b (bounded search) completed: {current_size_mb:.2f}MB")
-                    if current_bytes <= target_bytes:
-                        logger.info("Target met after Stage 3b (bounded search)")
-                        return True
-                
-                # If bounded search failed and mode is 'bounded_search', skip FFmpeg
-                if mode == 'bounded_search':
-                    logger.info("Near-target mode is 'bounded_search', skipping FFmpeg fallback")
-                    gifsicle_success = True  # Prevent FFmpeg from running
-        
-        # Stage 3c: FFmpeg fallback when gifsicle fails or unavailable
-        if not gifsicle_success:
-            current_bytes = os.path.getsize(gif_path)
-            current_size_mb = current_bytes / 1024 / 1024
-            if current_size_mb > target_size_mb:
-                logger.info(f"Stage 3c: Attempting FFmpeg fallback compression ({current_size_mb:.2f}MB -> {target_size_mb:.2f}MB target)...")
+            # Respect near_target.mode == 'bounded_search', which explicitly prefers gifsicle-only paths
+            if use_ffmpeg and mode == 'bounded_search' and gifsicle_near_target:
+                logger.info(
+                    "Stage 3c: Near-target mode is 'bounded_search'; not running FFmpeg fallback "
+                    "for near-target result (over by %.1f%%)",
+                    over_ratio * 100,
+                )
+                use_ffmpeg = False
+            
+            if use_ffmpeg:
+                logger.info(
+                    "Stage 3c: Attempting FFmpeg fallback compression (%.2fMB -> %.2fMB target)...",
+                    current_size_mb,
+                    target_size_mb,
+                )
                 if self._stage_ffmpeg_fallback_compression(gif_path, target_bytes, target_size_mb):
                     current_bytes = os.path.getsize(gif_path)
                     current_size_mb = current_bytes / 1024 / 1024
-                    logger.info(f"Stage 3c (FFmpeg fallback) completed: {current_size_mb:.2f}MB")
+                    logger.info("Stage 3c (FFmpeg fallback) completed: %.2fMB", current_size_mb)
                     if current_bytes <= target_bytes:
                         logger.info("Target met after Stage 3c (FFmpeg fallback)")
                         return True
                 else:
                     logger.warning("Stage 3c: FFmpeg fallback compression failed")
-                    # Try progressive resolution reduction as additional fallback
+                    # Try progressive resolution reduction as additional fallback, but only when
+                    # still significantly over the target size.
                     current_bytes = os.path.getsize(gif_path)
                     current_size_mb = current_bytes / 1024 / 1024
-                    if current_size_mb > target_size_mb:
-                        logger.info(f"Stage 3c.1: Attempting progressive resolution reduction ({current_size_mb:.2f}MB -> {target_size_mb:.2f}MB target)...")
-                        if self._progressive_resolution_reduction(gif_path, target_bytes, target_size_mb):
-                            current_bytes = os.path.getsize(gif_path)
-                            current_size_mb = current_bytes / 1024 / 1024
-                            logger.info(f"Stage 3c.1 (progressive resolution) completed: {current_size_mb:.2f}MB")
-                            if current_bytes <= target_bytes:
-                                logger.info("Target met after Stage 3c.1 (progressive resolution)")
-                                return True
+                    if current_bytes > target_bytes:
+                        progressive_threshold = 0.25  # Only for files ≥25% over target
+                        over_ratio = (current_bytes - target_bytes) / float(target_bytes) if target_bytes > 0 else 1.0
+                        if over_ratio >= progressive_threshold:
+                            logger.info(
+                                "Stage 3c.1: Attempting progressive resolution reduction "
+                                "(%.2fMB -> %.2fMB target, over by %.1f%%)...",
+                                current_size_mb,
+                                target_size_mb,
+                                over_ratio * 100,
+                            )
+                            if self._progressive_resolution_reduction(gif_path, target_bytes, target_size_mb):
+                                current_bytes = os.path.getsize(gif_path)
+                                current_size_mb = current_bytes / 1024 / 1024
+                                logger.info(
+                                    "Stage 3c.1 (progressive resolution) completed: %.2fMB",
+                                    current_size_mb,
+                                )
+                                if current_bytes <= target_bytes:
+                                    logger.info("Target met after Stage 3c.1 (progressive resolution)")
+                                    return True
+                        else:
+                            logger.debug(
+                                "Stage 3c.1: Skipping progressive resolution reduction "
+                                "(over_ratio=%.2f%% < %.0f%% threshold)",
+                                over_ratio * 100,
+                                progressive_threshold * 100,
+                            )
         
         # Stage 3d: PIL-based compression (when still over target)
         if self._shutdown_checker():
@@ -908,6 +993,17 @@ class GifOptimizer:
             
             if current_size_mb <= target_size_mb:
                 return True
+            
+            # Only run progressive reduction when the file is still significantly over target.
+            over_ratio = (current_bytes - target_bytes) / float(target_bytes) if target_bytes > 0 else 1.0
+            progressive_threshold = 0.25  # 25% over target
+            if over_ratio < progressive_threshold:
+                logger.debug(
+                    "Progressive resolution reduction skipped: over_ratio=%.2f%% < %.0f%% threshold",
+                    over_ratio * 100,
+                    progressive_threshold * 100,
+                )
+                return False
             
             # Get current GIF info
             try:
