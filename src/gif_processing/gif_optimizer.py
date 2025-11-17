@@ -374,35 +374,61 @@ class GifOptimizer:
         else:
             logger.warning("Stage 3: gifsicle not available, will try FFmpeg fallback")
         
-        # Stage 3b: FFmpeg fallback when gifsicle fails or unavailable
+        # Stage 3b: Near-target bounded search (when gifsicle got close but not under)
+        if gifsicle_success:
+            current_bytes = os.path.getsize(gif_path)
+            current_size_mb = current_bytes / 1024 / 1024
+            over_ratio = (current_bytes - target_bytes) / float(target_bytes) if target_bytes > 0 else 1.0
+            
+            # Get near-target config
+            near_target_config = self.config_helper.get_optimization_config().get('near_target', {})
+            near_threshold = near_target_config.get('threshold_percent', 15) / 100.0
+            mode = near_target_config.get('mode', 'both')
+            
+            if 0 < over_ratio <= near_threshold and mode in ['bounded_search', 'both']:
+                logger.info(f"Stage 3b: Gifsicle got close ({over_ratio*100:.1f}% over), attempting bounded search...")
+                if self._stage_adaptive_search(gif_path, target_bytes):
+                    current_bytes = os.path.getsize(gif_path)
+                    current_size_mb = current_bytes / 1024 / 1024
+                    logger.info(f"Stage 3b (bounded search) completed: {current_size_mb:.2f}MB")
+                    if current_bytes <= target_bytes:
+                        logger.info("Target met after Stage 3b (bounded search)")
+                        return True
+                
+                # If bounded search failed and mode is 'bounded_search', skip FFmpeg
+                if mode == 'bounded_search':
+                    logger.info("Near-target mode is 'bounded_search', skipping FFmpeg fallback")
+                    gifsicle_success = True  # Prevent FFmpeg from running
+        
+        # Stage 3c: FFmpeg fallback when gifsicle fails or unavailable
         if not gifsicle_success:
             current_bytes = os.path.getsize(gif_path)
             current_size_mb = current_bytes / 1024 / 1024
             if current_size_mb > target_size_mb:
-                logger.info(f"Stage 3b: Attempting FFmpeg fallback compression ({current_size_mb:.2f}MB -> {target_size_mb:.2f}MB target)...")
+                logger.info(f"Stage 3c: Attempting FFmpeg fallback compression ({current_size_mb:.2f}MB -> {target_size_mb:.2f}MB target)...")
                 if self._stage_ffmpeg_fallback_compression(gif_path, target_bytes, target_size_mb):
                     current_bytes = os.path.getsize(gif_path)
                     current_size_mb = current_bytes / 1024 / 1024
-                    logger.info(f"Stage 3b (FFmpeg fallback) completed: {current_size_mb:.2f}MB")
+                    logger.info(f"Stage 3c (FFmpeg fallback) completed: {current_size_mb:.2f}MB")
                     if current_bytes <= target_bytes:
-                        logger.info("Target met after Stage 3b (FFmpeg fallback)")
+                        logger.info("Target met after Stage 3c (FFmpeg fallback)")
                         return True
                 else:
-                    logger.warning("Stage 3b: FFmpeg fallback compression failed")
+                    logger.warning("Stage 3c: FFmpeg fallback compression failed")
                     # Try progressive resolution reduction as additional fallback
                     current_bytes = os.path.getsize(gif_path)
                     current_size_mb = current_bytes / 1024 / 1024
                     if current_size_mb > target_size_mb:
-                        logger.info(f"Stage 3b.1: Attempting progressive resolution reduction ({current_size_mb:.2f}MB -> {target_size_mb:.2f}MB target)...")
+                        logger.info(f"Stage 3c.1: Attempting progressive resolution reduction ({current_size_mb:.2f}MB -> {target_size_mb:.2f}MB target)...")
                         if self._progressive_resolution_reduction(gif_path, target_bytes, target_size_mb):
                             current_bytes = os.path.getsize(gif_path)
                             current_size_mb = current_bytes / 1024 / 1024
-                            logger.info(f"Stage 3b.1 (progressive resolution) completed: {current_size_mb:.2f}MB")
+                            logger.info(f"Stage 3c.1 (progressive resolution) completed: {current_size_mb:.2f}MB")
                             if current_bytes <= target_bytes:
-                                logger.info("Target met after Stage 3b.1 (progressive resolution)")
+                                logger.info("Target met after Stage 3c.1 (progressive resolution)")
                                 return True
         
-        # Stage 3c: PIL-based compression (when still over target)
+        # Stage 3d: PIL-based compression (when still over target)
         if self._shutdown_checker():
             return False
         
@@ -413,32 +439,37 @@ class GifOptimizer:
             
             # Try PIL compression if still significantly over target
             if over_ratio > 0.05:  # More than 5% over
-                logger.info(f"Stage 3c: Attempting PIL-based compression ({current_size_mb:.2f}MB -> {target_size_mb:.2f}MB target)...")
+                logger.info(f"Stage 3d: Attempting PIL-based compression ({current_size_mb:.2f}MB -> {target_size_mb:.2f}MB target)...")
                 if self._stage_pil_compression(gif_path, target_bytes, target_size_mb):
                     current_bytes = os.path.getsize(gif_path)
                     current_size_mb = current_bytes / 1024 / 1024
-                    logger.info(f"Stage 3c (PIL compression) completed: {current_size_mb:.2f}MB")
+                    logger.info(f"Stage 3d (PIL compression) completed: {current_size_mb:.2f}MB")
                     if current_bytes <= target_bytes:
-                        logger.info("Target met after Stage 3c (PIL compression)")
+                        logger.info("Target met after Stage 3d (PIL compression)")
                         return True
                 else:
-                    logger.debug("Stage 3c: PIL compression failed or did not reduce size sufficiently")
+                    logger.debug("Stage 3d: PIL compression failed or did not reduce size sufficiently")
         
-        # Stage 4: Final polish (only if within 5% of target)
+        # Stage 4: Final polish (only if within ~15% of target)
         if self._shutdown_checker():
             return False
         
         current_bytes = os.path.getsize(gif_path)
         if current_bytes > target_bytes:
             over_ratio = (current_bytes - target_bytes) / float(target_bytes) if target_bytes > 0 else 1.0
-            if over_ratio <= 0.05:
-                logger.info("Stage 4: Attempting final polish (within 5% of target)...")
+            stage4_threshold = 0.15
+            if over_ratio <= stage4_threshold:
+                logger.info(
+                    "Stage 4: Attempting final polish (over by %.1f%%, threshold %.0f%%)",
+                    over_ratio * 100,
+                    stage4_threshold * 100
+                )
                 self._stage_final_polish(gif_path, target_bytes)
                 current_bytes = os.path.getsize(gif_path)
                 current_size_mb = current_bytes / 1024 / 1024
                 logger.info(f"Stage 4 completed: {current_size_mb:.2f}MB")
             else:
-                logger.debug(f"Stage 4: Skipped (over_ratio={over_ratio:.2%} > 5%)")
+                logger.debug(f"Stage 4: Skipped (over_ratio={over_ratio:.2%} > {stage4_threshold:.0%})")
         
         final_size_mb = os.path.getsize(gif_path) / 1024 / 1024
         success = current_bytes <= target_bytes
@@ -631,6 +662,7 @@ class GifOptimizer:
         
         # Try multiple parameter combinations
         param_combinations = []
+        over_ratio = (current_size_mb / target_size_mb) if target_size_mb > 0 else float('inf')
         
         # Primary: use calculated parameters
         param_combinations.append({
@@ -639,6 +671,53 @@ class GifOptimizer:
             'scale': required_params['width'] / float(current_params['width']),
             'name': 'primary'
         })
+        
+        # Near-target fine tuning (within 5-15% over target)
+        near_target_lower = 1.05
+        near_target_upper = 1.15
+        if target_size_mb > 0 and near_target_lower <= over_ratio <= near_target_upper:
+            base_scale = required_params['width'] / float(max(1, current_params['width']))
+            fine_tune_scale = max(0.5, min(1.0, base_scale * 0.95))
+            param_combinations.append({
+                'colors': max(32, required_params['colors'] - 24),
+                'lossy': min(200, required_params['lossy'] + 15),
+                'scale': fine_tune_scale,
+                'name': 'near-target fine-tune'
+            })
+            logger.info(
+                "  Scheduling near-target gifsicle compression (%.1f%% over target)",
+                (over_ratio - 1.0) * 100
+            )
+        
+        # Fill the gap: 15-35% over target
+        if 1.15 < over_ratio <= 1.35:
+            param_combinations.append({
+                'colors': max(32, required_params['colors'] - 16),
+                'lossy': min(200, required_params['lossy'] + 10),
+                'scale': required_params['width'] / float(current_params['width']) * 0.95,
+                'name': 'moderate-1'
+            })
+            param_combinations.append({
+                'colors': max(32, required_params['colors'] - 32),
+                'lossy': min(200, required_params['lossy'] + 20),
+                'scale': required_params['width'] / float(current_params['width']) * 0.92,
+                'name': 'moderate-2'
+            })
+        
+        # Fill the gap: 35-50% over target
+        if 1.35 < over_ratio <= 1.50:
+            param_combinations.append({
+                'colors': max(32, required_params['colors'] - 24),
+                'lossy': min(200, required_params['lossy'] + 15),
+                'scale': required_params['width'] / float(current_params['width']) * 0.93,
+                'name': 'moderate-aggressive-1'
+            })
+            param_combinations.append({
+                'colors': max(32, required_params['colors'] - 40),
+                'lossy': min(200, required_params['lossy'] + 30),
+                'scale': required_params['width'] / float(current_params['width']) * 0.88,
+                'name': 'moderate-aggressive-2'
+            })
         
         # Secondary: more aggressive if needed
         if current_size_mb > target_size_mb * 1.5:
@@ -1050,7 +1129,7 @@ class GifOptimizer:
     
     def _stage_final_polish(self, gif_path: str, target_bytes: int) -> bool:
         """
-        Stage 4: Final polish with gifsicle squeeze for small overages.
+        Stage 4: Final polish with bounded gifsicle search for small overages.
         
         Returns:
             True if target met
@@ -1061,19 +1140,25 @@ class GifOptimizer:
         current_bytes = os.path.getsize(gif_path)
         over_ratio = (current_bytes - target_bytes) / float(target_bytes) if target_bytes > 0 else 1.0
         
-        # Only try if within 15% over target
-        if over_ratio > 0.15:
+        # Get configurable threshold
+        near_target_config = self.config_helper.get_optimization_config().get('near_target', {})
+        threshold = near_target_config.get('threshold_percent', 15) / 100.0
+        
+        # Only try if within configured threshold
+        if over_ratio > threshold:
             return False
         
+        logger.info(f"Stage 4: Using bounded search for final polish ({over_ratio*100:.1f}% over target)")
+        
         with temp_file_context("final_polish", ".gif", self.temp_dir) as temp_output:
-            if self._gifsicle_squeeze_small_overage(gif_path, temp_output):
+            if self._bounded_gifsicle_near_target(gif_path, temp_output, target_bytes):
                 if os.path.exists(temp_output):
                     temp_size = os.path.getsize(temp_output)
-                    if temp_size < current_bytes:
+                    if temp_size <= target_bytes:
                         try:
                             safe_file_operation(os.replace, temp_output, gif_path)
-                            logger.debug(f"Final polish applied: {temp_size / 1024 / 1024:.2f}MB")
-                            return temp_size <= target_bytes
+                            logger.info(f"Final polish succeeded: {temp_size / 1024 / 1024:.2f}MB")
+                            return True
                         except Exception as e:
                             logger.debug(f"Failed to replace with polished file: {e}")
         
@@ -1161,15 +1246,30 @@ class GifOptimizer:
     def _bounded_gifsicle_near_target(self, input_path: str, best_output_path: str, target_bytes: int) -> bool:
         """Bounded gifsicle search for near-target cases"""
         try:
-            # Conservative ladders
-            if self.fast_mode:
+            # Get configuration
+            near_target_config = self.config_helper.get_optimization_config().get('near_target', {})
+            max_runs = near_target_config.get('max_attempts', self.near_target_max_runs)
+            fine_tune_threshold = near_target_config.get('fine_tune_threshold_percent', 10) / 100.0
+            
+            current_size = os.path.getsize(input_path)
+            over_ratio = (current_size - target_bytes) / float(target_bytes) if target_bytes > 0 else 1.0
+            
+            # Use finer-grained search when very close
+            if 0 < over_ratio <= fine_tune_threshold:
+                color_steps = [256, 240, 224, 208, 192, 176, 160]
+                lossy_steps = [20, 30, 40, 50, 60]
+                scale_steps = [1.0, 0.98, 0.96, 0.94, 0.92, 0.90]
+                logger.info(f"Using fine-grained search ({over_ratio*100:.1f}% over target)")
+            # Conservative ladders for fast mode or larger gaps
+            elif self.fast_mode:
                 color_steps = [256, 192]
                 lossy_steps = [0, 20]
                 scale_steps = [1.0, 0.96]
             else:
-                color_steps = [256, 224, 208, 192, 176, 160]
-                lossy_steps = [0, 10, 20, 30]
-                scale_steps = [1.0, 0.96, 0.92]
+                # Original coarser steps
+                color_steps = [256, 224, 192, 160, 128, 96, 64]
+                lossy_steps = [20, 40, 60, 80, 100]
+                scale_steps = [1.0, 0.95, 0.90, 0.85, 0.80]
             
             original_size = os.path.getsize(input_path)
             best: Tuple[int, str] = (original_size, '')
@@ -1208,7 +1308,6 @@ class GifOptimizer:
                             best = (size, temp)
                 
                 # Small grid over lossy and scale
-                max_runs = self.near_target_max_runs
                 runs = 0
                 
                 for scale in scale_steps:
@@ -1311,7 +1410,8 @@ class GifOptimizer:
             if colors and colors < 256:
                 cmd.extend(["--colors", str(max(2, min(256, colors)))])
             if lossy and lossy > 0:
-                cmd.extend(["--lossy", str(max(1, min(150, int(lossy))))])
+                lossy_value = max(1, min(150, int(lossy)))
+                cmd.append(f"--lossy={lossy_value}")
             cmd.extend([input_path, "--output", output_path])
             
             logger.debug(f"gifsicle command: {' '.join(cmd)}")
@@ -1387,7 +1487,8 @@ class GifOptimizer:
         elif height == -1:
             return f"scale={width}:-2:flags=lanczos"
         else:
-            return f"scale={width}:{height}:flags=lanczos"
+            # Use force_original_aspect_ratio=decrease to preserve aspect ratio when both dimensions are specified
+            return f"scale={width}:{height}:flags=lanczos:force_original_aspect_ratio=decrease"
     
     def _get_palette_cache_key(self, input_video: str, method: str, width: int, height: int,
                                fps: int, colors: int, mpdecimate_frac: float = 0.3,
