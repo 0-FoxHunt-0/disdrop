@@ -632,12 +632,11 @@ class GifGenerator:
                 return None
             
             # Build filter with mpdecimate + fps + scale (no crop)
+            # Use gentler mpdecimate settings to preserve motion quality and reduce jerkiness
             pre_chain = []
-            # Support aggressive settings for feasibility checks
-            if settings.get('mpdecimate_aggressive'):
-                pre_chain.append('mpdecimate=hi=768:lo=64:frac=0.4')
-            else:
-                pre_chain.append('mpdecimate=hi=512:lo=256:frac=0.3')
+            # Removed aggressive feasibility settings - they caused too many artifacts
+            # Use consistent, gentler settings for better quality
+            pre_chain.append('mpdecimate=hi=640:lo=320:frac=0.25')
             pre_chain.append(f"fps={settings['fps']}")
             
             # Get video info for optimal scaling
@@ -666,12 +665,19 @@ class GifGenerator:
             # Improved scaling: preserve aspect ratio better and use higher quality
             if optimal_height == -2:
                 # Auto height already preserves aspect ratio
-                pre_chain.append(f"scale={optimal_width}:-2:flags=lanczos")
+                # Use high-quality scaling flags for better palette generation
+                pre_chain.append(f"scale={optimal_width}:-2:flags=lanczos+accurate_rnd+full_chroma_int")
             else:
                 # Explicit dimensions: use force_original_aspect_ratio=decrease to preserve aspect ratio
-                pre_chain.append(f"scale={optimal_width}:{optimal_height}:flags=lanczos:force_original_aspect_ratio=decrease")
-            max_colors = int(settings.get('palette_max_colors', settings.get('colors', 256)))
-            vf = ','.join(pre_chain + [f"palettegen=max_colors={max_colors}:stats_mode=diff:reserve_transparent=1"])  # Improved palette settings
+                pre_chain.append(f"scale={optimal_width}:{optimal_height}:flags=lanczos+accurate_rnd+full_chroma_int:force_original_aspect_ratio=decrease")
+            
+            # Always use full 256 colors for initial palette generation to capture all color nuances
+            # This provides the best quality starting point
+            max_colors = 256
+            
+            # Use stats_mode=full for better color distribution in complex scenes
+            # This analyzes all frames more thoroughly but produces higher quality palettes
+            vf = ','.join(pre_chain + [f"palettegen=max_colors={max_colors}:stats_mode=full:reserve_transparent=1"])  # High-quality palette settings
 
             # Palette cache directory (writable user temp)
             cache_dir = os.path.join(self.config.get_temp_dir(), 'palette_cache')
@@ -813,11 +819,9 @@ class GifGenerator:
                 return False
             
             # Build filter graph with mpdecimate, fps, scale and paletteuse (no crop)
+            # Use gentler mpdecimate settings to preserve motion quality
             pre_chain = []
-            if settings.get('mpdecimate_aggressive'):
-                pre_chain.append('mpdecimate=hi=768:lo=64:frac=0.4')
-            else:
-                pre_chain.append('mpdecimate=hi=512:lo=256:frac=0.3')
+            pre_chain.append('mpdecimate=hi=640:lo=320:frac=0.25')
             pre_chain.append(f"fps={settings['fps']}")
             
             # Get video info for optimal scaling
@@ -840,11 +844,12 @@ class GifGenerator:
             
             if target_height == -1:
                 # Preserve aspect ratio by only specifying width
-                scale_filter = f"scale={target_width}:-2:flags=lanczos"
+                # Use high-quality scaling flags for better output quality
+                scale_filter = f"scale={target_width}:-2:flags=lanczos+accurate_rnd+full_chroma_int"
                 logger.info(f"GIF scaling: preserving aspect ratio with width={target_width}, height=auto")
             else:
                 # Use both dimensions if explicitly specified, with force_original_aspect_ratio=decrease to preserve aspect ratio
-                scale_filter = f"scale={target_width}:{target_height}:flags=lanczos:force_original_aspect_ratio=decrease"
+                scale_filter = f"scale={target_width}:{target_height}:flags=lanczos+accurate_rnd+full_chroma_int:force_original_aspect_ratio=decrease"
                 logger.info(f"GIF scaling: using specified dimensions {target_width}x{target_height} with aspect ratio preservation")
             
             pre_chain.append(scale_filter)
@@ -900,8 +905,9 @@ class GifGenerator:
                 return False
 
             # Build filter chain without crop
+            # Use gentler mpdecimate for smoother motion
             pre = []
-            pre.append('mpdecimate=hi=512:lo=256:frac=0.3')
+            pre.append('mpdecimate=hi=640:lo=320:frac=0.25')
             pre.append(f"fps={settings['fps']}")
             
             # Get video info for optimal scaling
@@ -924,11 +930,12 @@ class GifGenerator:
             
             if target_height == -1:
                 # Preserve aspect ratio by only specifying width
-                scale_filter = f"scale={target_width}:-2:flags=lanczos"
+                # Use high-quality scaling flags for better output quality
+                scale_filter = f"scale={target_width}:-2:flags=lanczos+accurate_rnd+full_chroma_int"
                 logger.info(f"GIF scaling: preserving aspect ratio with width={target_width}, height=auto")
             else:
                 # Use both dimensions if explicitly specified, with force_original_aspect_ratio=decrease to preserve aspect ratio
-                scale_filter = f"scale={target_width}:{target_height}:flags=lanczos:force_original_aspect_ratio=decrease"
+                scale_filter = f"scale={target_width}:{target_height}:flags=lanczos+accurate_rnd+full_chroma_int:force_original_aspect_ratio=decrease"
                 logger.info(f"GIF scaling: using specified dimensions {target_width}x{target_height} with aspect ratio preservation")
             
             pre.append(scale_filter)
@@ -938,8 +945,8 @@ class GifGenerator:
 
             filter_complex = (
                 f"{chain},split[a][b];" 
-                f"[a]palettegen=stats_mode=diff:reserve_transparent=1:max_colors=256[p];"
-                f"[b][p]paletteuse=dither=sierra2_4a:diff_mode=rectangle:new=1"
+                f"[a]palettegen=stats_mode=full:reserve_transparent=1:max_colors=256[p];"
+                f"[b][p]paletteuse=dither=floyd_steinberg:diff_mode=rectangle:new=1"
             )
 
             cmd = [

@@ -141,15 +141,17 @@ class GifOptimizer:
         return predicted_bytes / (1024 * 1024)
     
     def _calculate_required_parameters(self, current_size_mb: float, target_size_mb: float,
-                                      current_params: Dict[str, Any], gif_info: Dict[str, Any]) -> Dict[str, Any]:
+                                      current_params: Dict[str, Any], gif_info: Dict[str, Any],
+                                      gif_path: Optional[str] = None) -> Dict[str, Any]:
         """
-        Calculate parameters needed to meet target size.
+        Calculate parameters needed to meet target size with content-aware adjustments.
         
         Args:
             current_size_mb: Current file size in MB
             target_size_mb: Target file size in MB
             current_params: Current parameters (width, fps, colors, etc.)
             gif_info: GIF information (width, height, fps, duration)
+            gif_path: Optional path to GIF for content analysis
         
         Returns:
             Dictionary with calculated parameters
@@ -159,6 +161,25 @@ class GifOptimizer:
         
         reduction_ratio = target_size_mb / current_size_mb
         
+        # Content-aware analysis for better parameter selection
+        motion_level = 'medium'
+        complexity_level = 'medium'
+        
+        if gif_path and os.path.exists(gif_path):
+            try:
+                # Analyze motion to adjust FPS intelligently
+                from .gif_analysis import analyze_motion, analyze_scene_complexity
+                motion_analysis = analyze_motion(gif_path, current_params.get('fps', 20), self.temp_dir)
+                motion_level = motion_analysis.get('motion_level', 'medium')
+                
+                # Analyze complexity to adjust colors intelligently
+                complexity_analysis = analyze_scene_complexity(gif_path, self.temp_dir)
+                complexity_level = complexity_analysis.get('complexity_level', 'medium')
+                
+                logger.debug(f"Content analysis: motion={motion_level}, complexity={complexity_level}")
+            except Exception as e:
+                logger.debug(f"Content analysis failed, using defaults: {e}")
+        
         # Get current values
         current_width = current_params.get('width', gif_info.get('width', 360))
         current_height = current_params.get('height', gif_info.get('height', 360))
@@ -167,40 +188,59 @@ class GifOptimizer:
         current_lossy = current_params.get('lossy', 0)
         duration = gif_info.get('duration', 10.0)
         
-        # Calculate required reductions
+        # Calculate required reductions with content-aware adjustments
         # Width reduction: use cube root since area is width^2
-        # For aggressive reduction, we need to reduce multiple factors
+        # Adjust factors based on content analysis
+        
+        # Motion-aware FPS adjustment
+        fps_motion_multiplier = {
+            'low': 0.85,     # Low motion: can reduce FPS more
+            'medium': 1.0,   # Medium motion: standard reduction
+            'high': 1.15     # High motion: preserve FPS better
+        }.get(motion_level, 1.0)
+        
+        # Complexity-aware color adjustment
+        color_complexity_multiplier = {
+            'low': 0.85,     # Low complexity: can use fewer colors
+            'medium': 1.0,   # Medium complexity: standard colors
+            'high': 1.15     # High complexity: preserve more colors
+        }.get(complexity_level, 1.0)
+        
         if reduction_ratio < 0.3:
             # Very aggressive: reduce all factors significantly
             width_factor = reduction_ratio ** (1/3)  # Cube root for area
-            fps_factor = reduction_ratio ** 0.4
-            color_factor = reduction_ratio ** 0.3
-            lossy_increase = 150
+            fps_factor = (reduction_ratio ** 0.4) * fps_motion_multiplier
+            color_factor = (reduction_ratio ** 0.3) * color_complexity_multiplier
+            lossy_increase = 120  # Reduced from 150
         elif reduction_ratio < 0.5:
             # Aggressive: reduce width and fps
             width_factor = reduction_ratio ** 0.4
-            fps_factor = reduction_ratio ** 0.5
-            color_factor = reduction_ratio ** 0.4
-            lossy_increase = 100
+            fps_factor = (reduction_ratio ** 0.5) * fps_motion_multiplier
+            color_factor = (reduction_ratio ** 0.4) * color_complexity_multiplier
+            lossy_increase = 80  # Reduced from 100
         elif reduction_ratio < 0.7:
             # Moderate: balanced reduction
             width_factor = reduction_ratio ** 0.5
-            fps_factor = reduction_ratio ** 0.6
-            color_factor = reduction_ratio ** 0.5
-            lossy_increase = 60
+            fps_factor = (reduction_ratio ** 0.6) * fps_motion_multiplier
+            color_factor = (reduction_ratio ** 0.5) * color_complexity_multiplier
+            lossy_increase = 50  # Reduced from 60
         else:
             # Small reduction: minimal changes
             width_factor = reduction_ratio ** 0.6
-            fps_factor = reduction_ratio ** 0.7
-            color_factor = reduction_ratio ** 0.6
-            lossy_increase = 30
+            fps_factor = (reduction_ratio ** 0.7) * fps_motion_multiplier
+            color_factor = (reduction_ratio ** 0.6) * color_complexity_multiplier
+            lossy_increase = 25  # Reduced from 30
         
-        # Calculate new values
-        new_width = max(2, int((current_width * width_factor) // 2 * 2))  # Ensure even
-        new_height = max(2, int((current_height * width_factor) // 2 * 2))  # Preserve aspect ratio
-        new_fps = max(6, int(round(current_fps * fps_factor)))
-        new_colors = max(32, int(round(current_colors * color_factor)))
-        new_lossy = min(200, current_lossy + lossy_increase)
+        # Calculate new values with improved quality floors to reduce artifacts
+        # Minimum width increased from 240 to 280 to reduce pixelation
+        # Minimum FPS increased from 6 to 10 for smoother motion
+        # Minimum colors increased from 32 to 128 to reduce banding
+        new_width = max(280, int((current_width * width_factor) // 2 * 2))  # Ensure even
+        new_height = max(280, int((current_height * width_factor) // 2 * 2))  # Preserve aspect ratio
+        new_fps = max(10, int(round(current_fps * fps_factor)))
+        new_colors = max(128, int(round(current_colors * color_factor)))
+        # Limit lossy to max 120 (reduced from 200) to prevent severe degradation
+        new_lossy = min(120, current_lossy + lossy_increase)
         
         # Get quality floors (may be bypassed in aggressive mode)
         quality_floors = self.config_helper.get_quality_floors()
@@ -212,11 +252,20 @@ class GifOptimizer:
             new_width = max(new_width, min_width)
             new_fps = max(new_fps, min_fps)
         else:
-            # Aggressive mode: use lower floors
-            min_width_aggressive = quality_floors.get('min_width_aggressive', 240)
-            min_fps_aggressive = quality_floors.get('min_fps_aggressive', 12)
+            # Aggressive mode: use improved floors (increased from 240/12 to 280/10)
+            min_width_aggressive = quality_floors.get('min_width_aggressive', 280)
+            min_fps_aggressive = quality_floors.get('min_fps_aggressive', 10)
             new_width = max(new_width, min_width_aggressive)
             new_fps = max(new_fps, min_fps_aggressive)
+        
+        # Improved dither selection based on color count
+        # Use better dithering algorithms to reduce artifacts
+        if new_colors >= 192:
+            dither = 'floyd_steinberg'  # Best for gradients with many colors
+        elif new_colors >= 128:
+            dither = 'sierra2_4a'  # Good balance
+        else:
+            dither = 'bayer'  # Simpler for few colors
         
         return {
             'width': new_width,
@@ -224,7 +273,7 @@ class GifOptimizer:
             'fps': new_fps,
             'colors': new_colors,
             'lossy': new_lossy,
-            'dither': current_params.get('dither', 'bayer' if new_colors < 128 else 'floyd_steinberg')
+            'dither': dither
         }
     
     def optimize_gif(self, gif_path: str, max_size_mb: float, source_video: Optional[str] = None) -> bool:
@@ -578,7 +627,7 @@ class GifOptimizer:
             }
             
             required_params = self._calculate_required_parameters(
-                current_size_mb, target_size_mb, current_params, gif_info
+                current_size_mb, target_size_mb, current_params, gif_info, gif_path=output_gif
             )
             
             # Use GifGenerator to create GIF with calculated parameters
@@ -587,13 +636,22 @@ class GifOptimizer:
             generator = GifGenerator(self.config, shutdown_checker=self._shutdown_checker)
             
             # Create settings dict from required params
+            # Use improved dithering based on color count
+            colors = required_params['colors']
+            if colors >= 192:
+                dither = 'floyd_steinberg'
+            elif colors >= 128:
+                dither = 'sierra2_4a'
+            else:
+                dither = 'bayer'
+            
             settings = {
                 'max_size_mb': target_size_mb,
                 'width': required_params['width'],
                 'height': required_params.get('height', -1),
                 'fps': required_params['fps'],
-                'colors': required_params['colors'],
-                'dither': required_params.get('dither', 'bayer'),
+                'colors': colors,
+                'dither': dither,
                 'lossy': required_params.get('lossy', 0),
                 'max_duration': video_info.get('duration', 30.0)
             }
@@ -655,7 +713,7 @@ class GifOptimizer:
         }
         
         required_params = self._calculate_required_parameters(
-            current_size_mb, target_size_mb, current_params, gif_info
+            current_size_mb, target_size_mb, current_params, gif_info, gif_path=gif_path
         )
         
         logger.info(f"Calculated compression parameters: colors={required_params['colors']}, lossy={required_params['lossy']}, width={required_params['width']}")
@@ -673,14 +731,15 @@ class GifOptimizer:
         })
         
         # Near-target fine tuning (within 5-15% over target)
+        # Use less aggressive settings to preserve quality
         near_target_lower = 1.05
         near_target_upper = 1.15
         if target_size_mb > 0 and near_target_lower <= over_ratio <= near_target_upper:
             base_scale = required_params['width'] / float(max(1, current_params['width']))
-            fine_tune_scale = max(0.5, min(1.0, base_scale * 0.95))
+            fine_tune_scale = max(0.7, min(1.0, base_scale * 0.95))  # Prevent scaling below 0.7
             param_combinations.append({
-                'colors': max(32, required_params['colors'] - 24),
-                'lossy': min(200, required_params['lossy'] + 15),
+                'colors': max(128, required_params['colors'] - 24),  # Increased from 32 to 128
+                'lossy': min(120, required_params['lossy'] + 15),  # Reduced from 200 to 120
                 'scale': fine_tune_scale,
                 'name': 'near-target fine-tune'
             })
@@ -689,52 +748,32 @@ class GifOptimizer:
                 (over_ratio - 1.0) * 100
             )
         
-        # Fill the gap: 15-35% over target
+        # Fill the gap: 15-35% over target - reduced to single attempt
         if 1.15 < over_ratio <= 1.35:
             param_combinations.append({
-                'colors': max(32, required_params['colors'] - 16),
-                'lossy': min(200, required_params['lossy'] + 10),
-                'scale': required_params['width'] / float(current_params['width']) * 0.95,
-                'name': 'moderate-1'
-            })
-            param_combinations.append({
-                'colors': max(32, required_params['colors'] - 32),
-                'lossy': min(200, required_params['lossy'] + 20),
-                'scale': required_params['width'] / float(current_params['width']) * 0.92,
-                'name': 'moderate-2'
+                'colors': max(128, required_params['colors'] - 20),  # Increased minimum
+                'lossy': min(120, required_params['lossy'] + 15),  # Reduced max lossy
+                'scale': required_params['width'] / float(current_params['width']) * 0.94,
+                'name': 'moderate'
             })
         
-        # Fill the gap: 35-50% over target
+        # Fill the gap: 35-50% over target - reduced to single attempt
         if 1.35 < over_ratio <= 1.50:
             param_combinations.append({
-                'colors': max(32, required_params['colors'] - 24),
-                'lossy': min(200, required_params['lossy'] + 15),
-                'scale': required_params['width'] / float(current_params['width']) * 0.93,
-                'name': 'moderate-aggressive-1'
-            })
-            param_combinations.append({
-                'colors': max(32, required_params['colors'] - 40),
-                'lossy': min(200, required_params['lossy'] + 30),
-                'scale': required_params['width'] / float(current_params['width']) * 0.88,
-                'name': 'moderate-aggressive-2'
+                'colors': max(128, required_params['colors'] - 32),  # Preserve more colors
+                'lossy': min(120, required_params['lossy'] + 20),  # Limit lossy
+                'scale': required_params['width'] / float(current_params['width']) * 0.90,
+                'name': 'moderate-aggressive'
             })
         
-        # Secondary: more aggressive if needed
-        if current_size_mb > target_size_mb * 1.5:
-            param_combinations.append({
-                'colors': max(32, required_params['colors'] - 32),
-                'lossy': min(200, required_params['lossy'] + 20),
-                'scale': required_params['width'] / float(current_params['width']) * 0.9,
-                'name': 'secondary (aggressive)'
-            })
-        
-        # Tertiary: even more aggressive
+        # Only use more aggressive settings for files significantly over target (>2x)
+        # Removed tertiary option to avoid over-optimization
         if current_size_mb > target_size_mb * 2.0:
             param_combinations.append({
-                'colors': max(32, required_params['colors'] - 64),
-                'lossy': min(200, required_params['lossy'] + 40),
-                'scale': required_params['width'] / float(current_params['width']) * 0.8,
-                'name': 'tertiary (very aggressive)'
+                'colors': max(128, required_params['colors'] - 48),  # Still preserve quality
+                'lossy': min(120, required_params['lossy'] + 30),  # Limited lossy
+                'scale': max(0.75, required_params['width'] / float(current_params['width']) * 0.85),  # Prevent extreme scaling
+                'name': 'aggressive (for large files)'
             })
         
         logger.info(f"Trying {len(param_combinations)} compression parameter combination(s)...")
@@ -787,6 +826,15 @@ class GifOptimizer:
                                 return True
                             except Exception as e:
                                 logger.warning(f"  Failed to replace file: {e}")
+                        
+                        # Early exit if we're very close to target (within 5%)
+                        # This prevents over-optimization and preserves quality
+                        if temp_size <= target_bytes * 1.05:
+                            if temp_size < best_size:
+                                best_size = temp_size
+                                best_result = temp_output
+                            logger.info(f"  Result is within 5% of target, stopping early to preserve quality")
+                            break
                         
                         if temp_size < best_size:
                             # Remove previous best from cleanup list
@@ -902,6 +950,14 @@ class GifOptimizer:
                     temp_files_to_cleanup.append(temp_output)
                     
                     # Try this resolution
+                    # Use improved dithering based on color count
+                    if current_colors >= 192:
+                        dither = 'floyd_steinberg'
+                    elif current_colors >= 128:
+                        dither = 'sierra2_4a'
+                    else:
+                        dither = 'bayer'
+                    
                     success = self._ffmpeg_palette_reencode(
                         gif_path, temp_output,
                         new_width=new_width,
@@ -909,7 +965,7 @@ class GifOptimizer:
                         max_colors=current_colors,
                         mpdecimate_frac=0.4,
                         stats_mode='diff',
-                        dither='sierra2_4a'
+                        dither=dither
                     )
                     
                     if success and os.path.exists(temp_output):
@@ -1017,16 +1073,23 @@ class GifOptimizer:
                 logger.debug(f"Motion analysis failed, using default FPS: {e}")
             
             required_params = self._calculate_required_parameters(
-                current_size_mb, target_size_mb, current_params, gif_info
+                current_size_mb, target_size_mb, current_params, gif_info, gif_path=gif_path
             )
             
-            # Use aggressive mpdecimate for better compression
-            mpdecimate_frac = 0.4  # More aggressive duplicate removal
+            # Use less aggressive mpdecimate to preserve quality and reduce jerkiness
+            # Reduced maximum from 0.5 to 0.3 to maintain smoother motion
+            mpdecimate_frac = 0.25  # Gentler duplicate removal
             if current_size_mb / target_size_mb > 3.0:
-                mpdecimate_frac = 0.5  # Very aggressive for large files
+                mpdecimate_frac = 0.3  # Still relatively gentle even for very large files
             
-            # Use simpler dithering for better compression
-            dither = 'bayer' if required_params['colors'] < 128 else 'sierra2_4a'
+            # Use improved dithering based on color count for better quality
+            colors = required_params['colors']
+            if colors >= 192:
+                dither = 'floyd_steinberg'  # Best for many colors
+            elif colors >= 128:
+                dither = 'sierra2_4a'  # Good balance
+            else:
+                dither = 'bayer'  # Simpler for few colors
             
             # Create temp output
             with temp_file_context("ffmpeg_fallback", ".gif", self.temp_dir) as temp_output:
@@ -1481,14 +1544,18 @@ class GifOptimizer:
     
     # Helper methods for FFmpeg operations
     def _build_scale_filter(self, width: int, height: int) -> str:
-        """Build scale filter with proper aspect ratio preservation"""
+        """Build scale filter with proper aspect ratio preservation and high quality flags"""
+        # Use high-quality scaling flags for better output quality
+        # lanczos: high-quality resampling algorithm
+        # accurate_rnd: more accurate rounding
+        # full_chroma_int: full chroma interpolation
         if width == -1 and height == -1:
-            return "scale=iw:ih:flags=lanczos"
+            return "scale=iw:ih:flags=lanczos+accurate_rnd+full_chroma_int"
         elif height == -1:
-            return f"scale={width}:-2:flags=lanczos"
+            return f"scale={width}:-2:flags=lanczos+accurate_rnd+full_chroma_int"
         else:
             # Use force_original_aspect_ratio=decrease to preserve aspect ratio when both dimensions are specified
-            return f"scale={width}:{height}:flags=lanczos:force_original_aspect_ratio=decrease"
+            return f"scale={width}:{height}:flags=lanczos+accurate_rnd+full_chroma_int:force_original_aspect_ratio=decrease"
     
     def _get_palette_cache_key(self, input_video: str, method: str, width: int, height: int,
                                fps: int, colors: int, mpdecimate_frac: float = 0.3,
