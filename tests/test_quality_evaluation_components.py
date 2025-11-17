@@ -11,7 +11,7 @@ import yaml
 import json
 import subprocess
 from src.config_manager import ConfigManager
-from src.quality_gates import QualityGates
+from src.quality_gates import QualityGates, ResolutionAwareQualityEvaluator
 
 
 class TestQualityGatesSSIMParsing(unittest.TestCase):
@@ -144,6 +144,54 @@ class TestQualityGatesSSIMParsing(unittest.TestCase):
             self.assertGreaterEqual(score, 0.9)
             self.assertLessEqual(score, 1.0)
         
+        self.assertGreater(confidence, 0.0)
+
+
+class TestQualityGatesSSIMDirectExecution(unittest.TestCase):
+    """Ensure SSIM execution path consumes stdout when stderr is empty."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.config_manager = ConfigManager(self.temp_dir)
+        self.evaluator = ResolutionAwareQualityEvaluator(self.config_manager)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp_dir)
+
+    def test_compute_ssim_direct_reads_stdout_output(self):
+        """FFmpeg SSIM stats usually land on stdout under -loglevel error."""
+        sample_stdout = (
+            "n:1 Y:0.998114 U:0.999274 V:0.998989 All:0.998453 (28.10dB)\n"
+            "n:2 Y:0.997057 U:0.998561 V:0.998171 All:0.997494 (26.01dB)\n"
+        )
+
+        def fake_run(_cmd, **_kwargs):
+            class Result:
+                returncode = 0
+                stdout = sample_stdout
+                stderr = ""
+
+            return Result()
+
+        with patch("src.video_processing.quality_gates.subprocess.run", side_effect=fake_run):
+            score, confidence = self.evaluator._compute_ssim_direct("dist.mp4", "ref.mp4")
+
+        self.assertIsNotNone(score)
+        self.assertGreater(score, 0.99)
+        self.assertGreater(confidence, 0.0)
+
+    def test_parse_ssim_output_simple_handles_stdout_snippet(self):
+        """Regression guard for parser using the FFmpeg stdout snippet."""
+        snippet = (
+            "n:1 Y:0.998114 U:0.999274 V:0.998989 All:0.998453 (28.104872)\n"
+            "n:2 Y:0.997057 U:0.998561 V:0.998171 All:0.997494 (26.009819)\n"
+        )
+
+        score, confidence = self.evaluator._parse_ssim_output_simple(snippet)
+
+        self.assertIsNotNone(score)
+        self.assertGreater(score, 0.99)
         self.assertGreater(confidence, 0.0)
 
 
