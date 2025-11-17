@@ -3452,20 +3452,21 @@ class ResolutionAwareQualityEvaluator:
             )
             
             if result.returncode == 0:
-                ssim_score, confidence = self._parse_ssim_output_simple(result.stderr)
+                ssim_output = result.stderr if result.stderr else result.stdout
+                ssim_score, confidence = self._parse_ssim_output_simple(ssim_output or "")
                 if ssim_score is None:
                     # Parsing failed - log detailed information
                     logger.error(f"SSIM parsing failed: Unable to parse FFmpeg output")
                     logger.debug(f"FFmpeg command: {' '.join(cmd)}")
                     logger.debug(f"FFmpeg returncode: {result.returncode}")
-                    logger.debug(f"FFmpeg stdout length: {len(result.stdout)} chars")
-                    logger.debug(f"FFmpeg stderr length: {len(result.stderr)} chars")
+                    logger.debug(f"FFmpeg stdout length: {len(result.stdout or '')} chars")
+                    logger.debug(f"FFmpeg stderr length: {len(result.stderr or '')} chars")
                     if result.stderr:
                         logger.debug(f"FFmpeg stderr output (first 1000 chars):\n{result.stderr[:1000]}")
-                    else:
-                        logger.debug("FFmpeg stderr is empty")
-                    if result.stdout:
+                    elif result.stdout:
                         logger.debug(f"FFmpeg stdout output (first 1000 chars):\n{result.stdout[:1000]}")
+                    else:
+                        logger.debug("FFmpeg produced no SSIM output on stdout or stderr")
                 return ssim_score, confidence
             else:
                 logger.error(f"Direct SSIM computation failed (returncode {result.returncode})")
