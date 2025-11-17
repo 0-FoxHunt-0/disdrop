@@ -402,8 +402,21 @@ class GifGenerator:
             return settings['max_size_mb']  # Conservative estimate
     
     def _create_single_gif(self, input_video: str, output_path: str, settings: Dict[str, Any], 
-                          start_time: float, duration: float, deadline: Optional[float] = None) -> Dict[str, Any]:
-        """Create a single optimized GIF"""
+                          start_time: float, duration: float, deadline: Optional[float] = None,
+                          skip_optimizer: bool = False) -> Dict[str, Any]:
+        """
+        Create a single GIF, optionally skipping automatic optimization.
+        
+        Args:
+            input_video: Source video path
+            output_path: Destination GIF path
+            settings: Encoding settings
+            start_time: Start offset in seconds
+            duration: Clip duration in seconds
+            deadline: Optional deadline timestamp for timeouts
+            skip_optimizer: If True, do not run the optimizer even if the GIF exceeds the size limit.
+                            Used by GifOptimizer during internal re-encoding to avoid recursion.
+        """
         try:
             # Check if input video still exists
             if not os.path.exists(input_video):
@@ -530,8 +543,21 @@ class GifGenerator:
                 if os.path.exists(output_path):
                     size_mb = os.path.getsize(output_path) / (1024 * 1024)
                     
-                    # If still over limit, use optimizer to target size precisely
+                    # If still over limit, use optimizer to target size precisely (unless explicitly skipped)
                     if size_mb > settings['max_size_mb']:
+                        if skip_optimizer:
+                            logger.info(
+                                "GIF size (%.2fMB) exceeds limit (%.2fMB), but optimizer is skipped (skip_optimizer=True)",
+                                size_mb,
+                                settings['max_size_mb']
+                            )
+                            return {
+                                'success': True,
+                                'size_mb': size_mb,
+                                'duration': duration,
+                                'fps': settings['fps'],
+                                'scale': settings.get('scale') or settings.get('width', 360)
+                            }
                         logger.info(f"GIF size ({size_mb:.2f}MB) exceeds limit ({settings['max_size_mb']:.2f}MB), optimizing...")
                         optimization_succeeded = False
                         try:

@@ -662,7 +662,7 @@ class GifOptimizer:
             # Create GIF from source with calculated parameters
             duration = min(settings['max_duration'], video_info.get('duration', 30.0))
             result = generator._create_single_gif(
-                source_video, temp_output, settings, 0.0, duration
+                source_video, temp_output, settings, 0.0, duration, skip_optimizer=True
             )
             
             if result.get('success', False) and os.path.exists(temp_output):
