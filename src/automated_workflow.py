@@ -564,6 +564,103 @@ class AutomatedWorkflow:
         except ValueError:
             return Path(file_path.name)
     
+    def _find_source_video_for_gif(self, gif_file: Path) -> Optional[str]:
+        """
+        Attempt to locate a source video (e.g., MP4) that corresponds to the provided GIF.
+        A richer source video lets the GIF optimizer run higher quality stages (palette
+        regeneration, fps adjustments) without re-encoding from the already-compressed GIF.
+        """
+        base_name = gif_file.stem
+        default_exts = ['.mp4', '.mov', '.mkv', '.webm', '.avi']
+        try:
+            config_exts = self.config.get('gif_settings.source_video_search.extensions', default_exts) or default_exts
+        except Exception:
+            config_exts = default_exts
+        normalized_exts = [ext.lower() if isinstance(ext, str) else '.mp4' for ext in config_exts]
+        
+        candidate_dirs: List[Path] = []
+        seen: set = set()
+        
+        def enqueue(path: Optional[Path]) -> None:
+            if not path:
+                return
+            try:
+                resolved = Path(path)
+            except Exception:
+                return
+            if resolved in seen:
+                return
+            seen.add(resolved)
+            candidate_dirs.append(resolved)
+        
+        # Start with the GIF's directory and a few ancestors
+        enqueue(gif_file.parent)
+        try:
+            for parent in list(gif_file.parents)[:4]:
+                enqueue(parent)
+        except Exception:
+            pass
+        
+        # Include segments directory next to the GIF if it exists
+        enqueue(gif_file.parent / f"{base_name}_segments")
+        
+        # Consider output/input mirrors when relative path is available
+        relative_path = self._get_relative_path(gif_file)
+        if relative_path != Path(gif_file.name):
+            rel_parent = relative_path.parent
+            enqueue(self.output_dir / rel_parent)
+            enqueue(self.input_dir / rel_parent)
+            enqueue((self.output_dir / rel_parent) / f"{base_name}_segments")
+        
+        # Always check global output/temp directories
+        enqueue(self.output_dir)
+        enqueue(self.temp_dir)
+        
+        # Allow user-defined extra directories from config
+        try:
+            extra_dirs = self.config.get('gif_settings.source_video_search.extra_dirs', []) or []
+        except Exception:
+            extra_dirs = []
+        for extra in extra_dirs:
+            try:
+                enqueue(Path(extra))
+            except Exception:
+                continue
+        
+        for directory in candidate_dirs:
+            try:
+                if not directory or not directory.exists() or not directory.is_dir():
+                    continue
+            except Exception:
+                continue
+            
+            # Exact filename match first
+            found_path = None
+            for ext in normalized_exts:
+                potential = directory / f"{base_name}{ext}"
+                try:
+                    if potential.exists():
+                        found_path = potential
+                        break
+                except Exception:
+                    continue
+            if not found_path:
+                # Fallback: look for files that start with the base name (case sensitive) but ensure extension matches
+                try:
+                    for match in directory.glob(f"{base_name}.*"):
+                        if match.suffix.lower() in normalized_exts and match.exists():
+                            found_path = match
+                            break
+                except Exception:
+                    pass
+            
+            if found_path:
+                logger.debug(f"[Workflow] Matched source video for {gif_file.name}: {found_path}")
+                return str(found_path)
+        
+        logger.debug(f"[Workflow] No source video located for {gif_file.name}")
+        return None
+    
     def _make_cache_key(self, input_file: Path) -> str:
         """Create cache key using relative path to handle files with same name in different folders"""
         try:
@@ -1511,47 +1608,85 @@ class AutomatedWorkflow:
                         # Check if the error is about file size being too large or file is empty (encoding failure)
                         if ("too large" in error_msg.lower() or "file size" in error_msg.lower() or 
                             "file is empty" in error_msg.lower()):
-                            print(f"    🔄 Single file optimization failed ({error_msg}), falling back to segmentation...")
-                            logger.info(f"Single file optimization failed ({error_msg}), attempting segmentation fallback")
+                            print(f"    🔁 Retrying with segmentation allowed ({error_msg})...")
+                            logger.info(f"Single-file validation failed ({error_msg}); retrying with segmentation permitted "
+                                        f"(encoder may still produce a single file).")
                             
-                            # Remove the oversized file
+                            # Remove the oversized/invalid file before retry
                             if output_path.exists():
                                 output_path.unlink()
                             
-                            # Retry with segmentation
                             try:
                                 result = self.video_compressor.compress_video(
                                     input_path=str(video_file),
                                     output_path=str(output_path),
                                     max_size_mb=max_size_mb,
-                                    force_single_file=False  # Allow segmentation
+                                    force_single_file=False
                                 )
                                 
-                                if result.get('success', False):
-                                    # Handle segmentation fallback result
+                                if not result.get('success', False):
+                                    print(f"    ❌ Retry with segmentation allowed failed: {result.get('error', 'Unknown error')}")
+                                    logger.error(f"Segmentation-enabled retry failed: {result.get('error', 'Unknown error')}")
+                                    return None
+                                
+                                segmentation_used = (
+                                    result.get('is_segmented_output')
+                                    or bool(result.get('segments'))
+                                    or bool(result.get('segments_folder'))
+                                    or result.get('method') in {'segmentation', 'segmentation_fallback'}
+                                )
+                                
+                                if segmentation_used:
                                     fallback_status = self._handle_segmentation_fallback_result(result, video_file, max_size_mb)
                                     
                                     if fallback_status == 'success':
-                                        # Get the segments folder path from result
-                                        # Check multiple possible keys: segments_folder (fallback), output_folder (regular), output_file (fallback)
-                                        segments_folder_path = result.get('segments_folder') or result.get('output_folder') or result.get('output_file')
+                                        segments_folder_path = (
+                                            result.get('segments_folder')
+                                            or result.get('output_folder')
+                                            or result.get('output_file')
+                                        )
                                         if segments_folder_path and os.path.exists(segments_folder_path):
                                             return Path(segments_folder_path)
-                                        else:
-                                            print(f"    ❌ Segmentation fallback completed but segments folder not found")
-                                            logger.error(f"Segmentation fallback completed but segments folder not found")
-                                            return None
-                                    else:
-                                        print(f"    ❌ Segmentation fallback handling failed")
-                                        logger.error(f"Segmentation fallback handling failed")
+                                        print(f"    ❌ Segmentation fallback completed but segments folder not found")
+                                        logger.error(f"Segmentation fallback completed but segments folder not found")
                                         return None
-                                else:
-                                    print(f"    ❌ Segmentation fallback failed")
-                                    logger.error(f"Segmentation fallback failed: {result.get('error', 'Unknown error')}")
+                                    
+                                    print(f"    ❌ Segmentation fallback handling failed")
+                                    logger.error(f"Segmentation fallback handling failed")
                                     return None
+                                
+                                # No segmentation was required; validate the new single-file output
+                                print(f"    ✅ Retry succeeded without segmentation; validating MP4...")
+                                logger.info("Segmentation-enabled retry produced a compliant single MP4; validating output.")
+                                
+                                is_valid, retry_error = self.file_validator.is_valid_video_with_enhanced_checks(
+                                    str(output_path),
+                                    original_path=str(video_file),
+                                    max_size_mb=max_size_mb
+                                )
+                                
+                                if is_valid:
+                                    size_mb = result.get('size_mb', 0)
+                                    print(f"    ✨ Video optimization successful after retry: {size_mb:.2f}MB")
+                                    logger.info(f"Video optimization successful after retry: {output_name} ({size_mb:.2f}MB)")
+                                    self._record_success_cache(video_file, 'single_mp4', output_path)
+                                    try:
+                                        specs = FFmpegUtils.get_detailed_file_specifications(str(output_path))
+                                        specs_log = FFmpegUtils.format_file_specifications_for_logging(specs)
+                                        logger.info(f"Final video file specifications - {specs_log}")
+                                    except Exception as e:
+                                        logger.warning(f"Could not log detailed video specifications: {e}")
+                                    return output_path
+                                
+                                print(f"    ❌ Retry output validation failed: {retry_error}")
+                                logger.error(f"Retry output validation failed: {retry_error}")
+                                if output_path.exists():
+                                    output_path.unlink()
+                                return None
+                            
                             except Exception as e:
-                                print(f"    ❌ Segmentation fallback error: {e}")
-                                logger.error(f"Segmentation fallback error: {e}")
+                                print(f"    ❌ Segmentation retry error: {e}")
+                                logger.error(f"Segmentation retry error: {e}")
                                 return None
                         else:
                             # Other validation error, remove the invalid file
@@ -2716,22 +2851,8 @@ class AutomatedWorkflow:
                 logger.error(f"Failed to prepare working copy for {gif_file.name}: {e}")
                 return 'error'
 
-            # Try to find source video (MP4) in the same directory
-            source_video = None
-            try:
-                # Look for MP4 with same base name in same directory
-                potential_mp4 = gif_file.parent / f"{gif_file.stem}.mp4"
-                if potential_mp4.exists():
-                    source_video = str(potential_mp4)
-                    logger.debug(f"[Workflow] Found source video for re-encoding: {source_video}")
-                else:
-                    # Also check in parent directory (for segments)
-                    potential_mp4_parent = gif_file.parent.parent / f"{gif_file.stem}.mp4"
-                    if potential_mp4_parent.exists():
-                        source_video = str(potential_mp4_parent)
-                        logger.debug(f"[Workflow] Found source video in parent directory: {source_video}")
-            except Exception as e:
-                logger.debug(f"[Workflow] Could not find source video: {e}")
+            # Try to find a higher-quality source video for re-encoding/optimization
+            source_video = self._find_source_video_for_gif(gif_file)
 
             # Use the GIF optimizer on the working copy
             from .gif_processing.gif_optimizer import GifOptimizer
@@ -3115,7 +3236,6 @@ class AutomatedWorkflow:
             
             # Calculate target width based on scale factor
             try:
-                from .ffmpeg_utils import FFmpegUtils
                 video_info = FFmpegUtils.get_video_info(str(gif_file))
                 if video_info and 'width' in video_info:
                     original_width = video_info['width']
@@ -3132,6 +3252,8 @@ class AutomatedWorkflow:
             except Exception as e:
                 logger.debug(f"Could not pre-calculate segment width: {e}")
                 target_segment_width = None
+            
+            base_source_video = self._find_source_video_for_gif(gif_file)
 
             # Limit parallelism based on configuration and system analysis
             max_workers = self._calculate_optimal_segmentation_workers()
@@ -3170,17 +3292,9 @@ class AutomatedWorkflow:
                         pass
                     
                     # Try to find source video for segment creation (preferred over GIF)
-                    segment_source_video = None
-                    try:
-                        # Check for source video in same directory or parent
-                        potential_video = gif_file.parent / f"{base_name}.mp4"
-                        if not potential_video.exists():
-                            potential_video = output_dir / f"{base_name}.mp4"
-                        if potential_video.exists():
-                            segment_source_video = str(potential_video)
-                            logger.debug(f"[Workflow] Found source video for segment creation: {segment_source_video}")
-                    except Exception:
-                        pass
+                    segment_source_video = base_source_video
+                    if segment_source_video:
+                        logger.debug(f"[Workflow] Using shared source video for segment creation: {segment_source_video}")
                     
                     # Use GifGenerator to create segments with proper compression if source video available
                     # Otherwise, create from GIF but with aggressive settings
@@ -3257,7 +3371,6 @@ class AutomatedWorkflow:
                         
                         # Get video info to calculate proper scaling that preserves aspect ratio
                         try:
-                            from .ffmpeg_utils import FFmpegUtils
                             video_info = FFmpegUtils.get_video_info(str(gif_file))
                             if video_info and 'width' in video_info and 'height' in video_info:
                                 original_width = video_info['width']
@@ -3502,7 +3615,6 @@ class AutomatedWorkflow:
                                                 logger.debug(f"Removed remaining file: {extra}")
                                             elif extra.is_dir():
                                                 # Remove subdirectories recursively
-                                                import shutil
                                                 shutil.rmtree(extra)
                                                 logger.debug(f"Removed remaining directory: {extra}")
                                         except Exception as e:
@@ -3526,7 +3638,7 @@ class AutomatedWorkflow:
                                 # Record cache for single GIF success (source = base MP4 if present)
                                 try:
                                     src_input = segments_dir.parent / f"{base_name}.mp4"
-                                    cache_input = src_input if src_input.exists() else segments_folder
+                                    cache_input = src_input if src_input.exists() else segments_dir
                                     self._record_success_cache(cache_input, 'single_gif', single_output_path)
                                 except Exception:
                                     pass
@@ -3840,12 +3952,7 @@ class AutomatedWorkflow:
                 if mp4_files:
                     f.write("MP4 Segments Details:\n")
                     f.write("--------------------\n")
-                    # Only add separators between batches if there are more than 10 files
-                    add_separators = len(mp4_files) > 10
                     for idx, mp4_file in enumerate(mp4_files, 1):
-                        # Add separator between batches of 10 (but not before the first batch)
-                        if add_separators and idx > 1 and (idx - 1) % 10 == 0:
-                            f.write("--------------------\n")
                         try:
                             info = FFmpegUtils.get_video_info(str(mp4_file))
                             size_mb = mp4_file.stat().st_size / (1024 * 1024)
@@ -3891,12 +3998,7 @@ class AutomatedWorkflow:
                 if gif_files:
                     f.write("GIF Segments Details:\n")
                     f.write("--------------------\n")
-                    # Only add separators between batches if there are more than 10 files
-                    add_separators = len(gif_files) > 10
                     for idx, gif_file in enumerate(gif_files, 1):
-                        # Add separator between batches of 10 (but not before the first batch)
-                        if add_separators and idx > 1 and (idx - 1) % 10 == 0:
-                            f.write("--------------------\n")
                         try:
                             # Get comprehensive GIF information using the existing method
                             gif_info = self._get_gif_info_for_summary(str(gif_file))

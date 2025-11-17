@@ -1235,6 +1235,61 @@ class DynamicVideoCompressor:
         # Load profile config
         profile_cfg = self.config.get('video_compression.profiles.discord_10mb', {})
         size_limit_mb = profile_cfg.get('size_limit_mb', 10.0)
+        refine_cfg = profile_cfg.get('refine', {})
+        size_guard_mb = max(0.0, refine_cfg.get('size_guard_mb', 0.05))
+        max_over_limit_mb = max(0.0, refine_cfg.get('max_over_limit_mb', 0.0))
+        target_limit_mb = max(size_limit_mb - size_guard_mb, 0.1)
+        acceptance_limit_mb = size_limit_mb + max_over_limit_mb
+        logger.debug(
+            "Discord 10MB size control: target %.3fMB, acceptance %.3fMB (guard %.3fMB, tolerance %.3fMB)",
+            target_limit_mb,
+            acceptance_limit_mb,
+            size_guard_mb,
+            max_over_limit_mb,
+        )
+
+        best_candidate = {
+            'path': None,
+            'size_mb': None,
+            'pass_index': None,
+            'reason': None,
+            'quality': None,
+            'artifacts': None,
+        }
+
+        def _store_best_candidate(size_mb: float, pass_index: int, reason: str,
+                                  quality_result: Optional[Dict[str, Any]] = None,
+                                  artifact_result: Optional[Dict[str, Any]] = None) -> None:
+            """Preserve the latest under-limit encode so we can fall back if later passes fail."""
+            if size_mb > acceptance_limit_mb:
+                return
+            if not os.path.exists(output_path):
+                return
+            if best_candidate['path'] is None:
+                best_candidate['path'] = os.path.join(
+                    self.temp_dir,
+                    f"cae_best_{int(time.time())}_{threading.get_ident()}.mp4"
+                )
+            try:
+                shutil.copy2(output_path, best_candidate['path'])
+                best_candidate['size_mb'] = size_mb
+                best_candidate['pass_index'] = pass_index
+                best_candidate['reason'] = reason
+                best_candidate['quality'] = quality_result
+                best_candidate['artifacts'] = artifact_result
+                logger.debug(f"Captured CAE best-effort candidate from pass {pass_index}: {size_mb:.4f}MB ({reason})")
+            except Exception as e:
+                logger.debug(f"Failed to preserve CAE best-effort candidate: {e}")
+
+        def _cleanup_best_candidate() -> None:
+            """Remove any temporary snapshot we created for best-effort fallback."""
+            path = best_candidate.get('path')
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+            best_candidate['path'] = None
         
         # Step 1: Analyze content complexity
         motion_level = video_info.get('motion_level', 'medium')  # from _analyze_video_content
@@ -1252,7 +1307,7 @@ class DynamicVideoCompressor:
         
         # Calculate resulting video bitrate with initial audio selection
         audio_bits = initial_audio_bitrate * 1000 * duration
-        total_bits_budget = size_limit_mb * 8 * 1024 * 1024
+        total_bits_budget = target_limit_mb * 8 * 1024 * 1024
         video_bits_budget = int(total_bits_budget - audio_bits)
         initial_video_bitrate = int(video_bits_budget / duration / 1000) if duration > 0 else 0
         
@@ -1296,7 +1351,8 @@ class DynamicVideoCompressor:
                 logger.info(f"Duration-aware audio adjustment: reduced audio from {initial_audio_bitrate}k to {audio_bitrate_kbps}k "
                           f"to meet video bitrate minimum ({target_video_bitrate_kbps}k >= {min_encoder_bitrate}k)")
         
-        logger.info(f"Budget: {size_limit_mb}MB = {target_video_bitrate_kbps}k video + {audio_bitrate_kbps}k audio over {duration:.1f}s")
+        logger.info(f"Budget: target {target_limit_mb:.2f}MB (limit {size_limit_mb:.2f}MB) = "
+                    f"{target_video_bitrate_kbps}k video + {audio_bitrate_kbps}k audio over {duration:.1f}s")
         
         # Step 2.5: Immediate bitrate validation and emergency adjustment
         
@@ -1538,7 +1594,6 @@ class DynamicVideoCompressor:
         
         # Step 4: 2-pass encode with refine loop
         x264_cfg = profile_cfg.get('x264', {})
-        refine_cfg = profile_cfg.get('refine', {})
         max_passes = refine_cfg.get('max_passes', 3)
         bitrate_step = refine_cfg.get('bitrate_step', 1.08)
         
@@ -1577,7 +1632,8 @@ class DynamicVideoCompressor:
             
             # Check size
             output_size_mb = os.path.getsize(output_path) / (1024 * 1024)
-            logger.info(f"Encoded size: {output_size_mb:.2f}MB (target: {size_limit_mb}MB)")
+            logger.info(f"Encoded size: {output_size_mb:.2f}MB (target: {target_limit_mb:.2f}MB, limit: {size_limit_mb:.2f}MB)")
+            within_acceptance = output_size_mb <= acceptance_limit_mb
             
             # Track this pass for progress detection
             previous_sizes.append((refine_pass + 1, output_size_mb, current_bitrate))
@@ -1585,7 +1641,7 @@ class DynamicVideoCompressor:
             # Detect if stuck at same size (within 0.1MB tolerance)
             # But allow one more pass if close to target (within 0.1MB over limit)
             close_to_target_threshold = 0.1  # MB over target to consider "close enough" for one more pass
-            is_close_to_target = (size_limit_mb < output_size_mb <= size_limit_mb + close_to_target_threshold)
+            is_close_to_target = (target_limit_mb < output_size_mb <= target_limit_mb + close_to_target_threshold)
             
             if len(previous_sizes) >= 2:
                 prev_size = previous_sizes[-2][1]
@@ -1595,7 +1651,7 @@ class DynamicVideoCompressor:
                 if size_diff < 0.1:  # Less than 0.1MB difference
                     # If we're close to target and size is decreasing, reset counter (one more pass might succeed)
                     if is_close_to_target and size_is_decreasing:
-                        logger.info(f"Output size close to target ({output_size_mb:.2f}MB, target: {size_limit_mb}MB) "
+                        logger.info(f"Output size close to target ({output_size_mb:.2f}MB, target: {target_limit_mb:.2f}MB) "
                                    f"and decreasing (prev: {prev_size:.2f}MB). Allowing one more pass.")
                         same_size_count = 0  # Reset counter to allow one more pass
                     else:
@@ -1603,6 +1659,8 @@ class DynamicVideoCompressor:
                         logger.warning(f"Output size unchanged: {output_size_mb:.2f}MB (prev: {prev_size:.2f}MB, diff: {size_diff:.3f}MB)")
                         # Only break if we're stuck AND not close to target
                         if same_size_count >= max_same_size_retries and not is_close_to_target:
+                            if within_acceptance:
+                                _store_best_candidate(output_size_mb, refine_pass + 1, "stuck_same_size")
                             logger.error(f"Stuck at same output size after {same_size_count} consecutive passes. "
                                        f"Bitrate: {current_bitrate}kbps (min: {min_encoder_bitrate}kbps). "
                                        f"Terminating refinement loop early.")
@@ -1614,23 +1672,27 @@ class DynamicVideoCompressor:
                 else:
                     same_size_count = 0  # Reset counter when size changes
             
-            # Add small tolerance (0.01MB) for size limit to handle floating point precision
-            size_tolerance_mb = 0.01
-            effective_limit = size_limit_mb + size_tolerance_mb
+            size_tolerance_mb = max_over_limit_mb
+            effective_limit = target_limit_mb + size_tolerance_mb
             
             # Log actual byte size for debugging
             if os.path.exists(output_path):
                 actual_bytes = os.path.getsize(output_path)
                 actual_mb = actual_bytes / (1024 * 1024)
-                limit_bytes = size_limit_mb * 1024 * 1024
-                logger.debug(f"Size check (overage): {actual_mb:.6f}MB ({actual_bytes} bytes) vs limit {size_limit_mb:.6f}MB ({limit_bytes:.0f} bytes), tolerance={size_tolerance_mb:.6f}MB")
+                limit_bytes = target_limit_mb * 1024 * 1024
+                logger.debug(f"Size check (overage): {actual_mb:.6f}MB ({actual_bytes} bytes) vs "
+                             f"target {target_limit_mb:.6f}MB ({limit_bytes:.0f} bytes), tolerance={size_tolerance_mb:.6f}MB")
             else:
                 actual_mb = output_size_mb
             
             if actual_mb > effective_limit:
-                logger.warning(f"Output exceeds size limit: {actual_mb:.6f}MB > {effective_limit:.6f}MB (limit={size_limit_mb:.6f}MB + tolerance={size_tolerance_mb:.6f}MB)")
-                # Calculate how much we need to reduce
-                overage_ratio = actual_mb / size_limit_mb
+                logger.warning(f"Output exceeds encode target: {actual_mb:.6f}MB > {effective_limit:.6f}MB "
+                               f"(target={target_limit_mb:.6f}MB + tolerance={size_tolerance_mb:.6f}MB, "
+                               f"acceptance={acceptance_limit_mb:.6f}MB)")
+                if within_acceptance:
+                    _store_best_candidate(actual_mb, refine_pass + 1, "pre_quality_over_target")
+                # Calculate how much we need to reduce relative to the encode target
+                overage_ratio = actual_mb / max(target_limit_mb, 0.0001)
                 
                 # Check if bitrate is at minimum - if so, use resolution/FPS reduction instead
                 if at_bitrate_minimum or current_bitrate <= min_encoder_bitrate:
@@ -1739,9 +1801,7 @@ class DynamicVideoCompressor:
             if quality_pass and artifact_pass:
                 logger.info(f"✓ All quality gates passed on refine pass {refine_pass + 1}")
                 
-                # Add small tolerance (0.01MB) for size limit to handle floating point precision
-                # This prevents loops where 10.00MB is slightly over 10MB due to precision
-                size_tolerance_mb = 0.01
+                size_tolerance_mb = max_over_limit_mb
                 effective_limit = size_limit_mb + size_tolerance_mb
                 
                 # Log actual byte size for debugging
@@ -1753,10 +1813,15 @@ class DynamicVideoCompressor:
                 else:
                     actual_mb = output_size_mb
                 
-                if actual_mb > effective_limit:
-                    logger.warning(f"Quality gates passed but output exceeds size limit: {actual_mb:.6f}MB > {effective_limit:.6f}MB (limit={size_limit_mb:.6f}MB + tolerance={size_tolerance_mb:.6f}MB). "
-                                 f"Continuing refinement to reduce size.")
+                if actual_mb > acceptance_limit_mb:
+                    logger.warning(f"Quality gates passed but output exceeds acceptance limit: "
+                                   f"{actual_mb:.6f}MB > {acceptance_limit_mb:.6f}MB. Continuing refinement.")
                     # Continue to refinement instead of returning
+                elif actual_mb > target_limit_mb:
+                    if within_acceptance:
+                        _store_best_candidate(actual_mb, refine_pass + 1, "headroom_continue", quality_result, artifact_result)
+                    logger.info(f"Quality gates passed but size {actual_mb:.6f}MB remains above headroom target "
+                                f"{target_limit_mb:.6f}MB; continuing refinement.")
                 else:
                     # Log structured metrics
                     self._log_cae_metrics({
@@ -1769,10 +1834,13 @@ class DynamicVideoCompressor:
                         'refine_pass': refine_pass + 1
                     })
                     
+                    _cleanup_best_candidate()
                     return self._get_compression_results(input_path, output_path, video_info, "cae_discord_10mb")
             
             # Step 7: Refine strategy if gates failed
             logger.warning(f"Quality gates failed on pass {refine_pass + 1}, attempting refinement")
+            if within_acceptance:
+                _store_best_candidate(actual_mb, refine_pass + 1, "quality_retry", quality_result, artifact_result)
             
             # Track quality for early termination detection
             if vmaf_score is not None:
@@ -1801,7 +1869,7 @@ class DynamicVideoCompressor:
                 refinement_result = self._calculate_refinement_strategy(
                     quality_pass=quality_pass,
                     output_size_mb=output_size_mb,
-                    size_limit_mb=size_limit_mb,
+                    size_limit_mb=target_limit_mb,
                     initial_params=initial_params.copy(),
                     audio_bitrate_kbps=audio_bitrate_kbps,
                     video_info=video_info,
@@ -1830,23 +1898,43 @@ class DynamicVideoCompressor:
                 except:
                     pass
             else:
+                if within_acceptance:
+                    _store_best_candidate(actual_mb, refine_pass + 1, "max_passes_reached", quality_result, artifact_result)
                 logger.warning("Maximum refinement passes reached. Cannot refine further.")
         
         # If we exhausted refine passes, return best attempt or fail to segmentation
         if os.path.exists(output_path):
             output_size_bytes = os.path.getsize(output_path)
             output_size_mb = output_size_bytes / (1024 * 1024)
-            # Add small tolerance (0.01MB) for size limit to handle floating point precision
-            size_tolerance_mb = 0.01
-            effective_limit = size_limit_mb + size_tolerance_mb
+            size_tolerance_mb = max_over_limit_mb
+            effective_limit = min(acceptance_limit_mb, size_limit_mb + size_tolerance_mb)
             limit_bytes = size_limit_mb * 1024 * 1024
-            logger.debug(f"Final size check: {output_size_mb:.6f}MB ({output_size_bytes} bytes) vs limit {size_limit_mb:.6f}MB ({limit_bytes:.0f} bytes), tolerance={size_tolerance_mb:.6f}MB")
+            logger.debug(f"Final size check: {output_size_mb:.6f}MB ({output_size_bytes} bytes) vs acceptance "
+                         f"{effective_limit:.6f}MB (limit {size_limit_mb:.6f}MB, tolerance {size_tolerance_mb:.6f}MB)")
             
             if output_size_mb <= effective_limit:
                 logger.warning("CAE completed with compromised quality (some gates failed)")
+                _cleanup_best_candidate()
                 return self._get_compression_results(input_path, output_path, video_info, "cae_discord_10mb_compromised")
+            else:
+                logger.error(f"CAE output rejected for size: {output_size_mb:.6f}MB > acceptance {effective_limit:.6f}MB")
         
         logger.error("CAE pipeline failed after all refine passes")
+
+        if best_candidate['path'] and os.path.exists(best_candidate['path']):
+            try:
+                shutil.copy2(best_candidate['path'], output_path)
+                logger.warning(f"Returning best-effort CAE result from pass {best_candidate['pass_index']} "
+                               f"(size {best_candidate['size_mb']:.2f}MB, reason={best_candidate['reason']})")
+                result = self._get_compression_results(input_path, output_path, video_info, "cae_discord_10mb_best_effort")
+                result['best_effort'] = True
+                result['best_effort_pass'] = best_candidate['pass_index']
+                result['best_effort_reason'] = best_candidate['reason']
+                result['best_effort_size_mb'] = best_candidate['size_mb']
+                _cleanup_best_candidate()
+                return result
+            except Exception as e:
+                logger.error(f"Failed to restore best-effort CAE candidate: {e}")
         
         # Enhanced segmentation fallback handling
         encoder = initial_params.get('encoder', 'libx264')
@@ -1859,6 +1947,7 @@ class DynamicVideoCompressor:
             logger.info(f"Segmentation fallback triggered: {segmentation_reason}")
             logger.info(f"Estimated segments needed: {estimated_segments}")
             
+            _cleanup_best_candidate()
             return self._try_segmentation_fallback(
                 input_path, output_path, size_limit_mb, initial_params, video_info, encoder,
                 f"CAE pipeline failed - {segmentation_reason}"
@@ -1871,6 +1960,7 @@ class DynamicVideoCompressor:
         
         if should_segment:
             logger.info(f"CAE failed, trying segmentation fallback: {reason}")
+            _cleanup_best_candidate()
             return self._try_segmentation_fallback(
                 input_path, output_path, size_limit_mb, initial_params, video_info, encoder,
                 f"CAE pipeline failed - {reason}"
@@ -1879,11 +1969,13 @@ class DynamicVideoCompressor:
         # Final check for emergency cases that might need segmentation
         if video_info.get('emergency_adjustment') or video_info.get('forced_minimum_bitrate'):
             logger.warning("Emergency adjustments were made but CAE still failed - attempting segmentation as last resort")
+            _cleanup_best_candidate()
             return self._try_segmentation_fallback(
                 input_path, output_path, size_limit_mb, initial_params, video_info, encoder,
                 "CAE pipeline failed after emergency adjustments - last resort segmentation"
             )
         
+        _cleanup_best_candidate()
         return {'success': False, 'error': 'CAE quality gates failed', 'method': 'cae_failed'}
     
     def _select_resolution_fps_by_bpp(self, video_info: Dict[str, Any], 

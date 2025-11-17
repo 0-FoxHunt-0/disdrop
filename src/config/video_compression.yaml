@@ -382,6 +382,10 @@ video_compression:
       refine:
         max_passes: 3
         bitrate_step: 1.08
+        # Encode with a small headroom cushion to ensure final muxed file remains under Discord's 10MB cap
+        size_guard_mb: 0.05
+        # Maximum tolerance beyond the published limit that we still consider acceptable (Discord requires 0)
+        max_over_limit_mb: 0.0
       # x264 two-pass tuning
       x264:
         preset: slow
