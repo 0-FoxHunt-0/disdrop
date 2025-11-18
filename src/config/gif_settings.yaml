@@ -24,6 +24,25 @@ gif_settings:
     # Threading for single GIF path
     single_gif_parallel:
       precompute_palette: true
+    # Workflow-wide detection/validation controls
+    file_scan_parallelism: 4        # Threads for intake scan + validation checks
+    validation_manifest_ttl_hours: 12 # Expire cached validation metadata after 12h
+    # Guardrails to prevent very long clips from overloading FFmpeg
+    long_clip_guardrails:
+      enabled: true
+      duration_seconds: 45           # Minimum duration before applying guardrails
+      frame_budget: 900              # duration * fps threshold before applying guardrails
+      segment_duration_ratio: 0.5    # Apply guardrails to segments once they exceed 50% of duration threshold
+      segment_frame_budget_ratio: 0.6 # Apply guardrails to segments once they exceed 60% of frame budget
+      palette_fps_cap: 14            # Cap palette/GIF FPS for long clips
+      palette_stats_mode: "diff"     # Use diff stats mode when guardrails active
+      palette_max_colors: 208        # Limit palette size to speed up processing
+      mpdecimate:
+        hi: 768
+        lo: 64
+        frac: 0.4
+      reencode_max_workers: 1        # Serialize Stage 2 re-encodes for very long clips
+      reencode_strategy_limit: 2     # Limit number of strategies when guardrails apply
 
   # Multiprocessing configuration
   multiprocessing:
@@ -193,6 +212,8 @@ gif_settings:
     near_target:
       # When within this % over target, use bounded gifsicle search instead of FFmpeg
       threshold_percent: 15
+      # Minimum absolute MB overage before near-target guardrails kick in
+      absolute_mb_threshold: 0.3
       # Mode: 'bounded_search', 'skip_ffmpeg', 'both'
       mode: 'both'
       # Maximum gifsicle attempts for bounded search

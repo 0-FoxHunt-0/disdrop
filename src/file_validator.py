@@ -6,6 +6,7 @@ Validates video and GIF files for corruption and size constraints
 import os
 import subprocess
 import logging
+import json
 from typing import Dict, Any, Optional, Tuple
 from pathlib import Path
 import cv2
@@ -53,8 +54,6 @@ class FileValidator:
             if result.returncode != 0:
                 return False, f"FFprobe validation failed: {result.stderr.strip()}"
             
-            # Parse JSON output
-            import json
             try:
                 stdout_text = result.stdout or ""
                 if not stdout_text.strip():
@@ -156,76 +155,161 @@ class FileValidator:
             return False, f"GIF validation error: {str(e)}"
 
     @staticmethod
-    def is_valid_gif_fast(gif_path: str, max_size_mb: float = 10.0) -> Tuple[bool, Optional[str]]:
+    def probe_gif_metadata(gif_path: str, max_size_mb: float = 10.0) -> Tuple[bool, Dict[str, Any], Optional[str]]:
         """
-        Fast validation for GIFs avoiding full frame iteration.
-        Checks: existence, size (if provided), basic GIF header/trailer, PIL open, animated flag,
-        frame count via n_frames, and ability to seek a few key frames.
+        Inspect a GIF once (header + lightweight PIL checks) and return metadata for caching.
         """
+        metadata: Dict[str, Any] = {}
         try:
             if not os.path.exists(gif_path):
-                return False, "File does not exist"
-            file_size_mb = os.path.getsize(gif_path) / (1024 * 1024)
-            if file_size_mb == 0:
-                return False, "File is empty"
-            if max_size_mb is not None and file_size_mb > max_size_mb:
-                return False, f"File too large: {file_size_mb:.2f}MB > {max_size_mb}MB"
+                return False, metadata, "File does not exist"
+            size_bytes = os.path.getsize(gif_path)
+            metadata['size_bytes'] = size_bytes
+            metadata['size_mb'] = size_bytes / (1024 * 1024) if size_bytes else 0.0
+            if size_bytes == 0:
+                return False, metadata, "File is empty"
+            if max_size_mb is not None and metadata['size_mb'] > max_size_mb:
+                return False, metadata, f"File too large: {metadata['size_mb']:.2f}MB > {max_size_mb}MB"
 
-            # Quick header/trailer check
-            try:
-                with open(gif_path, 'rb') as f:
-                    header = f.read(6)
-                    if header not in [b'GIF87a', b'GIF89a']:
-                        return False, "Invalid GIF header"
-                    f.seek(-1, 2)
-                    if f.read(1) != b';':
-                        return False, "Missing GIF trailer"
-            except Exception as e:
-                return False, f"Header/trailer check failed: {e}"
+            # Header/trailer sanity check
+            with open(gif_path, 'rb') as f:
+                header = f.read(6)
+                if header not in (b'GIF87a', b'GIF89a'):
+                    return False, metadata, "Invalid GIF header"
+                f.seek(-1, os.SEEK_END)
+                trailer = f.read(1)
+                if trailer != b';':
+                    return False, metadata, "Missing GIF trailer"
 
-            # PIL-based light checks
             with Image.open(gif_path) as img:
+                metadata['format'] = img.format
+                metadata['mode'] = img.mode
+                width, height = img.size
+                metadata['width'] = int(width)
+                metadata['height'] = int(height)
+                metadata['is_animated'] = bool(getattr(img, 'is_animated', False))
                 if img.format != 'GIF':
-                    return False, "File is not a valid GIF format"
-                if not getattr(img, 'is_animated', False):
-                    return False, "File is not an animated GIF"
+                    return False, metadata, "File is not a valid GIF format"
+                if not metadata['is_animated']:
+                    return False, metadata, "File is not an animated GIF"
 
                 frame_count = getattr(img, 'n_frames', None)
                 if frame_count is None:
-                    # Fallback: try seeking a couple frames without full iteration
                     try:
                         img.seek(0)
-                    except Exception:
-                        return False, "Cannot read first frame"
-                    try:
                         img.seek(1)
                         frame_count = 2
                     except EOFError:
                         frame_count = 1
+                    except Exception:
+                        return False, metadata, "Cannot read GIF frames"
+                metadata['frames'] = int(frame_count)
                 if frame_count <= 0:
-                    return False, "GIF has no frames"
+                    return False, metadata, "GIF has no frames"
 
-                # Probe a few positions to ensure seeking/decoding works
-                probes = {0, 1, max(0, (frame_count // 2)), max(0, frame_count - 1)}
+                frame_duration_ms = img.info.get('duration', 0) or 0
+                metadata['duration_ms'] = int(frame_duration_ms * max(1, frame_count))
+
+                probes = {0, 1, max(0, frame_count // 2), max(0, frame_count - 1)}
                 for pos in probes:
                     try:
                         img.seek(pos)
-                        # Convert quickly to ensure decodability; avoid heavy getdata()
-                        frame = img.convert('P') if img.mode != 'P' else img
-                        w, h = frame.size
+                        probe = img.convert('P') if img.mode != 'P' else img
+                        w, h = probe.size
                         if w <= 0 or h <= 0:
-                            return False, f"Invalid frame dimensions at {pos}"
+                            return False, metadata, f"Invalid frame dimensions at {pos}"
                     except EOFError:
-                        # If EOF on mid/last, still consider valid as long as first frames OK
                         if pos in (0, 1):
-                            return False, f"Unexpected EOF at frame {pos}"
+                            return False, metadata, f"Unexpected EOF at frame {pos}"
                     except Exception as e:
-                        return False, f"Cannot decode frame {pos}: {e}"
+                        return False, metadata, f"Cannot decode frame {pos}: {e}"
 
-            return True, None
-
+            return True, metadata, None
         except Exception as e:
-            return False, f"Fast GIF validation error: {str(e)}"
+            return False, metadata, f"Fast GIF probe error: {str(e)}"
+
+    @staticmethod
+    def is_valid_gif_fast(gif_path: str, max_size_mb: float = 10.0) -> Tuple[bool, Optional[str]]:
+        """
+        Fast validation for GIFs avoiding full frame iteration.
+        """
+        valid, _meta, error = FileValidator.probe_gif_metadata(gif_path, max_size_mb=max_size_mb)
+        return valid, error
+
+    @staticmethod
+    def probe_video_metadata(video_path: str, max_size_mb: Optional[float] = None, timeout: int = 15) -> Tuple[bool, Dict[str, Any], Optional[str]]:
+        """
+        Lightweight video probe using a single ffprobe invocation for caching/manifest usage.
+        """
+        metadata: Dict[str, Any] = {}
+        try:
+            if not os.path.exists(video_path):
+                return False, metadata, "File does not exist"
+            size_bytes = os.path.getsize(video_path)
+            metadata['size_bytes'] = size_bytes
+            metadata['size_mb'] = size_bytes / (1024 * 1024) if size_bytes else 0.0
+            if size_bytes == 0:
+                return False, metadata, "File is empty"
+            if max_size_mb is not None and metadata['size_mb'] > max_size_mb:
+                return False, metadata, f"File too large: {metadata['size_mb']:.2f}MB > {max_size_mb}MB"
+
+            cmd = [
+                'ffprobe', '-v', 'quiet', '-print_format', 'json',
+                '-show_format', '-show_streams', video_path
+            ]
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=timeout
+            )
+            if result.returncode != 0:
+                return False, metadata, f"FFprobe validation failed: {result.stderr.strip()}"
+
+            stdout_text = result.stdout or ""
+            if not stdout_text.strip():
+                return False, metadata, "Invalid FFprobe output"
+            try:
+                data = json.loads(stdout_text)
+            except (json.JSONDecodeError, TypeError):
+                return False, metadata, "Invalid FFprobe output"
+
+            format_info = data.get('format', {}) or {}
+            metadata['duration'] = float(format_info.get('duration', 0) or 0.0)
+            metadata['bit_rate'] = format_info.get('bit_rate')
+
+            streams = data.get('streams', []) or []
+            video_streams = [s for s in streams if s.get('codec_type') == 'video']
+            if not video_streams:
+                return False, metadata, "No video streams found"
+            video_stream = video_streams[0]
+            metadata['codec'] = video_stream.get('codec_name')
+            metadata['width'] = video_stream.get('width')
+            metadata['height'] = video_stream.get('height')
+            metadata['nb_frames'] = video_stream.get('nb_frames')
+            metadata['avg_frame_rate'] = video_stream.get('avg_frame_rate')
+
+            duration = metadata['duration'] or 0.0
+            nb_frames = video_stream.get('nb_frames')
+            if nb_frames in (None, 'N/A'):
+                if duration <= 0:
+                    return False, metadata, "Video has no duration or frame count"
+            else:
+                try:
+                    if int(nb_frames) <= 0:
+                        return False, metadata, "Video has no frames"
+                except (ValueError, TypeError):
+                    if duration <= 0:
+                        return False, metadata, "Video has no valid duration or frame count"
+
+            return True, metadata, None
+        except subprocess.TimeoutExpired:
+            return False, metadata, "Validation timeout - file may be corrupted"
+        except Exception as e:
+            return False, metadata, f"Video probe error: {str(e)}"
     
     @staticmethod
     def is_video_under_size(video_path: str, max_size_mb: float) -> bool:
@@ -629,7 +713,6 @@ class FileValidator:
             )
             
             if result.returncode == 0:
-                import json
                 stdout_text = result.stdout or ""
                 if not stdout_text.strip():
                     return 0.0
@@ -710,8 +793,6 @@ class FileValidator:
             if result.returncode != 0:
                 return False, f"FFprobe cannot parse file: {result.stderr.strip()}"
             
-            # Parse JSON output
-            import json
             stdout_text = result.stdout or ""
             if not stdout_text.strip():
                 return False, "Invalid FFprobe output"

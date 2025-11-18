@@ -85,6 +85,17 @@ class AutomatedWorkflow:
         self._session_start_time = time.time()
         # Cache persistence: track when cache was last used to allow persistence between executions
         self._cache_last_used_file = self._cache_dir / 'last_used.txt'
+        # Validation manifest (metadata cache for detection/validation fast-paths)
+        self.file_scan_parallelism = max(1, int(self.config.get('gif_settings.performance.file_scan_parallelism', 4) or 4))
+        ttl_hours = self.config.get('gif_settings.performance.validation_manifest_ttl_hours', 12) or 12
+        try:
+            ttl_seconds = max(3600.0, float(ttl_hours) * 3600.0)
+        except (TypeError, ValueError):
+            ttl_seconds = 43200.0
+        self._validation_manifest_ttl = ttl_seconds
+        self._validation_manifest: Dict[str, Any] = {}
+        self._validation_manifest_lock = threading.Lock()
+        self._validation_manifest_file: Path = self._cache_dir / 'validation_manifest.json'
         
         # Signal handlers are now handled by the CLI, not here
         
@@ -100,6 +111,12 @@ class AutomatedWorkflow:
                 logger.info(f"Workflow startup: cleaned {validation_result['cleaned']} invalid cache entries")
         except Exception:
             self._cache_index = {}
+        
+        try:
+            self._load_validation_manifest()
+            self._cleanup_validation_manifest()
+        except Exception:
+            self._validation_manifest = {}
     
     
     def _ensure_directories(self):
@@ -557,6 +574,120 @@ class AutomatedWorkflow:
         except Exception:
             pass
 
+    def _load_validation_manifest(self) -> None:
+        """Load validation manifest metadata for fast detection skips."""
+        try:
+            self._cache_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        manifest_data: Dict[str, Any] = {}
+        if self._validation_manifest_file.exists():
+            try:
+                with open(self._validation_manifest_file, 'r', encoding='utf-8') as f:
+                    loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        manifest_data = loaded
+            except Exception as e:
+                logger.debug(f"Failed to load validation manifest: {e}")
+        with self._validation_manifest_lock:
+            self._validation_manifest = manifest_data
+
+    def _save_validation_manifest(self) -> None:
+        """Persist validation manifest to disk (best-effort)."""
+        try:
+            self._cache_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        try:
+            with self._validation_manifest_lock:
+                snapshot = dict(self._validation_manifest)
+            with open(self._validation_manifest_file, 'w', encoding='utf-8') as f:
+                json.dump(snapshot, f, indent=2)
+        except Exception as e:
+            logger.debug(f"Failed to save validation manifest: {e}")
+
+    def _cleanup_validation_manifest(self) -> None:
+        """Remove stale or invalid manifest entries."""
+        with self._validation_manifest_lock:
+            if not self._validation_manifest:
+                return
+            now = time.time()
+            keys_to_remove = []
+            for key, record in self._validation_manifest.items():
+                if not isinstance(record, dict):
+                    keys_to_remove.append(key)
+                    continue
+                validated_at = float(record.get('validated_at', 0) or 0)
+                if validated_at and now - validated_at > self._validation_manifest_ttl:
+                    keys_to_remove.append(key)
+                    continue
+                path_str = record.get('path')
+                if not path_str or not Path(path_str).exists():
+                    keys_to_remove.append(key)
+            for key in keys_to_remove:
+                self._validation_manifest.pop(key, None)
+            dirty = bool(keys_to_remove)
+        if dirty:
+            self._save_validation_manifest()
+
+    def _manifest_key(self, file_path: Path) -> str:
+        try:
+            return str(file_path.resolve())
+        except Exception:
+            return str(file_path)
+
+    def _check_cached_validation(
+        self, file_path: Path, file_type: str, max_size_mb: Optional[float]
+    ) -> Tuple[bool, bool, Dict[str, Any], Optional[str]]:
+        """Return cached validation status if available."""
+        if not file_path.exists():
+            return False, False, {}, "File missing"
+        signature = self._get_path_signature(file_path)
+        key = self._manifest_key(file_path)
+        with self._validation_manifest_lock:
+            entry = self._validation_manifest.get(key)
+        if not isinstance(entry, dict):
+            return False, False, {}, None
+        if entry.get('type') != file_type:
+            return False, False, {}, None
+        validated_at = float(entry.get('validated_at', 0) or 0)
+        if validated_at and time.time() - validated_at > self._validation_manifest_ttl:
+            return False, False, {}, None
+        if signature != entry.get('signature'):
+            return False, False, {}, None
+        metadata = entry.get('metadata') or {}
+        error_msg = entry.get('error')
+        is_valid = bool(entry.get('valid'))
+        if is_valid and max_size_mb is not None:
+            size_mb = metadata.get('size_mb')
+            if size_mb is not None and size_mb > max_size_mb:
+                return True, False, metadata, f"File too large: {size_mb:.2f}MB > {max_size_mb}MB (cached)"
+        return True, is_valid, metadata, error_msg
+
+    def _update_validation_manifest(
+        self,
+        file_path: Path,
+        file_type: str,
+        valid: bool,
+        metadata: Optional[Dict[str, Any]],
+        error: Optional[str],
+        max_size_mb: Optional[float]
+    ) -> None:
+        entry = {
+            'path': str(file_path),
+            'type': file_type,
+            'valid': bool(valid),
+            'error': error,
+            'validated_at': time.time(),
+            'signature': self._get_path_signature(file_path),
+            'metadata': metadata or {},
+            'size_limit_mb': max_size_mb,
+        }
+        key = self._manifest_key(file_path)
+        with self._validation_manifest_lock:
+            self._validation_manifest[key] = entry
+        self._save_validation_manifest()
+
     def _get_relative_path(self, file_path: Path) -> Path:
         """Get relative path of file from input directory"""
         try:
@@ -669,10 +800,16 @@ class AutomatedWorkflow:
         except Exception:
             return str(input_file.name)
 
+    def _get_path_signature(self, file_path: Path) -> Dict[str, Any]:
+        try:
+            st = file_path.stat()
+            return {'size': int(st.st_size), 'mtime': float(st.st_mtime)}
+        except Exception:
+            return {'size': None, 'mtime': None}
+
     def _get_input_signature(self, input_file: Path) -> Dict[str, Any]:
         try:
-            st = input_file.stat()
-            return {'size': int(st.st_size), 'mtime': float(st.st_mtime)}
+            return self._get_path_signature(input_file)
         except Exception:
             return {'size': None, 'mtime': None}
 
@@ -821,74 +958,111 @@ class AutomatedWorkflow:
 
     def _find_new_files(self, processed_files: set, skip_stability_check: bool = False) -> List[Path]:
         """Find new files, sorted by creation time (newest first)."""
-        files = []
-        
+        files: List[Path] = []
         if not self.input_dir.exists():
             return files
         
+        scan_start = time.perf_counter()
         supported_video_extensions = self.file_validator.get_supported_video_extensions()
         supported_gif_extensions = {'.gif'}
         supported_extensions = supported_video_extensions | supported_gif_extensions
         
-        # First, collect all potential files (recursively scan all subdirectories)
-        potential_files = []
-        for file_path in self.input_dir.rglob("*"):
-            if (file_path.is_file() and 
-                file_path.suffix.lower() in supported_extensions and
-                file_path not in processed_files):
-                potential_files.append(file_path)
-        
-        # If we have many files, show progress
+        potential_files = [
+            file_path
+            for file_path in self.input_dir.rglob("*")
+            if (
+                file_path.is_file()
+                and file_path.suffix.lower() in supported_extensions
+                and file_path not in processed_files
+            )
+        ]
+
+        try:
+            max_allowed = getattr(self, 'max_input_size_bytes', None)
+        except Exception:
+            max_allowed = None
+
+        use_parallel = (
+            not skip_stability_check
+            and self.file_scan_parallelism > 1
+            and len(potential_files) > max(8, self.file_scan_parallelism)
+        )
+
         if len(potential_files) > 10:
-            if skip_stability_check:
+            if use_parallel:
+                print(
+                    f"🔍 Scanning {len(potential_files)} files with {self.file_scan_parallelism} workers..."
+                )
+            elif skip_stability_check:
                 print(f"🔍 Scanning {len(potential_files)} files (initial scan - skipping stability check)...")
             else:
                 print(f"🔍 Scanning {len(potential_files)} files for stability and existing outputs...")
-        
-        # Check stability, size limit, and existing outputs for each file
-        for i, file_path in enumerate(potential_files):
-            # Check for shutdown signal during file scanning
-            if self.shutdown_requested:
-                if len(potential_files) > 10:
-                    print(f"\r🛑 File scan interrupted by user" + " " * 30)
-                break
-                
-            if len(potential_files) > 10:
-                if skip_stability_check:
-                    print(f"\r  📁 Processing file {i+1}/{len(potential_files)}: {file_path.name[:30]}...", end="", flush=True)
-                else:
-                    print(f"\r  📁 Checking file {i+1}/{len(potential_files)}: {file_path.name[:30]}...", end="", flush=True)
-            
-            # Enforce optional max input size
-            try:
-                max_allowed = getattr(self, 'max_input_size_bytes', None)
-            except Exception:
-                max_allowed = None
-            if max_allowed is not None:
-                try:
-                    if file_path.exists():
-                        sz = file_path.stat().st_size
-                        if sz > int(max_allowed):
-                            safe_name = self._safe_filename_for_logging(file_path.name)
-                            print(f"    ⏭️  Skipping {safe_name}: {sz/1024/1024:.2f}MB exceeds max input size")
-                            logger.info(f"Skipping {file_path} due to max input size limit: {sz} > {max_allowed} bytes")
-                            continue
-                except Exception as _e:
-                    logger.debug(f"Could not enforce max input size on {file_path}: {_e}")
 
-            # Check if file is not currently being written to
-            if skip_stability_check or self._is_file_stable(file_path):
-                files.append(file_path)
-        
+        def _evaluate_candidate(candidate: Path, emit_console: bool = False) -> Optional[Path]:
+            if self.shutdown_requested:
+                return None
+            try:
+                if max_allowed is not None and candidate.exists():
+                    size_bytes = candidate.stat().st_size
+                    if size_bytes > int(max_allowed):
+                        safe_name = self._safe_filename_for_logging(candidate.name)
+                        message = f"{safe_name}: {size_bytes/1024/1024:.2f}MB exceeds max input size"
+                        if emit_console:
+                            print(f"    ⏭️  Skipping {message}")
+                        logger.info(f"Skipping {candidate} due to max input size limit: {size_bytes} > {max_allowed} bytes")
+                        return None
+            except Exception as size_error:
+                logger.debug(f"Could not enforce max input size on {candidate}: {size_error}")
+            stable = skip_stability_check or self._is_file_stable(candidate)
+            return candidate if stable else None
+
+        if use_parallel and potential_files:
+            max_workers = min(self.file_scan_parallelism, len(potential_files))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {
+                    executor.submit(_evaluate_candidate, file_path, False): file_path
+                    for file_path in potential_files
+                }
+                completed = 0
+                for future in as_completed(future_map):
+                    completed += 1
+                    if self.shutdown_requested:
+                        break
+                    try:
+                        result = future.result()
+                        if result:
+                            files.append(result)
+                    except Exception as e:
+                        logger.debug(f"Parallel scan error for {future_map[future]}: {e}")
+                    if len(potential_files) > 10 and completed % max_workers == 0:
+                        print(
+                            f"\r  📁 Checked {completed}/{len(potential_files)} files...",
+                            end="",
+                            flush=True,
+                        )
+        else:
+            for i, file_path in enumerate(potential_files):
+                if self.shutdown_requested:
+                    if len(potential_files) > 10:
+                        print(f"\r🛑 File scan interrupted by user" + " " * 30)
+                    break
+                if len(potential_files) > 10:
+                    status = "Processing" if skip_stability_check else "Checking"
+                    print(
+                        f"\r  📁 {status} file {i+1}/{len(potential_files)}: {file_path.name[:30]}...",
+                        end="",
+                        flush=True,
+                    )
+                result = _evaluate_candidate(file_path, emit_console=True)
+                if result:
+                    files.append(result)
+
         if len(potential_files) > 10:
             print(f"\r✅ File scan complete: {len(files)} files ready for processing" + " " * 20)
-        
-        # Sort by creation time descending (Windows Date Created equivalent), fallback to mtime
+
         def _creation_time_desc(path: Path) -> float:
             try:
                 st = path.stat()
-                # On Windows, st_ctime is creation time; elsewhere it may be metadata change time
-                # This still provides a reasonable ordering, with mtime as a fallback
                 return float(getattr(st, 'st_ctime', st.st_mtime))
             except Exception:
                 try:
@@ -896,8 +1070,12 @@ class AutomatedWorkflow:
                 except Exception:
                     return 0.0
 
-        # Newest first
         sorted_files = sorted(files, key=_creation_time_desc, reverse=True)
+        scan_duration = time.perf_counter() - scan_start
+        logger.debug(
+            f"File scan completed in {scan_duration:.3f}s "
+            f"({len(sorted_files)} ready / {len(potential_files)} candidates, parallel={'yes' if use_parallel else 'no'})"
+        )
         return sorted_files
     
     def _has_existing_output(self, input_file: Path) -> bool:
@@ -980,14 +1158,40 @@ class AutomatedWorkflow:
             # Basic validation first
             basic_valid = False
             if pattern_type.endswith('.mp4'):
-                # Validate MP4 file
-                is_valid, _ = self.file_validator.is_valid_video(str(output_path))
-                basic_valid = is_valid
+                cached_available, cached_valid, _meta, _err = self._check_cached_validation(output_path, 'video', None)
+                if cached_available:
+                    basic_valid = cached_valid
+                else:
+                    probe_valid, metadata, probe_error = self.file_validator.probe_video_metadata(str(output_path))
+                    if not probe_valid:
+                        enhanced_valid, enhanced_error = self.file_validator.is_valid_video(str(output_path))
+                        basic_valid = bool(enhanced_valid)
+                        error_msg = enhanced_error or probe_error
+                    else:
+                        basic_valid = True
+                        error_msg = None
+                    self._update_validation_manifest(
+                        output_path, 'video', basic_valid, metadata, error_msg, None
+                    )
                 
             elif pattern_type.endswith('.gif'):
-                # Fast validation for existing single GIF
-                is_valid, _ = self.file_validator.is_valid_gif_fast(str(output_path), max_size_mb=None)
-                basic_valid = is_valid
+                cached_available, cached_valid, _meta, _err = self._check_cached_validation(output_path, 'gif', None)
+                if cached_available:
+                    basic_valid = cached_valid
+                else:
+                    probe_valid, metadata, probe_error = self.file_validator.probe_gif_metadata(str(output_path), max_size_mb=None)
+                    if not probe_valid:
+                        enhanced_valid, enhanced_error = self.file_validator.is_valid_gif_with_enhanced_checks(
+                            str(output_path), original_path=None, max_size_mb=None
+                        )
+                        basic_valid = bool(enhanced_valid)
+                        error_msg = enhanced_error or probe_error
+                    else:
+                        basic_valid = True
+                        error_msg = None
+                    self._update_validation_manifest(
+                        output_path, 'gif', basic_valid, metadata, error_msg, None
+                    )
                 
             elif pattern_type.endswith('_segments'):
                 # Validate segment folder - check if it contains valid GIFs
@@ -1288,18 +1492,48 @@ class AutomatedWorkflow:
             
             if gif_path.exists():
                 print(f"  🔍 Found existing GIF, validating: {gif_name}")
-                is_valid, error_msg = self.file_validator.is_valid_gif_with_enhanced_checks(
-                    str(gif_path), 
-                    original_path=None, 
-                    max_size_mb=max_size_mb
+                cached_available, cached_valid, _cached_meta, cached_error = self._check_cached_validation(
+                    gif_path, 'gif', max_size_mb
                 )
-                if is_valid:
-                    print(f"  ✅ Valid GIF already exists: {gif_name}")
-                    logger.info(f"Valid GIF already exists for {video_file.name}: {gif_name}")
-                    # Cache success for single gif
-                    self._record_success_cache(video_file, 'single_gif', gif_path)
-                    return 'success'
+                if cached_available:
+                    logger.debug(
+                        f"Existing GIF validation for {gif_name} served from manifest cache (valid={cached_valid})"
+                    )
+                    if cached_valid:
+                        print(f"  ✅ Valid GIF already exists: {gif_name}")
+                        logger.info(f"Valid GIF already exists for {video_file.name}: {gif_name}")
+                        self._record_success_cache(video_file, 'single_gif', gif_path)
+                        return 'success'
+                    else:
+                        cached_reason = cached_error or "cached validation failure"
+                        print(f"  🔄 GIF validation failed ({cached_reason}), will regenerate")
+                        logger.info(f"Existing GIF validation failed (cached): {cached_reason}, will regenerate: {gif_name}")
                 else:
+                    validation_start = time.perf_counter()
+                    probe_valid, metadata, probe_error = self.file_validator.probe_gif_metadata(
+                        str(gif_path), max_size_mb=max_size_mb
+                    )
+                    if not probe_valid:
+                        enhanced_valid, enhanced_error = self.file_validator.is_valid_gif_with_enhanced_checks(
+                            str(gif_path), original_path=None, max_size_mb=max_size_mb
+                        )
+                        final_valid = bool(enhanced_valid)
+                        error_msg = enhanced_error or probe_error
+                    else:
+                        final_valid = True
+                        error_msg = None
+                    self._update_validation_manifest(
+                        gif_path, 'gif', final_valid, metadata, error_msg, max_size_mb
+                    )
+                    validation_elapsed = time.perf_counter() - validation_start
+                    logger.debug(
+                        f"Existing GIF validation for {gif_name} took {validation_elapsed:.3f}s (cached=False, result={final_valid})"
+                    )
+                    if final_valid:
+                        print(f"  ✅ Valid GIF already exists: {gif_name}")
+                        logger.info(f"Valid GIF already exists for {video_file.name}: {gif_name}")
+                        self._record_success_cache(video_file, 'single_gif', gif_path)
+                        return 'success'
                     print(f"  🔄 GIF validation failed ({error_msg}), will regenerate")
                     logger.info(f"Existing GIF validation failed: {error_msg}, will regenerate: {gif_name}")
             else:
@@ -1311,7 +1545,13 @@ class AutomatedWorkflow:
                 print(f"  🔍 Found segments folder, validating: {segments_folder.name}")
                 
                 # Validate segment folder GIFs
+                segments_validation_start = time.perf_counter()
                 valid_segments, invalid_segments = self._validate_segment_folder_gifs(segments_folder, max_size_mb)
+                segments_validation_elapsed = time.perf_counter() - segments_validation_start
+                logger.debug(
+                    f"Segment folder validation for {segments_folder.name} took {segments_validation_elapsed:.3f}s "
+                    f"(valid={len(valid_segments)}, invalid={len(invalid_segments)})"
+                )
                 
                 if valid_segments:
                     print(f"    ♻️  Using existing segment GIFs: {segments_folder.name}")
@@ -1388,8 +1628,27 @@ class AutomatedWorkflow:
         output_category_dir = self.output_dir / relative_path.parent
         mp4_path = output_category_dir / f"{base_name}.mp4"
         if mp4_path.exists():
-            is_valid, _ = self.file_validator.is_valid_video(str(mp4_path))
-            if is_valid:
+            cached_available, cached_valid, _cached_meta, _cached_error = self._check_cached_validation(
+                mp4_path, 'video', None
+            )
+            if cached_available and cached_valid:
+                logger.debug(f"Existing MP4 validated via manifest cache: {mp4_path.name}")
+                return mp4_path
+            validation_start = time.perf_counter()
+            probe_valid, metadata, probe_error = self.file_validator.probe_video_metadata(str(mp4_path))
+            if not probe_valid:
+                enhanced_valid, enhanced_error = self.file_validator.is_valid_video(str(mp4_path))
+                final_valid = bool(enhanced_valid)
+                error_msg = enhanced_error or probe_error
+            else:
+                final_valid = True
+                error_msg = None
+            self._update_validation_manifest(mp4_path, 'video', final_valid, metadata, error_msg, None)
+            validation_elapsed = time.perf_counter() - validation_start
+            logger.debug(
+                f"Existing MP4 validation for {mp4_path.name} took {validation_elapsed:.3f}s (cached=False, result={final_valid})"
+            )
+            if final_valid:
                 return mp4_path
         
         return None
@@ -2354,11 +2613,35 @@ class AutomatedWorkflow:
         
         def _validate(gf: Path) -> Tuple[Path, bool, str]:
             try:
-                is_valid, error_msg = self.file_validator.is_valid_gif_with_enhanced_checks(
-                    str(gf), original_path=None, max_size_mb=max_size_mb
+                cached_available, cached_valid, _meta, cached_error = self._check_cached_validation(
+                    gf, 'gif', max_size_mb
                 )
-                return gf, bool(is_valid), error_msg or ""
+                if cached_available:
+                    if not cached_valid and cached_error:
+                        logger.debug(f"Segment GIF manifest cached failure for {gf.name}: {cached_error}")
+                    return gf, cached_valid, cached_error or ""
+                validation_start = time.perf_counter()
+                probe_valid, metadata, probe_error = self.file_validator.probe_gif_metadata(
+                    str(gf), max_size_mb=max_size_mb
+                )
+                if not probe_valid:
+                    enhanced_valid, enhanced_error = self.file_validator.is_valid_gif_with_enhanced_checks(
+                        str(gf), original_path=None, max_size_mb=max_size_mb
+                    )
+                    final_valid = bool(enhanced_valid)
+                    error_msg = enhanced_error or probe_error
+                else:
+                    final_valid = True
+                    error_msg = None
+                self._update_validation_manifest(gf, 'gif', final_valid, metadata, error_msg, max_size_mb)
+                validation_elapsed = time.perf_counter() - validation_start
+                logger.debug(
+                    f"Segment GIF validation for {gf.name} took {validation_elapsed:.3f}s "
+                    f"(cached=False, result={final_valid})"
+                )
+                return gf, final_valid, error_msg or ""
             except Exception as e:
+                logger.debug(f"Segment GIF validation error for {gf}: {e}")
                 return gf, False, str(e)
         
         from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -3700,16 +3983,46 @@ class AutomatedWorkflow:
             output_category_dir.mkdir(parents=True, exist_ok=True)
             existing_output = output_category_dir / gif_file.name
             if existing_output.exists():
-                # Use fast validator to avoid 7-15s cost per file; we only need a quick accept here
-                is_valid_out, err_out = self.file_validator.is_valid_gif_fast(
-                    str(existing_output), max_size_mb=max_size_mb
+                cached_available, cached_valid, _cached_meta, cached_error = self._check_cached_validation(
+                    existing_output, 'gif', max_size_mb
                 )
-                if is_valid_out:
+                if cached_available and cached_valid:
                     print(f"    ♻️  Valid optimized GIF already exists in output: {existing_output.name}")
                     logger.info(f"Skipping optimization; existing optimized GIF present: {existing_output}")
                     # Cache success for gif input
                     self._record_success_cache(gif_file, 'gif_input', existing_output)
                     return 'success'
+                if not cached_available:
+                    validation_start = time.perf_counter()
+                    probe_valid, metadata, probe_error = self.file_validator.probe_gif_metadata(
+                        str(existing_output), max_size_mb=max_size_mb
+                    )
+                    if not probe_valid:
+                        enhanced_valid, enhanced_error = self.file_validator.is_valid_gif_with_enhanced_checks(
+                            str(existing_output), original_path=None, max_size_mb=max_size_mb
+                        )
+                        final_valid = bool(enhanced_valid)
+                        validation_error = enhanced_error or probe_error
+                    else:
+                        final_valid = True
+                        validation_error = None
+                    self._update_validation_manifest(
+                        existing_output, 'gif', final_valid, metadata, validation_error, max_size_mb
+                    )
+                    validation_elapsed = time.perf_counter() - validation_start
+                    logger.debug(
+                        f"Existing optimized GIF validation took {validation_elapsed:.3f}s "
+                        f"(cached=False, result={final_valid})"
+                    )
+                    if final_valid:
+                        print(f"    ♻️  Valid optimized GIF already exists in output: {existing_output.name}")
+                        logger.info(f"Skipping optimization; existing optimized GIF present: {existing_output}")
+                        self._record_success_cache(gif_file, 'gif_input', existing_output)
+                        return 'success'
+                else:
+                    logger.debug(
+                        f"Manifest indicates {existing_output.name} is invalid ({cached_error}); re-optimizing GIF input."
+                    )
             
             # Otherwise, optimize
             file_size_mb = self.file_validator.get_file_size_mb(str(gif_file))
