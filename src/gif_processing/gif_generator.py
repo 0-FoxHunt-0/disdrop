@@ -26,6 +26,9 @@ from .gif_config import GifConfigHelper
 from .gif_utils import temp_file_context, temp_dir_context, safe_file_operation, get_gif_info
 
 logger = logging.getLogger(__name__)
+_SEGMENT_WORD_PATTERN = re.compile(
+    r'(?<![a-z0-9])(segment|part|split)(?:[\s_\-]*\d+)?(?![a-z0-9])'
+)
 
 class GifGenerator:
     _DEFAULT_MPDECIMATE = {'hi': 640, 'lo': 320, 'frac': 0.25}
@@ -553,9 +556,9 @@ class GifGenerator:
             if '_segments' in parent_dir.name:
                 return True
             
-            # Check if the video filename contains segment indicators (case-insensitive)
+            # Check if the video filename contains dedicated segment indicators (case-insensitive)
             video_name = video_path.stem.lower()
-            if any(indicator in video_name for indicator in ['segment', 'part', 'split']):
+            if _SEGMENT_WORD_PATTERN.search(video_name):
                 return True
             
             # Check if the video is in a segments folder (case insensitive)
