@@ -181,6 +181,9 @@ class AutomatedWorkflow:
         # Configure cache usage
         self.use_cache = not bool(no_cache)
 
+        # Remove duplicate segment summaries before scanning existing folders
+        self.cleanup_segments_summary_files()
+
         logger.info("Starting automated workflow...")
         logger.info(f"Input directory: {self.input_dir.absolute()}")
         logger.info(f"Output directory: {self.output_dir.absolute()}")
@@ -4217,6 +4220,107 @@ class AutomatedWorkflow:
         # Reset error handler for next session
         self.error_handler.reset()
 
+    def cleanup_segments_summary_files(self) -> None:
+        """Best-effort cleanup to enforce a single summary per segments folder."""
+        try:
+            self._deduplicate_all_segments_summaries()
+        except Exception as e:
+            logger.debug(f"Could not deduplicate segment summaries: {e}")
+
+    def _canonical_segments_summary_path(self, segments_folder: Path, base_name: Optional[str] = None) -> Path:
+        """
+        Derive the canonical summary filename for a segments folder using a sanitized base name.
+        """
+        try:
+            derived_base = base_name if base_name and base_name.strip() else segments_folder.stem.replace('_segments', '')
+        except Exception:
+            derived_base = segments_folder.stem.replace('_segments', '')
+        safe_base = self._safe_filename_for_filesystem(derived_base or segments_folder.stem)
+        if not safe_base:
+            safe_base = 'segments_summary'
+        return segments_folder / f"~{safe_base}_comprehensive_summary.txt"
+
+    def _deduplicate_segments_summaries(self, segments_folder: Path, base_name: Optional[str] = None) -> Optional[Path]:
+        """
+        Ensure only a single canonical summary file exists inside the provided segments folder.
+        """
+        try:
+            if not segments_folder.exists() or not segments_folder.is_dir():
+                return None
+
+            canonical_path = self._canonical_segments_summary_path(segments_folder, base_name)
+            summary_candidates = [
+                path for path in segments_folder.glob("~*_comprehensive_summary.txt") if path.is_file()
+            ]
+
+            if not summary_candidates:
+                return canonical_path
+
+            def _clear_attributes(path: Path) -> None:
+                try:
+                    subprocess.run(
+                        ['attrib', '-R', '-S', '-H', str(path)],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        check=False
+                    )
+                except Exception:
+                    pass
+
+            def _remove_path(path: Path) -> None:
+                try:
+                    _clear_attributes(path)
+                    path.unlink()
+                except Exception as remove_err:
+                    logger.debug(f"Could not remove duplicate summary {path}: {remove_err}")
+
+            if canonical_path.exists():
+                for candidate in summary_candidates:
+                    if candidate != canonical_path:
+                        _remove_path(candidate)
+                return canonical_path
+
+            # Canonical file missing - promote the newest summary file to canonical
+            newest_candidate = max(summary_candidates, key=lambda p: p.stat().st_mtime if p.exists() else 0)
+            if newest_candidate != canonical_path:
+                try:
+                    _clear_attributes(newest_candidate)
+                    newest_candidate.rename(canonical_path)
+                except Exception as rename_err:
+                    logger.debug(f"Could not rename {newest_candidate} to canonical summary: {rename_err}")
+                    try:
+                        shutil.copy2(str(newest_candidate), str(canonical_path))
+                    except Exception as copy_err:
+                        logger.debug(f"Could not copy {newest_candidate} to canonical summary: {copy_err}")
+
+            for candidate in summary_candidates:
+                if candidate != canonical_path and candidate.exists():
+                    _remove_path(candidate)
+
+            return canonical_path
+        except Exception as e:
+            logger.debug(f"Failed to deduplicate summaries in {segments_folder}: {e}")
+            return None
+
+    def _deduplicate_all_segments_summaries(self) -> None:
+        """Scan all output segment folders and enforce single-summary rule."""
+        try:
+            segments_folders: List[Path] = []
+            for subdir in self.output_dir.rglob('*'):
+                try:
+                    if subdir.is_dir() and subdir.name.endswith('_segments'):
+                        segments_folders.append(subdir)
+                except Exception:
+                    continue
+
+            for segments_folder in segments_folders:
+                try:
+                    self._deduplicate_segments_summaries(segments_folder)
+                except Exception as folder_err:
+                    logger.debug(f"Could not deduplicate {segments_folder}: {folder_err}")
+        except Exception as e:
+            logger.debug(f"Could not enumerate segment folders for deduplication: {e}")
+
     def _create_comprehensive_segments_summary(self, segments_folder: Path, base_name: str) -> None:
         """
         Create a comprehensive summary file for both MP4 and GIF segments in a segments folder.
@@ -4236,8 +4340,8 @@ class AutomatedWorkflow:
                 return
             
             # Create summary filename with '~' prefix to ensure it appears last
-            summary_file = segments_folder / f"~{base_name}_comprehensive_summary.txt"
-            temp_file = segments_folder / f"~{base_name}_comprehensive_summary.txt.tmp"
+            summary_file = self._canonical_segments_summary_path(segments_folder, base_name)
+            temp_file = summary_file.with_name(f"{summary_file.name}.tmp")
 
             # Best-effort clear attributes on existing file
             try:
@@ -4522,26 +4626,13 @@ class AutomatedWorkflow:
             
             # Prefer sanitized base name (without '_segments')
             base_name = segments_folder.stem.replace('_segments', '')
-            sanitized = segments_folder / f"~{base_name}_comprehensive_summary.txt"
-            legacy = segments_folder / f"~{segments_folder.name}_comprehensive_summary.txt"
 
-            if sanitized.exists():
-                logger.debug(f"Summary already exists (sanitized): {sanitized.name}")
+            canonical_summary = self._canonical_segments_summary_path(segments_folder, base_name)
+            self._deduplicate_segments_summaries(segments_folder, base_name)
+
+            if canonical_summary.exists():
+                logger.debug(f"Summary already exists: {canonical_summary.name}")
                 return
-
-            # If only legacy exists, rename it to sanitized name
-            if legacy.exists() and not sanitized.exists():
-                try:
-                    # Clear attributes best-effort, then rename
-                    try:
-                        subprocess.run(['attrib', '-R', '-S', '-H', str(legacy)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-                    except Exception:
-                        pass
-                    legacy.rename(sanitized)
-                    logger.info(f"Renamed legacy summary to sanitized name: {sanitized.name}")
-                    return
-                except Exception as e:
-                    logger.debug(f"Could not rename legacy summary: {e}")
 
             # Create sanitized summary if none exists
             self._create_comprehensive_segments_summary(segments_folder, base_name)
@@ -4567,7 +4658,7 @@ class AutomatedWorkflow:
                 return
             
             logger.info(f"Found {len(segments_folders)} existing segments folders, ensuring summaries exist")
-            
+
             for segments_folder in segments_folders:
                 try:
                     self._ensure_segments_summary_exists(segments_folder)

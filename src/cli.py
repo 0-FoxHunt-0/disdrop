@@ -763,6 +763,12 @@ class VideoCompressorCLI:
                 self.automated_workflow.force_single_file = bool(getattr(args, 'no_segmentation', False))
             except Exception:
                 self.automated_workflow.force_single_file = False
+
+            # Clean up duplicate segment summaries at startup
+            try:
+                self.automated_workflow.cleanup_segments_summary_files()
+            except Exception as e:
+                logger.debug(f"Segments summary cleanup skipped: {e}")
             
             logger.info("All components initialized successfully")
             
