@@ -6,7 +6,7 @@ gif_settings:
   max_duration_seconds: 30 # Allow longer content but compress aggressively
 
   # Quality settings - Improved FPS
-  fps: 20 # Increased from 15 for better motion quality
+  fps: 22 # Increased again to keep more motion budget before any scaling
   width: 360 # Maximum width (aspect ratio will be preserved)
   height: -1 # Use -1 to preserve aspect ratio automatically (was 360 which forced square)
   # Note: height: -1 allows FFmpeg to automatically calculate height based on width while preserving aspect ratio
@@ -149,19 +149,19 @@ gif_settings:
         dither: "floyd_steinberg"
       - name: "Medium Quality"
         colors: 160 # Increased from 128
-        fps_multiplier: 0.9 # Increased from 0.85 (less FPS reduction)
+        fps_multiplier: 0.94 # Keep this stage nearly real-time to avoid choppy fallbacks
         resolution_multiplier: 0.92 # Less aggressive
         lossy: 60
         dither: "bayer"
       - name: "Standard Quality"
         colors: 128 # Increased from 96
-        fps_multiplier: 0.85 # Increased from 0.8 (less FPS reduction)
+        fps_multiplier: 0.9 # Maintain higher floor when size pressure builds
         resolution_multiplier: 0.88 # Less aggressive
         lossy: 80 # Reduced from 100
         dither: "bayer"
       - name: "Low Quality" # New stage for very challenging content
         colors: 96
-        fps_multiplier: 0.8 # Still reduced but better than before
+        fps_multiplier: 0.88 # Keep aggressive mode from dropping into slideshow territory
         resolution_multiplier: 0.8
         lossy: 120
         dither: "bayer"
@@ -193,10 +193,10 @@ gif_settings:
   quality_floors:
     enforce: true
     min_width: 320
-    min_fps: 18
+    min_fps: 20
     # Aggressive mode floors (used when allow_aggressive_compression is true)
     min_width_aggressive: 240
-    min_fps_aggressive: 12
+    min_fps_aggressive: 18
 
   # Optimization settings
   optimization:
@@ -225,7 +225,7 @@ gif_settings:
   adaptive_fps:
     enabled: true
     motion_analysis: true
-    fps_range: [1.0, 0.9, 0.8, 0.7, 0.6]  # Multipliers of original FPS
+    fps_range: [1.0, 0.95, 0.9, 0.85]  # Keep adaptive passes closer to capture speed
 
   adaptive_mpdecimate:
     enabled: true
