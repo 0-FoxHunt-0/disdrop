@@ -72,7 +72,7 @@ class TestGifOptimizerNearTargetBehavior(unittest.TestCase):
         fd, self.gif_path = tempfile.mkstemp(suffix=".gif")
         os.close(fd)
         # Start with a file clearly over the target (1.3x)
-        self.target_bytes = 1_000_000
+        self.target_bytes = 10_000_000
         with open(self.gif_path, "wb") as handle:
             handle.write(b"\x00" * int(self.target_bytes * 1.3))
         self.original_bytes = os.path.getsize(self.gif_path)
@@ -96,6 +96,7 @@ class TestGifOptimizerNearTargetBehavior(unittest.TestCase):
                         "mode": "both",
                         "fine_tune_threshold_percent": 10,
                         "max_attempts": 8,
+                        "absolute_mb_threshold": 0.3,
                     },
                     "allow_aggressive_compression": False,
                 }
@@ -104,6 +105,19 @@ class TestGifOptimizerNearTargetBehavior(unittest.TestCase):
                 return {}
 
         self.optimizer.config_helper = DummyConfigHelper()
+        self.optimizer.long_clip_guardrails = {
+            "enabled": True,
+            "duration_seconds": 45.0,
+            "frame_budget": 900.0,
+            "segment_duration_ratio": 0.5,
+            "segment_frame_budget_ratio": 0.6,
+            "palette_fps_cap": 14,
+            "palette_stats_mode": "diff",
+            "palette_max_colors": 208,
+            "mpdecimate": {"hi": 768, "lo": 64, "frac": 0.4},
+            "reencode_max_workers": 1,
+            "reencode_strategy_limit": 2,
+        }
 
     def tearDown(self):
         if self.gif_path and os.path.exists(self.gif_path):
@@ -117,7 +131,6 @@ class TestGifOptimizerNearTargetBehavior(unittest.TestCase):
             patch.object(self.optimizer, "_reencode_from_source", return_value=False), \
             patch.object(self.optimizer, "_stage_adaptive_search", return_value=False), \
             patch.object(self.optimizer, "_stage_pil_compression", return_value=False), \
-            patch.object(self.optimizer, "_stage_final_polish", return_value=False), \
             patch.object(self.optimizer, "_stage_gifsicle_lossy_compression") as gifsicle_mock, \
             patch.object(self.optimizer, "_stage_ffmpeg_fallback_compression", return_value=False) as ffmpeg_mock, \
             patch.object(self.optimizer, "_progressive_resolution_reduction", return_value=False) as progressive_mock:
@@ -133,7 +146,7 @@ class TestGifOptimizerNearTargetBehavior(unittest.TestCase):
             success = self.optimizer._run_optimization_stages(
                 self.gif_path,
                 target_bytes=self.target_bytes,
-                target_size_mb=1.0,
+                target_size_mb=self.target_bytes / (1024 * 1024),
                 original_size_mb=self.original_bytes / 1024 / 1024,
                 source_video=None,
             )
@@ -151,7 +164,6 @@ class TestGifOptimizerNearTargetBehavior(unittest.TestCase):
             patch.object(self.optimizer, "_reencode_from_source", return_value=False), \
             patch.object(self.optimizer, "_stage_adaptive_search", return_value=False), \
             patch.object(self.optimizer, "_stage_pil_compression", return_value=False), \
-            patch.object(self.optimizer, "_stage_final_polish", return_value=False), \
             patch.object(self.optimizer, "_stage_gifsicle_lossy_compression") as gifsicle_mock, \
             patch.object(self.optimizer, "_stage_ffmpeg_fallback_compression") as ffmpeg_mock, \
             patch.object(self.optimizer, "_progressive_resolution_reduction") as progressive_mock:
@@ -176,7 +188,7 @@ class TestGifOptimizerNearTargetBehavior(unittest.TestCase):
             success = self.optimizer._run_optimization_stages(
                 self.gif_path,
                 target_bytes=self.target_bytes,
-                target_size_mb=1.0,
+                target_size_mb=self.target_bytes / (1024 * 1024),
                 original_size_mb=self.original_bytes / 1024 / 1024,
                 source_video=None,
             )
@@ -186,6 +198,37 @@ class TestGifOptimizerNearTargetBehavior(unittest.TestCase):
             # Because FFmpeg already met the target, progressive reduction should not run
             progressive_mock.assert_not_called()
 
+    def test_guardrail_absolute_delta_triggers_ffmpeg(self):
+        """Guardrail clips should allow FFmpeg fallback when absolute delta stays high."""
+
+        with patch.object(self.optimizer, "_stage_lossless_optimization", return_value=False), \
+            patch.object(self.optimizer, "_reencode_from_source", return_value=False), \
+            patch.object(self.optimizer, "_stage_adaptive_search", return_value=False), \
+            patch.object(self.optimizer, "_stage_pil_compression", return_value=False), \
+            patch.object(self.optimizer, "_stage_gifsicle_lossy_compression") as gifsicle_mock, \
+            patch.object(self.optimizer, "_stage_ffmpeg_fallback_compression") as ffmpeg_mock:
+
+            target_size_mb = 10.0
+
+            def _fake_gifsicle(path, target_bytes, _target_mb):
+                with open(path, "wb") as handle:
+                    handle.write(b"\x00" * int(target_bytes * 1.04))
+                return False
+
+            gifsicle_mock.side_effect = _fake_gifsicle
+            ffmpeg_mock.return_value = True
+
+            success = self.optimizer._run_optimization_stages(
+                self.gif_path,
+                target_bytes=int(target_size_mb * 1024 * 1024),
+                target_size_mb=target_size_mb,
+                original_size_mb=self.original_bytes / 1024 / 1024,
+                source_video=None,
+                force_guardrails=True,
+            )
+
+            self.assertTrue(success)
+            ffmpeg_mock.assert_called_once()
 
 if __name__ == "__main__":
     unittest.main()

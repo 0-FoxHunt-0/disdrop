@@ -28,6 +28,8 @@ from .gif_utils import temp_file_context, temp_dir_context, safe_file_operation,
 logger = logging.getLogger(__name__)
 
 class GifGenerator:
+    _DEFAULT_MPDECIMATE = {'hi': 640, 'lo': 320, 'frac': 0.25}
+    
     """Advanced GIF generator with optimization and platform-specific settings"""
     
     def __init__(self, config_manager: ConfigManager, shutdown_checker: Optional[Callable[[], bool]] = None):
@@ -41,6 +43,7 @@ class GifGenerator:
         self.current_ffmpeg_process = None
         self._ffmpeg_processes = []  # Track all running FFmpeg processes
         self._shutdown_lock = threading.Lock()  # Protect shutdown state
+        self.long_clip_guardrails = self.config_helper.get_long_clip_guardrails()
         
         # Get temp directory
         try:
@@ -60,6 +63,71 @@ class GifGenerator:
             return bool(self.shutdown_requested or (self._shutdown_checker() if self._shutdown_checker else False))
         except Exception:
             return bool(self.shutdown_requested)
+    
+    def _build_filter_profile(self, settings: Dict[str, Any], duration: float, force_guardrails: bool = False) -> Dict[str, Any]:
+        """Build filter profile (fps/mpdecimate/palette settings) with guardrails for long clips."""
+        base_fps = max(1.0, float(settings.get('fps', 20) or 20))
+        base_colors = int(settings.get('palette_max_colors', settings.get('colors', 256)) or 256)
+        profile = {
+            'fps': base_fps,
+            'mpdecimate': dict(self._DEFAULT_MPDECIMATE),
+            'palette_stats_mode': 'full',
+            'max_colors': max(2, base_colors),
+            'guardrails_active': False
+        }
+        
+        guardrails = getattr(self, 'long_clip_guardrails', {}) or {}
+        if guardrails.get('enabled', False):
+            duration_threshold = float(guardrails.get('duration_seconds', float('inf')) or float('inf'))
+            frame_budget = float(guardrails.get('frame_budget', float('inf')) or float('inf'))
+            triggers_guardrails = force_guardrails or (duration >= duration_threshold) or ((base_fps * duration) >= frame_budget)
+        else:
+            triggers_guardrails = force_guardrails
+        
+        if triggers_guardrails:
+            profile['guardrails_active'] = True
+            palette_fps_cap = float(guardrails.get('palette_fps_cap', base_fps) or base_fps)
+            fps_multiplier = float(guardrails.get('fps_multiplier', 0.5))
+            reduced_fps = base_fps * fps_multiplier
+            profile['fps'] = max(1.0, min(reduced_fps, palette_fps_cap))
+            profile['palette_stats_mode'] = guardrails.get('palette_stats_mode', profile['palette_stats_mode'])
+            palette_cap = guardrails.get('palette_max_colors', profile['max_colors']) or profile['max_colors']
+            color_multiplier = float(guardrails.get('palette_color_multiplier', 0.7))
+            reduced_colors = int(base_colors * color_multiplier)
+            profile['max_colors'] = max(2, min(profile['max_colors'], int(palette_cap), max(2, reduced_colors)))
+            mp_cfg = guardrails.get('mpdecimate', {}) or {}
+            profile['mpdecimate'] = {
+                'hi': int(mp_cfg.get('hi', profile['mpdecimate']['hi'])),
+                'lo': int(mp_cfg.get('lo', profile['mpdecimate']['lo'])),
+                'frac': float(mp_cfg.get('frac', profile['mpdecimate']['frac']))
+            }
+            self._log_guardrail_activation(duration, base_fps, profile, forced=force_guardrails)
+        
+        return profile
+    
+    def _log_guardrail_activation(self, duration: float, base_fps: float, profile: Dict[str, Any], forced: bool = False) -> None:
+        """Log when guardrails are applied to help diagnose long-clip handling."""
+        logger.info(
+            "Applying long-clip guardrails (forced=%s): duration=%.1fs, fps %.1f -> %.1f, palette colors<=%d, stats_mode=%s, mpdecimate hi=%d lo=%d frac=%.2f",
+            forced,
+            duration,
+            base_fps,
+            profile['fps'],
+            profile['max_colors'],
+            profile['palette_stats_mode'],
+            profile['mpdecimate']['hi'],
+            profile['mpdecimate']['lo'],
+            profile['mpdecimate']['frac']
+        )
+    
+    @staticmethod
+    def _format_mpdecimate(mp_settings: Dict[str, Any]) -> str:
+        """Format mpdecimate filter string from settings."""
+        return "mpdecimate=hi={hi}:lo={lo}:frac={frac}".format(
+            hi=int(mp_settings.get('hi', 640)),
+            lo=int(mp_settings.get('lo', 320)),
+            frac=float(mp_settings.get('frac', 0.25))
+        )
 
     def _safe_text_for_logging(self, text: str) -> str:
         """Return a version of text safe for cp1252 consoles by replacing unsupported chars."""
@@ -73,7 +141,9 @@ class GifGenerator:
 
     def create_gif(self, input_video: str, output_path: str, platform: str = None,
                   max_size_mb: int = None, start_time: float = 0, 
-                  duration: float = None, disable_segmentation: bool = False) -> Dict[str, Any]:
+                  duration: float = None, disable_segmentation: bool = False,
+                  settings_override: Optional[Dict[str, Any]] = None,
+                  force_guardrails: bool = False) -> Dict[str, Any]:
         """
         Create optimized GIF from video with iterative quality optimization
         
@@ -85,6 +155,8 @@ class GifGenerator:
             start_time: Start time in seconds (default: 0)
             duration: Duration in seconds (default: use platform/config limit)
             disable_segmentation: If True, prevents the GIF generator from segmenting the video
+            settings_override: Optional overrides for width/fps/colors on this invocation
+            force_guardrails: Force guardrail profile even if duration/frame budget is low
             
         Returns:
             Dict with success status and metadata
@@ -96,6 +168,25 @@ class GifGenerator:
             
             # Get platform settings
             settings = self._get_platform_settings(platform, max_size_mb)
+            settings = self._apply_settings_override(settings, settings_override)
+            base_single_settings = settings.copy()
+            guardrail_retry_attempted = False
+
+            def _attempt_guardrail_retry(last_result: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+                nonlocal guardrail_retry_attempted
+                if guardrail_retry_attempted:
+                    return None
+                if not self._should_guardrail_retry(last_result, base_single_settings, duration):
+                    return None
+                guardrail_retry_attempted = True
+                print("    ♻️  Near-target single GIF detected; retrying with guardrail overrides before segmentation")
+                return self._guardrail_retry_single(
+                    input_video,
+                    output_path,
+                    base_single_settings,
+                    start_time,
+                    duration
+                )
             
             # Get video info
             video_info = self.ffmpeg_utils.get_video_info(input_video)
@@ -114,7 +205,9 @@ class GifGenerator:
             if (not disable_segmentation) and quick_enabled and (not self._is_segmented_video(input_video)):
                 logger.info("Starting quick single-GIF feasibility check before full optimization")
                 print("    🧪 Quick feasibility check: testing harsh single-file settings...")
-                feasible, feas_size_mb, feas_path = self._quick_single_feasibility_check(input_video, settings, start_time, duration)
+                feasible, feas_size_mb, feas_path = self._quick_single_feasibility_check(
+                    input_video, settings, start_time, duration, force_guardrails=force_guardrails
+                )
                 if feasible:
                     try:
                         target_mb = float(settings.get('max_size_mb', 10.0) or 10.0)
@@ -198,10 +291,16 @@ class GifGenerator:
                 logger.info(
                     f"Segmentation suggested (duration {duration:.1f}s or estimated size). Trying single-file creation first."
                 )
-                single_result = self._create_single_gif(input_video, output_path, settings, start_time, duration)
+                single_result = self._create_single_gif(input_video, output_path, settings, start_time, duration, force_guardrails=force_guardrails)
                 if single_result and single_result.get('success', False):
                     logger.info("Single-file GIF succeeded; skipping segmentation")
                     return single_result
+                guardrail_result = _attempt_guardrail_retry(single_result)
+                if guardrail_result:
+                    if guardrail_result.get('success', False):
+                        logger.info("Guardrail retry succeeded; skipping segmentation")
+                        return guardrail_result
+                    single_result = guardrail_result
                 logger.info("Single-file attempt failed or not under target; proceeding with segmentation as fallback")
                 print("    ↩️  Single-file attempt failed/not under target; proceeding with segmentation")
                 return self.segmenter.create_segments(input_video, output_path, settings, start_time, duration)
@@ -210,12 +309,17 @@ class GifGenerator:
             logger.info(f"Creating single GIF: {self._safe_text_for_logging(str(input_video))} -> {self._safe_text_for_logging(str(output_path))}")
             single_result = None
             try:
-                single_result = self._create_single_gif(input_video, output_path, settings, start_time, duration)
+                single_result = self._create_single_gif(input_video, output_path, settings, start_time, duration, force_guardrails=force_guardrails)
             except Exception as e:
                 logger.warning(f"Single-file GIF generation threw exception: {e}")
                 single_result = {'success': False, 'error': str(e)}
             if single_result and single_result.get('success', False):
                 return single_result
+            guardrail_result = _attempt_guardrail_retry(single_result)
+            if guardrail_result:
+                if guardrail_result.get('success', False):
+                    return guardrail_result
+                single_result = guardrail_result
             # If single-file failed and segmentation is allowed, fallback to segmentation even if split wasn't suggested
             if not disable_segmentation and (not self._is_segmented_video(input_video)):
                 logger.info("Single-file GIF failed; falling back to segmentation")
@@ -320,6 +424,112 @@ class GifGenerator:
             settings['floors_enforce'] = True
         
         return settings
+
+    def _apply_settings_override(self, settings: Dict[str, Any], overrides: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Apply per-call overrides (width/fps/colors) while respecting quality floors."""
+        if not overrides:
+            return settings
+
+        try:
+            quality_floors = self.config_helper.get_quality_floors()
+        except Exception:
+            quality_floors = {}
+        enforce_floors = settings.get('floors_enforce', False)
+        min_width = quality_floors.get('min_width', 0) if enforce_floors else 0
+        min_fps = quality_floors.get('min_fps', 0) if enforce_floors else 0
+
+        for key, value in overrides.items():
+            if value is None:
+                continue
+            if key == 'width':
+                settings['width'] = max(min_width or 1, int(value))
+            elif key == 'height':
+                settings['height'] = int(value)
+            elif key == 'fps':
+                settings['fps'] = max(min_fps or 1, int(value))
+            elif key in ('colors', 'palette_max_colors'):
+                settings[key] = max(2, int(value))
+            elif key in ('dither', 'lossy'):
+                settings[key] = value
+        return settings
+    
+    @staticmethod
+    def _build_guardrail_overrides(settings: Dict[str, Any]) -> Dict[str, Any]:
+        """Build per-call overrides to reduce width/fps/colors when guardrails need stricter settings."""
+        try:
+            width = int(settings.get('width', 360))
+            fps = int(settings.get('fps', 20))
+            colors = int(settings.get('colors', settings.get('palette_max_colors', 256)))
+        except Exception:
+            width, fps, colors = 360, 20, 256
+        return {
+            'width': max(160, int(width * 0.85)),
+            'fps': max(8, int(fps * 0.85)),
+            'palette_max_colors': max(64, int(colors * 0.8)),
+            'colors': max(64, int(colors * 0.8)),
+        }
+    
+    def _should_guardrail_retry(self, failure_result: Optional[Dict[str, Any]],
+                                settings: Dict[str, Any], duration: float) -> bool:
+        """Return True if a guardrail retry should run before falling back to segmentation."""
+        if not failure_result or failure_result.get('success'):
+            return False
+        size_mb = failure_result.get('size_mb')
+        if size_mb is None:
+            return False
+        target_mb = float(settings.get('max_size_mb', 10.0) or 10.0)
+        over_mb = size_mb - target_mb
+        if over_mb <= 0:
+            return False
+        near_cfg = self.config_helper.get_optimization_config().get('near_target', {})
+        near_threshold = float(near_cfg.get('threshold_percent', 15)) / 100.0
+        abs_threshold = float(near_cfg.get('absolute_mb_threshold', 0.0) or 0.0)
+        over_ratio = over_mb / max(target_mb, 1e-6)
+        if over_ratio > near_threshold:
+            return False
+        if abs_threshold and over_mb < abs_threshold:
+            return False
+        return self._is_guardrail_candidate(duration, settings.get('fps', 20))
+    
+    def _guardrail_retry_single(self, input_video: str, output_path: str, base_settings: Dict[str, Any],
+                                start_time: float, duration: float) -> Optional[Dict[str, Any]]:
+        overrides = self._build_guardrail_overrides(base_settings)
+        if not overrides:
+            return None
+        retry_settings = self._apply_settings_override(base_settings.copy(), overrides)
+        logger.info(
+            "Retrying single GIF with guardrail overrides: width=%s fps=%s colors=%s",
+            retry_settings.get('width'),
+            retry_settings.get('fps'),
+            retry_settings.get('colors')
+        )
+        return self._create_single_gif(
+            input_video,
+            output_path,
+            retry_settings,
+            start_time,
+            duration,
+            force_guardrails=True
+        )
+    
+    def _is_guardrail_candidate(self, duration: float, fps: Optional[float]) -> bool:
+        guardrails_cfg = getattr(self, 'long_clip_guardrails', {}) or {}
+        if not guardrails_cfg.get('enabled', False):
+            return False
+        duration = float(duration or 0.0)
+        fps_val = float(fps or guardrails_cfg.get('palette_fps_cap', 0) or 0.0)
+        frame_budget = float(guardrails_cfg.get('frame_budget', float('inf')) or float('inf'))
+        duration_threshold = float(guardrails_cfg.get('duration_seconds', float('inf')) or float('inf'))
+        frame_count = duration * max(fps_val, 0.0)
+        if duration >= duration_threshold or frame_count >= frame_budget:
+            return True
+        duration_ratio = float(guardrails_cfg.get('segment_duration_ratio', 0.0) or 0.0)
+        frame_ratio = float(guardrails_cfg.get('segment_frame_budget_ratio', 0.0) or 0.0)
+        if duration_ratio > 0 and duration_threshold < float('inf') and duration >= duration_threshold * duration_ratio:
+            return True
+        if frame_ratio > 0 and frame_budget < float('inf') and frame_count >= frame_budget * frame_ratio:
+            return True
+        return False
     
     def _should_split_video(self, input_video: str, duration: float, settings: Dict[str, Any]) -> bool:
         """Determine if video should be split into segments"""
@@ -403,7 +613,7 @@ class GifGenerator:
     
     def _create_single_gif(self, input_video: str, output_path: str, settings: Dict[str, Any], 
                           start_time: float, duration: float, deadline: Optional[float] = None,
-                          skip_optimizer: bool = False) -> Dict[str, Any]:
+                          skip_optimizer: bool = False, force_guardrails: bool = False) -> Dict[str, Any]:
         """
         Create a single GIF, optionally skipping automatic optimization.
         
@@ -437,6 +647,8 @@ class GifGenerator:
             palette_cancel_event: Optional[threading.Event] = None
             palette_generator: Optional[GifGenerator] = None
             success = False
+            filter_profile = self._build_filter_profile(settings, duration, force_guardrails)
+            effective_fps = filter_profile['fps']
 
             if enable_parallel_palette:
                 try:
@@ -447,12 +659,14 @@ class GifGenerator:
                         shutdown_checker=lambda: bool(self._is_shutdown_requested() or (palette_cancel_event.is_set() if palette_cancel_event else False))
                     )
                     def _gen_palette() -> Optional[str]:
-                        return palette_generator._generate_palette(input_video, settings, start_time, duration)
+                        return palette_generator._generate_palette(input_video, settings, start_time, duration, filter_profile, force_guardrails)
                     with ThreadPoolExecutor(max_workers=1) as _exec:
                         palette_future = _exec.submit(_gen_palette)
                         try:
                             # Run split-palette while palette is being generated in background
-                            split_success = self._create_gif_split_palette(input_video, output_path, settings, start_time, duration)
+                            split_success = self._create_gif_split_palette(
+                                input_video, output_path, settings, start_time, duration, filter_profile, force_guardrails
+                            )
                             if split_success:
                                 success = True
                                 # Cancel palette work if still running
@@ -477,7 +691,9 @@ class GifGenerator:
                                     palette_tmp_path = None
                                 if not palette_tmp_path:
                                     # Background generation did not succeed; generate palette now
-                                    palette_tmp_path = self._generate_palette(input_video, settings, start_time, duration)
+                                    palette_tmp_path = self._generate_palette(
+                                        input_video, settings, start_time, duration, filter_profile, force_guardrails
+                                    )
                                 if not palette_tmp_path:
                                     return {'success': False, 'error': 'Failed to generate palette'}
                                 # Double-check input video exists before creating GIF
@@ -485,7 +701,9 @@ class GifGenerator:
                                     if os.path.exists(palette_tmp_path):
                                         os.unlink(palette_tmp_path)
                                     return {'success': False, 'error': f'Input video disappeared during processing: {input_video}'}
-                                success = self._create_gif_with_palette(input_video, output_path, palette_tmp_path, settings, start_time, duration)
+                                success = self._create_gif_with_palette(
+                                    input_video, output_path, palette_tmp_path, settings, start_time, duration, filter_profile, force_guardrails
+                                )
                         finally:
                             # Ensure executor and futures are properly cleaned up
                             try:
@@ -519,16 +737,22 @@ class GifGenerator:
                         pass
             else:
                 # Non-parallel original flow
-                split_success = self._create_gif_split_palette(input_video, output_path, settings, start_time, duration)
+                split_success = self._create_gif_split_palette(
+                    input_video, output_path, settings, start_time, duration, filter_profile, force_guardrails
+                )
                 if not split_success:
-                    palette_path = self._generate_palette(input_video, settings, start_time, duration)
+                    palette_path = self._generate_palette(
+                        input_video, settings, start_time, duration, filter_profile, force_guardrails
+                    )
                     if not palette_path:
                         return {'success': False, 'error': 'Failed to generate palette'}
                     if not os.path.exists(input_video):
                         if os.path.exists(palette_path):
                             os.unlink(palette_path)
                         return {'success': False, 'error': f'Input video disappeared during processing: {input_video}'}
-                    success = self._create_gif_with_palette(input_video, output_path, palette_path, settings, start_time, duration)
+                    success = self._create_gif_with_palette(
+                        input_video, output_path, palette_path, settings, start_time, duration, filter_profile, force_guardrails
+                    )
                     # Don't delete cached palettes - preserve them for future reuse
                     # Only clean up temporary palettes that are not in the cache directory
                     if os.path.exists(palette_path):
@@ -556,7 +780,7 @@ class GifGenerator:
                                 'success': True,
                                 'size_mb': size_mb,
                                 'duration': duration,
-                                'fps': settings['fps'],
+                                'fps': effective_fps,
                                 'scale': settings.get('scale') or settings.get('width', 360)
                             }
                         logger.info(f"GIF size ({size_mb:.2f}MB) exceeds limit ({settings['max_size_mb']:.2f}MB), optimizing...")
@@ -565,8 +789,10 @@ class GifGenerator:
                             # Use optimizer to optimize the existing GIF file
                             # Pass source video if available for better re-encoding
                             optimization_succeeded = self.optimizer.optimize_gif(
-                                output_path, settings['max_size_mb'], 
-                                source_video=input_video if os.path.exists(input_video) else None
+                                output_path,
+                                settings['max_size_mb'], 
+                                source_video=input_video if os.path.exists(input_video) else None,
+                                force_guardrails=force_guardrails
                             )
                             if optimization_succeeded:
                                 # Verify final size and update size_mb to reflect optimized file
@@ -632,7 +858,7 @@ class GifGenerator:
                         'success': True,
                         'size_mb': size_mb,
                         'duration': duration,
-                        'fps': settings['fps'],
+                        'fps': effective_fps,
                         'scale': settings.get('scale') or settings.get('width', 360)
                     }
                 else:
@@ -645,7 +871,9 @@ class GifGenerator:
             return {'success': False, 'error': str(e)}
     
     def _generate_palette(self, input_video: str, settings: Dict[str, Any], 
-                         start_time: float, duration: float, timeout_override: Optional[int] = None) -> Optional[str]:
+                         start_time: float, duration: float, filter_profile: Optional[Dict[str, Any]] = None,
+                         force_guardrails: bool = False,
+                         timeout_override: Optional[int] = None) -> Optional[str]:
         """Generate optimized palette for GIF creation"""
         try:
             if self.shutdown_requested:
@@ -658,13 +886,13 @@ class GifGenerator:
                 logger.error(f"Input video not found for palette generation: {safe_input_path}")
                 return None
             
+            profile = filter_profile or self._build_filter_profile(settings, duration, force_guardrails)
             # Build filter with mpdecimate + fps + scale (no crop)
-            # Use gentler mpdecimate settings to preserve motion quality and reduce jerkiness
-            pre_chain = []
-            # Removed aggressive feasibility settings - they caused too many artifacts
-            # Use consistent, gentler settings for better quality
-            pre_chain.append('mpdecimate=hi=640:lo=320:frac=0.25')
-            pre_chain.append(f"fps={settings['fps']}")
+            # Guardrails adjust duplication removal / fps as needed
+            pre_chain = [
+                self._format_mpdecimate(profile['mpdecimate']),
+                f"fps={profile['fps']}"
+            ]
             
             # Get video info for optimal scaling
             video_info = self.ffmpeg_utils.get_video_info(safe_input_path)
@@ -698,13 +926,11 @@ class GifGenerator:
                 # Explicit dimensions: use force_original_aspect_ratio=decrease to preserve aspect ratio
                 pre_chain.append(f"scale={optimal_width}:{optimal_height}:flags=lanczos+accurate_rnd+full_chroma_int:force_original_aspect_ratio=decrease")
             
-            # Always use full 256 colors for initial palette generation to capture all color nuances
-            # This provides the best quality starting point
-            max_colors = 256
-            
-            # Use stats_mode=full for better color distribution in complex scenes
-            # This analyzes all frames more thoroughly but produces higher quality palettes
-            vf = ','.join(pre_chain + [f"palettegen=max_colors={max_colors}:stats_mode=full:reserve_transparent=1"])  # High-quality palette settings
+            # Use fewer colors/stats_mode when guardrails active to lighten workload
+            configured_max_colors = int(settings.get('palette_max_colors', settings.get('colors', 256)) or 256)
+            max_colors = max(2, min(configured_max_colors, profile['max_colors']))
+            stats_mode = profile['palette_stats_mode']
+            vf = ','.join(pre_chain + [f"palettegen=max_colors={max_colors}:stats_mode={stats_mode}:reserve_transparent=1"])
 
             # Palette cache directory (writable user temp)
             cache_dir = os.path.join(self.config.get_temp_dir(), 'palette_cache')
@@ -728,11 +954,13 @@ class GifGenerator:
                 'width': optimal_width,
                 'height': optimal_height,
                 'colors': colors_normalized,
+                'stats_mode': stats_mode,
+                'guardrails': profile.get('guardrails_active', False),
                 # Include mpdecimate settings for cache precision (avoid false cache hits)
                 # These values must match the actual filter settings used on line 665
-                'mpdecimate_hi': 640,
-                'mpdecimate_lo': 320,
-                'mpdecimate_frac': 0.25,
+                'mpdecimate_hi': profile['mpdecimate']['hi'],
+                'mpdecimate_lo': profile['mpdecimate']['lo'],
+                'mpdecimate_frac': profile['mpdecimate']['frac'],
             }
             key_str = json.dumps(key_payload, sort_keys=True, separators=(',', ':'))
             digest = hashlib.sha1(key_str.encode('utf-8')).hexdigest()
@@ -828,7 +1056,10 @@ class GifGenerator:
             return None
     
     def _create_gif_with_palette(self, input_video: str, output_path: str, palette_path: str,
-                                settings: Dict[str, Any], start_time: float, duration: float, timeout_override: Optional[int] = None) -> bool:
+                                settings: Dict[str, Any], start_time: float, duration: float,
+                                filter_profile: Optional[Dict[str, Any]] = None,
+                                force_guardrails: bool = False,
+                                timeout_override: Optional[int] = None) -> bool:
         """Create GIF using generated palette"""
         try:
             if self.shutdown_requested:
@@ -845,11 +1076,12 @@ class GifGenerator:
                 logger.error(f"Palette file not found for GIF creation: {palette_path}")
                 return False
             
+            profile = filter_profile or self._build_filter_profile(settings, duration, force_guardrails)
             # Build filter graph with mpdecimate, fps, scale and paletteuse (no crop)
-            # Use gentler mpdecimate settings to preserve motion quality
-            pre_chain = []
-            pre_chain.append('mpdecimate=hi=640:lo=320:frac=0.25')
-            pre_chain.append(f"fps={settings['fps']}")
+            pre_chain = [
+                self._format_mpdecimate(profile['mpdecimate']),
+                f"fps={profile['fps']}"
+            ]
             
             # Get video info for optimal scaling
             video_info = self.ffmpeg_utils.get_video_info(safe_input_path)
@@ -921,7 +1153,10 @@ class GifGenerator:
             return False
 
     def _create_gif_split_palette(self, input_video: str, output_path: str,
-                                  settings: Dict[str, Any], start_time: float, duration: float, timeout_override: Optional[int] = None) -> bool:
+                                  settings: Dict[str, Any], start_time: float, duration: float,
+                                  filter_profile: Optional[Dict[str, Any]] = None,
+                                  force_guardrails: bool = False,
+                                  timeout_override: Optional[int] = None) -> bool:
         """Create GIF using split palette single-pass pipeline with mpdecimate and optional crop"""
         try:
             if self.shutdown_requested:
@@ -930,12 +1165,13 @@ class GifGenerator:
             if not os.path.exists(safe_input_path):
                 logger.error(f"Input video not found for split-palette GIF: {safe_input_path}")
                 return False
+            profile = filter_profile or self._build_filter_profile(settings, duration, force_guardrails)
 
             # Build filter chain without crop
-            # Use gentler mpdecimate for smoother motion
-            pre = []
-            pre.append('mpdecimate=hi=640:lo=320:frac=0.25')
-            pre.append(f"fps={settings['fps']}")
+            pre = [
+                self._format_mpdecimate(profile['mpdecimate']),
+                f"fps={profile['fps']}"
+            ]
             
             # Get video info for optimal scaling
             video_info = self.ffmpeg_utils.get_video_info(safe_input_path)
@@ -971,8 +1207,8 @@ class GifGenerator:
             chain = ','.join(pre)
 
             filter_complex = (
-                f"{chain},split[a][b];" 
-                f"[a]palettegen=stats_mode=full:reserve_transparent=1:max_colors=256[p];"
+                f"{chain},split[a][b];"
+                f"[a]palettegen=stats_mode={profile['palette_stats_mode']}:reserve_transparent=1:max_colors={profile['max_colors']}[p];"
                 f"[b][p]paletteuse=dither=floyd_steinberg:diff_mode=rectangle:new=1"
             )
 
@@ -1124,6 +1360,15 @@ class GifGenerator:
         class FFResult:
             pass
         
+        cmd_preview = ''
+        try:
+            preview_parts = [str(part) for part in cmd[:8]]
+            cmd_preview = ' '.join(preview_parts)
+            if len(cmd) > 8:
+                cmd_preview += ' ...'
+        except Exception:
+            cmd_preview = 'ffmpeg (preview unavailable)'
+        
         # Check if shutdown was requested before starting
         if self._is_shutdown_requested():
             r = FFResult()
@@ -1160,7 +1405,8 @@ class GifGenerator:
                 
                 # Check timeout
                 if time.time() - start_time > timeout:
-                    logger.warning(f"FFmpeg timeout after {timeout}s, terminating...")
+                    elapsed = time.time() - start_time
+                    logger.warning("FFmpeg timeout after %.1fs (limit %ss), terminating command: %s", elapsed, timeout, cmd_preview)
                     self._terminate_ffmpeg_process()
                     r = FFResult()
                     r.stdout = ''
@@ -1181,6 +1427,8 @@ class GifGenerator:
             
             stdout, stderr = process.communicate()
             rc = process.returncode
+            elapsed = time.time() - start_time
+            logger.debug("FFmpeg completed in %.2fs (timeout %ss, rc=%s): %s", elapsed, timeout, rc, cmd_preview)
             
             r = FFResult()
             r.stdout = stdout
@@ -1394,7 +1642,7 @@ class GifGenerator:
             return ''.join(c if ord(c) < 128 else '_' for c in filename)
     
     def _quick_single_feasibility_check(self, input_video: str, settings: Dict[str, Any], 
-                                        start_time: float, duration: float) -> Tuple[bool, Optional[float], Optional[str]]:
+                                       start_time: float, duration: float, force_guardrails: bool = False) -> Tuple[bool, Optional[float], Optional[str]]:
         """Fast pre-check: try an aggressively compressed single GIF to test feasibility.
 
         Returns (True, size_mb) if a heavily-compressed full-length single GIF can be kept under the size target.
@@ -1426,6 +1674,7 @@ class GifGenerator:
             feas_settings['palette_max_colors'] = int(settings.get('palette_max_colors', 256))
             feas_settings['dither'] = settings.get('dither', 'sierra2_4a')
             feas_settings.pop('mpdecimate_aggressive', None)
+            feas_profile = self._build_filter_profile(feas_settings, duration, force_guardrails)
             
 
             # Generate palette and GIF to temp dir
@@ -1435,10 +1684,14 @@ class GifGenerator:
             palette_path = None
             try:
                 # Use longer timeout for palette generation in feasibility check to handle complex videos
-                palette_path = self._generate_palette(input_video, feas_settings, start_time, duration, timeout_override=90)
+                palette_path = self._generate_palette(
+                    input_video, feas_settings, start_time, duration, feas_profile, force_guardrails, timeout_override=90
+                )
                 if not palette_path:
                     return False, None, None
-                ok = self._create_gif_with_palette(input_video, temp_gif, palette_path, feas_settings, start_time, duration)
+                ok = self._create_gif_with_palette(
+                    input_video, temp_gif, palette_path, feas_settings, start_time, duration, feas_profile, force_guardrails
+                )
                 if not ok or not os.path.exists(temp_gif):
                     return False, None, None
                 size_mb = os.path.getsize(temp_gif) / (1024 * 1024)
@@ -1463,8 +1716,10 @@ class GifGenerator:
                         self.optimizer.near_target_max_runs = 8
                         # Pass source video for better re-encoding in feasibility check
                         ok = self.optimizer.optimize_gif(
-                            temp_gif, max_size_mb,
-                            source_video=input_video if os.path.exists(input_video) else None
+                            temp_gif,
+                            max_size_mb,
+                            source_video=input_video if os.path.exists(input_video) else None,
+                            force_guardrails=force_guardrails
                         )
                     except Exception as opt_e:
                         logger.debug(f"Feasibility quick-opt failed: {opt_e}")

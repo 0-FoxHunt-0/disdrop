@@ -31,6 +31,7 @@ class GifConfigHelper:
         gif_config = self.config.get('gif_settings', {}) or {}
         opt_config = gif_config.get('optimization', {}) or {}
         size_pred = opt_config.get('size_prediction', {}) or {}
+        near_target_cfg = opt_config.get('near_target', {}) or {}
         
         return {
             'fps': int(gif_config.get('fps', 20)),
@@ -44,7 +45,14 @@ class GifConfigHelper:
             'max_duration_seconds': float(gif_config.get('max_duration_seconds', 30.0)),
             'allow_aggressive_compression': bool(opt_config.get('allow_aggressive_compression', True)),
             'use_source_reencoding': bool(opt_config.get('use_source_reencoding', True)),
-            'size_prediction_enabled': bool(size_pred.get('enabled', True))
+            'size_prediction_enabled': bool(size_pred.get('enabled', True)),
+            'near_target': {
+                'threshold_percent': float(near_target_cfg.get('threshold_percent', 15.0)),
+                'mode': str(near_target_cfg.get('mode', 'both')),
+                'max_attempts': int(near_target_cfg.get('max_attempts', 60)),
+                'fine_tune_threshold_percent': float(near_target_cfg.get('fine_tune_threshold_percent', 10.0)),
+                'absolute_mb_threshold': float(near_target_cfg.get('absolute_mb_threshold', 0.3)),
+            }
         }
     
     def get_performance_config(self) -> Dict[str, Any]:
@@ -66,6 +74,44 @@ class GifConfigHelper:
             'gifsicle_optimize_level': int(gifsicle_perf.get('gifsicle_optimize_level', 2 if fast_mode else 3)),
             'skip_gifsicle_far_over_ratio': float(gifsicle_perf.get('skip_gifsicle_far_over_ratio', 0.35 if fast_mode else 0.5)),
             'near_target_max_runs': int(gifsicle_perf.get('near_target_max_runs', 12 if fast_mode else 24))
+        }
+    
+    def get_long_clip_guardrails(self) -> Dict[str, Any]:
+        """
+        Get guardrail settings for very long clips to keep FFmpeg within time budgets.
+        """
+        defaults = {
+            'enabled': True,
+            'duration_seconds': 45.0,
+            'frame_budget': 900.0,
+            'palette_fps_cap': 14,
+            'palette_stats_mode': 'diff',
+            'palette_max_colors': 208,
+            'mpdecimate': {'hi': 768, 'lo': 64, 'frac': 0.4},
+            'reencode_max_workers': 1,
+            'reencode_strategy_limit': 2,
+            'segment_duration_ratio': 0.5,
+            'segment_frame_budget_ratio': 0.6,
+        }
+        cfg = self.config.get('gif_settings.performance.long_clip_guardrails', {}) or {}
+        mp_cfg = cfg.get('mpdecimate', {}) or {}
+        
+        return {
+            'enabled': bool(cfg.get('enabled', defaults['enabled'])),
+            'duration_seconds': float(cfg.get('duration_seconds', defaults['duration_seconds'])),
+            'frame_budget': float(cfg.get('frame_budget', defaults['frame_budget'])),
+            'palette_fps_cap': int(cfg.get('palette_fps_cap', defaults['palette_fps_cap'])),
+            'palette_stats_mode': str(cfg.get('palette_stats_mode', defaults['palette_stats_mode'])),
+            'palette_max_colors': int(cfg.get('palette_max_colors', defaults['palette_max_colors'])),
+            'mpdecimate': {
+                'hi': int(mp_cfg.get('hi', defaults['mpdecimate']['hi'])),
+                'lo': int(mp_cfg.get('lo', defaults['mpdecimate']['lo'])),
+                'frac': float(mp_cfg.get('frac', defaults['mpdecimate']['frac'])),
+            },
+            'reencode_max_workers': int(cfg.get('reencode_max_workers', defaults['reencode_max_workers'])),
+            'reencode_strategy_limit': int(cfg.get('reencode_strategy_limit', defaults['reencode_strategy_limit'])),
+            'segment_duration_ratio': float(cfg.get('segment_duration_ratio', defaults['segment_duration_ratio'])),
+            'segment_frame_budget_ratio': float(cfg.get('segment_frame_budget_ratio', defaults['segment_frame_budget_ratio'])),
         }
     
     def get_quality_optimization_config(self) -> Dict[str, Any]:

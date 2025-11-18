@@ -217,6 +217,12 @@ class GifSegmenter:
                         if 'colors' in segment_settings:
                             segment_settings['colors'] = int(segment_settings['colors'] * color_reduction)
                     
+                    segment_force_guardrails = self._should_force_segment_guardrails(segment_duration_actual, segment_settings)
+                    if segment_force_guardrails:
+                        overrides = self.gif_generator._build_guardrail_overrides(segment_settings)
+                        if overrides:
+                            segment_settings = self.gif_generator._apply_settings_override(segment_settings, overrides)
+                    
                     # Create segment
                     result = self.gif_generator.create_gif(
                         input_video=input_video,
@@ -225,13 +231,44 @@ class GifSegmenter:
                         max_size_mb=max_size_mb,
                         start_time=segment_start,
                         duration=segment_duration_actual,
-                        disable_segmentation=True  # Prevent nested segmentation
+                        disable_segmentation=True,  # Prevent nested segmentation
+                        settings_override=segment_settings,
+                        force_guardrails=segment_force_guardrails
                     )
                     
-                    # Retry with reduced duration if size limit exceeded
+                    # Retry with guardrail overrides if size limit exceeded
                     if not result.get('success', False):
                         err = result.get('error', 'Unknown error')
-                        if 'exceeds limit' in str(err).lower() or 'size' in str(err).lower():
+                        if self._should_retry_due_to_size(err):
+                            overrides = self.gif_generator._build_guardrail_overrides(segment_settings)
+                            if overrides:
+                                logger.info(
+                                    f"Retrying segment {i+1} with guardrail overrides: width->{overrides.get('width')} fps->{overrides.get('fps')}"
+                                )
+                                try:
+                                    if os.path.exists(segment_path):
+                                        os.remove(segment_path)
+                                except Exception as cleanup_e:
+                                    logger.debug(f"Could not remove oversized segment before guardrail retry: {cleanup_e}")
+                                try:
+                                    result = self.gif_generator.create_gif(
+                                        input_video=input_video,
+                                        output_path=segment_path,
+                                        platform=None,
+                                        max_size_mb=max_size_mb,
+                                        start_time=segment_start,
+                                        duration=segment_duration_actual,
+                                        disable_segmentation=True,
+                                        settings_override=overrides,
+                                        force_guardrails=True
+                                    )
+                                except Exception as retry_e:
+                                    logger.warning(f"Exception during guardrail retry for segment {i+1}: {retry_e}")
+                    
+                    # Retry with reduced duration if size limit still exceeded
+                    if not result.get('success', False):
+                        err = result.get('error', 'Unknown error')
+                        if self._should_retry_due_to_size(err):
                             reduced_duration = max(5.0, segment_duration_actual * 0.8)
                             if reduced_duration < segment_duration_actual:
                                 logger.info(f"Retrying segment {i+1} with reduced duration: {reduced_duration:.2f}s")
@@ -246,7 +283,8 @@ class GifSegmenter:
                                         max_size_mb=max_size_mb,
                                         start_time=segment_start,
                                         duration=reduced_duration,
-                                        disable_segmentation=True
+                                        disable_segmentation=True,
+                                        force_guardrails=True
                                     )
                                 except Exception as retry_e:
                                     logger.warning(f"Exception during segment {i+1} retry: {retry_e}")
@@ -363,6 +401,24 @@ class GifSegmenter:
             return max(1, workers)
         except Exception:
             return 2  # Safe fallback
+
+    @staticmethod
+    def _should_retry_due_to_size(error: str) -> bool:
+        """Return True if error indicates the GIF exceeded size limits."""
+        err = (error or '').lower()
+        return 'exceeds limit' in err or 'size' in err
+    
+    def _should_force_segment_guardrails(self, segment_duration: float, settings: Dict[str, Any]) -> bool:
+        """Determine whether guardrails should be forced for this segment before the first encode."""
+        if not hasattr(self.gif_generator, '_is_guardrail_candidate'):
+            return False
+        fps = settings.get('fps')
+        if fps is None:
+            try:
+                fps = self.config_helper.get_optimization_config().get('fps', 20)
+            except Exception:
+                fps = 20
+        return self.gif_generator._is_guardrail_candidate(segment_duration, fps)
     
     def _safe_filename_for_filesystem(self, filename: str) -> str:
         """
