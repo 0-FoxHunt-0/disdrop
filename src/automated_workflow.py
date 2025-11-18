@@ -14,6 +14,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
+from dataclasses import dataclass, field
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 
@@ -27,6 +28,113 @@ from .ffmpeg_utils import FFmpegUtils
 from .error_handler import ErrorHandler, ErrorCategory
 
 logger = logging.getLogger(__name__)
+
+CORE_TRACKER_METRICS = {
+    'cache_hits',
+    'cache_misses',
+    'retries',
+    'segmentation_events',
+    'guardrail_events',
+    'timeout_events',
+    'validation_failures',
+    'summary_cleanups',
+    'mp4_moves'
+}
+
+
+@dataclass
+class AnalysisTracker:
+    """
+    Lightweight tracker for workflow diagnostics (cache hits, retries, guardrails, etc.).
+    Access is confined to the workflow thread, so no explicit locking is required.
+    """
+    counts: Dict[str, int] = field(default_factory=dict)
+    recent_events: List[str] = field(default_factory=list)
+    max_recent_events: int = 20
+
+    def _remember(self, message: Optional[str]) -> None:
+        if not message:
+            return
+        self.recent_events.append(message)
+        if len(self.recent_events) > self.max_recent_events:
+            self.recent_events.pop(0)
+
+    def bump(self, metric: str, amount: int = 1) -> int:
+        if amount <= 0:
+            return self.counts.get(metric, 0)
+        self.counts[metric] = self.counts.get(metric, 0) + amount
+        return self.counts[metric]
+
+    def record_cache_hit(self, context: str) -> None:
+        self.bump('cache_hits')
+        if context:
+            self.bump(f'cache_hit_{context}')
+        self._remember(f"cache_hit:{context}")
+
+    def record_cache_miss(self, context: str) -> None:
+        self.bump('cache_misses')
+        if context:
+            self.bump(f'cache_miss_{context}')
+        self._remember(f"cache_miss:{context}")
+
+    def record_retry(self, context: str) -> None:
+        self.bump('retries')
+        if context:
+            self.bump(f'retry_{context}')
+        self._remember(f"retry:{context}")
+
+    def record_segmentation(self, context: str) -> None:
+        self.bump('segmentation_events')
+        if context:
+            self.bump(f'segmentation_{context}')
+        self._remember(f"segmentation:{context}")
+
+    def record_guardrail(self, context: str) -> None:
+        self.bump('guardrail_events')
+        if context:
+            self.bump(f'guardrail_{context}')
+        self._remember(f"guardrail:{context}")
+
+    def record_timeout(self, context: str) -> None:
+        self.bump('timeout_events')
+        if context:
+            self.bump(f'timeout_{context}')
+        self._remember(f"timeout:{context}")
+
+    def record_validation_failure(self, context: str, amount: int = 1) -> None:
+        self.bump('validation_failures', amount)
+        if context:
+            self.bump(f'validation_fail_{context}', amount)
+        qualifier = f"+{amount}" if amount > 1 else ""
+        self._remember(f"validation_failure:{context}{qualifier}")
+
+    def record_summary_cleanup(self, context: str) -> None:
+        self.bump('summary_cleanups')
+        if context:
+            self.bump(f'summary_cleanup_{context}')
+        self._remember(f"summary_cleanup:{context}")
+
+    def record_mp4_move(self, context: str) -> None:
+        self.bump('mp4_moves')
+        if context:
+            self.bump(f'mp4_move_{context}')
+        self._remember(f"mp4_move:{context}")
+
+    def snapshot(self) -> Dict[str, Any]:
+        """Return a shallow copy of counters and recent events for reporting."""
+        return {
+            'counts': dict(self.counts),
+            'recent_events': list(self.recent_events[-self.max_recent_events:])
+        }
+
+    def top_metrics(self, limit: int = 5) -> List[Tuple[str, int]]:
+        """Return the top metrics by count, excluding derived per-context entries."""
+        base_metrics = [
+            (metric, value)
+            for metric, value in self.counts.items()
+            if metric in CORE_TRACKER_METRICS or '_' not in metric
+        ]
+        return sorted(base_metrics, key=lambda item: item[1], reverse=True)[:limit]
 
 class AutomatedWorkflow:
     """Manages automated video processing and GIF generation workflow"""
@@ -54,6 +162,8 @@ class AutomatedWorkflow:
         
         # Enhanced error handling for batch processing resilience
         self.error_handler = ErrorHandler()
+        # Per-run diagnostics tracker
+        self.analysis_tracker = AnalysisTracker()
         
         # Workflow directories (default under installed package base)
         base_dir = Path(get_app_base_dir())
@@ -233,7 +343,13 @@ class AutomatedWorkflow:
                                 break
 
                             # Fast-skip using cache if enabled and previously verified success exists
-                            if self._is_cached_success(file_path):
+                            cached_success = self._is_cached_success(file_path)
+                            if cached_success:
+                                if self.use_cache:
+                                    try:
+                                        self.analysis_tracker.record_cache_hit('workflow_loop')
+                                    except Exception:
+                                        logger.debug("Analysis tracker cache hit recording failed", exc_info=True)
                                 print(f"\n⚡ Skipping (cached success): {file_path.name}")
                                 safe_name = self._safe_filename_for_logging(file_path.name)
                                 logger.info(f"Skipping (cached success): {safe_name}")
@@ -245,6 +361,12 @@ class AutomatedWorkflow:
                                 processing_stats['skipped'] += 1
                                 processed_count += 1
                                 continue
+                            else:
+                                if self.use_cache:
+                                    try:
+                                        self.analysis_tracker.record_cache_miss('workflow_loop')
+                                    except Exception:
+                                        logger.debug("Analysis tracker cache miss recording failed", exc_info=True)
                             
                             # Determine file type and process accordingly
                             if file_path.suffix.lower() == '.gif':
@@ -1389,6 +1511,10 @@ class AutomatedWorkflow:
             if not is_valid:
                 print(f"  ⚠️  Skipping invalid file: {error_msg}")
                 logger.warning(f"Skipping invalid video file {video_file.name}: {error_msg}")
+                try:
+                    self.analysis_tracker.record_validation_failure('input_video')
+                except Exception:
+                    logger.debug("Analysis tracker validation failure recording failed", exc_info=True)
                 return 'skipped'
             print("  ✅ Video validation passed")
             
@@ -1510,6 +1636,10 @@ class AutomatedWorkflow:
                     else:
                         cached_reason = cached_error or "cached validation failure"
                         print(f"  🔄 GIF validation failed ({cached_reason}), will regenerate")
+                        try:
+                            self.analysis_tracker.record_validation_failure('existing_gif_manifest')
+                        except Exception:
+                            logger.debug("Analysis tracker existing GIF manifest failure recording failed", exc_info=True)
                         logger.info(f"Existing GIF validation failed (cached): {cached_reason}, will regenerate: {gif_name}")
                 else:
                     validation_start = time.perf_counter()
@@ -1538,6 +1668,10 @@ class AutomatedWorkflow:
                         self._record_success_cache(video_file, 'single_gif', gif_path)
                         return 'success'
                     print(f"  🔄 GIF validation failed ({error_msg}), will regenerate")
+                    try:
+                        self.analysis_tracker.record_validation_failure('existing_gif_probe')
+                    except Exception:
+                        logger.debug("Analysis tracker existing GIF probe failure recording failed", exc_info=True)
                     logger.info(f"Existing GIF validation failed: {error_msg}, will regenerate: {gif_name}")
             else:
                 print(f"  📄 No single GIF found: {gif_name}")
@@ -1580,6 +1714,10 @@ class AutomatedWorkflow:
                     return 'success'
                 else:
                     print(f"    🔄 Regenerating segment GIFs (invalid/corrupted): {segments_folder.name}")
+                    try:
+                        self.analysis_tracker.record_validation_failure('segment_gif_folder', amount=max(1, len(invalid_segments)))
+                    except Exception:
+                        logger.debug("Analysis tracker segment GIF folder failure recording failed", exc_info=True)
                     logger.info(f"Segment GIFs invalid, will regenerate: {segments_folder.name}")
                     # Clean up invalid segments and continue to main GIF generation
                     # DO NOT move MP4 to segments folder yet - wait until after successful generation
@@ -1866,6 +2004,10 @@ class AutomatedWorkflow:
                     else:
                         print(f"    ❌ Processed MP4 validation failed: {error_msg}")
                         logger.error(f"Processed MP4 validation failed: {error_msg}")
+                        try:
+                            self.analysis_tracker.record_validation_failure('mp4_output')
+                        except Exception:
+                            logger.debug("Analysis tracker MP4 validation failure recording failed", exc_info=True)
                         
                         # Check if the error is about file size being too large or file is empty (encoding failure)
                         if ("too large" in error_msg.lower() or "file size" in error_msg.lower() or 
@@ -1873,6 +2015,10 @@ class AutomatedWorkflow:
                             print(f"    🔁 Retrying with segmentation allowed ({error_msg})...")
                             logger.info(f"Single-file validation failed ({error_msg}); retrying with segmentation permitted "
                                         f"(encoder may still produce a single file).")
+                            try:
+                                self.analysis_tracker.record_retry('mp4_validation')
+                            except Exception:
+                                logger.debug("Analysis tracker MP4 retry recording failed", exc_info=True)
                             
                             # Remove the oversized/invalid file before retry
                             if output_path.exists():
@@ -1899,6 +2045,11 @@ class AutomatedWorkflow:
                                 )
                                 
                                 if segmentation_used:
+                                    try:
+                                        self.analysis_tracker.record_guardrail('video_segmentation_retry')
+                                        self.analysis_tracker.record_segmentation('video_mp4_retry')
+                                    except Exception:
+                                        logger.debug("Analysis tracker segmentation recording failed", exc_info=True)
                                     fallback_status = self._handle_segmentation_fallback_result(result, video_file, max_size_mb)
                                     
                                     if fallback_status == 'success':
@@ -1942,6 +2093,10 @@ class AutomatedWorkflow:
                                 
                                 print(f"    ❌ Retry output validation failed: {retry_error}")
                                 logger.error(f"Retry output validation failed: {retry_error}")
+                                try:
+                                    self.analysis_tracker.record_validation_failure('mp4_retry_output')
+                                except Exception:
+                                    logger.debug("Analysis tracker retry validation failure recording failed", exc_info=True)
                                 if output_path.exists():
                                     output_path.unlink()
                                 return None
@@ -2687,8 +2842,17 @@ class AutomatedWorkflow:
                         f"Segment completeness check failed for {segments_folder.name}: expected {expected}, found {present_count}"
                     )
                 # Consider folder invalid if incomplete; treat all as invalid to trigger regeneration
+                try:
+                    self.analysis_tracker.record_validation_failure('segment_gif_completeness', amount=len(gif_files) or 1)
+                except Exception:
+                    logger.debug("Analysis tracker segment completeness failure recording failed", exc_info=True)
                 return [], gif_files
 
+        if invalid_gifs:
+            try:
+                self.analysis_tracker.record_validation_failure('segment_gif_validation', amount=len(invalid_gifs))
+            except Exception:
+                logger.debug("Analysis tracker segment GIF validation failure recording failed", exc_info=True)
         return valid_gifs, invalid_gifs
     
     def _calculate_optimal_segmentation_workers(self) -> int:
@@ -2784,6 +2948,17 @@ class AutomatedWorkflow:
         except Exception as e:
             logger.debug(f"Failed to cleanup orphan segments: {e}")
 
+    @staticmethod
+    def _is_within_directory(candidate: Path, root: Path) -> bool:
+        """Return True if candidate path is inside root (inclusive)."""
+        try:
+            candidate.resolve().relative_to(root.resolve())
+            return True
+        except ValueError:
+            return False
+        except Exception:
+            return False
+
     def _ensure_mp4_in_segments(self, mp4_file: Path, segments_folder: Path):
         """Move the source MP4 into the segments folder if it resides in output; otherwise copy."""
         try:
@@ -2802,12 +2977,19 @@ class AutomatedWorkflow:
                         logger.warning(f"Could not remove duplicate MP4 from parent directory: {e}")
                 return
             
-            # If mp4 is in output dir, move it. Otherwise, copy it (e.g., original input still in input/).
+            output_root = self.output_dir.resolve()
+            mp4_parent = mp4_file.parent.resolve()
+
+            # If mp4 lives anywhere under the output directory, move it. Otherwise copy it (e.g. source still in input)
             try:
-                should_move = mp4_file.parent.resolve() == self.output_dir.resolve() and mp4_file.exists()
+                should_move = mp4_file.exists() and self._is_within_directory(mp4_parent, output_root)
                 if should_move:
                     shutil.move(str(mp4_file), str(target))
                     logger.info(f"Moved MP4 to segments folder: {mp4_file.name} -> {target}")
+                    try:
+                        self.analysis_tracker.record_mp4_move('segments_move')
+                    except Exception:
+                        logger.debug("Analysis tracker MP4 move recording failed", exc_info=True)
                     
                     # Validate that MP4 was moved correctly
                     if not target.exists():
@@ -2824,6 +3006,10 @@ class AutomatedWorkflow:
                 else:
                     shutil.copy2(str(mp4_file), str(target))
                     logger.info(f"Copied MP4 to segments folder: {mp4_file.name} -> {target}")
+                    try:
+                        self.analysis_tracker.record_mp4_move('segments_copy')
+                    except Exception:
+                        logger.debug("Analysis tracker MP4 copy recording failed", exc_info=True)
                     
                     # Validate copy operation
                     if not target.exists():
@@ -2977,6 +3163,17 @@ class AutomatedWorkflow:
                     except Exception:
                         pass
                         
+            except subprocess.TimeoutExpired as repair_timeout:
+                logger.warning(f"FFmpeg repair timed out for {gif_file.name}: {repair_timeout}")
+                try:
+                    self.analysis_tracker.record_timeout('gif_ffmpeg_repair')
+                except Exception:
+                    logger.debug("Analysis tracker FFmpeg repair timeout recording failed", exc_info=True)
+                try:
+                    if 'repaired_path' in locals() and repaired_path.exists():
+                        repaired_path.unlink()
+                except Exception:
+                    pass
             except Exception as repair_error:
                 logger.warning(f"FFmpeg repair failed for {gif_file.name}: {repair_error}")
             
@@ -3415,6 +3612,11 @@ class AutomatedWorkflow:
             if not should_segment:
                 print("    ℹ️  Segmentation not needed based on size/duration heuristics")
                 return False
+            try:
+                self.analysis_tracker.record_segmentation('gif_input')
+                self.analysis_tracker.record_guardrail('gif_segmentation')
+            except Exception:
+                logger.debug("Analysis tracker GIF segmentation recording failed", exc_info=True)
 
             # Prefer single file before splitting: try optimizing whole GIF first
             # Skip if we're already in a segmentation fallback (optimization already tried and failed)
@@ -3704,6 +3906,11 @@ class AutomatedWorkflow:
                             # Detect timeout by checking stderr for 'TimeoutExpired' string
                             # (the _run_subprocess_with_shutdown_check returns TimeoutResult with stderr='TimeoutExpired')
                             error_type = "timeout" if (err_excerpt and 'TimeoutExpired' in str(err_excerpt)) else "ffmpeg_error"
+                            if error_type == "timeout":
+                                try:
+                                    self.analysis_tracker.record_timeout('gif_segment_ffmpeg')
+                                except Exception:
+                                    logger.debug("Analysis tracker timeout recording failed", exc_info=True)
                             logger.error(f"Segment {index+1}/{num_segments} creation failed ({error_type}): FFmpeg returncode={result.returncode}, "
                                        f"file_exists={temp_seg.exists()}")
                             if err_excerpt:
@@ -4157,24 +4364,54 @@ class AutomatedWorkflow:
             'cache_age_info': cache_age_info
         }
 
-    def _print_cache_stats(self) -> None:
+    def _print_cache_stats(self, tracker_counts: Optional[Dict[str, int]] = None) -> None:
         """Print cache statistics for monitoring."""
         if not self.use_cache:
             return
         
         stats = self.get_cache_stats()
+        cache_section_printed = False
         if stats['total_entries'] > 0:
             print(f"\n📊 Cache Stats: {stats['current_session_entries']} current, {stats['old_entries']} old entries")
-            logger.info(f"Cache stats: {stats['current_session_entries']} current, {stats['old_entries']} old entries")
+            print(f"   Age window: {stats.get('cache_age_info', 'unknown')}")
+            logger.info(
+                f"Cache stats: {stats['current_session_entries']} current, "
+                f"{stats['old_entries']} old entries ({stats.get('cache_age_info', 'n/a')})"
+            )
+            cache_section_printed = True
+
+        if tracker_counts:
+            hits = tracker_counts.get('cache_hits', 0)
+            misses = tracker_counts.get('cache_misses', 0)
+            total_checks = hits + misses
+            if total_checks > 0:
+                if not cache_section_printed:
+                    print("\n📊 Cache Stats:")
+                    cache_section_printed = True
+                hit_rate = (hits / total_checks) * 100 if total_checks else 0.0
+                print(f"   Hit rate: {hit_rate:.1f}% ({hits} / {total_checks} checks)")
+                logger.info(f"Cache hit rate: {hit_rate:.1f}% ({hits}/{total_checks})")
 
     def _print_workflow_summary(self, processing_stats: Dict[str, int], start_time: float) -> None:
         """Print enhanced workflow summary with error analysis and cache information."""
         elapsed = time.time() - start_time
-        total_processed = processing_stats.get('processed', 0)
-        successful = processing_stats.get('successful', 0)
-        failed = processing_stats.get('errors', 0)
-        skipped = processing_stats.get('skipped', 0)
-        
+        total_processed = int(processing_stats.get('processed') or 0)
+        successful = int(processing_stats.get('successful') or 0)
+        failed = int(processing_stats.get('errors') or 0)
+        skipped = int(processing_stats.get('skipped') or 0)
+        success_rate = (successful / total_processed * 100.0) if total_processed else 0.0
+
+        tracker_snapshot: Dict[str, Any] = {}
+        tracker_counts: Dict[str, int] = {}
+        try:
+            tracker_snapshot = self.analysis_tracker.snapshot()
+            tracker_counts = tracker_snapshot.get('counts', {})
+        except Exception:
+            tracker_snapshot = {}
+            tracker_counts = {}
+
+        error_summary = self.error_handler.get_error_summary()
+
         print(f"\n{'='*60}")
         print(f"🎬 Workflow Complete!")
         print(f"⏱️  Total time: {elapsed:.1f} seconds")
@@ -4186,36 +4423,79 @@ class AutomatedWorkflow:
         # Enhanced error analysis if there were failures
         if failed > 0:
             print(f"\n📊 Error Analysis:")
-            error_summary = self.error_handler.get_error_summary()
-            
-            if error_summary['categories']:
+            categories = error_summary.get('categories', {})
+            if categories:
                 print(f"   Error breakdown:")
-                for category, count in error_summary['categories'].items():
-                    percentage = (count / failed) * 100
+                for category, count in categories.items():
+                    percentage = (count / failed * 100.0) if failed else 0.0
                     print(f"   • {category}: {count} files ({percentage:.1f}%)")
-            
-            # Show success rate with resilience message
-            success_rate = (successful / total_processed * 100) if total_processed > 0 else 0
+            severity_distribution = error_summary.get('severity_distribution', {})
+            if severity_distribution:
+                print(f"   Severity levels:")
+                for severity, count in severity_distribution.items():
+                    percentage = (count / failed * 100.0) if failed else 0.0
+                    print(f"   • {severity}: {count} ({percentage:.1f}%)")
+            retryable_errors = error_summary.get('retryable_errors')
+            non_retryable_errors = error_summary.get('non_retryable_errors')
+            if retryable_errors is not None and non_retryable_errors is not None:
+                print(f"   Retryable vs non-retryable: {retryable_errors} / {non_retryable_errors}")
+            top_failures = self.error_handler.get_top_failures()
+            if top_failures:
+                print(f"   Top failure signals:")
+                for entry in top_failures:
+                    sample = entry.get('sample_message') or ''
+                    if len(sample) > 80:
+                        sample = sample[:77] + "..."
+                    print(f"   • {entry.get('category')}: {entry.get('count')} (e.g., {sample})")
+            most_common = error_summary.get('most_common_category')
+            if most_common:
+                print(f"   Top category: {most_common}")
             print(f"   🛡️  Batch resilience: {success_rate:.1f}% success rate maintained")
-            
             # Log comprehensive error analysis
             self.error_handler.log_batch_summary(total_processed, successful)
+
+        # Diagnostics from tracker
+        diagnostic_lines = []
+        metric_labels = [
+            ('retries', "🔁 Retries"),
+            ('segmentation_events', "✂️  Segment guardrails"),
+            ('guardrail_events', "🛡️ Guardrail activations"),
+            ('timeout_events', "⏱️ Timeouts"),
+            ('validation_failures', "🧪 Validation failures"),
+            ('summary_cleanups', "🧹 Summary cleanups"),
+        ]
+        for metric, label in metric_labels:
+            value = tracker_counts.get(metric, 0)
+            if value:
+                diagnostic_lines.append(f"{label}: {value}")
+        if diagnostic_lines:
+            print(f"\n📈 Diagnostics:")
+            for line in diagnostic_lines:
+                print(f"   {line}")
+        recent_events = tracker_snapshot.get('recent_events') or []
+        if recent_events:
+            highlighted = ", ".join(recent_events[-5:])
+            print(f"   Recent events: {highlighted}")
         
-        # Print cache statistics
-        self._print_cache_stats()
+        # Print cache statistics with hit/miss data
+        self._print_cache_stats(tracker_counts)
         
         print(f"{'='*60}")
         
         # Enhanced logging with error context
         if failed > 0:
-            logger.info(f"Workflow completed with errors in {elapsed:.1f}s. "
-                       f"Processed: {total_processed}, Success: {successful}, "
-                       f"Failed: {failed}, Skipped: {skipped}")
-            logger.info(f"Batch processing resilience maintained: {(successful/total_processed*100):.1f}% success rate")
+            logger.info(
+                f"Workflow completed with errors in {elapsed:.1f}s. "
+                f"Processed: {total_processed}, Success: {successful}, "
+                f"Failed: {failed}, Skipped: {skipped}"
+            )
+            logger.info(f"Batch processing resilience maintained: {success_rate:.1f}% success rate")
         else:
-            logger.info(f"Workflow completed successfully in {elapsed:.1f}s. "
-                       f"Processed: {total_processed}, Success: {successful}, "
-                       f"Skipped: {skipped}")
+            logger.info(
+                f"Workflow completed successfully in {elapsed:.1f}s. "
+                f"Processed: {total_processed}, Success: {successful}, "
+                f"Skipped: {skipped}"
+            )
         
         # Reset error handler for next session
         self.error_handler.reset()
@@ -4249,6 +4529,7 @@ class AutomatedWorkflow:
                 return None
 
             canonical_path = self._canonical_segments_summary_path(segments_folder, base_name)
+            performed_cleanup = False
             summary_candidates = [
                 path for path in segments_folder.glob("~*_comprehensive_summary.txt") if path.is_file()
             ]
@@ -4278,6 +4559,12 @@ class AutomatedWorkflow:
                 for candidate in summary_candidates:
                     if candidate != canonical_path:
                         _remove_path(candidate)
+                        performed_cleanup = True
+                if performed_cleanup:
+                    try:
+                        self.analysis_tracker.record_summary_cleanup('segments_folder')
+                    except Exception:
+                        logger.debug("Analysis tracker summary cleanup recording failed", exc_info=True)
                 return canonical_path
 
             # Canonical file missing - promote the newest summary file to canonical
@@ -4286,17 +4573,25 @@ class AutomatedWorkflow:
                 try:
                     _clear_attributes(newest_candidate)
                     newest_candidate.rename(canonical_path)
+                    performed_cleanup = True
                 except Exception as rename_err:
                     logger.debug(f"Could not rename {newest_candidate} to canonical summary: {rename_err}")
                     try:
                         shutil.copy2(str(newest_candidate), str(canonical_path))
+                        performed_cleanup = True
                     except Exception as copy_err:
                         logger.debug(f"Could not copy {newest_candidate} to canonical summary: {copy_err}")
 
             for candidate in summary_candidates:
                 if candidate != canonical_path and candidate.exists():
                     _remove_path(candidate)
+                    performed_cleanup = True
 
+            if performed_cleanup:
+                try:
+                    self.analysis_tracker.record_summary_cleanup('segments_folder')
+                except Exception:
+                    logger.debug("Analysis tracker summary cleanup recording failed", exc_info=True)
             return canonical_path
         except Exception as e:
             logger.debug(f"Failed to deduplicate summaries in {segments_folder}: {e}")
@@ -4315,11 +4610,80 @@ class AutomatedWorkflow:
 
             for segments_folder in segments_folders:
                 try:
+                    # First deduplicate summaries
                     self._deduplicate_segments_summaries(segments_folder)
+                    # Then check if folder is empty and remove it if so
+                    self._remove_empty_segments_folder(segments_folder)
                 except Exception as folder_err:
-                    logger.debug(f"Could not deduplicate {segments_folder}: {folder_err}")
+                    logger.debug(f"Could not process {segments_folder}: {folder_err}")
         except Exception as e:
             logger.debug(f"Could not enumerate segment folders for deduplication: {e}")
+
+    def _remove_empty_segments_folder(self, segments_folder: Path) -> bool:
+        """
+        Remove a segments folder if it contains no media files.
+        
+        Args:
+            segments_folder: Path to the segments folder to check and potentially remove
+            
+        Returns:
+            True if folder was removed, False otherwise
+        """
+        try:
+            # Check if folder exists and is a directory
+            if not segments_folder.exists() or not segments_folder.is_dir():
+                return False
+            
+            # Check for segment files (MP4 or GIF) - exclude summary files and other metadata
+            segment_files = []
+            try:
+                for item in segments_folder.iterdir():
+                    if item.is_file():
+                        # Check if it's a segment file (MP4 or GIF), not a summary or metadata file
+                        if item.suffix.lower() in ['.mp4', '.gif']:
+                            # Exclude summary files and other metadata
+                            if not item.name.startswith('~') and not item.name.startswith('folder.'):
+                                segment_files.append(item)
+            except Exception as e:
+                logger.debug(f"Error checking for segment files in {segments_folder}: {e}")
+                return False
+            
+            # If media files found, don't remove
+            if segment_files:
+                return False
+            
+            # No media files found - remove the folder
+            # First, clear Windows file attributes on folder contents (best-effort)
+            try:
+                for item in segments_folder.iterdir():
+                    try:
+                        subprocess.run(
+                            ['attrib', '-R', '-S', '-H', str(item)],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            check=False
+                        )
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.debug(f"Could not clear attributes in {segments_folder}: {e}")
+            
+            # Remove the folder
+            try:
+                shutil.rmtree(segments_folder)
+                logger.info(f"Removed empty segments folder: {segments_folder.name}")
+                try:
+                    self.analysis_tracker.record_summary_cleanup('empty_segments_folder')
+                except Exception:
+                    logger.debug("Analysis tracker empty segments cleanup recording failed", exc_info=True)
+                return True
+            except Exception as remove_err:
+                logger.debug(f"Could not remove empty segments folder {segments_folder}: {remove_err}")
+                return False
+                
+        except Exception as e:
+            logger.debug(f"Failed to check/remove empty segments folder {segments_folder}: {e}")
+            return False
 
     def _create_comprehensive_segments_summary(self, segments_folder: Path, base_name: str) -> None:
         """
@@ -4542,15 +4906,29 @@ class AutomatedWorkflow:
             
             # Try to get GIF-specific info using FFmpeg
             cmd = ['ffmpeg', '-i', gif_path]
-            result = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding='utf-8',
-                errors='replace',
-                timeout=30
-            )
+            try:
+                result = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace',
+                    timeout=30
+                )
+            except subprocess.TimeoutExpired as info_timeout:
+                logger.warning(f"FFmpeg summary probe timed out for {gif_path}: {info_timeout}")
+                try:
+                    self.analysis_tracker.record_timeout('summary_probe')
+                except Exception:
+                    logger.debug("Analysis tracker summary timeout recording failed", exc_info=True)
+                return {
+                    'duration': 0,
+                    'fps': 12.0,
+                    'width': 320,
+                    'height': 240,
+                    'file_size_mb': file_size_mb
+                }
             
             duration = 0
             fps = 12.0  # Default GIF FPS
@@ -4621,7 +4999,9 @@ class AutomatedWorkflow:
             
             # Only create summary if there are actual segment files
             if not segment_files:
-                logger.warning(f"Segments folder is empty (no segment files found): {segments_folder.name}, skipping summary creation")
+                # Remove empty segments folder
+                if not self._remove_empty_segments_folder(segments_folder):
+                    logger.warning(f"Segments folder is empty (no segment files found): {segments_folder.name}, skipping summary creation")
                 return
             
             # Prefer sanitized base name (without '_segments')

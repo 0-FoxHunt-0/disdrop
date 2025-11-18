@@ -34,6 +34,7 @@ class ProcessingError:
     exception_type: str
     severity: str  # 'warning', 'error', 'critical'
     suggestions: List[str]
+    retryable: bool = True
     context: Optional[str] = None
     
     def get_short_description(self) -> str:
@@ -80,6 +81,7 @@ class ErrorHandler:
                     "Use hardware encoders: --force-hardware",
                     "Increase target size if possible"
                 ],
+                retryable=True,
                 context=context
             )
         
@@ -98,6 +100,7 @@ class ErrorHandler:
                     "Enable segmentation for long videos",
                     "Increase target file size"
                 ],
+                retryable=True,
                 context=context
             )
         
@@ -113,6 +116,7 @@ class ErrorHandler:
                     "Try smaller segment duration",
                     "Force single file: --force-single-file"
                 ],
+                retryable=True,
                 context=context
             )
         
@@ -129,6 +133,7 @@ class ErrorHandler:
                     "Update FFmpeg installation",
                     "Try different encoder settings"
                 ],
+                retryable=True,
                 context=context
             )
         
@@ -144,6 +149,7 @@ class ErrorHandler:
                     "Enable segmentation for large files",
                     "Increase timeout settings"
                 ],
+                retryable=True,
                 context=context
             )
         
@@ -160,6 +166,7 @@ class ErrorHandler:
                     "Close other applications",
                     "Process files individually"
                 ],
+                retryable=False,
                 context=context
             )
         
@@ -175,6 +182,7 @@ class ErrorHandler:
                     "Run with appropriate privileges",
                     "Ensure output directory is writable"
                 ],
+                retryable=False,
                 context=context
             )
         
@@ -190,6 +198,7 @@ class ErrorHandler:
                     "Retry operation",
                     "Use local processing only"
                 ],
+                retryable=True,
                 context=context
             )
         
@@ -206,6 +215,7 @@ class ErrorHandler:
                     "Try re-downloading the file",
                     "Convert to standard format first"
                 ],
+                retryable=False,
                 context=context
             )
         
@@ -221,6 +231,7 @@ class ErrorHandler:
                     "Retry operation",
                     "Check logs for more details"
                 ],
+                retryable=True,
                 context=context
             )
     
@@ -259,6 +270,8 @@ class ErrorHandler:
         severity_counts = {}
         for error in self.processed_errors:
             severity_counts[error.severity] = severity_counts.get(error.severity, 0) + 1
+        retryable_count = sum(1 for error in self.processed_errors if error.retryable)
+        non_retryable_count = total_errors - retryable_count
         
         return {
             'total_errors': total_errors,
@@ -266,8 +279,31 @@ class ErrorHandler:
             'severity_distribution': severity_counts,
             'most_common_category': max(category_counts.items(), key=lambda x: x[1])[0] if category_counts else None,
             'critical_errors': severity_counts.get('critical', 0),
-            'error_rate': total_errors  # Will be calculated by caller with total files
+            'error_rate': total_errors,  # Will be calculated by caller with total files
+            'retryable_errors': retryable_count,
+            'non_retryable_errors': non_retryable_count
         }
+
+    def get_top_failures(self, limit: int = 3) -> List[Dict[str, Any]]:
+        """Return ranked failure categories with a representative message for reporting."""
+        if limit <= 0 or not self.processed_errors:
+            return []
+        category_counts: Dict[str, int] = {}
+        sample_messages: Dict[str, str] = {}
+        for error in self.processed_errors:
+            key = error.category.value
+            category_counts[key] = category_counts.get(key, 0) + 1
+            # Capture the latest message for the category
+            sample_messages[key] = error.message
+        sorted_categories = sorted(category_counts.items(), key=lambda item: item[1], reverse=True)[:limit]
+        top_failures = []
+        for category, count in sorted_categories:
+            top_failures.append({
+                'category': category,
+                'count': count,
+                'sample_message': sample_messages.get(category, '')
+            })
+        return top_failures
     
     def log_batch_summary(self, total_files: int, successful_files: int):
         """Log comprehensive batch processing summary with error analysis"""
