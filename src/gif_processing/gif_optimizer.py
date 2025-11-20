@@ -9,6 +9,7 @@ import json
 import hashlib
 import shutil
 import time
+import math
 from typing import Dict, Any, Optional, Callable, Tuple
 import logging
 
@@ -240,6 +241,7 @@ class GifOptimizer:
         new_height = max(280, int((current_height * width_factor) // 2 * 2))  # Preserve aspect ratio
         new_fps = max(10, int(round(current_fps * fps_factor)))
         new_colors = max(128, int(round(current_colors * color_factor)))
+        new_colors = min(256, new_colors)
         # Limit lossy to max 120 (reduced from 200) to prevent severe degradation
         new_lossy = min(120, current_lossy + lossy_increase)
         
@@ -771,7 +773,8 @@ class GifOptimizer:
             generator = GifGenerator(self.config, shutdown_checker=self._shutdown_checker)
             
             # Create settings dict from params
-            colors = params.get('colors', 256)
+            colors = int(params.get('colors', 256))
+            colors = max(2, min(256, colors))
             if colors >= 192:
                 dither = 'floyd_steinberg'
             elif colors >= 128:
@@ -785,6 +788,7 @@ class GifOptimizer:
                 'height': params.get('height', -1),
                 'fps': params['fps'],
                 'colors': colors,
+                'palette_max_colors': colors,
                 'dither': dither,
                 'lossy': params.get('lossy', 0),
                 'max_duration': video_info.get('duration', 30.0)
@@ -792,8 +796,22 @@ class GifOptimizer:
             
             # Create GIF from source with calculated parameters
             duration = min(settings['max_duration'], video_info.get('duration', 30.0))
+            palette_timeout_override = None
+            try:
+                timeout_cfg = self.config.get('gif_settings.performance.timeouts.palette', {}) or {}
+            except Exception:
+                timeout_cfg = {}
+            reencode_multiplier = float(timeout_cfg.get('reencode_duration_multiplier', 0.0) or 0.0)
+            if reencode_multiplier > 0 and duration > 0:
+                min_seconds = int(timeout_cfg.get('min_seconds', 30))
+                max_seconds = int(timeout_cfg.get('max_seconds', 240))
+                palette_timeout_override = int(
+                    max(min_seconds, min(max_seconds, math.ceil(duration * reencode_multiplier)))
+                )
             result = generator._create_single_gif(
-                source_video, output_path, settings, 0.0, duration, skip_optimizer=True
+                source_video, output_path, settings, 0.0, duration, skip_optimizer=True,
+                disable_parallel_palette=True,
+                palette_timeout_override=palette_timeout_override
             )
             
             return result.get('success', False) and os.path.exists(output_path)

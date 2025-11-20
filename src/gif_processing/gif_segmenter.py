@@ -215,9 +215,20 @@ class GifSegmenter:
                         if 'fps' in segment_settings:
                             segment_settings['fps'] = int(segment_settings['fps'] * fps_reduction)
                         if 'colors' in segment_settings:
-                            segment_settings['colors'] = int(segment_settings['colors'] * color_reduction)
+                            segment_settings['colors'] = self.gif_generator._clamp_palette_colors(
+                                int(segment_settings['colors'] * color_reduction)
+                            )
+                        if 'palette_max_colors' in segment_settings:
+                            segment_settings['palette_max_colors'] = self.gif_generator._clamp_palette_colors(
+                                segment_settings['palette_max_colors']
+                            )
                     
                     segment_force_guardrails = self._should_force_segment_guardrails(segment_duration_actual, segment_settings)
+                    segment_timeout_override = self._segment_palette_timeout(segment_duration_actual)
+                    runtime_kwargs = {
+                        'disable_parallel_palette': True,
+                        'palette_timeout_override': segment_timeout_override
+                    }
                     if segment_force_guardrails:
                         overrides = self.gif_generator._build_guardrail_overrides(segment_settings)
                         if overrides:
@@ -233,7 +244,8 @@ class GifSegmenter:
                         duration=segment_duration_actual,
                         disable_segmentation=True,  # Prevent nested segmentation
                         settings_override=segment_settings,
-                        force_guardrails=segment_force_guardrails
+                        force_guardrails=segment_force_guardrails,
+                        **runtime_kwargs
                     )
                     
                     # Retry with guardrail overrides if size limit exceeded
@@ -260,7 +272,8 @@ class GifSegmenter:
                                         duration=segment_duration_actual,
                                         disable_segmentation=True,
                                         settings_override=overrides,
-                                        force_guardrails=True
+                                        force_guardrails=True,
+                                        **runtime_kwargs
                                     )
                                 except Exception as retry_e:
                                     logger.warning(f"Exception during guardrail retry for segment {i+1}: {retry_e}")
@@ -276,6 +289,10 @@ class GifSegmenter:
                                     if os.path.exists(segment_path):
                                         os.remove(segment_path)
                                     
+                                    reduced_runtime_kwargs = {
+                                        'disable_parallel_palette': True,
+                                        'palette_timeout_override': self._segment_palette_timeout(reduced_duration)
+                                    }
                                     result = self.gif_generator.create_gif(
                                         input_video=input_video,
                                         output_path=segment_path,
@@ -284,7 +301,8 @@ class GifSegmenter:
                                         start_time=segment_start,
                                         duration=reduced_duration,
                                         disable_segmentation=True,
-                                        force_guardrails=True
+                                        force_guardrails=True,
+                                        **reduced_runtime_kwargs
                                     )
                                 except Exception as retry_e:
                                     logger.warning(f"Exception during segment {i+1} retry: {retry_e}")
@@ -419,6 +437,20 @@ class GifSegmenter:
             except Exception:
                 fps = 20
         return self.gif_generator._is_guardrail_candidate(segment_duration, fps)
+    
+    def _segment_palette_timeout(self, segment_duration: float) -> Optional[int]:
+        """Compute a palette timeout override for segmentation workloads."""
+        try:
+            cfg = self.gif_generator._get_palette_timeout_config()
+        except AttributeError:
+            return None
+        multiplier = float(cfg.get('segment_duration_multiplier', 0.0) or 0.0)
+        if multiplier <= 0:
+            return None
+        min_seconds = int(cfg.get('min_seconds', 30))
+        max_seconds = int(cfg.get('max_seconds', 240))
+        timeout = math.ceil(segment_duration * multiplier)
+        return int(max(min_seconds, min(max_seconds, timeout)))
     
     def _safe_filename_for_filesystem(self, filename: str) -> str:
         """
