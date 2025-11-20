@@ -70,3 +70,24 @@ def test_reencode_with_params_clamps_palette_colors(monkeypatch, tmp_path):
     assert captured['colors'] == 256
     assert captured['palette_max_colors'] == 256
 
+
+def test_settings_override_enforces_minimum_width_and_fps():
+    generator = GifGenerator(ConfigManager())
+    base_settings = generator._get_platform_settings(platform=None, max_size_mb=10)
+    overrides = {'width': 120, 'fps': 5}
+
+    updated = generator._apply_settings_override(base_settings, overrides)
+
+    assert updated['width'] >= 360
+    assert updated['fps'] >= 15
+
+
+def test_optimizer_parameter_adjustments_respect_minimums():
+    optimizer = GifOptimizer(ConfigManager())
+    current_params = {'width': 280, 'height': 280, 'fps': 12, 'colors': 200, 'lossy': 0}
+    gif_info = {'duration': 15.0, 'width': 640, 'height': 360, 'fps': 24}
+
+    params = optimizer._calculate_required_parameters(45.0, 10.0, current_params, gif_info)
+
+    assert params['width'] >= 360
+    assert params['fps'] >= 15

@@ -7,6 +7,8 @@ import pytest
 
 from src.automated_workflow import AutomatedWorkflow
 from src.config_manager import ConfigManager
+from src.gif_processing.gif_segmenter import GifSegmenter
+from src.utils.segments_naming import sanitize_segments_base_name
 
 
 @pytest.fixture
@@ -62,6 +64,20 @@ def test_cleanup_segments_summary_files_collapses_duplicates(workflow, tmp_path)
     assert canonical_path.exists(), "Canonical summary file should be created"
     assert remaining == [canonical_path], "Only the canonical summary should remain"
     assert canonical_path.read_text(encoding="utf-8") == expected_content
+
+
+def test_workflow_and_segmenter_share_canonical_summary_name(workflow, tmp_path):
+    raw_base = "~[HMV] Dream ⧸ Party - Sample [abcd1234]"
+    segments_folder = tmp_path / f"{raw_base}_segments"
+    segments_folder.mkdir(parents=True, exist_ok=True)
+
+    canonical = workflow._canonical_segments_summary_path(segments_folder, raw_base)
+
+    segmenter = GifSegmenter(workflow.config, MagicMock())
+    safe_base = segmenter._safe_filename_for_filesystem(raw_base)
+
+    assert safe_base == sanitize_segments_base_name(raw_base)
+    assert canonical.name == f"~{safe_base}_comprehensive_summary.txt"
 
 
 def test_ensure_mp4_in_segments_moves_files_under_output(workflow):
