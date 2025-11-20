@@ -2,21 +2,25 @@
 # Note: Width and height are maximum dimensions. The actual dimensions will preserve the original video's aspect ratio.
 gif_settings:
   # General settings - Platform-compatible defaults
+  # Theoretical limits: max_file_size_mb > 0 (practical: 1MB-10MB for most platforms), max_duration_seconds >= 1
   max_file_size_mb: 10 # Keep at 10MB for platform compatibility (Discord, etc.)
   max_duration_seconds: 30 # Allow longer content but compress aggressively
 
   # Quality settings - Improved FPS
+  # Theoretical limits: fps >= 1 (practical: 10-30 for smooth motion), width >= 64 (practical: 360-1920), height >= -1 (-1=auto, or >= 64)
   fps: 22 # Increased again to keep more motion budget before any scaling
   width: 360 # Maximum width (aspect ratio will be preserved)
   height: -1 # Use -1 to preserve aspect ratio automatically (was 360 which forced square)
   # Note: height: -1 allows FFmpeg to automatically calculate height based on width while preserving aspect ratio
 
   # Optimization settings - More balanced defaults
+  # Theoretical limits: palette_size (2-256, FFmpeg palettegen constraint), dither (floyd_steinberg|bayer|sierra2_4a|etc.), lossy (0-200, gifsicle constraint)
   palette_size: 256
   dither: "floyd_steinberg" # Better quality default
   lossy: 60 # Reduced from 80 for better quality
 
   # Performance tuning
+  # Theoretical limits: threads (auto|integer >= 1), timeout seconds >= 1, multipliers (>= 0.0), max_seconds >= min_seconds
   perf:
     threads: auto # auto or integer
     filter_threads: auto # auto or integer
@@ -24,27 +28,42 @@ gif_settings:
     # Threading for single GIF path
     single_gif_parallel:
       precompute_palette: true
+    timeouts:
+      palette:
+        min_seconds: 30 # Hard floor to avoid extremely small budgets
+        max_seconds: 240 # Prevent runaway FFmpeg executions
+        base_seconds: 30 # Starting point before multipliers
+        short_duration_multiplier: 2.0 # duration * multiplier for clips < threshold
+        long_duration_multiplier: 0.75 # duration * multiplier for long clips
+        long_duration_threshold: 45 # seconds
+        guardrail_extra_seconds: 45 # add when guardrails active
+        workload_reference_width: 360 # normalize width scaling
+        workload_reference_fps: 12 # normalize fps scaling
+        workload_scale_seconds: 18 # add seconds when width/fps exceed reference
+        reencode_duration_multiplier: 1.2 # override used by Stage 2 re-encodes
+        segment_duration_multiplier: 1.35 # override used by GIF segmentation
     # Workflow-wide detection/validation controls
-    file_scan_parallelism: 4        # Threads for intake scan + validation checks
+    file_scan_parallelism: 4 # Threads for intake scan + validation checks
     validation_manifest_ttl_hours: 12 # Expire cached validation metadata after 12h
     # Guardrails to prevent very long clips from overloading FFmpeg
     long_clip_guardrails:
       enabled: true
-      duration_seconds: 45           # Minimum duration before applying guardrails
-      frame_budget: 900              # duration * fps threshold before applying guardrails
-      segment_duration_ratio: 0.5    # Apply guardrails to segments once they exceed 50% of duration threshold
+      duration_seconds: 45 # Minimum duration before applying guardrails
+      frame_budget: 900 # duration * fps threshold before applying guardrails
+      segment_duration_ratio: 0.5 # Apply guardrails to segments once they exceed 50% of duration threshold
       segment_frame_budget_ratio: 0.6 # Apply guardrails to segments once they exceed 60% of frame budget
-      palette_fps_cap: 14            # Cap palette/GIF FPS for long clips
-      palette_stats_mode: "diff"     # Use diff stats mode when guardrails active
-      palette_max_colors: 208        # Limit palette size to speed up processing
+      palette_fps_cap: 14 # Cap palette/GIF FPS for long clips
+      palette_stats_mode: "diff" # Use diff stats mode when guardrails active
+      palette_max_colors: 208 # Limit palette size to speed up processing
       mpdecimate:
         hi: 768
         lo: 64
         frac: 0.4
-      reencode_max_workers: 1        # Serialize Stage 2 re-encodes for very long clips
-      reencode_strategy_limit: 2     # Limit number of strategies when guardrails apply
+      reencode_max_workers: 1 # Serialize Stage 2 re-encodes for very long clips
+      reencode_strategy_limit: 2 # Limit number of strategies when guardrails apply
 
   # Multiprocessing configuration
+  # Theoretical limits: max_concurrent_segments >= 1, analysis_mode (conservative|recommended|maximum_safe), boolean flags
   multiprocessing:
     max_concurrent_segments: 4 # Maximum concurrent processes for segmentation (MP4 and GIF)
     enabled: true # Enable multiprocessing for segmentation
@@ -52,6 +71,7 @@ gif_settings:
     analysis_mode: "recommended" # Analysis mode: "conservative", "recommended", or "maximum_safe"
 
   # Gifsicle performance controls
+  # Theoretical limits: gifsicle_time_budget_seconds >= 1, gifsicle_max_candidates >= 1, gifsicle_optimize_level (1-3)
   gifsicle_performance:
     fast_mode: true # When true, use faster gifsicle settings and limit search
     gifsicle_time_budget_seconds: 25 # Limit adaptive search time
@@ -59,17 +79,21 @@ gif_settings:
     gifsicle_optimize_level: 2 # 1-3; 2 is faster, 3 is slowest
 
   # Color reduction
+  # Theoretical limits: colors (2-256, FFmpeg palettegen constraint), stats_mode (full|diff)
   colors: 256
   stats_mode: "diff" # full, diff
 
   # Crop detection (disabled by default to avoid slight unintended crops)
 
   # Single GIF feasibility pre-check (speeds up failure cases by avoiding long attempts)
+  # Theoretical limits: width >= 64, fps >= 1, boolean flags
   single_gif:
     quick_feasibility:
       enabled: true
       width: 240
       fps: 12
+  # Crop detection settings
+  # Theoretical limits: min_border_px >= 0, min_border_ratio (0.0-1.0), boolean flags
   crop_detection:
     enabled: false
     # Only apply crop if borders exceed BOTH of these loosened thresholds
@@ -77,6 +101,7 @@ gif_settings:
     min_border_ratio: 0.04 # Or at least 4% of dimension combined per axis
 
   # Segmentation settings - DISABLED for segmented videos
+  # Theoretical limits: size_threshold_multiplier >= 1.0, fallback_duration_limit >= 1, min_segment_duration >= 1, max_segment_duration >= min_segment_duration, multipliers (0.0-1.0)
   segmentation:
     prefer_single_file_first: true
     # Size-based thresholds (primary decision factors) - More conservative
@@ -116,6 +141,7 @@ gif_settings:
       aggressive_lossy: 100
 
   # Quality optimization settings - Better FPS preservation
+  # Theoretical limits: max_attempts_per_stage >= 1, target_size_efficiency (0.0-1.0), min_target_utilization (0.0-1.0), min_quality_score (0-10), min_size_headroom (0.0-1.0), multipliers (0.0-1.0), colors (2-256), lossy (0-200)
   quality_optimization:
     enabled: true # Enable iterative quality optimization
     max_attempts_per_stage: 4 # Increased from 3 for better optimization
@@ -167,6 +193,7 @@ gif_settings:
         dither: "bayer"
 
   # Platform specific settings
+  # Theoretical limits: max_width/height >= 64, max_duration >= 1, colors (2-256), lossy (0-200), max_file_size_mb > 0
   platforms:
     twitter:
       max_width: 506
@@ -190,15 +217,17 @@ gif_settings:
       lossy: 60
 
   # Global quality floors to prevent unreadable tiny GIFs
+  # Theoretical limits: min_width >= 64 (practical: 360+ for watchable), min_fps >= 1 (practical: 15+ for smooth), min_width_aggressive >= 64, min_fps_aggressive >= 1
   quality_floors:
     enforce: true
-    min_width: 320
-    min_fps: 20
+    min_width: 360
+    min_fps: 15
     # Aggressive mode floors (used when allow_aggressive_compression is true)
-    min_width_aggressive: 240
-    min_fps_aggressive: 18
+    min_width_aggressive: 360
+    min_fps_aggressive: 15
 
   # Optimization settings
+  # Theoretical limits: threshold_percent (0.0-100.0), absolute_mb_threshold >= 0.0, max_attempts >= 1, mode (bounded_search|skip_ffmpeg|both), boolean flags
   optimization:
     # Allow aggressive compression that bypasses quality floors when needed
     allow_aggressive_compression: true
@@ -207,7 +236,7 @@ gif_settings:
     # Size prediction for accurate parameter calculation
     size_prediction:
       enabled: true
-    
+
     # Near-target optimization settings
     near_target:
       # When within this % over target, use bounded gifsicle search instead of FFmpeg
@@ -215,25 +244,28 @@ gif_settings:
       # Minimum absolute MB overage before near-target guardrails kick in
       absolute_mb_threshold: 0.3
       # Mode: 'bounded_search', 'skip_ffmpeg', 'both'
-      mode: 'both'
+      mode: "both"
       # Maximum gifsicle attempts for bounded search
       max_attempts: 60
       # When within this % of target, use more fine-grained search
       fine_tune_threshold_percent: 10
 
   # Adaptive optimization settings
+  # Theoretical limits: fps_range values (0.0-1.0), frac_range values (0.0-1.0), boolean flags
   adaptive_fps:
     enabled: true
     motion_analysis: true
-    fps_range: [1.0, 0.95, 0.9, 0.85]  # Keep adaptive passes closer to capture speed
+    fps_range: [1.0, 0.95, 0.9, 0.85] # Keep adaptive passes closer to capture speed
 
   adaptive_mpdecimate:
     enabled: true
     motion_adaptive: true
-    frac_range: [0.1, 0.2, 0.3, 0.4, 0.5]  # Duplicate detection aggressiveness
+    frac_range: [0.1, 0.2, 0.3, 0.4, 0.5] # Duplicate detection aggressiveness
 
+  # Optimization strategy settings
+  # Theoretical limits: boolean flags (true/false), no numeric constraints
   optimization_strategies:
-    variable_fps: true  # Use variable FPS based on motion
-    motion_based_optimization: true  # Adjust parameters based on motion analysis
-    content_aware_palette: true  # Select palette mode based on scene complexity
-    progressive_quality: true  # Use intermediate values instead of fixed steps
+    variable_fps: true # Use variable FPS based on motion
+    motion_based_optimization: true # Adjust parameters based on motion analysis
+    content_aware_palette: true # Select palette mode based on scene complexity
+    progressive_quality: true # Use intermediate values instead of fixed steps

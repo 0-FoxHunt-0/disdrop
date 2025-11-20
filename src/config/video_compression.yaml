@@ -1,17 +1,20 @@
 # Video Compression Configuration (packaged defaults)
 video_compression:
   # General settings
+  # Theoretical limits: max_file_size_mb > 0 (practical: 1MB-100MB for most platforms)
   max_file_size_mb: 10
   # temp_dir is ignored as of v0.1.2; temp is fixed at <package_root>/temp
   temp_dir: "./temp"
 
   # Hardware acceleration settings
+  # Theoretical limits: encoder names must match FFmpeg encoder names (h264_nvenc, h264_amf, libx264, libx265, etc.)
   hardware_acceleration:
     nvidia: "h264_nvenc"
     amd: "h264_amf"
     fallback: "libx264"
 
   # Bitrate validation settings
+  # Theoretical limits: encoder_minimums (kbps) >= 1, min_resolution width/height >= 64 (H.264 minimum), min_fps >= 1, fps_reduction_steps (0.0-1.0)
   bitrate_validation:
     enabled: true
     # Minimum bitrate requirements per encoder (in kbps)
@@ -24,19 +27,15 @@ video_compression:
       h264_videotoolbox: 8 # Apple VideoToolbox minimum (raised for better audio quality)
     # Fallback resolutions for extreme compression scenarios
     fallback_resolutions:
-      - [320, 180] # Ultra-low for extreme cases
-      - [426, 240] # 240p
-      - [480, 270] # 270p
-      - [640, 360] # 360p
-      - [854, 480] # 480p
+      - [1280, 720] # Enforce 720p minimum outputs
     # Auto-segment threshold - files larger than this will be considered for segmentation
     segmentation_threshold_mb: 50
     # Safety margin for bitrate calculations (multiplier)
     safety_margin: 1.1
     # Minimum resolution constraints
     min_resolution:
-      width: 320
-      height: 180
+      width: 1280
+      height: 720
     # Minimum FPS constraint
     min_fps: 20
     # FPS reduction steps (as ratios of original FPS)
@@ -45,6 +44,7 @@ video_compression:
     prefer_quality_over_fps: true
 
   # Video segmentation settings - LAST RESORT only
+  # Theoretical limits: min_segment_duration >= 1s, max_segment_duration >= min_segment_duration, max_concurrent_segments >= 1, multipliers (0.0-1.0)
   segmentation:
     # Enable watchdog timeout to prevent hanging ffmpeg segment encodes
     enable_timeout: true
@@ -95,6 +95,7 @@ video_compression:
     max_concurrent_optimizations: 1 # Max concurrent segment optimizations
 
   # Social media platform presets
+  # Theoretical limits: max_width/height >= 64 (H.264 minimum), bitrate (kbps) >= encoder minimum, fps >= 1, aspect_ratio must be valid ratio string
   platforms:
     instagram:
       max_width: 1080
@@ -140,12 +141,14 @@ video_compression:
       max_file_size_mb: 10 # Discord's 10MB limit for free users
 
   # Quality settings
+  # Theoretical limits: crf (0-51, lower=better quality), preset (ultrafast|superfast|veryfast|faster|fast|medium|slow|slower|veryslow), tune (film|animation|grain|stillimage|fastdecode|zerolatency)
   quality:
     crf: 24 # Constant Rate Factor (lower = higher quality)
     preset: "slower" # ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow
     tune: "film" # film, animation, grain, stillimage, fastdecode, zerolatency
 
   # Quality evaluation settings
+  # Theoretical limits: confidence_thresholds (0.0-1.0), timeout_seconds >= 1, retry_attempts >= 0, thresholds (0.0-100.0), weights sum should be ~1.0
   quality_evaluation:
     fallback_mode: "conservative" # 'conservative', 'permissive', 'strict'
     confidence_thresholds:
@@ -258,6 +261,7 @@ video_compression:
         duration_penalty: -0.0001
 
   # Comprehensive debug logging configuration
+  # Theoretical limits: boolean flags (true/false), no numeric constraints
   debug_logging:
     enabled: false # Enable comprehensive debug logging (can be overridden by CLI --debug)
     performance_metrics: false # Enable performance metrics logging
@@ -297,6 +301,7 @@ video_compression:
       performance_summary: true # Log performance metrics summary
 
   # Advanced codec and quality controls
+  # Theoretical limits: min_bpp (bits-per-pixel) >= 0.001, size_savings_threshold (0.0-1.0), min_bitrate (kbps) >= encoder minimum, priority list order matters
   codec:
     allow_hevc: true
     allow_h264_high10: true
@@ -314,10 +319,14 @@ video_compression:
       quality_maintained: true # Only if quality is maintained
       min_bitrate: 500 # Minimum bitrate for HEVC consideration
 
+  # FPS policy settings
+  # Theoretical limits: low_motion_threshold (0.0-1.0), boolean flags
   fps_policy:
     prefer_24fps_for_low_motion: true
     low_motion_threshold: 0.35
 
+  # Prefilter settings
+  # Theoretical limits: filter_strengths (0.0-1.0), boolean flags
   prefilters:
     denoise: true
     deband: true
@@ -336,6 +345,8 @@ video_compression:
         medium_complexity_low_motion: 0.3
         high_complexity_low_motion: 0.2
 
+  # Quality control settings
+  # Theoretical limits: min_target_utilization (0.0-1.0), refine_iterations >= 0, quality_floors (0-100), weights sum should be ~1.0, bitrate_step >= 1.0, max_multiplier >= 1.0
   quality_controls:
     min_target_utilization: 0.92
     refine_iterations: 2
@@ -360,11 +371,13 @@ video_compression:
       min_quality_improvement: 2.0 # Minimum quality improvement (VMAF/SSIM points) to continue uplift
     on_fail_segment: true
   # Strict size enforcement and near-limit retry
+  # Theoretical limits: near_limit_retry_percent (0.0-1.0)
   size_control:
     near_limit_retry_percent: 0.08
   # Segmentation finalize policy (merge into top segmentation block)
 
   # Profiles for specialized pipelines
+  # Theoretical limits: size_limit_mb > 0, audio_kbps_range [min, max] where min <= max and both >= 1, vmaf_threshold (0-100), ssim_threshold (0.0-1.0), bpp_floor >= 0.001, max_passes >= 1, bitrate_step >= 1.0, min_short_side_px >= 64
   profiles:
     discord_10mb:
       size_limit_mb: 10
@@ -386,6 +399,8 @@ video_compression:
         size_guard_mb: 0.05
         # Maximum tolerance beyond the published limit that we still consider acceptable (Discord requires 0)
         max_over_limit_mb: 0.0
+      guardrails:
+        min_short_side_px: 480  # If CAE would drop below 480p short side, switch to segmentation
       # x264 two-pass tuning
       x264:
         preset: slow

@@ -3,6 +3,8 @@ logging:
   version: 1
   disable_existing_loggers: false
 
+  # Formatter settings
+  # Theoretical limits: format string (Python logging format), datefmt (strftime format), no numeric constraints
   formatters:
     detailed:
       format: "[%(asctime)s] %(levelname)s [%(name)s.%(funcName)s:%(lineno)d] %(message)s"
@@ -12,6 +14,8 @@ logging:
       format: "%(asctime)s | %(levelname)-8s | %(message)s"
       datefmt: "%H:%M:%S"
 
+  # Handler settings
+  # Theoretical limits: level (DEBUG|INFO|WARNING|ERROR|CRITICAL), stream (ext://sys.stdout|ext://sys.stderr|file path), mode (a|w), filename (file path)
   handlers:
     console:
       class: logging.StreamHandler
@@ -33,6 +37,8 @@ logging:
       filename: logs/errors.log
       mode: a
 
+  # Logger settings
+  # Theoretical limits: level (DEBUG|INFO|WARNING|ERROR|CRITICAL), handlers (list of handler names), propagate (boolean)
   loggers:
     video_compressor:
       level: DEBUG

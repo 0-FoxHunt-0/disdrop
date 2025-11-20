@@ -2,12 +2,14 @@
 
 performance_monitoring:
   # System monitoring settings
+  # Theoretical limits: memory_threshold_mb >= 0, boolean flags
   system_monitoring:
     enabled: true
     memory_threshold_mb: 500
     cpu_monitoring: true
 
   # Logging configuration
+  # Theoretical limits: boolean flags (true/false), no numeric constraints
   logging:
     operation_timing: true
     parameter_changes: true
@@ -15,6 +17,7 @@ performance_monitoring:
     cache_operations: true
 
   # Analysis thresholds
+  # Theoretical limits: slow_operation_seconds >= 0.0, high_memory_mb >= 0.0, low_cache_hit_rate (0.0-100.0), poor_success_rate (0.0-100.0)
   thresholds:
     slow_operation_seconds: 30.0
     high_memory_mb: 500.0
@@ -22,6 +25,7 @@ performance_monitoring:
     poor_success_rate: 80.0
 
   # Performance profiles
+  # Theoretical limits: max_quality_evaluation_time >= 0.0, max_compression_iterations >= 1, boolean flags
   profiles:
     fast:
       max_quality_evaluation_time: 10.0
@@ -48,6 +52,7 @@ performance_monitoring:
       memory_optimization: false
 
 # Performance controls for users
+# Theoretical limits: preferred_profile (fast|balanced|quality), boolean flags
 performance_controls:
   preferred_profile: "balanced"
   show_progress: true
@@ -56,6 +61,7 @@ performance_controls:
   performance_notifications: true
 
 # Performance analysis settings
+# Theoretical limits: thresholds same as above, analysis_period_days >= 1, minimum_sessions_for_analysis >= 1, multipliers >= 1.0, boolean flags
 performance_analysis:
   thresholds:
     slow_operation_seconds: 30.0

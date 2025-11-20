@@ -280,7 +280,7 @@ class ConfigManager:
             'fallback_resolutions': self.get('video_compression.bitrate_validation.fallback_resolutions', []),
             'segmentation_threshold_mb': self.get('video_compression.bitrate_validation.segmentation_threshold_mb', 50),
             'safety_margin': self.get('video_compression.bitrate_validation.safety_margin', 1.1),
-            'min_resolution': self.get('video_compression.bitrate_validation.min_resolution', {'width': 320, 'height': 180}),
+            'min_resolution': self.get('video_compression.bitrate_validation.min_resolution', {'width': 1280, 'height': 720}),
             'min_fps': self.get('video_compression.bitrate_validation.min_fps', 10),
             'fps_reduction_steps': self.get('video_compression.bitrate_validation.fps_reduction_steps', [0.8, 0.6, 0.5])
         }
@@ -629,8 +629,8 @@ class ConfigManager:
         
         # Check resolution against minimum
         min_resolution = self.get('video_compression.bitrate_validation.min_resolution', {})
-        min_width = min_resolution.get('width', 320)
-        min_height = min_resolution.get('height', 180)
+        min_width = min_resolution.get('width', 1280)
+        min_height = min_resolution.get('height', 720)
         
         if width < min_width:
             issues.append(f"Width {width} is below configured minimum {min_width}")
