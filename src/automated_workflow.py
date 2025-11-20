@@ -2180,6 +2180,7 @@ class AutomatedWorkflow:
             
             # Check for existing segment folder first in the same category folder
             segments_folder = mp4_category_dir / f"{mp4_file.stem}_segments"
+            source_mp4_path = self._resolve_mp4_source_path(mp4_file, segments_folder)
             if segments_folder.exists() and segments_folder.is_dir():
                 logger.info(f"Found existing segments folder: {segments_folder}")
                 
@@ -2261,24 +2262,24 @@ class AutomatedWorkflow:
             
             try:
                 # Check if MP4 file still exists before processing
-                if not mp4_file.exists():
-                    print(f"    ❌ MP4 file no longer exists: {mp4_file}")
-                    logger.error(f"MP4 file no longer exists: {mp4_file}")
+                if not source_mp4_path.exists():
+                    print(f"    ❌ MP4 file no longer exists: {source_mp4_path}")
+                    logger.error(f"MP4 file no longer exists: {source_mp4_path}")
                     return False
                 
                 # Get video duration to preserve full length in GIF
-                video_duration = FFmpegUtils.get_video_duration(str(mp4_file))
+                video_duration = FFmpegUtils.get_video_duration(str(source_mp4_path))
                 logger.info(f"Video duration: {video_duration:.2f}s - generating GIF with full duration")
                 
                 # Double-check file exists before GIF generation
-                if not mp4_file.exists():
-                    print(f"    ❌ MP4 file disappeared during processing: {mp4_file}")
-                    logger.error(f"MP4 file disappeared during processing: {mp4_file}")
+                if not source_mp4_path.exists():
+                    print(f"    ❌ MP4 file disappeared during processing: {source_mp4_path}")
+                    logger.error(f"MP4 file disappeared during processing: {source_mp4_path}")
                     return False
                 
                 # Generate GIF to temp directory first with full duration
                 result = self.gif_generator.create_gif(
-                    input_video=str(mp4_file),
+                    input_video=str(source_mp4_path),
                     output_path=str(temp_gif_path),
                     max_size_mb=max_size_mb,
                     duration=video_duration  # Preserve full video duration
@@ -2414,8 +2415,8 @@ class AutomatedWorkflow:
                                     cover_jpg = final_segments_dir / 'folder.jpg'
                                     if not cover_jpg.exists():
                                         # Prefer MP4 source for thumbnail; fallback to first valid GIF if MP4 unavailable
-                                        thumb_src = str(mp4_file)
-                                        if not mp4_file.exists():
+                                        thumb_src = str(source_mp4_path)
+                                        if not source_mp4_path.exists():
                                             try:
                                                 if valid_segments:
                                                     thumb_src = str(valid_segments[0])
@@ -2495,7 +2496,8 @@ class AutomatedWorkflow:
                         print(f"    ✨ GIF generation successful: {size_mb:.2f}MB")
                         logger.info(f"GIF generation successful: {gif_name} ({size_mb:.2f}MB)")
                         # Record cache for single GIF success
-                        self._record_success_cache(mp4_file if mp4_file.exists() else final_gif_path, 'single_gif', final_gif_path)
+                        cache_source = source_mp4_path if source_mp4_path.exists() else final_gif_path
+                        self._record_success_cache(cache_source, 'single_gif', final_gif_path)
                         return True
                     else:
                         print(f"    ❌ Final GIF validation failed: {error_msg}")
@@ -2950,39 +2952,92 @@ class AutomatedWorkflow:
 
     @staticmethod
     def _is_within_directory(candidate: Path, root: Path) -> bool:
-        """Return True if candidate path is inside root (inclusive)."""
+        """
+        Return True if candidate path is inside root (inclusive), using normalized absolute paths.
+        """
         try:
-            candidate.resolve().relative_to(root.resolve())
-            return True
-        except ValueError:
-            return False
+            candidate_path = os.path.normcase(os.path.normpath(str(candidate.resolve())))
+            root_path = os.path.normcase(os.path.normpath(str(root.resolve())))
         except Exception:
             return False
+        
+        if candidate_path == root_path:
+            return True
+        
+        if not root_path.endswith(os.sep):
+            root_path = root_path + os.sep
+        return candidate_path.startswith(root_path)
+
+    def _resolve_mp4_source_path(self, mp4_file: Path, segments_folder: Optional[Path] = None) -> Path:
+        """
+        Return an existing MP4 path, falling back to copies that were moved into segments folders.
+
+        Args:
+            mp4_file: The original expected MP4 path.
+            segments_folder: Optional explicit segments folder to search first.
+
+        Returns:
+            Path to an existing MP4 file if found; otherwise returns the original path.
+        """
+        try:
+            if mp4_file and mp4_file.exists():
+                return mp4_file
+        except Exception:
+            pass
+
+        candidates: List[Path] = []
+        if segments_folder and segments_folder.is_dir():
+            candidates.append(segments_folder / mp4_file.name)
+        try:
+            inferred_segments = mp4_file.parent / f"{mp4_file.stem}_segments"
+            candidates.append(inferred_segments / mp4_file.name)
+        except Exception:
+            pass
+
+        seen: set = set()
+        for candidate in candidates:
+            if not candidate:
+                continue
+            resolved = candidate.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            if candidate.exists():
+                logger.info(
+                    f"Resolved MP4 source via segments fallback: {candidate} (missing original: {mp4_file})"
+                )
+                return candidate
+
+        return mp4_file
 
     def _ensure_mp4_in_segments(self, mp4_file: Path, segments_folder: Path):
         """Move the source MP4 into the segments folder if it resides in output; otherwise copy."""
         try:
             segments_folder.mkdir(exist_ok=True)
             target = segments_folder / mp4_file.name
+            output_root = self.output_dir
+            mp4_parent = mp4_file.parent
+            mp4_within_output = self._is_within_directory(mp4_parent, output_root)
+            
+            def _remove_source_duplicate(reason: str) -> None:
+                if not mp4_within_output:
+                    return
+                if not mp4_file.exists():
+                    return
+                try:
+                    mp4_file.unlink()
+                    logger.info(f"Removed duplicate MP4 from output ({reason}): {mp4_file.name}")
+                except Exception as removal_error:
+                    logger.warning(f"Could not remove duplicate MP4 ({reason}): {removal_error}")
+            
             if target.exists():
                 logger.debug(f"MP4 already exists in segments folder: {target.name}")
-                # Verify that source MP4 is not still in parent directory (should have been moved)
-                if mp4_file.parent.resolve() == self.output_dir.resolve() and mp4_file.exists():
-                    logger.warning(f"MP4 still exists in parent directory after being moved to segments folder: {mp4_file.name}")
-                    # Remove duplicate from parent directory
-                    try:
-                        mp4_file.unlink()
-                        logger.info(f"Removed duplicate MP4 from parent directory: {mp4_file.name}")
-                    except Exception as e:
-                        logger.warning(f"Could not remove duplicate MP4 from parent directory: {e}")
+                _remove_source_duplicate("target_exists")
                 return
             
-            output_root = self.output_dir.resolve()
-            mp4_parent = mp4_file.parent.resolve()
-
             # If mp4 lives anywhere under the output directory, move it. Otherwise copy it (e.g. source still in input)
             try:
-                should_move = mp4_file.exists() and self._is_within_directory(mp4_parent, output_root)
+                should_move = mp4_file.exists() and mp4_within_output
                 if should_move:
                     shutil.move(str(mp4_file), str(target))
                     logger.info(f"Moved MP4 to segments folder: {mp4_file.name} -> {target}")
@@ -3014,16 +3069,22 @@ class AutomatedWorkflow:
                     # Validate copy operation
                     if not target.exists():
                         logger.error(f"MP4 copy failed: {target.name} does not exist in segments folder")
+                    _remove_source_duplicate("post_copy_cleanup")
             except Exception as e:
                 logger.warning(f"Failed to move/copy MP4 to segments folder: {e}")
                 # As a last resort, try copying
                 try:
                     shutil.copy2(str(mp4_file), str(target))
                     logger.info(f"Fallback copy MP4 to segments folder: {mp4_file.name} -> {target}")
+                    try:
+                        self.analysis_tracker.record_mp4_move('segments_copy')
+                    except Exception:
+                        logger.debug("Analysis tracker fallback MP4 copy recording failed", exc_info=True)
                     
                     # Validate fallback copy
                     if not target.exists():
                         logger.error(f"Fallback MP4 copy failed: {target.name} does not exist in segments folder")
+                    _remove_source_duplicate("fallback_copy_cleanup")
                 except Exception as copy_e:
                     logger.error(f"Failed to copy MP4 to segments folder: {copy_e}")
         except Exception as e:
