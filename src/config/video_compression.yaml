@@ -38,6 +38,13 @@ video_compression:
       height: 720
     # Minimum FPS constraint
     min_fps: 20
+    guardrail_override:
+      enabled: true
+      bpp_ratio_threshold: 0.7
+      min_resolution:
+        width: 640
+        height: 360
+      min_fps: 12
     # FPS reduction steps (as ratios of original FPS)
     fps_reduction_steps: [0.8, 0.6, 0.5]
     # Prefer quality/resolution reduction over aggressive FPS reduction

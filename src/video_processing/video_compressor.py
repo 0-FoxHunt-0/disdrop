@@ -1310,6 +1310,39 @@ class DynamicVideoCompressor:
                     pass
             best_candidate['path'] = None
         
+        def _reroute_to_segmentation(reason_key: str,
+                                     details: Optional[Dict[str, Any]],
+                                     log_message: str) -> Dict[str, Any]:
+            """Invoke segmentation workflow with guardrail metadata."""
+            logger.info(log_message)
+            video_info_guard = video_info.copy()
+            video_info_guard['requires_segmentation'] = True
+            video_info_guard['segmentation_reason'] = reason_key
+            if details:
+                video_info_guard['guardrail_details'] = details
+            segmentation_result = self._compress_with_segmentation(
+                input_path,
+                output_path,
+                size_limit_mb,
+                platform_config,
+                video_info_guard,
+                platform or 'discord'
+            )
+            if not segmentation_result:
+                segmentation_result = {
+                    'success': False,
+                    'error': 'Segmentation guardrail failed to produce output',
+                    'method': 'segmentation_guardrail_failed'
+                }
+            segmentation_result['guardrail_triggered'] = True
+            segmentation_result['guardrail_reason'] = reason_key
+            segmentation_result['guardrail_details'] = details
+            segmentation_result.setdefault('method', 'segmentation')
+            segmentation_result.setdefault('is_segmented_output', True)
+            segmentation_result.setdefault('video_info', video_info_guard)
+            segmentation_result.setdefault('segmentation_trigger', reason_key)
+            return segmentation_result
+        
         # Step 1: Analyze content complexity
         motion_level = video_info.get('motion_level', 'medium')  # from _analyze_video_content
         logger.info(f"Content analysis: motion={motion_level}, complexity={video_info.get('complexity_score', 5.0):.1f}")
@@ -1560,6 +1593,133 @@ class DynamicVideoCompressor:
         initial_params['audio_bitrate'] = audio_bitrate_kbps
         initial_params['encoder'] = 'libx264'  # Default encoder for CAE pipeline
 
+        logger.info(
+            f"Initial target: {initial_params['width']}x{initial_params['height']}@{initial_params['fps']}fps, "
+            f"BPP={bpp_min:.3f}, bitrate={target_video_bitrate_kbps}k"
+        )
+        
+        calculated_bpp = self._calculate_actual_bpp(
+            initial_params['width'],
+            initial_params['height'],
+            initial_params['fps'],
+            target_video_bitrate_kbps
+        )
+        bpp_ratio = (calculated_bpp / bpp_min) if bpp_min > 0 else None
+        if bpp_ratio is not None:
+            logger.info(
+                "CAE planning BPP: actual %.4f vs floor %.4f (%.1f%%)",
+                calculated_bpp,
+                bpp_min,
+                bpp_ratio * 100.0
+            )
+            if bpp_ratio < 1.0:
+                logger.warning(
+                    "Planned encode is below the BPP floor; expect severe blocking unless guardrails adjust "
+                    "(actual %.4f vs floor %.4f, %.1f%% of target)",
+                    calculated_bpp,
+                    bpp_min,
+                    bpp_ratio * 100.0
+                )
+                if enforce_min_resolution and min_width_guard and min_height_guard:
+                    logger.warning(
+                        "Minimum resolution guard (%dx%d) prevented a safer downscale; attempting override heuristics",
+                        min_width_guard,
+                        min_height_guard
+                    )
+        else:
+            logger.info("CAE planning BPP: floor disabled or zero, skipping comparison")
+        
+        guardrail_override_cfg = self.config.get(
+            'video_compression.bitrate_validation.guardrail_override',
+            {}
+        )
+        override_enabled = guardrail_override_cfg.get('enabled', False)
+        override_threshold = guardrail_override_cfg.get('bpp_ratio_threshold', 0.7)
+        guardrail_override_used = False
+        
+        if (
+            override_enabled
+            and bpp_ratio is not None
+            and bpp_ratio < override_threshold
+        ):
+            override_min_res = guardrail_override_cfg.get('min_resolution', {}) or {}
+            override_width = int(override_min_res.get('width', 640))
+            override_height = int(override_min_res.get('height', 360))
+            override_min_fps = int(guardrail_override_cfg.get('min_fps', 12))
+            logger.warning(
+                "CAE guardrail override engaged: %.1f%% of BPP floor (%.4f < %.4f). "
+                "Temporarily relaxing min resolution/FPS guardrails.",
+                bpp_ratio * 100.0,
+                calculated_bpp,
+                bpp_min
+            )
+            override_params = self._select_resolution_fps_by_bpp(
+                video_info,
+                target_video_bitrate_kbps,
+                bpp_min,
+                profile_cfg,
+                enforce_min_resolution=False,
+                min_resolution_override=(override_width, override_height),
+                min_fps_override=override_min_fps
+            )
+            override_bpp = self._calculate_actual_bpp(
+                override_params['width'],
+                override_params['height'],
+                override_params['fps'],
+                target_video_bitrate_kbps
+            )
+            override_ratio = (override_bpp / bpp_min) if bpp_min > 0 else None
+            if override_bpp > calculated_bpp:
+                guardrail_override_used = True
+                initial_params.update({
+                    'width': override_params['width'],
+                    'height': override_params['height'],
+                    'fps': override_params['fps'],
+                })
+                calculated_bpp = override_bpp
+                bpp_ratio = override_ratio
+                logger.info(
+                    "Guardrail override selected %dx%d@%sfps (BPP %.4f, %.1f%% of floor)",
+                    initial_params['width'],
+                    initial_params['height'],
+                    initial_params['fps'],
+                    calculated_bpp,
+                    (bpp_ratio * 100.0) if bpp_ratio is not None else 0.0
+                )
+            else:
+                logger.warning(
+                    "Guardrail override could not improve BPP (still %.4f).",
+                    override_bpp
+                )
+        
+        if bpp_min > 0 and calculated_bpp < bpp_min:
+            details = {
+                'width': initial_params['width'],
+                'height': initial_params['height'],
+                'fps': initial_params['fps'],
+                'bitrate_kbps': target_video_bitrate_kbps,
+                'bpp_actual': calculated_bpp,
+                'bpp_floor': bpp_min,
+                'bpp_ratio': bpp_ratio,
+                'guardrail_override_used': guardrail_override_used,
+            }
+            logger.warning(
+                "CAE cannot meet BPP floor even after overrides (%.4f < %.4f). "
+                "Routing to segmentation before encoding.",
+                calculated_bpp,
+                bpp_min
+            )
+            return _reroute_to_segmentation(
+                'discord_bpp_floor_guardrail',
+                details,
+                "BPP floor failure detected pre-encode; invoking segmentation fallback"
+            )
+        
+        initial_params['bitrate'] = target_video_bitrate_kbps
+        initial_params['audio_bitrate'] = audio_bitrate_kbps
+        initial_params['encoder'] = 'libx264'
+        initial_params['calculated_bpp'] = calculated_bpp
+        
         guardrail_cfg = profile_cfg.get('guardrails', {}) or {}
         guardrail_details = {}
         min_short_side = int(guardrail_cfg.get('min_short_side_px', 0) or 0)
@@ -1579,38 +1739,11 @@ class DynamicVideoCompressor:
                 initial_params['height'],
                 min_short_side
             )
-            logger.info("Rerouting to segmentation to preserve watchable resolution before CAE encode")
-            video_info_guard = video_info.copy()
-            video_info_guard['requires_segmentation'] = True
-            video_info_guard['segmentation_reason'] = 'cae_resolution_guardrail'
-            video_info_guard['guardrail_details'] = guardrail_details
-            segmentation_result = self._compress_with_segmentation(
-                input_path,
-                output_path,
-                size_limit_mb,
-                platform_config,
-                video_info_guard,
-                platform or 'discord'
+            return _reroute_to_segmentation(
+                'discord_resolution_guardrail',
+                guardrail_details,
+                "Rerouting to segmentation to preserve watchable resolution before CAE encode"
             )
-            if not segmentation_result:
-                segmentation_result = {
-                    'success': False,
-                    'error': 'Segmentation guardrail failed to produce output',
-                    'method': 'segmentation_guardrail_failed'
-                }
-            segmentation_result['guardrail_triggered'] = True
-            segmentation_result['guardrail_reason'] = 'discord_resolution_guardrail'
-            segmentation_result['guardrail_details'] = guardrail_details
-            segmentation_result.setdefault('method', 'segmentation')
-            segmentation_result.setdefault('is_segmented_output', True)
-            segmentation_result.setdefault('video_info', video_info_guard)
-            segmentation_result.setdefault('segmentation_trigger', 'cae_resolution_guardrail')
-            return segmentation_result
-        
-        logger.info(
-            f"Initial target: {initial_params['width']}x{initial_params['height']}@{initial_params['fps']}fps, "
-            f"BPP={bpp_min:.3f}, bitrate={target_video_bitrate_kbps}k"
-        )
         
         # Step 3.5: Pre-encoding bitrate validation and parameter adjustment
         if self.bitrate_validator.is_validation_enabled():
@@ -2090,10 +2223,21 @@ class DynamicVideoCompressor:
         _cleanup_best_candidate()
         return {'success': False, 'error': 'CAE quality gates failed', 'method': 'cae_failed'}
     
+    def _calculate_actual_bpp(self, width: int, height: int, fps: float,
+                              bitrate_kbps: int) -> float:
+        """Compute bits-per-pixel for a proposed encode plan."""
+        if width <= 0 or height <= 0 or fps <= 0 or bitrate_kbps <= 0:
+            return 0.0
+        pixels_per_second = width * height * fps
+        bits_per_second = bitrate_kbps * 1000.0
+        return bits_per_second / pixels_per_second if pixels_per_second else 0.0
+    
     def _select_resolution_fps_by_bpp(self, video_info: Dict[str, Any], 
                                     target_bitrate_kbps: int, bpp_min: float,
                                     profile_cfg: Dict[str, Any],
-                                    enforce_min_resolution: bool = False) -> Dict[str, Any]:
+                                    enforce_min_resolution: bool = False,
+                                    min_resolution_override: Optional[Tuple[int, int]] = None,
+                                    min_fps_override: Optional[int] = None) -> Dict[str, Any]:
         """Select highest resolution and FPS that satisfy BPP floor constraint and encoder minimums."""
         orig_w = video_info['width']
         orig_h = video_info['height']
@@ -2102,6 +2246,9 @@ class DynamicVideoCompressor:
         min_height_guard = None
         if enforce_min_resolution:
             min_width_guard, min_height_guard = self._get_min_resolution()
+        if min_resolution_override is not None:
+            min_width_guard = min_resolution_override[0]
+            min_height_guard = min_resolution_override[1]
         
         # Get encoder minimum bitrate requirement
         encoder = 'libx264'  # Default encoder for CAE pipeline
@@ -2117,7 +2264,9 @@ class DynamicVideoCompressor:
             logger.warning("Implementing progressive resolution reduction to meet bitrate floor")
             return self._progressive_resolution_reduction(
                 video_info, target_bitrate_kbps, bpp_min, profile_cfg, encoder,
-                enforce_min_resolution=enforce_min_resolution
+                enforce_min_resolution=enforce_min_resolution,
+                min_resolution_override=min_resolution_override,
+                min_fps_override=min_fps_override
             )
         
         # Candidate resolutions (maintain aspect ratio) - enhanced with more aggressive options
@@ -2156,6 +2305,9 @@ class DynamicVideoCompressor:
         # Candidate FPS values - expanded for bitrate floor scenarios
         # Use config minimum FPS instead of hardcoded 10
         config_min_fps = self.config.get('video_compression.bitrate_validation.min_fps', 20)
+        effective_min_fps = config_min_fps
+        if min_fps_override is not None:
+            effective_min_fps = min(effective_min_fps, min_fps_override)
         
         fps_candidates = [30, 24, 20, 15, 12, 8, 6] if orig_fps >= 30 else [24, 20, 15, 12, 8, 6, int(orig_fps)]
         fps_prefer_24 = profile_cfg.get('fps_policy', {}).get('prefer_24_for_low_motion', True)
@@ -2164,8 +2316,8 @@ class DynamicVideoCompressor:
         if fps_prefer_24 and motion_level == 'low':
             fps_candidates = [24, 20, 15, 12, 8, 6, 30]  # Prefer 24 for low motion
         
-        # Filter to only include FPS values >= config_min_fps
-        fps_candidates = [fps for fps in fps_candidates if fps >= config_min_fps]
+        # Filter to only include FPS values >= effective minimum
+        fps_candidates = [fps for fps in fps_candidates if fps >= effective_min_fps]
         
         # Find best combo that satisfies both BPP and bitrate floor
         target_bits_per_sec = target_bitrate_kbps * 1000
@@ -2209,7 +2361,9 @@ class DynamicVideoCompressor:
     def _progressive_resolution_reduction(self, video_info: Dict[str, Any], 
                                         target_bitrate_kbps: int, bpp_min: float,
                                         profile_cfg: Dict[str, Any], encoder: str,
-                                        enforce_min_resolution: bool = False) -> Dict[str, Any]:
+                                        enforce_min_resolution: bool = False,
+                                        min_resolution_override: Optional[Tuple[int, int]] = None,
+                                        min_fps_override: Optional[int] = None) -> Dict[str, Any]:
         """Implement progressive resolution reduction until bitrate floor is met."""
         orig_w = video_info['width']
         orig_h = video_info['height']
@@ -2219,6 +2373,9 @@ class DynamicVideoCompressor:
         min_height_guard = None
         if enforce_min_resolution:
             min_width_guard, min_height_guard = self._get_min_resolution()
+        if min_resolution_override is not None:
+            min_width_guard = min_resolution_override[0]
+            min_height_guard = min_resolution_override[1]
         
         logger.info(f"Starting progressive resolution reduction from {orig_w}x{orig_h}")
         
@@ -2272,11 +2429,14 @@ class DynamicVideoCompressor:
         # Progressive FPS reduction candidates
         # Use config minimum FPS instead of hardcoded 10
         config_min_fps = self.config.get('video_compression.bitrate_validation.min_fps', 20)
+        effective_min_fps = config_min_fps
+        if min_fps_override is not None:
+            effective_min_fps = min(effective_min_fps, min_fps_override)
         
         fps_candidates = [orig_fps, 24, 20, 15, 12, 8, 6, 5] if orig_fps > 6 else [orig_fps, 5, 4, 3, 2, 1]
         fps_candidates = [fps for fps in fps_candidates if fps <= orig_fps]
-        # Filter to only include FPS values >= config_min_fps
-        fps_candidates = [fps for fps in fps_candidates if fps >= config_min_fps]
+        # Filter to only include FPS values >= effective floor
+        fps_candidates = [fps for fps in fps_candidates if fps >= effective_min_fps]
         
         target_bits_per_sec = target_bitrate_kbps * 1000
         
