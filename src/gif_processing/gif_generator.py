@@ -25,6 +25,7 @@ from .gif_optimizer import GifOptimizer
 from .gif_segmenter import GifSegmenter
 from .gif_config import GifConfigHelper
 from .gif_utils import temp_file_context, temp_dir_context, safe_file_operation, get_gif_info
+from ..utils.segments_naming import sanitize_segments_base_name, segments_summary_path
 
 logger = logging.getLogger(__name__)
 _SEGMENT_WORD_PATTERN = re.compile(
@@ -484,16 +485,16 @@ class GifGenerator:
                 settings[key] = value
         return settings
     
-    @staticmethod
-    def _build_guardrail_overrides(settings: Dict[str, Any]) -> Dict[str, Any]:
+    @classmethod
+    def _build_guardrail_overrides(cls, settings: Dict[str, Any]) -> Dict[str, Any]:
         """Build per-call overrides to reduce width/fps/colors when guardrails need stricter settings."""
         try:
             width = int(settings.get('width', 360))
             fps = int(settings.get('fps', 20))
-            colors = self._clamp_palette_colors(settings.get('colors', settings.get('palette_max_colors', 256)))
+            colors = cls._clamp_palette_colors(settings.get('colors', settings.get('palette_max_colors', 256)))
         except Exception:
             width, fps, colors = 360, 20, 256
-        reduced_colors = self._clamp_palette_colors(max(64, int(colors * 0.8)))
+        reduced_colors = cls._clamp_palette_colors(max(64, int(colors * 0.8)))
         return {
             'width': max(160, int(width * 0.85)),
             'fps': max(8, int(fps * 0.85)),
@@ -1567,8 +1568,8 @@ class GifGenerator:
         - Prefixed with '~' so it's listed last and avoided as a thumbnail
         """
         try:
-            summary_path = os.path.join(segments_dir, f"~{base_name}_comprehensive_summary.txt")
-            temp_path = os.path.join(segments_dir, f"~{base_name}_comprehensive_summary.txt.tmp")
+            summary_path = segments_summary_path(segments_dir, base_name)
+            temp_path = summary_path.with_name(f"{summary_path.name}.tmp")
 
             # Collect files
             entries = [e for e in os.listdir(segments_dir) if os.path.isfile(os.path.join(segments_dir, e))]
@@ -1590,15 +1591,15 @@ class GifGenerator:
 
             # Best-effort clear attributes on existing file
             try:
-                if os.path.exists(summary_path):
-                    subprocess.run(['attrib', '-R', '-S', '-H', summary_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+                if summary_path.exists():
+                    subprocess.run(['attrib', '-R', '-S', '-H', str(summary_path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
             except Exception:
                 pass
 
             # Write to temp file first
             try:
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
+                if temp_path.exists():
+                    temp_path.unlink()
             except Exception:
                 pass
 
@@ -1698,15 +1699,15 @@ class GifGenerator:
 
             # Atomic replace
             try:
-                os.replace(temp_path, summary_path)
+                os.replace(str(temp_path), str(summary_path))
             except Exception:
                 try:
-                    subprocess.run(['attrib', '-R', '-S', '-H', summary_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-                    os.replace(temp_path, summary_path)
+                    subprocess.run(['attrib', '-R', '-S', '-H', str(summary_path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+                    os.replace(str(temp_path), str(summary_path))
                 except Exception:
                     try:
-                        if os.path.exists(temp_path):
-                            os.remove(temp_path)
+                        if temp_path.exists():
+                            temp_path.unlink()
                     except Exception:
                         pass
                     raise
@@ -1717,34 +1718,8 @@ class GifGenerator:
             logger.warning(f"Comprehensive summary creation failed for {segments_dir}: {e}")
     
     def _safe_filename_for_filesystem(self, filename: str) -> str:
-        """Convert filename to safe string for filesystem operations, handling problematic Unicode characters."""
-        try:
-            # Replace problematic Unicode characters that cause Windows encoding issues
-            # Specifically handle the problematic character U+29F8 (⧸) and similar
-            safe_chars = []
-            for char in filename:
-                if ord(char) < 128:
-                    # Keep ASCII characters
-                    safe_chars.append(char)
-                elif char == '⧸':  # U+29F8 - avoid creating path separators on Windows; substitute underscore
-                    safe_chars.append('_')
-                elif char in ['/', '\\', ':', '*', '?', '"', '<', '>', '|']:
-                    # Replace Windows filesystem-invalid characters with underscore
-                    safe_chars.append('_')
-                else:
-                    # Replace other Unicode characters with underscore
-                    safe_chars.append('_')
-            
-            safe_name = ''.join(safe_chars)
-            
-            # Ensure the filename isn't empty after sanitization
-            if not safe_name.strip():
-                safe_name = 'sanitized_filename'
-            
-            return safe_name
-        except Exception:
-            # Fallback: replace any non-ASCII characters with safe alternatives
-            return ''.join(c if ord(c) < 128 else '_' for c in filename)
+        """Delegate to the shared sanitizer so GIF + workflow paths remain consistent."""
+        return sanitize_segments_base_name(filename)
     
     def _quick_single_feasibility_check(self, input_video: str, settings: Dict[str, Any], 
                                        start_time: float, duration: float, force_guardrails: bool = False) -> Tuple[bool, Optional[float], Optional[str]]:

@@ -5,13 +5,13 @@ Handles segmentation of long videos into multiple GIF files
 
 import os
 import math
-import re
 from typing import Dict, Any, List, Tuple, Optional, Callable
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 import logging
 
 from .gif_utils import safe_file_operation, create_unique_temp_filename
 from .gif_config import GifConfigHelper
+from ..utils.segments_naming import sanitize_segments_base_name
 
 logger = logging.getLogger(__name__)
 
@@ -453,22 +453,6 @@ class GifSegmenter:
         return int(max(min_seconds, min(max_seconds, timeout)))
     
     def _safe_filename_for_filesystem(self, filename: str) -> str:
-        """
-        Sanitize filename to avoid filesystem issues with problematic Unicode characters.
-        
-        Args:
-            filename: Original filename
-        
-        Returns:
-            Sanitized filename safe for filesystem use
-        """
-        # Remove or replace problematic characters
-        # Keep alphanumeric, spaces, hyphens, underscores, dots
-        safe = re.sub(r'[^\w\s\-_.]', '_', filename)
-        # Remove leading/trailing spaces and dots
-        safe = safe.strip(' .')
-        # Limit length
-        if len(safe) > 200:
-            safe = safe[:200]
-        return safe if safe else 'gif_segment'
+        """Sanitize filenames using the shared helper to keep segment folders consistent."""
+        return sanitize_segments_base_name(filename)
 

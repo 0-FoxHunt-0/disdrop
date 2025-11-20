@@ -234,12 +234,12 @@ class GifOptimizer:
             lossy_increase = 25  # Reduced from 30
         
         # Calculate new values with improved quality floors to reduce artifacts
-        # Minimum width increased from 240 to 280 to reduce pixelation
-        # Minimum FPS increased from 6 to 10 for smoother motion
+        # Minimum width increased to 360px to avoid unwatchable outputs
+        # Minimum FPS increased to 15 for smoother motion
         # Minimum colors increased from 32 to 128 to reduce banding
-        new_width = max(280, int((current_width * width_factor) // 2 * 2))  # Ensure even
-        new_height = max(280, int((current_height * width_factor) // 2 * 2))  # Preserve aspect ratio
-        new_fps = max(10, int(round(current_fps * fps_factor)))
+        new_width = max(360, int((current_width * width_factor) // 2 * 2))  # Ensure even
+        new_height = max(360, int((current_height * width_factor) // 2 * 2))  # Preserve aspect ratio
+        new_fps = max(15, int(round(current_fps * fps_factor)))
         new_colors = max(128, int(round(current_colors * color_factor)))
         new_colors = min(256, new_colors)
         # Limit lossy to max 120 (reduced from 200) to prevent severe degradation
@@ -250,14 +250,14 @@ class GifOptimizer:
         allow_aggressive = self.config_helper.get_optimization_config().get('allow_aggressive_compression', False)
         
         if not allow_aggressive and quality_floors.get('enforce', True):
-            min_width = quality_floors.get('min_width', 320)
-            min_fps = quality_floors.get('min_fps', 18)
+            min_width = quality_floors.get('min_width', 360)
+            min_fps = quality_floors.get('min_fps', 15)
             new_width = max(new_width, min_width)
             new_fps = max(new_fps, min_fps)
         else:
-            # Aggressive mode: use improved floors (increased from 240/12 to 280/10)
-            min_width_aggressive = quality_floors.get('min_width_aggressive', 280)
-            min_fps_aggressive = quality_floors.get('min_fps_aggressive', 10)
+            # Aggressive mode: honor the same floors to prevent unreadable segments
+            min_width_aggressive = quality_floors.get('min_width_aggressive', 360)
+            min_fps_aggressive = quality_floors.get('min_fps_aggressive', 15)
             new_width = max(new_width, min_width_aggressive)
             new_fps = max(new_fps, min_fps_aggressive)
         
@@ -1277,7 +1277,7 @@ class GifOptimizer:
             # Try: 100%, 90%, 80%, 70%, 60%, 50% of current width
             resolution_steps = [1.0, 0.9, 0.8, 0.7, 0.6, 0.5]
             quality_floors = self.config_helper.get_quality_floors()
-            min_width = quality_floors.get('min_width_aggressive', 240)
+            min_width = quality_floors.get('min_width_aggressive', 360)
             
             best_result = None
             best_size = current_bytes

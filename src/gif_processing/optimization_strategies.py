@@ -74,17 +74,17 @@ class QualityFirstStrategy(OptimizationStrategy):
         # Quality-first: minimize quality loss
         if size_ratio > 1.5:
             # Need significant reduction - reduce resolution first
-            params['width'] = max(int(gif_info.get('width', 360) * 0.85), 320)
+            params['width'] = max(int(gif_info.get('width', 360) * 0.85), 360)
             params['fps'] = max(int(base_params.get('fps', 20) * 0.9), 15)
             params['colors'] = max(int(base_params.get('colors', 256) * 0.9), 192)
         elif size_ratio > 1.2:
             # Moderate reduction - slight quality adjustments
-            params['width'] = max(int(gif_info.get('width', 360) * 0.92), 320)
-            params['fps'] = max(int(base_params.get('fps', 20) * 0.95), 18)
+            params['width'] = max(int(gif_info.get('width', 360) * 0.92), 360)
+            params['fps'] = max(int(base_params.get('fps', 20) * 0.95), 15)
             params['colors'] = max(int(base_params.get('colors', 256) * 0.95), 224)
         else:
             # Small reduction - minimal quality impact
-            params['width'] = max(int(gif_info.get('width', 360) * 0.96), 320)
+            params['width'] = max(int(gif_info.get('width', 360) * 0.96), 360)
             params['fps'] = base_params.get('fps', 20)
             params['colors'] = base_params.get('colors', 256)
         
@@ -128,8 +128,8 @@ class SizeFirstStrategy(OptimizationStrategy):
         
         # Size-first: aggressive reduction
         quality_floors = self.config.get_quality_floors()
-        min_width = quality_floors.get('min_width', 320)
-        min_fps = quality_floors.get('min_fps', 18)
+        min_width = quality_floors.get('min_width', 360)
+        min_fps = quality_floors.get('min_fps', 15)
         
         if size_ratio > 2.0:
             # Very aggressive reduction
@@ -189,8 +189,8 @@ class BalancedStrategy(OptimizationStrategy):
         
         # Balanced approach
         quality_floors = self.config.get_quality_floors()
-        min_width = quality_floors.get('min_width', 320)
-        min_fps = quality_floors.get('min_fps', 18)
+        min_width = quality_floors.get('min_width', 360)
+        min_fps = quality_floors.get('min_fps', 15)
         
         if size_ratio > 1.5:
             # Need reduction - balanced approach
@@ -288,18 +288,18 @@ class AdaptiveStrategy(OptimizationStrategy):
         
         # Apply size-based adjustments
         if size_ratio > 1.5:
-            params['width'] = max(int(gif_info.get('width', 360) * 0.85), 320)
+            params['width'] = max(int(gif_info.get('width', 360) * 0.85), 360)
             params['fps'] = max(int(base_params.get('fps', 20) * fps_mult * 0.9), 15)
             params['colors'] = max(int(base_params.get('colors', 256) * color_mult * 0.9), 128)
             params['lossy'] = 60
         elif size_ratio > 1.2:
-            params['width'] = max(int(gif_info.get('width', 360) * 0.92), 320)
-            params['fps'] = max(int(base_params.get('fps', 20) * fps_mult), 18)
+            params['width'] = max(int(gif_info.get('width', 360) * 0.92), 360)
+            params['fps'] = max(int(base_params.get('fps', 20) * fps_mult), 15)
             params['colors'] = max(int(base_params.get('colors', 256) * color_mult), 192)
             params['lossy'] = 40
         else:
-            params['width'] = max(int(gif_info.get('width', 360) * 0.96), 320)
-            params['fps'] = max(int(base_params.get('fps', 20) * fps_mult), 18)
+            params['width'] = max(int(gif_info.get('width', 360) * 0.96), 360)
+            params['fps'] = max(int(base_params.get('fps', 20) * fps_mult), 15)
             params['colors'] = max(int(base_params.get('colors', 256) * color_mult), 224)
             params['lossy'] = 20
         
@@ -338,7 +338,7 @@ class AdaptiveStrategy(OptimizationStrategy):
                 color_mult = 0.9
             
             params.update({
-                'width': max(int(gif_info.get('width', 360) * size_mult), 320),
+                'width': max(int(gif_info.get('width', 360) * size_mult), 360),
                 'fps': max(int(base_params.get('fps', 20) * fps_mult), 15),
                 'colors': max(int(base_params.get('colors', 256) * color_mult), 128),
                 'dither': 'floyd_steinberg' if complexity_level == 'high' else 'bayer',

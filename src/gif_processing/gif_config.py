@@ -191,10 +191,10 @@ class GifConfigHelper:
         
         return {
             'enforce': bool(floors.get('enforce', True)),
-            'min_width': int(floors.get('min_width', 320)),
-            'min_fps': int(floors.get('min_fps', 18)),
-            'min_width_aggressive': int(floors.get('min_width_aggressive', 240)),
-            'min_fps_aggressive': int(floors.get('min_fps_aggressive', 12))
+            'min_width': int(floors.get('min_width', 360)),
+            'min_fps': int(floors.get('min_fps', 15)),
+            'min_width_aggressive': int(floors.get('min_width_aggressive', 360)),
+            'min_fps_aggressive': int(floors.get('min_fps_aggressive', 15))
         }
     
     def get_segmentation_config(self) -> Dict[str, Any]:
