@@ -370,3 +370,4 @@ def _probe_gif_info(
         "estimated_frames": estimated_frames,
     }
 
+
