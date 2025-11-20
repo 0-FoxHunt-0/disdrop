@@ -26,6 +26,8 @@ from .gif_processing.gif_generator import GifGenerator
 from .file_validator import FileValidator
 from .ffmpeg_utils import FFmpegUtils
 from .error_handler import ErrorHandler, ErrorCategory
+from .utils.segments_naming import sanitize_segments_base_name, segments_summary_path
+from .utils.segments_summary import write_segments_summary
 
 logger = logging.getLogger(__name__)
 
@@ -236,25 +238,12 @@ class AutomatedWorkflow:
             logger.debug(f"Directory ensured: {directory}")
 
     def _safe_filename_for_filesystem(self, filename: str) -> str:
-        """Convert filename to safe string for filesystem operations, handling problematic Unicode characters."""
-        try:
-            safe_chars = []
-            for char in filename:
-                if ord(char) < 128:
-                    safe_chars.append(char)
-                elif char == '⧸':
-                    # Avoid creating path separators on Windows; substitute underscore
-                    safe_chars.append('_')
-                elif char in ['/', '\\', ':', '*', '?', '"', '<', '>', '|']:
-                    safe_chars.append('_')
-                else:
-                    safe_chars.append('_')
-            safe_name = ''.join(safe_chars)
-            if not safe_name.strip():
-                safe_name = 'sanitized_filename'
-            return safe_name
-        except Exception:
-            return ''.join(c if ord(c) < 128 else '_' for c in filename)
+        """
+        Convert filename to a safe string for filesystem operations.
+
+        Delegates to the shared sanitizer so all components derive identical folder/summary names.
+        """
+        return sanitize_segments_base_name(filename)
     
     def _interruptible_sleep(self, duration: float, check_interval: float = 0.1):
         """Sleep that can be interrupted by shutdown signal"""
@@ -591,35 +580,13 @@ class AutomatedWorkflow:
             # Ensure segments folder exists
             segments_folder.mkdir(parents=True, exist_ok=True)
             
-            # Create comprehensive summary for batch processing
             base_name = input_file.stem
-            summary_data = {
-                'source_file': str(input_file),
-                'creation_time': time.time(),
-                'creation_method': 'segmentation_fallback',
-                'num_segments': len(segments),
-                'total_size_mb': sum(s.get('size_mb', 0) for s in segments),
-                'total_duration': sum(s.get('duration', 0) for s in segments),
-                'target_size_mb': max_size_mb,
-                'segments': segments
-            }
-            
-            # Write summary file for batch processing tools
-            summary_path = segments_folder / f"{base_name}_segments_summary.json"
-            with open(summary_path, 'w', encoding='utf-8') as f:
-                json.dump(summary_data, f, indent=2)
-            
-            # Create a simple text index for easy batch processing
-            index_path = segments_folder / "segments_index.txt"
-            with open(index_path, 'w', encoding='utf-8') as f:
-                f.write(f"# Segments for {input_file.name}\n")
-                f.write(f"# Created: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"# Method: segmentation_fallback\n")
-                f.write(f"# Total segments: {len(segments)}\n")
-                f.write(f"# Total size: {summary_data['total_size_mb']:.2f}MB\n\n")
-                
-                for segment in segments:
-                    f.write(f"{segment.get('filename', '')}\t{segment.get('size_mb', 0):.2f}MB\t{segment.get('duration', 0):.1f}s\n")
+            summary_path = write_segments_summary(
+                segments_folder,
+                base_name,
+                logger=logger,
+                analysis_tracker=self.analysis_tracker,
+            )
             
             logger.info(f"Organized {len(segments)} segmented outputs in {segments_folder}")
             
@@ -627,7 +594,6 @@ class AutomatedWorkflow:
                 'success': True,
                 'segments_folder': segments_folder,
                 'summary_path': summary_path,
-                'index_path': index_path,
                 'num_segments': len(segments)
             }
             
@@ -1897,6 +1863,22 @@ class AutomatedWorkflow:
             
             if result.get('cancelled'):
                 return None
+
+            guardrail_triggered = result.get('guardrail_triggered')
+            guardrail_reason = result.get('guardrail_reason', 'video_guardrail')
+            if guardrail_triggered:
+                guardrail_details = result.get('guardrail_details')
+                print(f"    ⚠️ Guardrail triggered ({guardrail_reason}); routing through segmentation-safe output")
+                logger.info(
+                    "MP4 guardrail activated (%s): %s",
+                    guardrail_reason,
+                    guardrail_details or 'no additional details'
+                )
+                try:
+                    self.analysis_tracker.record_guardrail(guardrail_reason)
+                except Exception:
+                    logger.debug("Analysis tracker guardrail recording failed", exc_info=True)
+
             if result.get('success', False):
                 # Check if segmentation was used (including segmentation fallback)
                 if (result.get('method') == 'segmentation' or 
@@ -1925,6 +1907,12 @@ class AutomatedWorkflow:
                         
                         if segments_folder_path and os.path.exists(segments_folder_path):
                             segments_folder = Path(segments_folder_path)
+
+                            if guardrail_triggered:
+                                try:
+                                    self.analysis_tracker.record_segmentation(guardrail_reason)
+                                except Exception:
+                                    logger.debug("Analysis tracker segmentation guardrail recording failed", exc_info=True)
                             
                             # Verify folder contains segments before returning
                             try:
@@ -2204,7 +2192,12 @@ class AutomatedWorkflow:
 
                     # Recreate comprehensive summary to include the MP4 just ensured
                     try:
-                        self._create_comprehensive_segments_summary(segments_folder, mp4_file.stem)
+                        write_segments_summary(
+                            segments_folder,
+                            mp4_file.stem,
+                            logger=logger,
+                            analysis_tracker=self.analysis_tracker,
+                        )
                     except Exception:
                         pass
 
@@ -2439,11 +2432,16 @@ class AutomatedWorkflow:
 
                                 # Recreate summary AFTER ensuring MP4 is present
                                 try:
-                                    try:
-                                        sanitized_base = final_segments_dir.name.replace('_segments', '')
-                                    except Exception:
-                                        sanitized_base = final_segments_dir.name
-                                    self._create_comprehensive_segments_summary(final_segments_dir, sanitized_base)
+                                    sanitized_base = final_segments_dir.name.replace('_segments', '')
+                                except Exception:
+                                    sanitized_base = final_segments_dir.name
+                                try:
+                                    write_segments_summary(
+                                        final_segments_dir,
+                                        sanitized_base,
+                                        logger=logger,
+                                        analysis_tracker=self.analysis_tracker,
+                                    )
                                 except Exception as e:
                                     logger.debug(f"Could not create comprehensive summary: {e}")
                                 # Record cache for segments-based success
@@ -2460,11 +2458,16 @@ class AutomatedWorkflow:
                                     pass
                                 # Create summary for invalid segments case so incomplete segments still have a summary
                                 try:
-                                    try:
-                                        sanitized_base = final_segments_dir.name.replace('_segments', '')
-                                    except Exception:
-                                        sanitized_base = final_segments_dir.name
-                                    self._create_comprehensive_segments_summary(final_segments_dir, sanitized_base)
+                                    sanitized_base = final_segments_dir.name.replace('_segments', '')
+                                except Exception:
+                                    sanitized_base = final_segments_dir.name
+                                try:
+                                    write_segments_summary(
+                                        final_segments_dir,
+                                        sanitized_base,
+                                        logger=logger,
+                                        analysis_tracker=self.analysis_tracker,
+                                    )
                                 except Exception as e:
                                     logger.debug(f"Could not create comprehensive summary for invalid segments: {e}")
                                 return False
@@ -3791,7 +3794,7 @@ class AutomatedWorkflow:
                     base_width = int(self.config.get('gif_settings.width', 360) or 360)
                     # Apply scale factor to base width, but don't go below quality floors
                     quality_floors = self.config.get('gif_settings.quality_floors', {}) or {}
-                    min_width = int(quality_floors.get('min_width_aggressive', 240) or 240)
+                    min_width = int(quality_floors.get('min_width_aggressive', 360) or 360)
                     target_segment_width = max(min_width, int(base_width * scale_factor))
                     # Ensure even
                     target_segment_width = (target_segment_width // 2) * 2
@@ -4205,7 +4208,12 @@ class AutomatedWorkflow:
                     
                     # Create comprehensive summary for the segments folder
                     try:
-                        self._create_comprehensive_segments_summary(segments_dir, base_name)
+                        write_segments_summary(
+                            segments_dir,
+                            base_name,
+                            logger=logger,
+                            analysis_tracker=self.analysis_tracker,
+                        )
                         logger.debug(f"Created comprehensive summary for segments folder: {segments_dir.name}")
                     except Exception as e:
                         logger.warning(f"Could not create comprehensive summary for segments folder: {e}")
@@ -4570,16 +4578,9 @@ class AutomatedWorkflow:
 
     def _canonical_segments_summary_path(self, segments_folder: Path, base_name: Optional[str] = None) -> Path:
         """
-        Derive the canonical summary filename for a segments folder using a sanitized base name.
+        Derive the canonical summary filename for a segments folder using the shared sanitizer.
         """
-        try:
-            derived_base = base_name if base_name and base_name.strip() else segments_folder.stem.replace('_segments', '')
-        except Exception:
-            derived_base = segments_folder.stem.replace('_segments', '')
-        safe_base = self._safe_filename_for_filesystem(derived_base or segments_folder.stem)
-        if not safe_base:
-            safe_base = 'segments_summary'
-        return segments_folder / f"~{safe_base}_comprehensive_summary.txt"
+        return segments_summary_path(segments_folder, base_name)
 
     def _deduplicate_segments_summaries(self, segments_folder: Path, base_name: Optional[str] = None) -> Optional[Path]:
         """
@@ -4746,296 +4747,6 @@ class AutomatedWorkflow:
             logger.debug(f"Failed to check/remove empty segments folder {segments_folder}: {e}")
             return False
 
-    def _create_comprehensive_segments_summary(self, segments_folder: Path, base_name: str) -> None:
-        """
-        Create a comprehensive summary file for both MP4 and GIF segments in a segments folder.
-        The summary will be prefixed with '~' to ensure it appears last in folder listings.
-        Uses a temporary file and atomic replace to avoid Windows file locking issues.
-        """
-        try:
-            import time
-            from .ffmpeg_utils import FFmpegUtils
-            
-            # Find all MP4 and GIF files in the segments folder
-            mp4_files = list(segments_folder.glob("*.mp4"))
-            gif_files = list(segments_folder.glob("*.gif"))
-            
-            if not mp4_files and not gif_files:
-                logger.info(f"No MP4 or GIF files found in segments folder: {segments_folder}")
-                return
-            
-            # Create summary filename with '~' prefix to ensure it appears last
-            summary_file = self._canonical_segments_summary_path(segments_folder, base_name)
-            temp_file = summary_file.with_name(f"{summary_file.name}.tmp")
-
-            # Best-effort clear attributes on existing file
-            try:
-                if summary_file.exists():
-                    subprocess.run(['attrib', '-R', '-S', '-H', str(summary_file)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-            except Exception:
-                pass
-            # Remove stale temp file if present
-            try:
-                if temp_file.exists():
-                    temp_file.unlink()
-            except Exception:
-                pass
-
-            with open(temp_file, 'w', encoding='utf-8') as f:
-                f.write("Comprehensive Segments Summary\n")
-                f.write("=============================\n\n")
-                f.write(f"Base Name: {base_name}\n")
-                f.write(f"Created: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"Total MP4 Segments: {len(mp4_files)}\n")
-                f.write(f"Total GIF Segments: {len(gif_files)}\n")
-                f.write(f"Total Files: {len(mp4_files) + len(gif_files)}\n\n")
-
-                # MP4 details
-                if mp4_files:
-                    f.write("MP4 Segments Details:\n")
-                    f.write("--------------------\n")
-                    for idx, mp4_file in enumerate(mp4_files, 1):
-                        try:
-                            info = FFmpegUtils.get_video_info(str(mp4_file))
-                            size_mb = mp4_file.stat().st_size / (1024 * 1024)
-                            f.write(f"MP4 Segment {idx:03d}: {mp4_file.name}\n")
-                            f.write(f"  Duration: {info.get('duration', 0.0):.2f}s\n")
-                            f.write(f"  FPS: {info.get('fps', 0.0):.2f}\n")
-                            f.write(f"  Frame Count: {info.get('frame_count', 0)}\n")
-                            f.write(f"  Resolution: {info.get('width', 0)}x{info.get('height', 0)}\n")
-                            f.write(f"  Codec: {info.get('codec', 'unknown')}\n")
-                            f.write(f"  Bitrate: {info.get('bitrate', 0)} kbps\n")
-                            f.write(f"  Size: {size_mb:.2f}MB\n\n")
-                        except Exception as e:
-                            f.write(f"MP4 Segment {idx:03d}: {mp4_file.name}\n")
-                            f.write(f"  Error reading info: {e}\n\n")
-
-                    f.write("MP4 Summary:\n")
-                    f.write(f"  Total MP4 Segments: {len(mp4_files)}\n")
-                    
-                    # Calculate totals for MP4 summary
-                    total_mp4_size = 0.0
-                    total_mp4_duration = 0.0
-                    total_mp4_frames = 0
-                    
-                    for mp4_file in mp4_files:
-                        try:
-                            info = FFmpegUtils.get_video_info(str(mp4_file))
-                            total_mp4_size += mp4_file.stat().st_size / (1024 * 1024)
-                            total_mp4_duration += float(info.get('duration', 0.0) or 0.0)
-                            total_mp4_frames += int(info.get('frame_count', 0) or 0)
-                        except Exception:
-                            pass
-                    
-                    f.write(f"  Total Size: {total_mp4_size:.2f}MB\n")
-                    f.write(f"  Total Duration: {total_mp4_duration:.2f}s\n")
-                    f.write(f"  Total Frames: {total_mp4_frames}\n")
-                    if len(mp4_files) > 0:
-                        f.write(f"  Average Size: {total_mp4_size/len(mp4_files):.2f}MB\n")
-                        f.write(f"  Average Duration: {total_mp4_duration/len(mp4_files):.2f}s\n")
-                        f.write(f"  Average FPS: {total_mp4_frames/total_mp4_duration if total_mp4_duration>0 else 0:.2f}\n")
-                    f.write("\n")
-
-                # GIF details
-                if gif_files:
-                    f.write("GIF Segments Details:\n")
-                    f.write("--------------------\n")
-                    for idx, gif_file in enumerate(gif_files, 1):
-                        try:
-                            # Get comprehensive GIF information using the existing method
-                            gif_info = self._get_gif_info_for_summary(str(gif_file))
-                            size_mb = gif_file.stat().st_size / (1024 * 1024)
-                            duration = gif_info.get('duration', 0.0)
-                            fps = gif_info.get('fps', 0.0)
-                            width = gif_info.get('width', 0)
-                            height = gif_info.get('height', 0)
-                            estimated_frames = int(round(duration * fps)) if duration > 0 and fps > 0 else 0
-                            
-                            f.write(f"GIF Segment {idx:03d}: {gif_file.name}\n")
-                            f.write(f"  Duration: {duration:.2f}s\n")
-                            f.write(f"  FPS: {fps:.2f}\n")
-                            f.write(f"  Estimated Frame Count: {estimated_frames}\n")
-                            f.write(f"  Resolution: {width}x{height}\n")
-                            f.write(f"  Size: {size_mb:.2f}MB\n\n")
-                        except Exception as e:
-                            f.write(f"GIF Segment {idx:03d}: {gif_file.name}\n")
-                            f.write(f"  Error reading info: {e}\n\n")
-
-                    f.write("GIF Summary:\n")
-                    f.write(f"  Total GIF Segments: {len(gif_files)}\n")
-                    
-                    # Calculate totals for GIF summary
-                    total_gif_size = 0.0
-                    total_gif_duration = 0.0
-                    total_gif_frames = 0
-                    
-                    for gif_file in gif_files:
-                        try:
-                            gif_info = self._get_gif_info_for_summary(str(gif_file))
-                            total_gif_size += gif_file.stat().st_size / (1024 * 1024)
-                            total_gif_duration += gif_info.get('duration', 0.0)
-                            fps = gif_info.get('fps', 0.0)
-                            duration = gif_info.get('duration', 0.0)
-                            if duration > 0 and fps > 0:
-                                total_gif_frames += int(round(duration * fps))
-                        except Exception:
-                            pass
-                    
-                    f.write(f"  Total Size: {total_gif_size:.2f}MB\n")
-                    f.write(f"  Total Duration: {total_gif_duration:.2f}s\n")
-                    f.write(f"  Estimated Total Frames: {total_gif_frames}\n")
-                    if len(gif_files) > 0:
-                        f.write(f"  Average Size: {total_gif_size/len(gif_files):.2f}MB\n")
-                        f.write(f"  Average Duration: {total_gif_duration/len(gif_files):.2f}s\n")
-                        f.write(f"  Average FPS: {total_gif_frames/total_gif_duration if total_gif_duration>0 else 0:.2f}\n")
-                    f.write("\n")
-
-                # Overall
-                total_files = len(mp4_files) + len(gif_files)
-                f.write("Overall Summary:\n")
-                f.write("---------------\n")
-                f.write(f"Total Files: {total_files}\n")
-                f.write(f"File Types: MP4 ({len(mp4_files)}), GIF ({len(gif_files)})\n")
-                
-                # Calculate overall totals
-                total_size = 0.0
-                total_duration = 0.0
-                total_frames = 0
-                
-                # Add MP4 totals
-                for mp4_file in mp4_files:
-                    try:
-                        info = FFmpegUtils.get_video_info(str(mp4_file))
-                        total_size += mp4_file.stat().st_size / (1024 * 1024)
-                        total_duration += float(info.get('duration', 0.0) or 0.0)
-                        total_frames += int(info.get('frame_count', 0) or 0)
-                    except Exception:
-                        pass
-                
-                # Add GIF totals
-                for gif_file in gif_files:
-                    try:
-                        gif_info = self._get_gif_info_for_summary(str(gif_file))
-                        total_size += gif_file.stat().st_size / (1024 * 1024)
-                        total_duration += gif_info.get('duration', 0.0)
-                        fps = gif_info.get('fps', 0.0)
-                        duration = gif_info.get('duration', 0.0)
-                        if duration > 0 and fps > 0:
-                            total_frames += int(round(duration * fps))
-                    except Exception:
-                        pass
-                
-                f.write(f"Total Size: {total_size:.2f}MB\n")
-                f.write(f"Total Duration: {total_duration:.2f}s\n")
-                f.write(f"Total Frames: {total_frames}\n")
-                if total_duration > 0:
-                    f.write(f"Overall Average FPS: {total_frames/total_duration:.2f}\n")
-
-            # Atomic replace
-            try:
-                os.replace(str(temp_file), str(summary_file))
-            except Exception:
-                try:
-                    subprocess.run(['attrib', '-R', '-S', '-H', str(summary_file)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-                    os.replace(str(temp_file), str(summary_file))
-                except Exception:
-                    try:
-                        if temp_file.exists():
-                            temp_file.unlink()
-                    except Exception:
-                        pass
-                    raise
-
-            # Do not hide the summary; folder.jpg controls thumbnail selection
-
-        except Exception as e:
-            logger.error(f"Failed to create comprehensive segments summary: {e}")
-            print(f"    ❌ Failed to create comprehensive summary: {e}")
-
-    def _get_gif_info_for_summary(self, gif_path: str) -> Dict[str, Any]:
-        """
-        Get GIF information for summary generation using FFmpeg.
-        This is a simplified version focused on summary needs.
-        """
-        try:
-            import subprocess
-            import re
-            
-            # Get basic file info
-            file_size = os.path.getsize(gif_path)
-            file_size_mb = file_size / (1024 * 1024)
-            
-            # Try to get GIF-specific info using FFmpeg
-            cmd = ['ffmpeg', '-i', gif_path]
-            try:
-                result = subprocess.run(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding='utf-8',
-                    errors='replace',
-                    timeout=30
-                )
-            except subprocess.TimeoutExpired as info_timeout:
-                logger.warning(f"FFmpeg summary probe timed out for {gif_path}: {info_timeout}")
-                try:
-                    self.analysis_tracker.record_timeout('summary_probe')
-                except Exception:
-                    logger.debug("Analysis tracker summary timeout recording failed", exc_info=True)
-                return {
-                    'duration': 0,
-                    'fps': 12.0,
-                    'width': 320,
-                    'height': 240,
-                    'file_size_mb': file_size_mb
-                }
-            
-            duration = 0
-            fps = 12.0  # Default GIF FPS
-            width = 320
-            height = 240
-            
-            if result.stderr:
-                # Parse FFmpeg output for GIF info
-                lines = result.stderr.split('\n')
-                for line in lines:
-                    if 'Duration:' in line:
-                        # Extract duration
-                        duration_match = re.search(r'Duration: (\d{2}):(\d{2}):(\d{2})\.(\d{2})', line)
-                        if duration_match:
-                            h, m, s, cs = map(int, duration_match.groups())
-                            duration = h * 3600 + m * 60 + s + cs / 100
-                    
-                    elif 'Video:' in line:
-                        # Extract resolution
-                        res_match = re.search(r'(\d+)x(\d+)', line)
-                        if res_match:
-                            width, height = map(int, res_match.groups())
-                        
-                        # Extract FPS if available
-                        fps_match = re.search(r'(\d+(?:\.\d+)?) fps', line)
-                        if fps_match:
-                            fps = float(fps_match.group(1))
-            
-            return {
-                'duration': duration,
-                'fps': fps,
-                'width': width,
-                'height': height,
-                'file_size_mb': file_size_mb
-            }
-            
-        except Exception as e:
-            logger.warning(f"Error getting GIF info for summary: {e}")
-            return {
-                'duration': 0,
-                'fps': 12.0,
-                'width': 320,
-                'height': 240,
-                'file_size_mb': 0
-            }
-
     def _ensure_segments_summary_exists(self, segments_folder: Path) -> None:
         """Ensure a comprehensive summary exists for the segments folder"""
         try:
@@ -5076,7 +4787,12 @@ class AutomatedWorkflow:
                 return
 
             # Create sanitized summary if none exists
-            self._create_comprehensive_segments_summary(segments_folder, base_name)
+            write_segments_summary(
+                segments_folder,
+                base_name,
+                logger=logger,
+                analysis_tracker=self.analysis_tracker,
+            )
             logger.info(f"Created comprehensive summary for existing segments folder: {segments_folder.name}")
          
         except Exception as e:

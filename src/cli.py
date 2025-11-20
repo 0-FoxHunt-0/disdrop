@@ -474,7 +474,7 @@ class VideoCompressorCLI:
         parser.add_argument('--bitrate-safety-margin', type=float, metavar='MULTIPLIER',
                           help='Safety margin multiplier for bitrate calculations (default: 1.1)')
         parser.add_argument('--min-resolution', nargs=2, type=int, metavar=('WIDTH', 'HEIGHT'),
-                          help='Override minimum resolution constraints (e.g., --min-resolution 320 180)')
+                          help='Override minimum resolution constraints (e.g., --min-resolution 1280 720)')
         parser.add_argument('--min-fps', type=float, metavar='FPS',
                           help='Override minimum FPS constraint (default: 10)')
         
