@@ -28,6 +28,7 @@ from .bitrate_validator import BitrateValidator, BitrateValidationError
 from .adaptive_parameter_adjuster import AdaptiveParameterAdjuster
 from .compression_strategy import SmartCompressionStrategy, CompressionStrategy, CompressionConstraints
 from .quality_improvement_engine import QualityImprovementEngine, FailureAnalysis, ImprovementPlan, CompressionParams as QICompressionParams
+from ..utils.segments_summary import write_segments_summary
 # FastQualityEstimator replaced by unified QualityPredictor
 from .performance_monitor import PerformanceMonitor
 from .performance_controls import PerformanceController
@@ -1224,13 +1225,16 @@ class DynamicVideoCompressor:
     # ===== Content-Adaptive Encoding (CAE) for Discord 10MB =====
     
     def _compress_with_cae_discord_10mb(self, input_path: str, output_path: str,
-                                       video_info: Dict[str, Any]) -> Dict[str, Any]:
+                                       video_info: Dict[str, Any],
+                                       platform_config: Optional[Dict[str, Any]] = None,
+                                       platform: Optional[str] = None) -> Dict[str, Any]:
         """Content-Adaptive Encoding pipeline optimized for Discord 10MB limit.
         
         Uses 2-pass x264, BPP-driven resolution/FPS selection, VMAF/SSIM quality gates,
         artifact detection, and adaptive refine loop.
         """
         logger.info("=== Starting Discord 10MB CAE Pipeline ===")
+        platform_config = platform_config or {}
         
         # Load profile config
         profile_cfg = self.config.get('video_compression.profiles.discord_10mb', {})
@@ -1514,9 +1518,58 @@ class DynamicVideoCompressor:
         initial_params['bitrate'] = target_video_bitrate_kbps
         initial_params['audio_bitrate'] = audio_bitrate_kbps
         initial_params['encoder'] = 'libx264'  # Default encoder for CAE pipeline
+
+        guardrail_cfg = profile_cfg.get('guardrails', {}) or {}
+        guardrail_details = {}
+        min_short_side = int(guardrail_cfg.get('min_short_side_px', 0) or 0)
+        short_side = min(initial_params['width'], initial_params['height'])
+        if min_short_side and short_side < min_short_side:
+            guardrail_details = {
+                'requested_width': initial_params['width'],
+                'requested_height': initial_params['height'],
+                'short_side_px': short_side,
+                'min_short_side_px': min_short_side,
+                'video_duration': video_info.get('duration'),
+                'video_size_mb': video_info.get('size_mb')
+            }
+            logger.warning(
+                "CAE guardrail triggered before encode: predicted %dx%d falls below %dpx short-side floor",
+                initial_params['width'],
+                initial_params['height'],
+                min_short_side
+            )
+            logger.info("Rerouting to segmentation to preserve watchable resolution before CAE encode")
+            video_info_guard = video_info.copy()
+            video_info_guard['requires_segmentation'] = True
+            video_info_guard['segmentation_reason'] = 'cae_resolution_guardrail'
+            video_info_guard['guardrail_details'] = guardrail_details
+            segmentation_result = self._compress_with_segmentation(
+                input_path,
+                output_path,
+                size_limit_mb,
+                platform_config,
+                video_info_guard,
+                platform or 'discord'
+            )
+            if not segmentation_result:
+                segmentation_result = {
+                    'success': False,
+                    'error': 'Segmentation guardrail failed to produce output',
+                    'method': 'segmentation_guardrail_failed'
+                }
+            segmentation_result['guardrail_triggered'] = True
+            segmentation_result['guardrail_reason'] = 'discord_resolution_guardrail'
+            segmentation_result['guardrail_details'] = guardrail_details
+            segmentation_result.setdefault('method', 'segmentation')
+            segmentation_result.setdefault('is_segmented_output', True)
+            segmentation_result.setdefault('video_info', video_info_guard)
+            segmentation_result.setdefault('segmentation_trigger', 'cae_resolution_guardrail')
+            return segmentation_result
         
-        logger.info(f"Initial target: {initial_params['width']}x{initial_params['height']}@{initial_params['fps']}fps, "
-                   f"BPP={bpp_min:.3f}, bitrate={target_video_bitrate_kbps}k")
+        logger.info(
+            f"Initial target: {initial_params['width']}x{initial_params['height']}@{initial_params['fps']}fps, "
+            f"BPP={bpp_min:.3f}, bitrate={target_video_bitrate_kbps}k"
+        )
         
         # Step 3.5: Pre-encoding bitrate validation and parameter adjustment
         if self.bitrate_validator.is_validation_enabled():
@@ -2773,7 +2826,9 @@ class DynamicVideoCompressor:
             
             if use_cae:
                 try:
-                    cae_result = self._compress_with_cae_discord_10mb(input_path, output_path, video_info)
+                    cae_result = self._compress_with_cae_discord_10mb(
+                        input_path, output_path, video_info, platform_config, platform
+                    )
                     if cae_result.get('success'):
                         final_size_mb = cae_result.get('compressed_size_mb') or cae_result.get('size_mb')
                         self._end_compression_session(True, output_path, final_size_mb)
@@ -4378,9 +4433,13 @@ class DynamicVideoCompressor:
                     'failed_segments': failed_segments
                 }
             
-            # Create segments summary for batch processing
+            # Create canonical segments summary for batch processing
             try:
-                self._create_segments_summary(segments_folder, organized_segments, base_name)
+                write_segments_summary(
+                    segments_folder,
+                    base_name,
+                    logger=logger,
+                )
             except Exception as e:
                 logger.warning(f"Failed to create segments summary: {e}")
             
@@ -4401,48 +4460,6 @@ class DynamicVideoCompressor:
                 'success': False,
                 'error': f"Segment organization exception: {str(e)}"
             }
-
-    def _create_segments_summary(self, segments_folder: str, segments: List[Dict[str, Any]], base_name: str):
-        """
-        Create a summary file for segmentation fallback outputs
-        
-        Args:
-            segments_folder: Path to segments folder
-            segments: List of organized segment information
-            base_name: Base name for the summary file
-        """
-        try:
-            summary_path = os.path.join(segments_folder, f"{base_name}_segments_summary.json")
-            
-            summary_data = {
-                'base_name': base_name,
-                'creation_time': time.time(),
-                'creation_method': 'segmentation_fallback',
-                'num_segments': len(segments),
-                'total_size_mb': sum(s.get('size_mb', 0) for s in segments),
-                'total_duration': sum(s.get('duration', 0) for s in segments),
-                'segments': [
-                    {
-                        'index': segment.get('index', 0),
-                        'filename': segment.get('filename', ''),
-                        'size_mb': segment.get('size_mb', 0),
-                        'duration': segment.get('duration', 0),
-                        'start_time': segment.get('start_time', 0),
-                        'method': segment.get('method', 'segmentation_fallback'),
-                        'quality_score': segment.get('quality_score', 8.0),
-                        'bitrate_validated': segment.get('bitrate_validated', True)
-                    }
-                    for segment in segments
-                ]
-            }
-            
-            with open(summary_path, 'w', encoding='utf-8') as f:
-                json.dump(summary_data, f, indent=2)
-            
-            logger.info(f"Created segments summary: {summary_path}")
-            
-        except Exception as e:
-            logger.warning(f"Failed to create segments summary: {e}")
 
     def _ensure_consistent_segment_naming(self, segments_folder: str, base_name: str) -> bool:
         """

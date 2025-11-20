@@ -23,6 +23,7 @@ from ..hardware_detector import HardwareDetector
 from ..ffmpeg_utils import FFmpegUtils
 from .bitrate_validator import BitrateValidator, ValidationResult
 from .adaptive_parameter_adjuster import AdaptiveParameterAdjuster
+from ..utils.segments_summary import write_segments_summary
 
 logger = logging.getLogger(__name__)
 
@@ -1221,9 +1222,6 @@ class VideoSegmenter:
             
             if renamed_count > 0:
                 logger.info(f"Updated {renamed_count} segment names for consistent batch processing")
-                
-                # Update segments index file for batch processing
-                self._create_batch_processing_index(segments_folder, base_name)
             
             return True
             
@@ -1231,44 +1229,6 @@ class VideoSegmenter:
             logger.error(f"Error ensuring consistent segment naming: {e}")
             return False
 
-    def _create_batch_processing_index(self, segments_folder: str, base_name: str):
-        """
-        Create an index file for batch processing of segments
-        
-        Args:
-            segments_folder: Path to segments folder
-            base_name: Base name for the index file
-        """
-        try:
-            # Find all segments
-            segment_files = []
-            for file in os.listdir(segments_folder):
-                if file.endswith('.mp4') and 'segment' in file:
-                    segment_files.append(file)
-            
-            segment_files.sort()
-            
-            # Create batch processing index
-            index_path = os.path.join(segments_folder, f"{base_name}_batch_index.txt")
-            with open(index_path, 'w', encoding='utf-8') as f:
-                f.write(f"# Batch Processing Index for {base_name}\n")
-                f.write(f"# Created: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"# Total segments: {len(segment_files)}\n")
-                f.write(f"# Segmentation method: bitrate_constrained\n\n")
-                
-                for i, filename in enumerate(segment_files):
-                    file_path = os.path.join(segments_folder, filename)
-                    try:
-                        size_mb = os.path.getsize(file_path) / (1024 * 1024)
-                        f.write(f"{i+1:03d}\t{filename}\t{size_mb:.2f}MB\n")
-                    except Exception:
-                        f.write(f"{i+1:03d}\t{filename}\t0.00MB\n")
-            
-            logger.info(f"Created batch processing index: {index_path}")
-            
-        except Exception as e:
-            logger.warning(f"Failed to create batch processing index: {e}")
-    
     def _optimize_oversized_segment(self, segment_path: str, duration: float, 
                                   video_info: Dict[str, Any], platform_config: Dict[str, Any], 
                                   target_size_mb: float) -> Dict[str, Any]:
@@ -1761,50 +1721,6 @@ class VideoSegmenter:
             logger.error(f"Failed to get basic video info: {e}")
             raise
     
-    def _create_segments_summary(self, segments_folder: str, segments: List[Dict[str, Any]], 
-                               base_name: str, total_duration: float):
-        """Create a summary file with segment information"""
-        try:
-            summary_file = os.path.join(segments_folder, f"{base_name}_segments_summary.txt")
-            
-            with open(summary_file, 'w') as f:
-                f.write(f"Video Segments Summary\n")
-                f.write(f"=====================\n\n")
-                f.write(f"Base Name: {base_name}\n")
-                f.write(f"Total Duration: {total_duration:.2f} seconds\n")
-                f.write(f"Number of Segments: {len(segments)}\n")
-                f.write(f"Created: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-                
-                f.write(f"Segment Details:\n")
-                f.write(f"---------------\n")
-                
-                total_size = 0
-                optimized_count = 0
-                for segment in segments:
-                    f.write(f"Segment {segment['index']:03d}:\n")
-                    f.write(f"  Duration: {segment['duration']:.2f}s\n")
-                    f.write(f"  Start Time: {segment['start_time']:.2f}s\n")
-                    f.write(f"  Size: {segment['size_mb']:.2f}MB\n")
-                    f.write(f"  Method: {segment['method']}\n")
-                    f.write(f"  Quality Score: {segment['quality_score']:.1f}\n")
-                    if segment.get('optimization_applied', False):
-                        f.write(f"  Optimization Applied: Yes\n")
-                        optimized_count += 1
-                    else:
-                        f.write(f"  Optimization Applied: No\n")
-                    f.write(f"  File: {os.path.basename(segment['path'])}\n\n")
-                    
-                    total_size += segment['size_mb']
-                
-                f.write(f"Total Size: {total_size:.2f}MB\n")
-                f.write(f"Average Segment Size: {total_size/len(segments):.2f}MB\n")
-                f.write(f"Segments Optimized: {optimized_count}/{len(segments)}\n")
-            
-            logger.info(f"Created segments summary: {summary_file}")
-            
-        except Exception as e:
-            logger.warning(f"Failed to create segments summary: {e}")
-    
     def _finalize_segments(self, results: Dict[str, Any], output_base_path: str) -> Dict[str, Any]:
         """Move segments from temp folder to final location with strict size enforcement"""
         try:
@@ -1860,7 +1776,11 @@ class VideoSegmenter:
             
             # Create comprehensive summary for the segments folder
             try:
-                self._create_comprehensive_segments_summary(final_segments_folder, base_name)
+                write_segments_summary(
+                    final_segments_folder,
+                    base_name,
+                    logger=logger,
+                )
             except Exception as e:
                 logger.warning(f"Could not create comprehensive summary: {e}")
             
@@ -2042,182 +1962,3 @@ class VideoSegmenter:
                 if target is self.current_ffmpeg_process:
                     self.current_ffmpeg_process = None 
 
-    def _create_comprehensive_segments_summary(self, segments_folder: str, base_name: str) -> None:
-        """
-        Create a comprehensive summary file for both MP4 and GIF segments in a segments folder.
-        The summary will be prefixed with '~' to ensure it appears last in folder listings.
-        """
-        try:
-            import time
-            from ..ffmpeg_utils import FFmpegUtils
-            
-            # Find all MP4 and GIF files in the segments folder
-            mp4_files = [f for f in os.listdir(segments_folder) if f.lower().endswith('.mp4')]
-            gif_files = [f for f in os.listdir(segments_folder) if f.lower().endswith('.gif')]
-            
-            if not mp4_files and not gif_files:
-                logger.info(f"No MP4 or GIF files found in segments folder: {segments_folder}")
-                return
-            
-            # Create summary filename with '~' prefix to ensure it appears last
-            summary_file = os.path.join(segments_folder, f"~{base_name}_comprehensive_summary.txt")
-            temp_file = os.path.join(segments_folder, f"~{base_name}_comprehensive_summary.txt.tmp")
-            # Best-effort clear attributes
-            try:
-                if os.path.exists(summary_file):
-                    subprocess.run(['attrib', '-R', '-S', '-H', summary_file], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-            except Exception:
-                pass
-            
-            # Write to temp file first
-            try:
-                if os.path.exists(temp_file):
-                    os.remove(temp_file)
-            except Exception:
-                pass
-            with open(temp_file, 'w', encoding='utf-8') as f:
-                f.write("Comprehensive Segments Summary\n")
-                f.write("=============================\n\n")
-                f.write(f"Base Name: {base_name}\n")
-                f.write(f"Created: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"Total MP4 Segments: {len(mp4_files)}\n")
-                f.write(f"Total GIF Segments: {len(gif_files)}\n")
-                f.write(f"Total Files: {len(mp4_files) + len(gif_files)}\n\n")
-
-                # MP4 details
-                if mp4_files:
-                    f.write("MP4 Segments Details:\n")
-                    f.write("--------------------\n")
-                    for idx, name in enumerate(mp4_files, 1):
-                        path = os.path.join(segments_folder, name)
-                        try:
-                            info = FFmpegUtils.get_video_info(path)
-                            size_mb = os.path.getsize(path) / (1024 * 1024)
-                            f.write(f"MP4 Segment {idx:03d}: {name}\n")
-                            f.write(f"  Duration: {info.get('duration', 0.0):.2f}s\n")
-                            f.write(f"  FPS: {info.get('fps', 0.0):.2f}\n")
-                            f.write(f"  Frame Count: {info.get('frame_count', 0)}\n")
-                            f.write(f"  Resolution: {info.get('width', 0)}x{info.get('height', 0)}\n")
-                            f.write(f"  Codec: {info.get('codec', 'unknown')}\n")
-                            f.write(f"  Bitrate: {info.get('bitrate', 0)} kbps\n")
-                            f.write(f"  Size: {size_mb:.2f}MB\n\n")
-                        except Exception as e:
-                            f.write(f"MP4 Segment {idx:03d}: {name}\n")
-                            f.write(f"  Error reading info: {e}\n\n")
-
-                    f.write("MP4 Summary:\n")
-                    f.write(f"  Total MP4 Segments: {len(mp4_files)}\n\n")
-
-                # GIF details
-                if gif_files:
-                    f.write("GIF Segments Details:\n")
-                    f.write("--------------------\n")
-                    for idx, name in enumerate(gif_files, 1):
-                        path = os.path.join(segments_folder, name)
-                        try:
-                            size_mb = os.path.getsize(path) / (1024 * 1024)
-                            f.write(f"GIF Segment {idx:03d}: {name}\n")
-                            f.write(f"  Size: {size_mb:.2f}MB\n\n")
-                        except Exception as e:
-                            f.write(f"GIF Segment {idx:03d}: {name}\n")
-                            f.write(f"  Error reading info: {e}\n\n")
-
-                    f.write("GIF Summary:\n")
-                    f.write(f"  Total GIF Segments: {len(gif_files)}\n\n")
-
-                # Overall
-                total_files = len(mp4_files) + len(gif_files)
-                f.write("Overall Summary:\n")
-                f.write("---------------\n")
-                f.write(f"Total Files: {total_files}\n")
-                f.write(f"File Types: MP4 ({len(mp4_files)}), GIF ({len(gif_files)})\n")
-
-            # Atomic replace
-            try:
-                os.replace(temp_file, summary_file)
-            except Exception:
-                try:
-                    subprocess.run(['attrib', '-R', '-S', '-H', summary_file], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-                    os.replace(temp_file, summary_file)
-                except Exception:
-                    try:
-                        if os.path.exists(temp_file):
-                            os.remove(temp_file)
-                    except Exception:
-                        pass
-                    raise
-
-            # Do not hide the summary; folder.jpg controls thumbnail selection
-
-        except Exception as e:
-            logger.warning(f"Failed to create segments summary: {e}")
-
-    def _get_gif_info_for_summary(self, gif_path: str) -> Dict[str, Any]:
-        """
-        Get GIF information for summary generation using FFmpeg.
-        This is a simplified version focused on summary needs.
-        """
-        try:
-            import subprocess
-            import re
-            
-            # Get basic file info
-            file_size = os.path.getsize(gif_path)
-            file_size_mb = file_size / (1024 * 1024)
-            
-            # Try to get GIF-specific info using FFmpeg
-            cmd = ['ffmpeg', '-i', gif_path]
-            result = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding='utf-8',
-                errors='replace',
-                timeout=30
-            )
-            
-            duration = 0
-            fps = 12.0  # Default GIF FPS
-            width = 320
-            height = 240
-            
-            if result.stderr:
-                # Parse FFmpeg output for GIF info
-                lines = result.stderr.split('\n')
-                for line in lines:
-                    if 'Duration:' in line:
-                        # Extract duration
-                        duration_match = re.search(r'Duration: (\d{2}):(\d{2}):(\d{2})\.(\d{2})', line)
-                        if duration_match:
-                            h, m, s, cs = map(int, duration_match.groups())
-                            duration = h * 3600 + m * 60 + s + cs / 100
-                    
-                    elif 'Video:' in line:
-                        # Extract resolution
-                        res_match = re.search(r'(\d+)x(\d+)', line)
-                        if res_match:
-                            width, height = map(int, res_match.groups())
-                        
-                        # Extract FPS if available
-                        fps_match = re.search(r'(\d+(?:\.\d+)?) fps', line)
-                        if fps_match:
-                            fps = float(fps_match.group(1))
-            
-            return {
-                'duration': duration,
-                'fps': fps,
-                'width': width,
-                'height': height,
-                'file_size_mb': file_size_mb
-            }
-            
-        except Exception as e:
-            logger.warning(f"Error getting GIF info for summary: {e}")
-            return {
-                'duration': 0,
-                'fps': 12.0,
-                'width': 320,
-                'height': 240,
-                'file_size_mb': 0
-            } 

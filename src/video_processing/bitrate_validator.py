@@ -55,7 +55,7 @@ class BitrateValidationError(Exception):
             if self.deficit_ratio > 3.0:
                 suggestions = [
                     "• CRITICAL: Bitrate is extremely low - consider segmentation",
-                    "• Reduce resolution to 320x180 or lower",
+                    "• Reduce resolution toward the 1280x720 floor (avoid smaller outputs)",
                     "• Lower frame rate to 10-15 fps",
                     "• Split video into multiple smaller files",
                     "• Increase target file size if possible"
@@ -115,6 +115,10 @@ class BitrateValidator:
     def __init__(self, config: ConfigManager):
         self.config = config
         
+        min_resolution = self.config.get('video_compression.bitrate_validation.min_resolution', {})
+        self.min_resolution_width = min_resolution.get('width', 1280)
+        self.min_resolution_height = min_resolution.get('height', 720)
+        
         # Load encoder minimums from config or use defaults
         self.encoder_minimums = self._load_encoder_minimums()
         
@@ -149,11 +153,7 @@ class BitrateValidator:
         
         # Default fallback resolutions for extreme compression scenarios
         defaults = [
-            (320, 180),   # Ultra-low for extreme cases
-            (426, 240),   # 240p
-            (480, 270),   # 270p
-            (640, 360),   # 360p
-            (854, 480),   # 480p
+            (1280, 720),  # Enforce 720p minimum
         ]
         
         # Convert config format to tuples if provided
@@ -166,7 +166,15 @@ class BitrateValidator:
         else:
             fallback_resolutions = defaults
         
-        return fallback_resolutions
+        filtered_resolutions = [
+            (w, h) for w, h in fallback_resolutions
+            if w >= self.min_resolution_width and h >= self.min_resolution_height
+        ]
+        
+        if not filtered_resolutions:
+            filtered_resolutions = [(self.min_resolution_width, self.min_resolution_height)]
+        
+        return filtered_resolutions
     
     def validate_bitrate(self, bitrate_kbps: int, encoder: str) -> ValidationResult:
         """

@@ -89,8 +89,8 @@ class SmartCompressionStrategy:
             min_fps=self.config.get('video_compression.bitrate_validation.min_fps', 20),
             max_file_size_mb=self.config.get('video_compression.max_file_size_mb', 10),
             min_resolution=(
-                self.config.get('video_compression.bitrate_validation.min_resolution.width', 320),
-                self.config.get('video_compression.bitrate_validation.min_resolution.height', 180)
+                self.config.get('video_compression.bitrate_validation.min_resolution.width', 1280),
+                self.config.get('video_compression.bitrate_validation.min_resolution.height', 720)
             ),
             fps_reduction_steps=self.config.get('video_compression.bitrate_validation.fps_reduction_steps', [0.8, 0.6, 0.5]),
             prefer_quality_over_fps=self.config.get('video_compression.prefer_quality_over_fps', True)

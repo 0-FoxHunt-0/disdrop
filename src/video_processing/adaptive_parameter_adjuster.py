@@ -48,8 +48,8 @@ class AdaptiveParameterAdjuster:
         self.safety_margin = self.config.get('video_compression.bitrate_validation.safety_margin', 1.1)
         
         # Resolution adjustment settings
-        self.min_resolution_width = self.config.get('video_compression.bitrate_validation.min_resolution.width', 320)
-        self.min_resolution_height = self.config.get('video_compression.bitrate_validation.min_resolution.height', 180)
+        self.min_resolution_width = self.config.get('video_compression.bitrate_validation.min_resolution.width', 1280)
+        self.min_resolution_height = self.config.get('video_compression.bitrate_validation.min_resolution.height', 720)
         
         # FPS adjustment settings - use config default of 20 to match video_compression.yaml
         self.min_fps = self.config.get('video_compression.bitrate_validation.min_fps', 20)
@@ -80,8 +80,8 @@ class AdaptiveParameterAdjuster:
         # Reload values
         self.min_fps = self.config.get('video_compression.bitrate_validation.min_fps', 20)
         self.fps_reduction_steps = self.config.get('video_compression.bitrate_validation.fps_reduction_steps', [0.8, 0.6, 0.5])
-        self.min_resolution_width = self.config.get('video_compression.bitrate_validation.min_resolution.width', 320)
-        self.min_resolution_height = self.config.get('video_compression.bitrate_validation.min_resolution.height', 180)
+        self.min_resolution_width = self.config.get('video_compression.bitrate_validation.min_resolution.width', 1280)
+        self.min_resolution_height = self.config.get('video_compression.bitrate_validation.min_resolution.height', 720)
         
         # Log changes
         if old_min_fps != self.min_fps:
@@ -98,12 +98,7 @@ class AdaptiveParameterAdjuster:
         
         # Default cascade from highest to lowest quality
         default_cascade = [
-            (1280, 720),   # 720p
-            (854, 480),    # 480p
-            (640, 360),    # 360p
-            (480, 270),    # 270p
-            (426, 240),    # 240p
-            (320, 180),    # Ultra-low for extreme cases
+            (1280, 720),   # Enforce 720p minimum
         ]
         
         if config_resolutions:
@@ -114,6 +109,10 @@ class AdaptiveParameterAdjuster:
                 return default_cascade
         
         return default_cascade
+
+    def _is_resolution_allowed(self, width: int, height: int) -> bool:
+        """Check whether a resolution satisfies configured minimums"""
+        return width >= self.min_resolution_width and height >= self.min_resolution_height
     
     def adjust_for_bitrate_floor(self, params: Dict[str, Any], min_bitrate: int, 
                                 video_info: Dict[str, Any], target_size_mb: float) -> ParameterAdjustment:
@@ -182,8 +181,13 @@ class AdaptiveParameterAdjuster:
         current_width = params.get('width', 1920)
         current_height = params.get('height', 1080)
         
+        allowed_fallbacks = [
+            (w, h) for w, h in self.fallback_resolutions
+            if self._is_resolution_allowed(w, h)
+        ]
+        
         # Try each fallback resolution
-        for width, height in self.fallback_resolutions:
+        for width, height in allowed_fallbacks:
             if width >= current_width and height >= current_height:
                 continue  # Skip if not actually reducing resolution
             
@@ -216,8 +220,8 @@ class AdaptiveParameterAdjuster:
                 )
         
         # Return best attempt even if it doesn't meet minimum
-        if self.fallback_resolutions:
-            width, height = self.fallback_resolutions[-1]  # Smallest resolution
+        if allowed_fallbacks:
+            width, height = allowed_fallbacks[-1]  # Smallest allowed resolution
             adjusted_params = params.copy()
             adjusted_params.update({
                 'width': width,
@@ -338,7 +342,12 @@ class AdaptiveParameterAdjuster:
         best_bitrate = 0
         
         # Try combinations of resolution and FPS reductions
-        for width, height in self.fallback_resolutions:
+        allowed_fallbacks = [
+            (w, h) for w, h in self.fallback_resolutions
+            if self._is_resolution_allowed(w, h)
+        ]
+        
+        for width, height in allowed_fallbacks:
             if width >= current_width and height >= current_height:
                 continue
             
@@ -420,7 +429,12 @@ class AdaptiveParameterAdjuster:
         # Filter to only resolutions smaller than original
         fallback_options = [
             (w, h) for w, h in self.fallback_resolutions
-            if w * h < original_pixels and w <= original_width and h <= original_height
+            if (
+                w * h < original_pixels
+                and w <= original_width
+                and h <= original_height
+                and self._is_resolution_allowed(w, h)
+            )
         ]
         
         # Sort by pixel count (descending - highest quality first)
