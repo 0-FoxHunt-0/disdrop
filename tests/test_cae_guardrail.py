@@ -104,3 +104,40 @@ def test_workflow_tracks_guardrail_segmentation(tmp_path, config_manager, monkey
     assert guardrail_events == 1
     assert segmentation_events == 1
 
+
+def test_cae_refine_respects_min_resolution(config_manager):
+    hardware = MagicMock()
+    compressor = DynamicVideoCompressor(config_manager, hardware)
+
+    video_info = {
+        'width': 1920,
+        'height': 1080,
+        'duration': 86.9,
+        'fps': 60.0,
+        'motion_level': 'high'
+    }
+    initial_params = {
+        'bitrate': 896,
+        'width': 1280,
+        'height': 720,
+        'fps': 24,
+        'audio_bitrate': 64,
+        'encoder': 'libx264'
+    }
+    quality_result = {'ssim_score': 0.90, 'vmaf_score': None}
+
+    strategy = compressor._calculate_refinement_strategy(
+        quality_pass=False,
+        output_size_mb=9.94,
+        size_limit_mb=9.95,
+        initial_params=initial_params,
+        audio_bitrate_kbps=64,
+        video_info=video_info,
+        duration=video_info['duration'],
+        bitrate_step=1.0,
+        refine_pass=2,
+        quality_result=quality_result
+    )
+
+    assert strategy['strategy'] != 'reduce_resolution'
+    assert strategy['adjusted_params']['height'] == 720

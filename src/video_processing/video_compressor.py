@@ -114,6 +114,21 @@ class DynamicVideoCompressor:
         cap = int(pixels_per_sec * max_bpp / 1000)
         # Absolute bounds: 500k-8000k
         return max(500, min(cap, 8000))
+
+    def _get_min_resolution(self) -> Tuple[int, int]:
+        """Return configured minimum resolution (width, height)."""
+        min_resolution = self.config.get('video_compression.bitrate_validation.min_resolution', {}) or {}
+        min_width = min_resolution.get('width', 1280)
+        min_height = min_resolution.get('height', 720)
+        return min_width, min_height
+
+    def _should_enforce_min_resolution(self, video_info: Dict[str, Any]) -> bool:
+        """Determine if minimum resolution guard applies to this video."""
+        min_width, min_height = self._get_min_resolution()
+        return (
+            video_info.get('width', 0) >= min_width
+            and video_info.get('height', 0) >= min_height
+        )
     
     def _is_debug_logging_enabled(self) -> bool:
         """Check if comprehensive debug logging is enabled."""
@@ -1298,6 +1313,18 @@ class DynamicVideoCompressor:
         # Step 1: Analyze content complexity
         motion_level = video_info.get('motion_level', 'medium')  # from _analyze_video_content
         logger.info(f"Content analysis: motion={motion_level}, complexity={video_info.get('complexity_score', 5.0):.1f}")
+
+        # Minimum resolution guard (enforced only when original input meets configured floor)
+        min_width, min_height = self._get_min_resolution()
+        enforce_min_resolution = self._should_enforce_min_resolution(video_info)
+        min_width_guard = min_width if enforce_min_resolution else None
+        min_height_guard = min_height if enforce_min_resolution else None
+        if enforce_min_resolution:
+            logger.debug(
+                "Minimum resolution guard active for CAE pipeline (%dx%d floor)",
+                min_width,
+                min_height
+            )
         
         # Step 2: Budget calculation (reserve audio)
         audio_range = profile_cfg.get('audio_kbps_range', [64, 96])
@@ -1502,17 +1529,31 @@ class DynamicVideoCompressor:
             emergency_video_info['height'] = emergency_height
             
             initial_params = self._select_resolution_fps_by_bpp(
-                emergency_video_info, target_video_bitrate_kbps, bpp_min, profile_cfg
+                emergency_video_info, target_video_bitrate_kbps, bpp_min, profile_cfg,
+                enforce_min_resolution=enforce_min_resolution
             )
             
             # Override with emergency resolution (in case BPP selection chose different)
-            initial_params['width'] = emergency_width
-            initial_params['height'] = emergency_height
+            if not enforce_min_resolution or (
+                min_width_guard is not None and min_height_guard is not None
+                and emergency_width >= min_width_guard and emergency_height >= min_height_guard
+            ):
+                initial_params['width'] = emergency_width
+                initial_params['height'] = emergency_height
+            else:
+                logger.warning(
+                    "Emergency resolution %dx%d violates minimum floor %dx%d; ignoring override",
+                    emergency_width,
+                    emergency_height,
+                    min_width_guard or 0,
+                    min_height_guard or 0
+                )
             
         else:
             # Normal BPP-driven selection
             initial_params = self._select_resolution_fps_by_bpp(
-                video_info, target_video_bitrate_kbps, bpp_min, profile_cfg
+                video_info, target_video_bitrate_kbps, bpp_min, profile_cfg,
+                enforce_min_resolution=enforce_min_resolution
             )
         
         initial_params['bitrate'] = target_video_bitrate_kbps
@@ -1753,10 +1794,16 @@ class DynamicVideoCompressor:
                                  f"Switching to resolution/FPS reduction instead of bitrate reduction.")
                     # Use resolution reduction
                     if initial_params['height'] > 480:
-                        new_width, new_height = self._scale_down_one_step(initial_params['width'], initial_params['height'])
-                        initial_params['width'] = new_width
-                        initial_params['height'] = new_height
-                        logger.info(f"Refine (overage, bitrate at min): scaling down to {new_width}x{new_height}")
+                        new_width, new_height = self._scale_down_one_step(
+                            initial_params['width'], initial_params['height'],
+                            min_width_guard, min_height_guard
+                        )
+                        if (new_width, new_height) == (initial_params['width'], initial_params['height']):
+                            logger.info("Minimum resolution guard prevented additional scaling during overage handling")
+                        else:
+                            initial_params['width'] = new_width
+                            initial_params['height'] = new_height
+                            logger.info(f"Refine (overage, bitrate at min): scaling down to {new_width}x{new_height}")
                     else:
                         # Try FPS reduction as last resort
                         min_fps = self.config.get('video_compression.bitrate_validation.min_fps', 20)
@@ -1786,10 +1833,16 @@ class DynamicVideoCompressor:
                             logger.warning(f"Bitrate reduction would go below minimum. Clamping to {min_encoder_bitrate}kbps")
                             # Also scale down resolution
                             if initial_params['height'] > 480:
-                                new_width, new_height = self._scale_down_one_step(initial_params['width'], initial_params['height'])
-                                initial_params['width'] = new_width
-                                initial_params['height'] = new_height
-                                logger.info(f"Refine (overage): scaling down to {new_width}x{new_height}")
+                                new_width, new_height = self._scale_down_one_step(
+                                    initial_params['width'], initial_params['height'],
+                                    min_width_guard, min_height_guard
+                                )
+                                if (new_width, new_height) == (initial_params['width'], initial_params['height']):
+                                    logger.info("Minimum resolution guard prevented additional scaling during aggressive overage handling")
+                                else:
+                                    initial_params['width'] = new_width
+                                    initial_params['height'] = new_height
+                                    logger.info(f"Refine (overage): scaling down to {new_width}x{new_height}")
                         initial_params['bitrate'] = new_bitrate
                     else:
                         # Less than 10% over: just reduce bitrate proportionally
@@ -1801,10 +1854,16 @@ class DynamicVideoCompressor:
                             logger.warning(f"Bitrate reduction would go below minimum. Clamping to {min_encoder_bitrate}kbps")
                             # Also try scaling down
                             if initial_params['height'] > 480:
-                                new_width, new_height = self._scale_down_one_step(initial_params['width'], initial_params['height'])
-                                initial_params['width'] = new_width
-                                initial_params['height'] = new_height
-                                logger.info(f"Refine (overage): scaling down to {new_width}x{new_height}")
+                                new_width, new_height = self._scale_down_one_step(
+                                    initial_params['width'], initial_params['height'],
+                                    min_width_guard, min_height_guard
+                                )
+                                if (new_width, new_height) == (initial_params['width'], initial_params['height']):
+                                    logger.info("Minimum resolution guard prevented additional scaling during minor overage handling")
+                                else:
+                                    initial_params['width'] = new_width
+                                    initial_params['height'] = new_height
+                                    logger.info(f"Refine (overage): scaling down to {new_width}x{new_height}")
                         initial_params['bitrate'] = new_bitrate
                 
                 logger.info(f"Refine (overage): reducing bitrate to {initial_params['bitrate']}k")
@@ -2032,12 +2091,17 @@ class DynamicVideoCompressor:
         return {'success': False, 'error': 'CAE quality gates failed', 'method': 'cae_failed'}
     
     def _select_resolution_fps_by_bpp(self, video_info: Dict[str, Any], 
-                                     target_bitrate_kbps: int, bpp_min: float,
-                                     profile_cfg: Dict[str, Any]) -> Dict[str, Any]:
+                                    target_bitrate_kbps: int, bpp_min: float,
+                                    profile_cfg: Dict[str, Any],
+                                    enforce_min_resolution: bool = False) -> Dict[str, Any]:
         """Select highest resolution and FPS that satisfy BPP floor constraint and encoder minimums."""
         orig_w = video_info['width']
         orig_h = video_info['height']
         orig_fps = video_info['fps']
+        min_width_guard = None
+        min_height_guard = None
+        if enforce_min_resolution:
+            min_width_guard, min_height_guard = self._get_min_resolution()
         
         # Get encoder minimum bitrate requirement
         encoder = 'libx264'  # Default encoder for CAE pipeline
@@ -2051,7 +2115,10 @@ class DynamicVideoCompressor:
         if not validation_result.is_valid and validation_result.severity == 'critical':
             logger.warning(f"Target bitrate {target_bitrate_kbps}kbps critically below {encoder} minimum {min_encoder_bitrate}kbps")
             logger.warning("Implementing progressive resolution reduction to meet bitrate floor")
-            return self._progressive_resolution_reduction(video_info, target_bitrate_kbps, bpp_min, profile_cfg, encoder)
+            return self._progressive_resolution_reduction(
+                video_info, target_bitrate_kbps, bpp_min, profile_cfg, encoder,
+                enforce_min_resolution=enforce_min_resolution
+            )
         
         # Candidate resolutions (maintain aspect ratio) - enhanced with more aggressive options
         aspect_ratio = orig_w / orig_h
@@ -2061,17 +2128,30 @@ class DynamicVideoCompressor:
         for h in candidate_heights:
             if h > orig_h:
                 continue
+            if min_height_guard is not None and h < min_height_guard:
+                continue
             w = int(h * aspect_ratio)
             # Ensure even dimensions
             w = w if w % 2 == 0 else w - 1
             # Ensure minimum width of 64 pixels
             if w < 64:
                 w = 64
+            if min_width_guard is not None and w < min_width_guard:
+                continue
             candidates.append((w, h))
         
         # Add original resolution if not in list
         if orig_h not in candidate_heights:
             candidates.insert(0, (orig_w, orig_h))
+
+        if enforce_min_resolution and min_width_guard is not None and min_height_guard is not None:
+            if not any(w >= min_width_guard and h >= min_height_guard for w, h in candidates):
+                logger.warning(
+                    "Minimum resolution guard removed all downscale candidates (floor: %dx%d)",
+                    min_width_guard,
+                    min_height_guard
+                )
+                candidates = [(max(orig_w, min_width_guard), max(orig_h, min_height_guard))]
         
         # Candidate FPS values - expanded for bitrate floor scenarios
         # Use config minimum FPS instead of hardcoded 10
@@ -2128,12 +2208,17 @@ class DynamicVideoCompressor:
     
     def _progressive_resolution_reduction(self, video_info: Dict[str, Any], 
                                         target_bitrate_kbps: int, bpp_min: float,
-                                        profile_cfg: Dict[str, Any], encoder: str) -> Dict[str, Any]:
+                                        profile_cfg: Dict[str, Any], encoder: str,
+                                        enforce_min_resolution: bool = False) -> Dict[str, Any]:
         """Implement progressive resolution reduction until bitrate floor is met."""
         orig_w = video_info['width']
         orig_h = video_info['height']
         orig_fps = video_info['fps']
         min_encoder_bitrate = self.bitrate_validator.get_encoder_minimum(encoder)
+        min_width_guard = None
+        min_height_guard = None
+        if enforce_min_resolution:
+            min_width_guard, min_height_guard = self._get_min_resolution()
         
         logger.info(f"Starting progressive resolution reduction from {orig_w}x{orig_h}")
         
@@ -2147,6 +2232,10 @@ class DynamicVideoCompressor:
         # Add fallback resolutions maintaining aspect ratio
         for fallback_w, fallback_h in fallback_resolutions:
             if fallback_w <= orig_w and fallback_h <= orig_h:
+                if min_width_guard is not None and fallback_w < min_width_guard:
+                    continue
+                if min_height_guard is not None and fallback_h < min_height_guard:
+                    continue
                 # Adjust to maintain aspect ratio
                 if abs(fallback_w / fallback_h - aspect_ratio) > 0.1:  # Significant aspect ratio difference
                     # Recalculate to maintain aspect ratio
@@ -2161,13 +2250,24 @@ class DynamicVideoCompressor:
         ultra_low_heights = [120, 90, 72, 60]
         for h in ultra_low_heights:
             if h < orig_h:
+                if min_height_guard is not None and h < min_height_guard:
+                    continue
                 w = int(h * aspect_ratio)
                 w = max(64, w if w % 2 == 0 else w - 1)  # Ensure minimum width and even dimensions
+                if min_width_guard is not None and w < min_width_guard:
+                    continue
                 progressive_candidates.append((w, h))
         
         # Remove duplicates and sort by resolution (largest first)
         progressive_candidates = list(set(progressive_candidates))
         progressive_candidates.sort(key=lambda x: x[0] * x[1], reverse=True)
+        if not progressive_candidates:
+            logger.warning(
+                "Minimum resolution guard prevented progressive resolution reduction (floor: %dx%d)",
+                min_width_guard or 0,
+                min_height_guard or 0
+            )
+            return {'width': orig_w, 'height': orig_h, 'fps': orig_fps}
         
         # Progressive FPS reduction candidates
         # Use config minimum FPS instead of hardcoded 10
@@ -2185,6 +2285,10 @@ class DynamicVideoCompressor:
         # Try each resolution/FPS combination
         for i, (w, h) in enumerate(progressive_candidates):
             for fps in fps_candidates:
+                if min_width_guard is not None and w < min_width_guard:
+                    continue
+                if min_height_guard is not None and h < min_height_guard:
+                    continue
                 pixels_per_sec = w * h * fps
                 actual_bpp = target_bits_per_sec / pixels_per_sec
                 
@@ -2209,12 +2313,17 @@ class DynamicVideoCompressor:
     
     def _calculate_minimum_viable_resolution(self, video_info: Dict[str, Any], 
                                            target_bitrate_kbps: int, bpp_min: float,
-                                           profile_cfg: Dict[str, Any], encoder: str) -> Dict[str, Any]:
+                                           profile_cfg: Dict[str, Any], encoder: str,
+                                           enforce_min_resolution: bool = False) -> Dict[str, Any]:
         """Calculate the minimum viable resolution that can meet bitrate requirements."""
         min_encoder_bitrate = self.bitrate_validator.get_encoder_minimum(encoder)
         orig_w = video_info['width']
         orig_h = video_info['height']
         aspect_ratio = orig_w / orig_h
+        min_width_guard = None
+        min_height_guard = None
+        if enforce_min_resolution:
+            min_width_guard, min_height_guard = self._get_min_resolution()
         
         logger.info("Calculating minimum viable resolution for bitrate floor compliance")
         
@@ -2238,6 +2347,15 @@ class DynamicVideoCompressor:
         # Ensure even dimensions and minimum size
         max_width = max(64, max_width if max_width % 2 == 0 else max_width - 1)
         max_height = max(48, max_height if max_height % 2 == 0 else max_height - 1)
+
+        if min_width_guard is not None and min_height_guard is not None:
+            if max_width < min_width_guard or max_height < min_height_guard:
+                logger.warning(
+                    "Minimum resolution guard prevents calculating sub-floor resolution (%dx%d floor)",
+                    min_width_guard,
+                    min_height_guard
+                )
+                return {'width': min_width_guard, 'height': min_height_guard, 'fps': min_fps}
         
         # Validate this calculated resolution
         pixels_per_sec = max_width * max_height * min_fps
@@ -2412,6 +2530,11 @@ class DynamicVideoCompressor:
         encoder = initial_params.get('encoder', 'libx264')
         min_bitrate = self.bitrate_validator.get_encoder_minimum(encoder)
         config_min_fps = self.config.get('video_compression.bitrate_validation.min_fps', 20)
+        min_width_guard = None
+        min_height_guard = None
+        enforce_min_resolution = self._should_enforce_min_resolution(video_info)
+        if enforce_min_resolution:
+            min_width_guard, min_height_guard = self._get_min_resolution()
         
         # Get quality scores for logging
         vmaf_score = quality_result.get('vmaf_score') if quality_result else None
@@ -2532,7 +2655,28 @@ class DynamicVideoCompressor:
         
         # Strategy 3: Reduce resolution (last resort)
         # When reducing resolution, increase bitrate proportionally to maintain BPP
-        new_width, new_height = self._scale_down_one_step(current_width, current_height)
+        if enforce_min_resolution and min_width_guard is not None and min_height_guard is not None:
+            if current_width <= min_width_guard or current_height <= min_height_guard:
+                logger.warning(
+                    "Minimum resolution guard prevents further reduction (%dx%d floor)",
+                    min_width_guard,
+                    min_height_guard
+                )
+                return {
+                    'strategy': 'exhausted',
+                    'adjusted_params': initial_params.copy(),
+                    'reasoning': 'Minimum resolution guard prevents further reduction'
+                }
+        new_width, new_height = self._scale_down_one_step(
+            current_width, current_height, min_width_guard, min_height_guard
+        )
+        if new_width == current_width and new_height == current_height and enforce_min_resolution:
+            logger.warning("Resolution reduction blocked by minimum guard")
+            return {
+                'strategy': 'exhausted',
+                'adjusted_params': initial_params.copy(),
+                'reasoning': 'Minimum resolution guard prevents further reduction'
+            }
         
         if new_height >= 360:  # Minimum resolution check
             # Calculate bitrate increase needed to maintain BPP
@@ -2592,23 +2736,46 @@ class DynamicVideoCompressor:
             'reasoning': 'All refinement strategies exhausted'
         }
     
-    def _scale_down_one_step(self, width: int, height: int) -> Tuple[int, int]:
-        """Scale resolution down one step (e.g., 720p -> 540p)."""
+    def _scale_down_one_step(self, width: int, height: int,
+                             min_width: Optional[int] = None,
+                             min_height: Optional[int] = None) -> Tuple[int, int]:
+        """Scale resolution down one step (e.g., 720p -> 540p) with optional minimum guard."""
         common_heights = [1080, 720, 540, 480, 360, 270]
+        aspect_ratio = width / max(height, 1)
+        enforce_min = min_width is not None and min_height is not None
         
         for i, h in enumerate(common_heights):
             if height >= h and i + 1 < len(common_heights):
-                new_h = common_heights[i + 1]
-                aspect_ratio = width / height
-                new_w = int(new_h * aspect_ratio)
-                new_w = new_w if new_w % 2 == 0 else new_w - 1
-                return (new_w, new_h)
+                candidate_height = common_heights[i + 1]
+                if enforce_min and candidate_height < min_height:
+                    candidate_height = min_height
+                if candidate_height >= height:
+                    continue
+                candidate_width = int(candidate_height * aspect_ratio)
+                candidate_width = candidate_width if candidate_width % 2 == 0 else candidate_width - 1
+                if enforce_min and candidate_width < min_width:
+                    logger.debug(
+                        "Minimum resolution guard prevented width from dropping below %dpx",
+                        min_width
+                    )
+                    return (width, height)
+                return (candidate_width, candidate_height)
         
         # Fallback: scale by 0.75
         new_h = int(height * 0.75)
         new_h = new_h if new_h % 2 == 0 else new_h - 1
-        new_w = int(width * 0.75)
+        if enforce_min and new_h < min_height:
+            new_h = min_height
+        if new_h >= height:
+            return (width, height)
+        new_w = int(new_h * aspect_ratio)
         new_w = new_w if new_w % 2 == 0 else new_w - 1
+        if enforce_min and new_w < min_width:
+            logger.debug(
+                "Minimum resolution guard prevented fallback width from dropping below %dpx",
+                min_width
+            )
+            return (width, height)
         return (new_w, new_h)
     
     def _log_cae_metrics(self, metrics: Dict[str, Any]):
