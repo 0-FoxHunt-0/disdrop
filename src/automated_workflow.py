@@ -290,6 +290,9 @@ class AutomatedWorkflow:
         logger.info(f"Check interval: {check_interval} seconds")
         logger.info(f"Max file size: {max_size_mb}MB")
         
+        # Store active size limit for cache entries
+        self._active_cache_size_limit_mb = max_size_mb
+        
         # Ensure all existing segments folders have summaries
         try:
             self._ensure_all_segments_summaries_exist()
@@ -332,7 +335,7 @@ class AutomatedWorkflow:
                                 break
 
                             # Fast-skip using cache if enabled and previously verified success exists
-                            cached_success = self._is_cached_success(file_path)
+                            cached_success = self._is_cached_success(file_path, max_size_mb=max_size_mb)
                             if cached_success:
                                 if self.use_cache:
                                     try:
@@ -524,9 +527,32 @@ class AutomatedWorkflow:
                 logger.error(f"Result output_file: {result.get('output_file')}")
                 logger.error(f"Input file: {input_file}")
                 return 'error'
-            
             segments_folder = Path(segments_folder_path)
-            segments = result.get('segments', [])
+            if segments_folder.is_file():
+                logger.error(f"Expected segments directory but found file: {segments_folder}")
+                return 'error'
+            
+            segments = result.get('segments', []) or []
+            if not segments:
+                # Attempt to infer segments from filesystem if metadata was lost
+                discovered_segments = []
+                if segments_folder.exists():
+                    for candidate in segments_folder.glob("*.mp4"):
+                        try:
+                            size_mb = candidate.stat().st_size / (1024 * 1024)
+                        except OSError:
+                            size_mb = 0
+                        discovered_segments.append({
+                            'path': str(candidate),
+                            'size_mb': size_mb
+                        })
+                if discovered_segments:
+                    logger.warning("Segmentation metadata missing; inferred segments from filesystem.")
+                    segments = discovered_segments
+                    result['segments'] = segments
+                else:
+                    logger.error("Segmentation fallback produced no segments to organize.")
+                    return 'error'
             
             print(f"    ✅ Segmentation fallback successful: {segments_folder.name}")
             print(f"    📁 Created {len(segments)} segments totaling {result.get('size_mb', 0):.2f}MB")
@@ -541,7 +567,7 @@ class AutomatedWorkflow:
             
             if organized_result.get('success', False):
                 # Record success for caching
-                self._record_success_cache(input_file, 'segments', segments_folder)
+                self._record_success_cache(input_file, 'segments', segments_folder, max_size_mb=max_size_mb)
                 
                 # Generate GIFs from segments if needed
                 gif_success = self._generate_gifs_from_segments(segments_folder, max_size_mb)
@@ -577,7 +603,12 @@ class AutomatedWorkflow:
             Organization result dictionary
         """
         try:
-            # Ensure segments folder exists
+            # Ensure segments folder exists and is a directory
+            if segments_folder.exists() and segments_folder.is_file():
+                return {
+                    'success': False,
+                    'error': f"Segments path points to a file: {segments_folder}"
+                }
             segments_folder.mkdir(parents=True, exist_ok=True)
             
             base_name = input_file.stem
@@ -904,14 +935,22 @@ class AutomatedWorkflow:
         except Exception:
             return {'size': None, 'mtime': None}
 
-    def _is_cached_success(self, input_file: Path) -> bool:
+    def _is_cached_success(self, input_file: Path, max_size_mb: Optional[float] = None) -> bool:
         """Return True if input was previously verified successful and outputs still exist.
 
         This performs minimal checks for speed: input signature matches and basic output existence.
         Cache entries can persist between executions but are cleaned up if very old (>24 hours).
+        
+        Args:
+            input_file: The input file to check
+            max_size_mb: Current size limit to validate against (defaults to active workflow limit)
         """
         if not self.use_cache:
             return False
+        
+        # Use provided limit or fall back to active workflow limit
+        current_limit = max_size_mb if max_size_mb is not None else getattr(self, '_active_cache_size_limit_mb', None)
+        
         key = self._make_cache_key(input_file)
         rec = self._cache_index.get(key)
         if not isinstance(rec, dict):
@@ -925,6 +964,7 @@ class AutomatedWorkflow:
             safe_name = self._safe_filename_for_logging(input_file.name)
             logger.debug(f"Cache miss for {safe_name}: signature mismatch")
             return False
+        
         # Quick output existence check
         out_type = rec.get('type')
         out_path = rec.get('output')
@@ -932,41 +972,120 @@ class AutomatedWorkflow:
             safe_name = self._safe_filename_for_logging(input_file.name)
             logger.debug(f"Cache miss for {safe_name}: missing output info")
             return False
+        
+        # Check cached size limit if available
+        cached_limit = rec.get('max_size_mb')
+        needs_size_validation = False
+        validation_limit = current_limit
+        
+        if current_limit is not None:
+            if cached_limit is None:
+                # Legacy entry without size limit - need to validate
+                needs_size_validation = True
+                validation_limit = current_limit
+            elif current_limit < cached_limit:
+                # Current limit is stricter - need to revalidate
+                needs_size_validation = True
+                validation_limit = current_limit
+        elif cached_limit is not None:
+            # No current limit specified, but we have a cached limit
+            # Validate against cached limit to ensure file hasn't grown beyond original acceptable size
+            needs_size_validation = True
+            validation_limit = cached_limit
+        
         try:
             if out_type == 'single_gif':
                 exists = Path(out_path).exists()
-                if exists:
-                    safe_name = self._safe_filename_for_logging(input_file.name)
-                    logger.debug(f"Cache hit for {safe_name}: single GIF exists")
-                else:
+                if not exists:
                     safe_name = self._safe_filename_for_logging(input_file.name)
                     logger.debug(f"Cache miss for {safe_name}: single GIF missing - {out_path}")
-                return exists
+                    return False
+                
+                # Validate size if needed
+                if needs_size_validation:
+                    file_size_mb = self.file_validator.get_file_size_mb(str(out_path))
+                    if file_size_mb > validation_limit:
+                        safe_name = self._safe_filename_for_logging(input_file.name)
+                        logger.debug(f"Cache miss for {safe_name}: single GIF exceeds limit ({file_size_mb:.2f}MB > {validation_limit}MB)")
+                        # Remove invalid cache entry
+                        del self._cache_index[key]
+                        self._save_cache_index()
+                        return False
+                    # Update cache entry with stricter limit if current_limit is provided and stricter
+                    if current_limit is not None and (cached_limit is None or current_limit < cached_limit):
+                        rec['max_size_mb'] = current_limit
+                        self._save_cache_index()
+                
+                safe_name = self._safe_filename_for_logging(input_file.name)
+                logger.debug(f"Cache hit for {safe_name}: single GIF exists")
+                return True
+                
             elif out_type == 'segments':
                 seg_dir = Path(out_path)
                 if not seg_dir.exists() or not seg_dir.is_dir():
                     safe_name = self._safe_filename_for_logging(input_file.name)
                     logger.debug(f"Cache miss for {safe_name}: segments directory missing - {out_path}")
                     return False
+                
                 # Check if at least one GIF segment exists
                 gif_segments = list(seg_dir.glob("*.gif"))
-                if gif_segments:
-                    safe_name = self._safe_filename_for_logging(input_file.name)
-                    logger.debug(f"Cache hit for {safe_name}: {len(gif_segments)} GIF segments exist")
-                    return True
-                else:
+                if not gif_segments:
                     safe_name = self._safe_filename_for_logging(input_file.name)
                     logger.debug(f"Cache miss for {safe_name}: no GIF segments found in {out_path}")
                     return False
+                
+                # Validate size if needed
+                if needs_size_validation:
+                    all_valid = True
+                    for gif_file in gif_segments:
+                        file_size_mb = self.file_validator.get_file_size_mb(str(gif_file))
+                        if file_size_mb > validation_limit:
+                            safe_name = self._safe_filename_for_logging(input_file.name)
+                            logger.debug(f"Cache miss for {safe_name}: segment {gif_file.name} exceeds limit ({file_size_mb:.2f}MB > {validation_limit}MB)")
+                            all_valid = False
+                            break
+                    
+                    if not all_valid:
+                        # Remove invalid cache entry
+                        del self._cache_index[key]
+                        self._save_cache_index()
+                        return False
+                    
+                    # Update cache entry with stricter limit if current_limit is provided and stricter
+                    if current_limit is not None and (cached_limit is None or current_limit < cached_limit):
+                        rec['max_size_mb'] = current_limit
+                        self._save_cache_index()
+                
+                safe_name = self._safe_filename_for_logging(input_file.name)
+                logger.debug(f"Cache hit for {safe_name}: {len(gif_segments)} GIF segments exist")
+                return True
+                
             elif out_type == 'gif_input':
                 exists = Path(out_path).exists()
-                if exists:
-                    safe_name = self._safe_filename_for_logging(input_file.name)
-                    logger.debug(f"Cache hit for {safe_name}: GIF input exists")
-                else:
+                if not exists:
                     safe_name = self._safe_filename_for_logging(input_file.name)
                     logger.debug(f"Cache miss for {safe_name}: GIF input missing - {out_path}")
-                return exists
+                    return False
+                
+                # Validate size if needed
+                if needs_size_validation:
+                    file_size_mb = self.file_validator.get_file_size_mb(str(out_path))
+                    if file_size_mb > validation_limit:
+                        safe_name = self._safe_filename_for_logging(input_file.name)
+                        logger.debug(f"Cache miss for {safe_name}: GIF input exceeds limit ({file_size_mb:.2f}MB > {validation_limit}MB)")
+                        # Remove invalid cache entry
+                        del self._cache_index[key]
+                        self._save_cache_index()
+                        return False
+                    # Update cache entry with stricter limit if current_limit is provided and stricter
+                    if current_limit is not None and (cached_limit is None or current_limit < cached_limit):
+                        rec['max_size_mb'] = current_limit
+                        self._save_cache_index()
+                
+                safe_name = self._safe_filename_for_logging(input_file.name)
+                logger.debug(f"Cache hit for {safe_name}: GIF input exists")
+                return True
+                
             elif out_type == 'single_mp4':
                 # Do not treat MP4-only outputs as a final success for caching purposes.
                 # An MP4 may exist from a previous run, but GIFs might still need generation.
@@ -989,18 +1108,51 @@ class AutomatedWorkflow:
             return False
         return False
 
-    def _record_success_cache(self, input_file: Path, out_type: str, output_path: Path) -> None:
-        """Record a successful processing outcome in the cache."""
+    def _record_success_cache(self, input_file: Path, out_type: str, output_path: Path, max_size_mb: Optional[float] = None) -> None:
+        """Record a successful processing outcome in the cache.
+        
+        Args:
+            input_file: The input file that was processed
+            out_type: Type of output ('single_gif', 'segments', 'gif_input', 'single_mp4')
+            output_path: Path to the output file or directory
+            max_size_mb: Size limit that was satisfied (defaults to active workflow limit)
+        """
         try:
+            # Use provided limit or fall back to active workflow limit
+            size_limit = max_size_mb if max_size_mb is not None else getattr(self, '_active_cache_size_limit_mb', None)
+            
+            # Get output signature (file size for files, directory info for segments)
+            output_sig = None
+            try:
+                output_path_obj = Path(output_path)
+                if output_path_obj.exists():
+                    if output_path_obj.is_file():
+                        output_sig = {'size_bytes': output_path_obj.stat().st_size}
+                    elif output_path_obj.is_dir():
+                        # For segments, store count and total size
+                        gif_files = list(output_path_obj.glob("*.gif"))
+                        total_size = sum(f.stat().st_size for f in gif_files if f.exists())
+                        output_sig = {'segment_count': len(gif_files), 'total_size_bytes': total_size}
+            except Exception as sig_e:
+                logger.debug(f"Could not compute output signature for {output_path}: {sig_e}")
+            
             key = self._make_cache_key(input_file)
-            self._cache_index[key] = {
+            cache_entry = {
                 'type': out_type,
                 'output': str(output_path),
                 'input_signature': self._get_input_signature(input_file),
                 'time': time.time(),
             }
+            
+            # Add size limit and output signature if available
+            if size_limit is not None:
+                cache_entry['max_size_mb'] = size_limit
+            if output_sig is not None:
+                cache_entry['output_signature'] = output_sig
+            
+            self._cache_index[key] = cache_entry
             self._save_cache_index()
-            logger.debug(f"Cached success for {input_file.name}: {out_type} -> {output_path}")
+            logger.debug(f"Cached success for {input_file.name}: {out_type} -> {output_path} (limit: {size_limit}MB)")
         except Exception as e:
             logger.warning(f"Failed to cache success for {input_file.name}: {e}")
 
@@ -1597,7 +1749,7 @@ class AutomatedWorkflow:
                     if cached_valid:
                         print(f"  ✅ Valid GIF already exists: {gif_name}")
                         logger.info(f"Valid GIF already exists for {video_file.name}: {gif_name}")
-                        self._record_success_cache(video_file, 'single_gif', gif_path)
+                        self._record_success_cache(video_file, 'single_gif', gif_path, max_size_mb=max_size_mb)
                         return 'success'
                     else:
                         cached_reason = cached_error or "cached validation failure"
@@ -1631,7 +1783,7 @@ class AutomatedWorkflow:
                     if final_valid:
                         print(f"  ✅ Valid GIF already exists: {gif_name}")
                         logger.info(f"Valid GIF already exists for {video_file.name}: {gif_name}")
-                        self._record_success_cache(video_file, 'single_gif', gif_path)
+                        self._record_success_cache(video_file, 'single_gif', gif_path, max_size_mb=max_size_mb)
                         return 'success'
                     print(f"  🔄 GIF validation failed ({error_msg}), will regenerate")
                     try:
@@ -1673,7 +1825,7 @@ class AutomatedWorkflow:
                     
                     # Record cache for segments-based success
                     try:
-                        self._record_success_cache(video_file, 'segments', segments_folder)
+                        self._record_success_cache(video_file, 'segments', segments_folder, max_size_mb=max_size_mb)
                     except Exception:
                         pass
 
@@ -1783,7 +1935,7 @@ class AutomatedWorkflow:
                 print(f"    ♻️  Using existing MP4: {output_name}")
                 logger.debug(f"Valid optimized MP4 already exists: {output_name}")
                 # Cache successful existing MP4 output
-                self._record_success_cache(video_file, 'single_mp4', output_path)
+                self._record_success_cache(video_file, 'single_mp4', output_path, max_size_mb=max_size_mb)
                 return output_path
             else:
                 print(f"    🔄 Reprocessing MP4 (validation failed): {output_name}")
@@ -1812,6 +1964,7 @@ class AutomatedWorkflow:
                         all_valid = False
                         logger.info(f"Existing MP4 segment invalid or too large, will reprocess: {mp4.name} ({err})")
                         break
+                
                 if all_valid:
                     print(f"    ♻️  Using existing MP4 segments: {segments_folder.name}")
                     logger.info(f"Using existing MP4 segments: {segments_folder}")
@@ -1821,7 +1974,7 @@ class AutomatedWorkflow:
                     except Exception:
                         pass
                     # Record success and return the folder as the output artifact
-                    self._record_success_cache(video_file, 'segments', segments_folder)
+                    self._record_success_cache(video_file, 'segments', segments_folder, max_size_mb=max_size_mb)
                     return segments_folder
 
             # If no valid MP4 segments, fall back to checking GIF segments for reuse
@@ -1833,7 +1986,7 @@ class AutomatedWorkflow:
                     self._ensure_segments_summary_exists(segments_folder)
                 except Exception:
                     pass
-                self._record_success_cache(video_file, 'segments', segments_folder)
+                self._record_success_cache(video_file, 'segments', segments_folder, max_size_mb=max_size_mb)
                 return segments_folder
         
         if self.shutdown_requested:
@@ -1976,7 +2129,7 @@ class AutomatedWorkflow:
                         logger.info(f"Video optimization successful: {output_name} ({size_mb:.2f}MB)")
                         
                         # Cache successful MP4 output
-                        self._record_success_cache(video_file, 'single_mp4', output_path)
+                        self._record_success_cache(video_file, 'single_mp4', output_path, max_size_mb=max_size_mb)
                         
                         # Log detailed file specifications
                         try:
@@ -2070,7 +2223,7 @@ class AutomatedWorkflow:
                                     size_mb = result.get('size_mb', 0)
                                     print(f"    ✨ Video optimization successful after retry: {size_mb:.2f}MB")
                                     logger.info(f"Video optimization successful after retry: {output_name} ({size_mb:.2f}MB)")
-                                    self._record_success_cache(video_file, 'single_mp4', output_path)
+                                    self._record_success_cache(video_file, 'single_mp4', output_path, max_size_mb=max_size_mb)
                                     try:
                                         specs = FFmpegUtils.get_detailed_file_specifications(str(output_path))
                                         specs_log = FFmpegUtils.format_file_specifications_for_logging(specs)
@@ -2134,7 +2287,7 @@ class AutomatedWorkflow:
                     src = segments_folder.parent / f"{base_name}.mp4" if base_name else mp4_file
                 except Exception:
                     src = mp4_file
-                self._record_success_cache(src, 'segments', segments_folder)
+                self._record_success_cache(src, 'segments', segments_folder, max_size_mb=max_size_mb)
                 return True
             else:
                 print(f"    🔄 Regenerating segment GIFs (invalid/corrupted): {segments_folder.name}")
@@ -2234,7 +2387,7 @@ class AutomatedWorkflow:
                     print(f"    ♻️  Using existing GIF: {gif_name}")
                     logger.debug(f"Valid optimized GIF already exists: {gif_name}")
                     # Record cache for single GIF success
-                    self._record_success_cache(mp4_file, 'single_gif', final_gif_path)
+                    self._record_success_cache(mp4_file, 'single_gif', final_gif_path, max_size_mb=max_size_mb)
                     return True
                 else:
                     print(f"    🔄 Regenerating GIF (validation failed): {gif_name}")
@@ -2445,7 +2598,7 @@ class AutomatedWorkflow:
                                 except Exception as e:
                                     logger.debug(f"Could not create comprehensive summary: {e}")
                                 # Record cache for segments-based success
-                                self._record_success_cache(mp4_file, 'segments', final_segments_dir)
+                                self._record_success_cache(mp4_file, 'segments', final_segments_dir, max_size_mb=max_size_mb)
                                 
                                 return True
                             else:
@@ -2500,7 +2653,7 @@ class AutomatedWorkflow:
                         logger.info(f"GIF generation successful: {gif_name} ({size_mb:.2f}MB)")
                         # Record cache for single GIF success
                         cache_source = source_mp4_path if source_mp4_path.exists() else final_gif_path
-                        self._record_success_cache(cache_source, 'single_gif', final_gif_path)
+                        self._record_success_cache(cache_source, 'single_gif', final_gif_path, max_size_mb=max_size_mb)
                         return True
                     else:
                         print(f"    ❌ Final GIF validation failed: {error_msg}")
@@ -2558,17 +2711,6 @@ class AutomatedWorkflow:
                 try:
                     if self.shutdown_requested:
                         return (False, 'shutdown')
-                    # Duration pre-check
-                    try:
-                        segment_duration = FFmpegUtils.get_video_duration(str(segment_file))
-                        print(f"    ⏱️  Segment duration: {segment_duration:.1f}s")
-                        if segment_duration > 30.0:
-                            print(f"    ⏭️  Skipping segment {segment_file.name}: too long ({segment_duration:.1f}s > 30s)")
-                            logger.info(f"Skipping segment {segment_file.name}: too long ({segment_duration:.1f}s)")
-                            return (False, 'too_long')
-                    except Exception as e:
-                        print(f"    ⚠️  Could not get segment duration, proceeding with caution: {e}")
-                        logger.warning(f"Could not get segment duration for {segment_file.name}: {e}")
 
                     # Sanitize the filename to avoid Unicode encoding issues
                     safe_stem = self._safe_filename_for_filesystem(segment_file.stem)
@@ -2705,17 +2847,15 @@ class AutomatedWorkflow:
                     if successful_gifs > 0:
                         print(f"    🎉 GIF generation completed: {successful_gifs} GIFs created successfully!")
                         if skipped_segments > 0:
-                            print(f"    ⏭️  Skipped {skipped_segments} segments (too long or would create multiple GIFs)")
+                            print(f"    ⏭️  Skipped {skipped_segments} segments (failed or invalid)")
 
                         return True
                     else:
-                        # No GIFs created, but this might be correct behavior if all segments were skipped
+                        # No GIFs created - this is a failure if all segments were skipped
                         if skipped_segments > 0:
-                            print(f"    ⚠️  No GIFs created - all {skipped_segments} segments were skipped (too long or would create multiple GIFs)")
-                            print(f"    💡 This is expected behavior for segmented videos with long segments")
-                            logger.info(f"No GIFs created from segments - all {skipped_segments} segments were skipped as expected")
-
-                            return True  # Return True since this is correct behavior
+                            print(f"    ❌ No GIFs created - all {skipped_segments} segments failed or were skipped")
+                            logger.error(f"No GIFs created from segments - all {skipped_segments} segments were skipped or failed.")
+                            return False  # Return False - this is a failure, not expected behavior
                         else:
                             print(f"    ❌ No valid GIFs created from segments")
                             return False
@@ -2734,6 +2874,45 @@ class AutomatedWorkflow:
             print(f"    ❌ Error generating GIFs from segments: {e}")
             logger.error(f"Error generating GIFs from segments: {e}")
             return False
+
+    def _validate_segment_durations_for_gif(self, segments_folder: Path) -> bool:
+        """
+        Validates that all MP4 segments in a folder are within GIF max duration limit.
+        
+        Args:
+            segments_folder: Path to the segments folder containing MP4 files
+            
+        Returns:
+            True if all segments are ≤ GIF max duration, False otherwise
+        """
+        if not segments_folder.exists() or not segments_folder.is_dir():
+            logger.warning(f"Segments folder not found or not a directory: {segments_folder}")
+            return False
+        
+        # Get GIF max duration from config
+        gif_max_duration = self.config.get('gif_settings.max_duration_seconds', 30.0)
+        
+        # Collect MP4 files
+        mp4_files = sorted([f for f in segments_folder.iterdir() if f.is_file() and f.suffix.lower() == '.mp4'])
+        
+        if not mp4_files:
+            logger.debug(f"No MP4 files found in segments folder: {segments_folder}")
+            return True  # Empty folder is considered valid (no segments to validate)
+        
+        # Check duration of each segment
+        for mp4_file in mp4_files:
+            try:
+                segment_duration = FFmpegUtils.get_video_duration(str(mp4_file))
+                if segment_duration > gif_max_duration:
+                    logger.info(f"Segment {mp4_file.name} exceeds GIF max duration: {segment_duration:.1f}s > {gif_max_duration:.1f}s")
+                    return False
+            except Exception as e:
+                logger.warning(f"Could not get duration for segment {mp4_file.name}: {e}")
+                # If we can't determine duration, err on the side of caution and invalidate
+                return False
+        
+        logger.debug(f"All {len(mp4_files)} segments in {segments_folder.name} are within GIF max duration ({gif_max_duration:.1f}s)")
+        return True
 
     def _validate_segment_folder_gifs(self, segments_folder: Path, max_size_mb: float) -> Tuple[List[Path], List[Path]]:
         """
@@ -3406,14 +3585,14 @@ class AutomatedWorkflow:
             optimizer = GifOptimizer(self.config)
 
             logger.debug(f"[Workflow] Calling optimizer.optimize_gif() with target: {max_size_mb:.2f}MB, source_video: {source_video}")
-            result = optimizer.optimize_gif(
+            success, final_size, converged = optimizer.optimize_gif(
                 gif_path=str(working_path),
                 max_size_mb=max_size_mb,
                 source_video=source_video
             )
-            logger.debug(f"[Workflow] Optimizer returned: {result}, working file exists: {working_path.exists()}")
+            logger.debug(f"[Workflow] Optimizer returned: success={success}, size={final_size:.2f}MB, converged={converged}, working file exists: {working_path.exists()}")
 
-            if result and working_path.exists():
+            if success and working_path.exists():
                 optimized_size = self.file_validator.get_file_size_mb(str(working_path))
                 reduction_pct = ((initial_size - optimized_size) / initial_size * 100) if initial_size > 0 else 0
                 logger.debug(f"[Workflow] Optimization successful: {optimized_size:.2f}MB (reduction: {reduction_pct:.1f}% from {initial_size:.2f}MB)")
@@ -3890,7 +4069,7 @@ class AutomatedWorkflow:
                             if seg_size_mb > max_size_mb:
                                 # Try to optimize it
                                 logger.debug(f"Segment {index+1}/{num_segments} from source is {seg_size_mb:.2f}MB, optimizing...")
-                                opt_ok = optimizer.optimize_gif(
+                                opt_ok, _, _ = optimizer.optimize_gif(
                                     gif_path=str(temp_seg),
                                     max_size_mb=max_size_mb,
                                     source_video=segment_source_video  # Pass source for re-encoding
@@ -3998,7 +4177,7 @@ class AutomatedWorkflow:
                         
                         # Optimize with quality target for stronger convergence
                         logger.debug(f"Optimizing segment {index+1}/{num_segments}")
-                        opt_ok = optimizer.optimize_gif(
+                        opt_ok, _, _ = optimizer.optimize_gif(
                             gif_path=str(temp_seg),
                             max_size_mb=max_size_mb,
                             source_video=segment_source_video
@@ -4196,7 +4375,7 @@ class AutomatedWorkflow:
                                 try:
                                     src_input = segments_dir.parent / f"{base_name}.mp4"
                                     cache_input = src_input if src_input.exists() else segments_dir
-                                    self._record_success_cache(cache_input, 'single_gif', single_output_path)
+                                    self._record_success_cache(cache_input, 'single_gif', single_output_path, max_size_mb=max_size_mb)
                                 except Exception:
                                     pass
                                 return True
@@ -4222,7 +4401,7 @@ class AutomatedWorkflow:
                     try:
                         src_input = segments_dir.parent / f"{base_name}.mp4"
                         cache_input = src_input if src_input.exists() else segments_dir
-                        self._record_success_cache(cache_input, 'segments', segments_dir)
+                        self._record_success_cache(cache_input, 'segments', segments_dir, max_size_mb=max_size_mb)
                     except Exception:
                         pass
                 else:
@@ -4233,7 +4412,7 @@ class AutomatedWorkflow:
                     try:
                         src_input = single_output_path.parent / f"{base_name}.mp4"
                         cache_input = src_input if src_input.exists() else single_output_path.parent
-                        self._record_success_cache(cache_input, 'single_gif', single_output_path)
+                        self._record_success_cache(cache_input, 'single_gif', single_output_path, max_size_mb=max_size_mb)
                     except Exception:
                         pass
                 return True
@@ -4269,7 +4448,7 @@ class AutomatedWorkflow:
                     print(f"    ♻️  Valid optimized GIF already exists in output: {existing_output.name}")
                     logger.info(f"Skipping optimization; existing optimized GIF present: {existing_output}")
                     # Cache success for gif input
-                    self._record_success_cache(gif_file, 'gif_input', existing_output)
+                    self._record_success_cache(gif_file, 'gif_input', existing_output, max_size_mb=max_size_mb)
                     return 'success'
                 if not cached_available:
                     validation_start = time.perf_counter()
@@ -4296,7 +4475,7 @@ class AutomatedWorkflow:
                     if final_valid:
                         print(f"    ♻️  Valid optimized GIF already exists in output: {existing_output.name}")
                         logger.info(f"Skipping optimization; existing optimized GIF present: {existing_output}")
-                        self._record_success_cache(gif_file, 'gif_input', existing_output)
+                        self._record_success_cache(gif_file, 'gif_input', existing_output, max_size_mb=max_size_mb)
                         return 'success'
                 else:
                     logger.debug(

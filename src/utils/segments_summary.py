@@ -371,3 +371,13 @@ def _probe_gif_info(
     }
 
 
+
+
+
+
+
+
+
+
+
+
