@@ -195,3 +195,10 @@ Thumbs.db
 .kiro-cache/
 kiro-temp/
 .kiro-logs/
+
+# Cursor AI Assistant
+.cursor/
+*.cursor
+.cursor-cache/
+cursor-temp/
+.cursor-logs/
