@@ -1326,7 +1326,8 @@ class DynamicVideoCompressor:
                 size_limit_mb,
                 platform_config,
                 video_info_guard,
-                platform or 'discord'
+                platform or 'discord',
+                force_segmentation=True
             )
             if not segmentation_result:
                 segmentation_result = {
@@ -1658,7 +1659,7 @@ class DynamicVideoCompressor:
                 target_video_bitrate_kbps,
                 bpp_min,
                 profile_cfg,
-                enforce_min_resolution=False,
+                enforce_min_resolution=False,  # Guardrail overrides relax constraints, so don't enforce minimum resolution
                 min_resolution_override=(override_width, override_height),
                 min_fps_override=override_min_fps
             )
@@ -2022,9 +2023,10 @@ class DynamicVideoCompressor:
                 input_path, output_path, vmaf_thresh, ssim_threshold, eval_height
             )
             
-            # Step 6: Artifact detection
+            # Step 6: Artifact detection (with SSIM-relative threshold adjustment)
+            ssim_score = quality_result.get('ssim_score')
             artifact_result = self.artifact_detector.detect_artifacts(
-                output_path, blockiness_threshold=0.12, banding_threshold=0.10
+                output_path, ssim_score=ssim_score
             )
             
             vmaf_score = quality_result.get('vmaf_score')
@@ -2244,11 +2246,17 @@ class DynamicVideoCompressor:
         orig_fps = video_info['fps']
         min_width_guard = None
         min_height_guard = None
+        config_min_width, config_min_height = self._get_min_resolution()
         if enforce_min_resolution:
-            min_width_guard, min_height_guard = self._get_min_resolution()
+            min_width_guard, min_height_guard = config_min_width, config_min_height
         if min_resolution_override is not None:
-            min_width_guard = min_resolution_override[0]
-            min_height_guard = min_resolution_override[1]
+            override_width, override_height = min_resolution_override
+            if min_width_guard is not None and min_height_guard is not None:
+                min_width_guard = min(min_width_guard, override_width)
+                min_height_guard = min(min_height_guard, override_height)
+            else:
+                min_width_guard = override_width
+                min_height_guard = override_height
         
         # Get encoder minimum bitrate requirement
         encoder = 'libx264'  # Default encoder for CAE pipeline
@@ -2293,7 +2301,7 @@ class DynamicVideoCompressor:
         if orig_h not in candidate_heights:
             candidates.insert(0, (orig_w, orig_h))
 
-        if enforce_min_resolution and min_width_guard is not None and min_height_guard is not None:
+        if min_width_guard is not None and min_height_guard is not None:
             if not any(w >= min_width_guard and h >= min_height_guard for w, h in candidates):
                 logger.warning(
                     "Minimum resolution guard removed all downscale candidates (floor: %dx%d)",
@@ -2307,6 +2315,7 @@ class DynamicVideoCompressor:
         config_min_fps = self.config.get('video_compression.bitrate_validation.min_fps', 20)
         effective_min_fps = config_min_fps
         if min_fps_override is not None:
+            # Use min() to allow override to relax FPS constraint (e.g., allow 12fps instead of 20fps)
             effective_min_fps = min(effective_min_fps, min_fps_override)
         
         fps_candidates = [30, 24, 20, 15, 12, 8, 6] if orig_fps >= 30 else [24, 20, 15, 12, 8, 6, int(orig_fps)]
@@ -2338,7 +2347,8 @@ class DynamicVideoCompressor:
         
         # Second pass: prioritize bitrate floor over BPP if necessary
         logger.warning(f"Cannot satisfy both BPP floor ({bpp_min:.4f}) and bitrate floor ({min_encoder_bitrate}kbps) simultaneously")
-        logger.warning("Prioritizing encoder bitrate minimum over BPP floor")
+        logger.warning(f"Prioritizing encoder bitrate minimum over BPP floor. This may result in lower quality. "
+                      f"Consider routing to segmentation for better quality preservation.")
         
         # Progressive resolution reduction until bitrate floor is met
         for w, h in candidates:
@@ -2356,7 +2366,15 @@ class DynamicVideoCompressor:
         
         # Third pass: Calculate minimum viable resolution for the given bitrate
         logger.error(f"Standard resolution candidates cannot meet bitrate floor {min_encoder_bitrate}kbps")
-        return self._calculate_minimum_viable_resolution(video_info, target_bitrate_kbps, bpp_min, profile_cfg, encoder)
+        return self._calculate_minimum_viable_resolution(
+            video_info,
+            target_bitrate_kbps,
+            bpp_min,
+            profile_cfg,
+            encoder,
+            enforce_min_resolution=enforce_min_resolution,
+            min_resolution_override=min_resolution_override
+        )
     
     def _progressive_resolution_reduction(self, video_info: Dict[str, Any], 
                                         target_bitrate_kbps: int, bpp_min: float,
@@ -2371,11 +2389,17 @@ class DynamicVideoCompressor:
         min_encoder_bitrate = self.bitrate_validator.get_encoder_minimum(encoder)
         min_width_guard = None
         min_height_guard = None
+        config_min_width, config_min_height = self._get_min_resolution()
         if enforce_min_resolution:
-            min_width_guard, min_height_guard = self._get_min_resolution()
+            min_width_guard, min_height_guard = config_min_width, config_min_height
         if min_resolution_override is not None:
-            min_width_guard = min_resolution_override[0]
-            min_height_guard = min_resolution_override[1]
+            override_width, override_height = min_resolution_override
+            if min_width_guard is not None and min_height_guard is not None:
+                min_width_guard = min(min_width_guard, override_width)
+                min_height_guard = min(min_height_guard, override_height)
+            else:
+                min_width_guard = override_width
+                min_height_guard = override_height
         
         logger.info(f"Starting progressive resolution reduction from {orig_w}x{orig_h}")
         
@@ -2431,6 +2455,7 @@ class DynamicVideoCompressor:
         config_min_fps = self.config.get('video_compression.bitrate_validation.min_fps', 20)
         effective_min_fps = config_min_fps
         if min_fps_override is not None:
+            # Use min() to allow override to relax FPS constraint (e.g., allow 12fps instead of 20fps)
             effective_min_fps = min(effective_min_fps, min_fps_override)
         
         fps_candidates = [orig_fps, 24, 20, 15, 12, 8, 6, 5] if orig_fps > 6 else [orig_fps, 5, 4, 3, 2, 1]
@@ -2474,7 +2499,8 @@ class DynamicVideoCompressor:
     def _calculate_minimum_viable_resolution(self, video_info: Dict[str, Any], 
                                            target_bitrate_kbps: int, bpp_min: float,
                                            profile_cfg: Dict[str, Any], encoder: str,
-                                           enforce_min_resolution: bool = False) -> Dict[str, Any]:
+                                           enforce_min_resolution: bool = False,
+                                           min_resolution_override: Optional[Tuple[int, int]] = None) -> Dict[str, Any]:
         """Calculate the minimum viable resolution that can meet bitrate requirements."""
         min_encoder_bitrate = self.bitrate_validator.get_encoder_minimum(encoder)
         orig_w = video_info['width']
@@ -2484,6 +2510,14 @@ class DynamicVideoCompressor:
         min_height_guard = None
         if enforce_min_resolution:
             min_width_guard, min_height_guard = self._get_min_resolution()
+        if min_resolution_override is not None:
+            override_width, override_height = min_resolution_override
+            if min_width_guard is not None and min_height_guard is not None:
+                min_width_guard = min(min_width_guard, override_width)
+                min_height_guard = min(min_height_guard, override_height)
+            else:
+                min_width_guard = override_width
+                min_height_guard = override_height
         
         logger.info("Calculating minimum viable resolution for bitrate floor compliance")
         
@@ -4455,42 +4489,67 @@ class DynamicVideoCompressor:
     
     def _compress_with_segmentation(self, input_path: str, output_path: str, target_size_mb: float,
                                   platform_config: Dict[str, Any], video_info: Dict[str, Any], 
-                                  platform: str = None) -> Dict[str, Any]:
+                                  platform: str = None, force_segmentation: bool = False) -> Dict[str, Any]:
         """Compress video using segmentation approach with bitrate validation"""
         try:
             logger.info("Starting video segmentation compression")
             
             # Check if segmentation is needed due to bitrate constraints
             encoder = self.hardware.get_best_encoder("h264")[0]
-            should_segment_bitrate, bitrate_reason = self.video_segmenter.should_segment_for_bitrate_constraints(
-                video_info, target_size_mb, encoder
-            )
-            
-            if should_segment_bitrate:
-                logger.info(f"Using bitrate-constrained segmentation: {bitrate_reason}")
-                # Use bitrate-specific segmentation
-                result = self.video_segmenter.segment_video_for_bitrate_constraints(
-                    input_video=input_path,
-                    output_base_path=output_path,
-                    encoder=encoder,
-                    target_size_mb=target_size_mb,
-                    video_info=video_info
-                )
-            else:
-                logger.info(f"Using standard segmentation: {bitrate_reason}")
-                # Use standard segmentation
+            if force_segmentation:
+                logger.info("Segmentation forced by guardrail; bypassing bitrate heuristics")
                 result = self.video_segmenter.segment_video(
                     input_video=input_path,
                     output_base_path=output_path,
                     platform=platform,
-                    max_size_mb=target_size_mb
+                    max_size_mb=target_size_mb,
+                    force_segment=True
                 )
+            else:
+                should_segment_bitrate, bitrate_reason = self.video_segmenter.should_segment_for_bitrate_constraints(
+                    video_info, target_size_mb, encoder
+                )
+                
+                if should_segment_bitrate:
+                    logger.info(f"Using bitrate-constrained segmentation: {bitrate_reason}")
+                    # Use bitrate-specific segmentation
+                    result = self.video_segmenter.segment_video_for_bitrate_constraints(
+                        input_video=input_path,
+                        output_base_path=output_path,
+                        encoder=encoder,
+                        target_size_mb=target_size_mb,
+                        video_info=video_info
+                    )
+                else:
+                    logger.info(f"Using standard segmentation: {bitrate_reason}")
+                    # Use standard segmentation
+                    result = self.video_segmenter.segment_video(
+                        input_video=input_path,
+                        output_base_path=output_path,
+                        platform=platform,
+                        max_size_mb=target_size_mb
+                    )
             
             if result.get('success', False):
+                if force_segmentation and not result.get('is_segmented_output', False) and 'segments' not in result:
+                    logger.error("Forced segmentation returned a single-file result; treating as failure.")
+                    return {
+                        'success': False,
+                        'error': 'Forced segmentation declined to create segments',
+                        'video_info': video_info
+                    }
+                
                 # If segmentation was successful, return the results
                 if 'segments' in result:
                     # Multiple segments were created
                     total_size = sum(segment.get('size_mb', 0) for segment in result['segments'])
+                    if not result['segments']:
+                        logger.error("Segmentation reported success but no segments were produced.")
+                        return {
+                            'success': False,
+                            'error': 'Segmentation produced no segments',
+                            'video_info': video_info
+                        }
                     
                     # Get output_folder from result, with fallback construction
                     output_folder = result.get('output_folder')
@@ -5168,6 +5227,24 @@ class DynamicVideoCompressor:
         
         original_width, original_height = video_info['width'], video_info['height']
         original_pixels = original_width * original_height
+        enforce_min_resolution = self._should_enforce_min_resolution(video_info)
+        min_width_guard = None
+        min_height_guard = None
+        guard_scale_factor = 0.0
+        if enforce_min_resolution and original_width > 0 and original_height > 0:
+            min_width_guard, min_height_guard = self._get_min_resolution()
+            guard_scale_factor = max(
+                min_width_guard / original_width,
+                min_height_guard / original_height
+            )
+            guard_scale_factor = min(max(guard_scale_factor, 0.0), 1.0)
+            logger.debug(
+                "Configuration minimum resolution guard active (>= %dx%d). "
+                "Minimum scale factor: %.3f",
+                min_width_guard,
+                min_height_guard,
+                guard_scale_factor
+            )
         
         logger.info(f"Calculating optimal resolution: original {original_width}x{original_height} "
                    f"({original_pixels:,} pixels), target size {target_size_mb}MB")
@@ -5231,6 +5308,8 @@ class DynamicVideoCompressor:
                 
                 # Apply minimum scale factor to prevent extreme downscaling
                 scale_factor = max(scale_factor, min_scale_factor)
+                if guard_scale_factor:
+                    scale_factor = max(scale_factor, guard_scale_factor)
                 
                 optimal_width = int(original_width * scale_factor)
                 optimal_height = int(original_height * scale_factor)
@@ -5270,6 +5349,8 @@ class DynamicVideoCompressor:
                 # Apply minimum scale factor
                 min_scale_factor = 0.6  # Never go below 60% of original
                 scale_factor = max(scale_factor, min_scale_factor)
+                if guard_scale_factor:
+                    scale_factor = max(scale_factor, guard_scale_factor)
                 
                 optimal_width = int(original_width * scale_factor)
                 optimal_height = int(original_height * scale_factor)
@@ -5306,6 +5387,10 @@ class DynamicVideoCompressor:
                 min_width = max(640, int(original_width * 0.6))   # 60% of original width
                 min_height = max(480, int(original_height * 0.6)) # 60% of original height
 
+            if enforce_min_resolution:
+                min_width = max(min_width, min_width_guard)
+                min_height = max(min_height, min_height_guard)
+
             optimal_width = max(optimal_width, min_width)
             optimal_height = max(optimal_height, min_height)
 
@@ -5318,7 +5403,10 @@ class DynamicVideoCompressor:
         
         # Final safety check - ensure reasonable minimum resolution
         # These are much higher than the previous 128x96 to prevent extreme downscaling
-        if original_pixels > 1000000:  # High resolution videos
+        if enforce_min_resolution and min_width_guard and min_height_guard:
+            final_min_width = min_width_guard
+            final_min_height = min_height_guard
+        elif original_pixels > 1000000:  # High resolution videos
             final_min_width = 720   # Much higher minimum for high-res videos
             final_min_height = 540  # Much higher minimum for high-res videos
         else:  # Lower resolution videos

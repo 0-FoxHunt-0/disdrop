@@ -460,6 +460,9 @@ class AdvancedVideoOptimizer:
                                         platform_config: Dict[str, Any] = None) -> List[Dict[str, Any]]:
         """
         Generate optimization candidates using genetic algorithm principles
+        
+        All candidates are adjusted to ensure they stay within target_size_mb to avoid
+        wasting computational resources on invalid candidates.
         """
         
         logger.info("Generating optimization candidates using advanced algorithms...")
@@ -477,24 +480,82 @@ class AdvancedVideoOptimizer:
         quality_candidate = self._generate_quality_optimized_candidate(
             encoder, accel_type, scene_data, perceptual_data, target_size_mb, platform_config
         )
+        quality_candidate = self._apply_size_guardrails(quality_candidate, target_size_mb, scene_data)
         candidates.append(quality_candidate)
         
         # 2. Size-optimized candidate
         size_candidate = self._generate_size_optimized_candidate(
             encoder, accel_type, scene_data, perceptual_data, target_size_mb, platform_config
         )
+        size_candidate = self._apply_size_guardrails(size_candidate, target_size_mb, scene_data)
         candidates.append(size_candidate)
         
         # 3. Balanced candidate
         balanced_candidate = self._generate_balanced_candidate(
             encoder, accel_type, scene_data, perceptual_data, target_size_mb, platform_config
         )
+        balanced_candidate = self._apply_size_guardrails(balanced_candidate, target_size_mb, scene_data)
         candidates.append(balanced_candidate)
         
         # Note: Removed scene-adaptive and perceptual-optimized candidates for faster processing
         # The three remaining candidates provide good coverage of the optimization space
         
+        # Log candidate metadata for diagnostics
+        for candidate in candidates:
+            duration = scene_data.get('duration', 30.0)
+            estimated_size = (candidate.get('bitrate', 0) * duration) / (8 * 1024)  # MB
+            logger.debug(f"Candidate '{candidate['name']}': bitrate={candidate.get('bitrate', 0)}kbps, "
+                        f"estimated_size={estimated_size:.2f}MB, target={target_size_mb:.2f}MB, "
+                        f"size_guardrails_applied={candidate.get('size_guardrails_applied', False)}")
+        
         return candidates
+    
+    def _apply_size_guardrails(self, candidate: Dict[str, Any], target_size_mb: float, 
+                              scene_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply size guardrails to ensure candidate stays within target size.
+        
+        Adjusts bitrate to account for encoding overhead, audio, and container overhead
+        to prevent generating candidates that exceed the target size.
+        
+        Args:
+            candidate: Candidate dictionary with encoding parameters
+            target_size_mb: Target file size in MB
+            scene_data: Scene analysis data including duration
+        
+        Returns:
+            Candidate dictionary with adjusted parameters and metadata
+        """
+        duration = scene_data.get('duration', 30.0)
+        
+        # Guard against invalid duration
+        if duration <= 0:
+            logger.warning(f"Invalid duration {duration}s in scene_data, using default 30.0s")
+            duration = 30.0
+        
+        # Account for overhead: audio (~10%), container/metadata (~5%), encoding variance (~5%)
+        # Use 80% of target for video bitrate to leave headroom
+        video_size_mb = target_size_mb * 0.80
+        max_video_bitrate = int((video_size_mb * 8 * 1024) / duration)
+        
+        current_bitrate = candidate.get('bitrate', 0)
+        
+        # If current bitrate would exceed target, reduce it
+        if current_bitrate > max_video_bitrate:
+            original_bitrate = current_bitrate
+            candidate['bitrate'] = max_video_bitrate
+            candidate['size_guardrails_applied'] = True
+            candidate['original_bitrate'] = original_bitrate
+            logger.debug(f"Candidate '{candidate['name']}': Reduced bitrate from {original_bitrate}kbps "
+                        f"to {max_video_bitrate}kbps to stay within {target_size_mb:.2f}MB target")
+        else:
+            candidate['size_guardrails_applied'] = False
+        
+        # Store metadata for diagnostics
+        candidate['target_size_mb'] = target_size_mb
+        candidate['max_video_bitrate'] = max_video_bitrate
+        candidate['duration'] = duration
+        
+        return candidate
     
     def _generate_quality_optimized_candidate(self, encoder: str, accel_type: str,
                                             scene_data: Dict[str, Any], perceptual_data: Dict[str, Any],
@@ -686,6 +747,12 @@ class AdvancedVideoOptimizer:
                 try:
                     result = future.result(timeout=300)  # 5 minute timeout per candidate
                     if result and result.get('success', False):
+                        # Check if candidate exceeded target size (shouldn't happen with guardrails, but log if it does)
+                        if result['size_mb'] > target_size_mb:
+                            logger.warning(f"Candidate '{candidate['name']}' exceeded target size: "
+                                         f"{result['size_mb']:.2f}MB > {target_size_mb:.2f}MB "
+                                         f"(bitrate={candidate.get('bitrate', 'N/A')}kbps, "
+                                         f"guardrails_applied={candidate.get('size_guardrails_applied', False)})")
                         successful_results.append(result)
                         logger.info(f"Candidate '{candidate['name']}' completed: "
                                   f"{result['size_mb']:.2f}MB, quality: {result['quality_score']:.1f}")

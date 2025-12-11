@@ -18,35 +18,133 @@ class ArtifactDetector:
     
     def __init__(self, config_manager=None):
         self.config = config_manager
+        self._load_config()
+    
+    def _load_config(self):
+        """Load artifact detection configuration from config manager."""
+        if not self.config:
+            self.base_blockiness_threshold = 0.65
+            self.base_banding_threshold = 0.50
+            self.ssim_relative_enabled = True
+            self.ssim_reference = 0.94
+            self.adjustment_factor = 5.0
+            self.max_adjustment = 10.0
+            self.num_keyframes = 5
+            self.num_random = 3
+            return
+        
+        artifact_cfg = self.config.get('video_compression.quality_evaluation.artifact_detection', {})
+        base_thresholds = artifact_cfg.get('base_thresholds', {})
+        self.base_blockiness_threshold = base_thresholds.get('blockiness', 0.65)
+        self.base_banding_threshold = base_thresholds.get('banding', 0.50)
+        
+        ssim_adj = artifact_cfg.get('ssim_relative_adjustment', {})
+        self.ssim_relative_enabled = ssim_adj.get('enabled', True)
+        self.ssim_reference = ssim_adj.get('ssim_reference', 0.94)
+        self.adjustment_factor = ssim_adj.get('adjustment_factor', 5.0)
+        self.max_adjustment = ssim_adj.get('max_adjustment', 10.0)
+        
+        frame_sampling = artifact_cfg.get('frame_sampling', {})
+        self.num_keyframes = frame_sampling.get('num_keyframes', 5)
+        self.num_random = frame_sampling.get('num_random', 3)
+    
+    def _calculate_ssim_adjusted_thresholds(self, ssim_score: Optional[float], 
+                                           base_blockiness: float, 
+                                           base_banding: float) -> Tuple[float, float]:
+        """Calculate SSIM-adjusted artifact thresholds.
+        
+        When SSIM is high (indicating good quality), we relax artifact thresholds
+        to prevent false positives. This is based on the observation that high SSIM
+        scores (e.g., >0.94) indicate good quality even if artifact metrics are elevated.
+        
+        Args:
+            ssim_score: SSIM score (0-1), or None if not available
+            base_blockiness: Base blockiness threshold
+            base_banding: Base banding threshold
+        
+        Returns:
+            Tuple of (adjusted_blockiness_threshold, adjusted_banding_threshold)
+        """
+        if not self.ssim_relative_enabled or ssim_score is None:
+            return base_blockiness, base_banding
+        
+        # Validate SSIM score range (should be 0-1)
+        if ssim_score < 0 or ssim_score > 1:
+            logger.warning(f"Invalid SSIM score {ssim_score}, expected 0-1. Using base thresholds.")
+            return base_blockiness, base_banding
+        
+        # If SSIM is above reference, adjust thresholds proportionally
+        if ssim_score >= self.ssim_reference:
+            # Calculate adjustment: higher SSIM = more lenient thresholds
+            # Adjustment scales from 1.0 (at reference) to max_adjustment (at SSIM=1.0)
+            ssim_excess = ssim_score - self.ssim_reference
+            ssim_range = 1.0 - self.ssim_reference  # Typically 0.06 (0.94 to 1.0)
+            
+            if ssim_range > 0:
+                adjustment_ratio = 1.0 + (ssim_excess / ssim_range) * (self.adjustment_factor - 1.0)
+                adjustment_ratio = min(adjustment_ratio, self.max_adjustment)
+            else:
+                adjustment_ratio = self.max_adjustment
+            
+            adjusted_blockiness = base_blockiness * adjustment_ratio
+            adjusted_banding = base_banding * adjustment_ratio
+            
+            logger.debug(f"SSIM-adjusted thresholds: SSIM={ssim_score:.4f}, "
+                        f"blockiness={base_blockiness:.4f}->{adjusted_blockiness:.4f}, "
+                        f"banding={base_banding:.4f}->{adjusted_banding:.4f}")
+            
+            return adjusted_blockiness, adjusted_banding
+        
+        return base_blockiness, base_banding
     
     def detect_artifacts(self, video_path: str, 
-                        blockiness_threshold: float = 0.12,
-                        banding_threshold: float = 0.10,
-                        num_keyframes: int = 5,
-                        num_random: int = 3) -> Dict[str, Any]:
+                        blockiness_threshold: Optional[float] = None,
+                        banding_threshold: Optional[float] = None,
+                        ssim_score: Optional[float] = None,
+                        num_keyframes: Optional[int] = None,
+                        num_random: Optional[int] = None) -> Dict[str, Any]:
         """Detect compression artifacts in video by sampling frames.
         
         Args:
             video_path: Path to video file
-            blockiness_threshold: Max acceptable blockiness score (0-1)
-            banding_threshold: Max acceptable banding score (0-1)
-            num_keyframes: Number of evenly-spaced keyframes to sample
-            num_random: Number of random frames to sample
+            blockiness_threshold: Max acceptable blockiness score (0-1). If None, uses config base threshold.
+            banding_threshold: Max acceptable banding score (0-1). If None, uses config base threshold.
+            ssim_score: SSIM score (0-1) for threshold adjustment. If provided and SSIM-relative adjustment
+                       is enabled, thresholds are relaxed when SSIM is high.
+            num_keyframes: Number of evenly-spaced keyframes to sample. If None, uses config default.
+            num_random: Number of random frames to sample. If None, uses config default.
         
         Returns:
             Dict with keys:
                 - blockiness_score: float (avg)
                 - banding_score: float (avg)
                 - passes: bool (both under thresholds)
-                - details: frame-level scores
+                - details: frame-level scores and threshold info
         """
+        # Use provided thresholds or config defaults
+        base_blockiness = blockiness_threshold if blockiness_threshold is not None else self.base_blockiness_threshold
+        base_banding = banding_threshold if banding_threshold is not None else self.base_banding_threshold
+        
+        # Calculate SSIM-adjusted thresholds if SSIM is provided
+        final_blockiness, final_banding = self._calculate_ssim_adjusted_thresholds(
+            ssim_score, base_blockiness, base_banding
+        )
+        
+        # Use provided sampling params or config defaults
+        num_key = num_keyframes if num_keyframes is not None else self.num_keyframes
+        num_rand = num_random if num_random is not None else self.num_random
+        
         result = {
             'blockiness_score': None,
             'banding_score': None,
             'passes': False,
             'details': {
-                'blockiness_threshold': blockiness_threshold,
-                'banding_threshold': banding_threshold,
+                'blockiness_threshold': final_blockiness,
+                'banding_threshold': final_banding,
+                'base_blockiness_threshold': base_blockiness,
+                'base_banding_threshold': base_banding,
+                'ssim_score': ssim_score,
+                'ssim_adjusted': ssim_score is not None and self.ssim_relative_enabled and ssim_score >= self.ssim_reference,
                 'frame_scores': []
             }
         }
@@ -57,7 +155,7 @@ class ArtifactDetector:
                 return result
             
             # Sample frames
-            frames = self._sample_frames(video_path, num_keyframes, num_random)
+            frames = self._sample_frames(video_path, num_key, num_rand)
             if not frames:
                 result['details']['error'] = "Could not sample any frames"
                 return result
@@ -86,16 +184,18 @@ class ArtifactDetector:
             result['blockiness_score'] = avg_blockiness
             result['banding_score'] = avg_banding
             
-            # Check thresholds
-            blockiness_pass = avg_blockiness <= blockiness_threshold
-            banding_pass = avg_banding <= banding_threshold
+            # Check thresholds using SSIM-adjusted values
+            blockiness_pass = avg_blockiness <= final_blockiness
+            banding_pass = avg_banding <= final_banding
             result['passes'] = blockiness_pass and banding_pass
             
             result['details']['blockiness_pass'] = blockiness_pass
             result['details']['banding_pass'] = banding_pass
             
-            logger.info(f"Artifact detection: blockiness={avg_blockiness:.4f} (thresh={blockiness_threshold}), "
-                       f"banding={avg_banding:.4f} (thresh={banding_threshold}), passes={result['passes']}")
+            ssim_info = f", SSIM={ssim_score:.4f}" if ssim_score is not None else ""
+            adj_info = " (SSIM-adjusted)" if result['details']['ssim_adjusted'] else ""
+            logger.info(f"Artifact detection: blockiness={avg_blockiness:.4f} (thresh={final_blockiness:.4f}{adj_info}), "
+                       f"banding={avg_banding:.4f} (thresh={final_banding:.4f}{adj_info}){ssim_info}, passes={result['passes']}")
             
         except Exception as e:
             logger.error(f"Artifact detection failed: {e}")

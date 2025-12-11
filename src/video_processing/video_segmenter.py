@@ -253,7 +253,7 @@ class VideoSegmenter:
     
     def segment_video(self, input_video: str, output_base_path: str, platform: str = None,
                      max_size_mb: float = None, start_time: float = 0, 
-                     duration: float = None) -> Dict[str, Any]:
+                     duration: float = None, force_segment: bool = False) -> Dict[str, Any]:
         """
         Split a large video into multiple high-quality segments
         
@@ -293,7 +293,10 @@ class VideoSegmenter:
             actual_duration = video_info['duration'] - start_time
         
         # Check if video should be segmented
-        if self.should_segment_video(actual_duration, video_info, target_size_mb):
+        should_segment = force_segment or self.should_segment_video(actual_duration, video_info, target_size_mb)
+        if should_segment:
+            if force_segment:
+                logger.info("Force-segmentation flag active; bypassing estimator safeguards.")
             logger.info("Video will be split into high-quality segments")
             print("🎬 Video will be split into high-quality segments")
             print(f"    📊 Processing {actual_duration:.1f}s video with target size {target_size_mb}MB per segment")
@@ -588,11 +591,12 @@ class VideoSegmenter:
             content_duration = self._calculate_content_based_duration(total_duration, video_info, target_size_mb)
             optimal_duration = min(bitrate_duration, content_duration)
             logger.info(f"Bitrate-constrained duration: {bitrate_duration:.1f}s, content-based: {content_duration:.1f}s, using: {optimal_duration:.1f}s")
-            return optimal_duration
-
-        # Favor longer segments for better quality and fewer total segments
-        logger.info(f"Calculating optimal segment duration for {total_duration:.1f}s video - favoring longer segments")
-        return self._calculate_content_based_duration(total_duration, video_info, target_size_mb)
+        else:
+            # Favor longer segments for better quality and fewer total segments
+            logger.info(f"Calculating optimal segment duration for {total_duration:.1f}s video - favoring longer segments")
+            optimal_duration = self._calculate_content_based_duration(total_duration, video_info, target_size_mb)
+        
+        return optimal_duration
     
     def _calculate_content_based_duration(self, total_duration: float, video_info: Dict[str, Any], target_size_mb: float) -> float:
         """Calculate segment duration based on content characteristics"""

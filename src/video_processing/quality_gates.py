@@ -2964,8 +2964,20 @@ class QualityGates:
             exec_result = self._execute_ffmpeg_with_retry(cmd, "SSIM computation (legacy)")
             
             if exec_result['success']:
-                # Use robust parsing with multiple strategies and validation
-                return self._parse_ssim_output(exec_result['stderr'])
+                # When using stats_file=- with -loglevel error, SSIM output goes to stdout
+                # Check stdout first, then fallback to stderr
+                ssim_output = exec_result.get('stdout', '') if exec_result.get('stdout') else exec_result.get('stderr', '')
+                ssim_score, confidence = self._parse_ssim_output(ssim_output)
+                
+                # If parsing failed on first stream, try the other stream as fallback
+                if ssim_score is None and exec_result.get('stdout') and exec_result.get('stderr'):
+                    logger.debug("SSIM parsing failed on first stream in legacy method, trying fallback stream")
+                    fallback_output = exec_result.get('stderr', '') if ssim_output == exec_result.get('stdout', '') else exec_result.get('stdout', '')
+                    ssim_score, confidence = self._parse_ssim_output(fallback_output)
+                    if ssim_score is not None:
+                        logger.debug(f"SSIM parsing succeeded on fallback stream in legacy method (confidence: {confidence:.2f})")
+                
+                return ssim_score, confidence
             else:
                 # Log detailed error information
                 if self.ffmpeg_config['enable_detailed_errors']:
@@ -3452,8 +3464,19 @@ class ResolutionAwareQualityEvaluator:
             )
             
             if result.returncode == 0:
-                ssim_output = result.stderr if result.stderr else result.stdout
+                # When using stats_file=- with -loglevel error, SSIM output goes to stdout
+                # Check stdout first, then fallback to stderr
+                ssim_output = result.stdout if result.stdout else result.stderr
                 ssim_score, confidence = self._parse_ssim_output_simple(ssim_output or "")
+                
+                # If parsing failed on first stream, try the other stream as fallback
+                if ssim_score is None and result.stdout and result.stderr:
+                    logger.debug("SSIM parsing failed on first stream, trying fallback stream")
+                    fallback_output = result.stderr if ssim_output == result.stdout else result.stdout
+                    ssim_score, confidence = self._parse_ssim_output_simple(fallback_output or "")
+                    if ssim_score is not None:
+                        logger.debug(f"SSIM parsing succeeded on fallback stream (confidence: {confidence:.2f})")
+                
                 if ssim_score is None:
                     # Parsing failed - log detailed information
                     logger.error(f"SSIM parsing failed: Unable to parse FFmpeg output")
@@ -3463,9 +3486,9 @@ class ResolutionAwareQualityEvaluator:
                     logger.debug(f"FFmpeg stderr length: {len(result.stderr or '')} chars")
                     if result.stderr:
                         logger.debug(f"FFmpeg stderr output (first 1000 chars):\n{result.stderr[:1000]}")
-                    elif result.stdout:
+                    if result.stdout:
                         logger.debug(f"FFmpeg stdout output (first 1000 chars):\n{result.stdout[:1000]}")
-                    else:
+                    if not result.stdout and not result.stderr:
                         logger.debug("FFmpeg produced no SSIM output on stdout or stderr")
                 return ssim_score, confidence
             else:
