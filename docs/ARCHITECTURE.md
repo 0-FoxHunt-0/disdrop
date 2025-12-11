@@ -8,7 +8,7 @@ This document describes the architecture of the Disdrop video compression system
 
 ### Cache Layer
 
-#### CacheManager (`src/cache_manager.py`)
+#### CacheManager (`src/video_processing/cache_manager.py`)
 **Primary unified interface for all caching functionality.**
 
 **Responsibilities:**
@@ -33,7 +33,7 @@ This document describes the architecture of the Disdrop video compression system
 from disdrop import CacheManager
 
 # Create cache manager
-cache_manager = CacheManager(cache_dir="/path/to/cache", max_cache_size_mb=500)
+cache_manager = CacheManager(config_dir="/path/to/cache", max_cache_size_mb=500)
 
 # Get quality result (with automatic prediction)
 result, is_cache_hit, response_time = cache_manager.get_quality_result(
@@ -49,7 +49,7 @@ cache_manager.cache_quality_result(video_path, compression_params, quality_resul
 - Use `CacheManager` instead of `PerformanceCacheSystem`
 - `create_performance_cache_system()` replaced by `create_cache_manager()`
 
-#### PerformanceCache (`src/performance_cache.py`)
+#### PerformanceCache (`src/video_processing/performance_cache.py`)
 **Core SQLite-based caching system.**
 
 **Responsibilities:**
@@ -62,7 +62,7 @@ cache_manager.cache_quality_result(video_path, compression_params, quality_resul
 
 ### Quality Prediction Layer
 
-#### QualityPredictor (`src/quality_predictor.py`)
+#### QualityPredictor (`src/video_processing/quality_predictor.py`)
 **Unified quality predictor with multiple strategies.**
 
 **Responsibilities:**
@@ -113,7 +113,7 @@ predictor.record_evaluation_result(
 
 ### Performance Monitoring Layer
 
-#### PerformanceMonitor (`src/performance_monitor.py`)
+#### PerformanceMonitor (`src/video_processing/performance_monitor.py`)
 **Core metrics collection and session tracking.**
 
 **Responsibilities:**
@@ -123,7 +123,7 @@ predictor.record_evaluation_result(
 - Performance profile management
 - Session metrics export
 
-#### PerformanceAnalyzer (`src/performance_analyzer.py`)
+#### PerformanceAnalyzer (`src/video_processing/performance_analyzer.py`)
 **Advanced analysis of performance metrics.**
 
 **Responsibilities:**
@@ -134,7 +134,7 @@ predictor.record_evaluation_result(
 
 **Note:** Used internally by `PerformanceController`.
 
-#### PerformanceController (`src/performance_controls.py`)
+#### PerformanceController (`src/video_processing/performance_controls.py`)
 **User-facing performance features.**
 
 **Responsibilities:**
@@ -171,7 +171,7 @@ bottlenecks = controller.get_bottleneck_report()
 - Quality validation against thresholds
 - Resolution scaling for comparison
 
-#### QualityEvaluationPerformanceOptimizer (`src/quality_evaluation_performance_optimizer.py`)
+#### QualityEvaluationPerformanceOptimizer (`src/video_processing/quality_evaluation_performance_optimizer.py`)
 **Integrates performance optimization for quality evaluation.**
 
 **Responsibilities:**
@@ -184,7 +184,7 @@ bottlenecks = controller.get_bottleneck_report()
 
 ### Video Compression Layer
 
-#### DynamicVideoCompressor (`src/video_compressor.py`)
+#### DynamicVideoCompressor (`src/video_processing/video_compressor.py`)
 **Main orchestrator for video compression.**
 
 **Responsibilities:**
@@ -286,6 +286,16 @@ QualityEvaluationPerformanceOptimizer
 2. **Quality Prediction**: Use `QualityPredictor` with `AUTO` strategy for best results
 3. **Performance Monitoring**: Use `PerformanceController` for user-facing performance features
 4. **Strategy Selection**: Let `QualityPredictor` auto-select strategy unless you have specific requirements
+
+
+
+
+
+
+
+
+
+
 
 
 

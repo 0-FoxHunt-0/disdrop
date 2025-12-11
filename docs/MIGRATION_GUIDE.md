@@ -1,5 +1,7 @@
 # Migration Guide: Component Consolidation
 
+> **Note**: This guide is for historical reference. The migration described here has been completed. If you're using a recent version of disdrop, you should already be using the unified components described below.
+
 This guide helps you migrate from deprecated components to the new unified interfaces.
 
 ## Cache Layer Migration
@@ -256,6 +258,9 @@ prediction = predictor.predict_quality(
 3. **Unified Interface**: Consistent API across all prediction methods
 4. **Better Performance**: Optimized implementations in unified components
 5. **Easier Maintenance**: Single codebase instead of multiple overlapping components
+
+
+
 
 
 

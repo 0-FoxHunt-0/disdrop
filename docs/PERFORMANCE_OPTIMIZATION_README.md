@@ -40,7 +40,7 @@ These components are integrated through the `QualityEvaluationPerformanceOptimiz
 ### Basic Usage
 
 ```python
-from quality_evaluation_performance_optimizer import QualityEvaluationPerformanceOptimizer
+from disdrop.video_processing.quality_evaluation_performance_optimizer import QualityEvaluationPerformanceOptimizer
 
 # Initialize optimizer
 optimizer = QualityEvaluationPerformanceOptimizer(config_manager)
@@ -141,10 +141,12 @@ The optimizer integrates seamlessly with the existing `QualityGates` class:
 
 ```python
 # Replace direct QualityGates usage
+# from disdrop.video_processing.quality_gates import QualityGates
 # quality_gates = QualityGates(config)
 # result = quality_gates.evaluate_quality(original, compressed, vmaf_threshold, ssim_threshold)
 
 # With optimized evaluation
+from disdrop.video_processing.quality_evaluation_performance_optimizer import QualityEvaluationPerformanceOptimizer
 optimizer = QualityEvaluationPerformanceOptimizer(config)
 result = optimizer.execute_optimized_evaluation(original, compressed, vmaf_threshold, ssim_threshold)
 ```
@@ -165,7 +167,7 @@ print(f"Prediction accuracy: {stats['result_predictor']['vmaf_accuracy']['mean_a
 Run the included test suite to verify functionality:
 
 ```bash
-python src/test_performance_optimization.py
+python src/video_processing/test_performance_optimization.py
 ```
 
 This will test all components and verify they work correctly together.
