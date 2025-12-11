@@ -252,10 +252,17 @@ class GifSegmenter:
                     if not result.get('success', False):
                         err = result.get('error', 'Unknown error')
                         if self._should_retry_due_to_size(err):
+                            # Check if this is a segmentation-disabled error
+                            is_segmentation_disabled = 'segmentation is disabled' in (err or '').lower()
+                            if is_segmentation_disabled:
+                                logger.info(
+                                    f"Segment {i+1} failed with segmentation disabled, retrying with aggressive guardrail settings"
+                                )
+                            
                             overrides = self.gif_generator._build_guardrail_overrides(segment_settings)
                             if overrides:
                                 logger.info(
-                                    f"Retrying segment {i+1} with guardrail overrides: width->{overrides.get('width')} fps->{overrides.get('fps')}"
+                                    f"Retrying segment {i+1} with guardrail overrides: width->{overrides.get('width')} fps->{overrides.get('fps')} colors->{overrides.get('colors')}"
                                 )
                                 try:
                                     if os.path.exists(segment_path):
@@ -275,6 +282,45 @@ class GifSegmenter:
                                         force_guardrails=True,
                                         **runtime_kwargs
                                     )
+                                    
+                                    # If guardrail retry still fails, try even more aggressive settings
+                                    # This applies if the retry failed with segmentation disabled or size-related errors
+                                    if not result.get('success', False):
+                                        retry_err = result.get('error', 'Unknown error')
+                                        retry_err_lower = (retry_err or '').lower()
+                                        should_try_ultra_aggressive = (
+                                            'segmentation is disabled' in retry_err_lower or
+                                            self._should_retry_due_to_size(retry_err)
+                                        )
+                                        
+                                        if should_try_ultra_aggressive:
+                                            logger.info(
+                                                f"Segment {i+1} still failing after guardrail retry ({retry_err[:100]}), applying ultra-aggressive settings"
+                                            )
+                                            # Apply guardrail overrides again for even more aggressive reduction
+                                            ultra_aggressive = self.gif_generator._build_guardrail_overrides(overrides)
+                                            if ultra_aggressive:
+                                                try:
+                                                    if os.path.exists(segment_path):
+                                                        os.remove(segment_path)
+                                                except Exception:
+                                                    pass
+                                                try:
+                                                    result = self.gif_generator.create_gif(
+                                                        input_video=input_video,
+                                                        output_path=segment_path,
+                                                        platform=None,
+                                                        max_size_mb=max_size_mb,
+                                                        start_time=segment_start,
+                                                        duration=segment_duration_actual,
+                                                        disable_segmentation=True,
+                                                        settings_override=ultra_aggressive,
+                                                        force_guardrails=True,
+                                                        **runtime_kwargs
+                                                    )
+                                                except Exception as ultra_retry_e:
+                                                    logger.warning(f"Exception during ultra-aggressive retry for segment {i+1}: {ultra_retry_e}")
+                                    
                                 except Exception as retry_e:
                                     logger.warning(f"Exception during guardrail retry for segment {i+1}: {retry_e}")
                     
@@ -313,11 +359,39 @@ class GifSegmenter:
                         return (True, sz, segment_name)
                     else:
                         err = result.get('error', 'Unknown error')
-                        logger.warning(f"Failed to create segment {i+1}/{num_segments}: {err}")
+                        size_mb = result.get('size_mb', 0.0)
+                        duration_actual = result.get('duration', segment_duration_actual)
+                        
+                        # Build detailed error message
+                        error_details = [f"Segment {i+1}/{num_segments} failed"]
+                        error_details.append(f"Error: {err}")
+                        if size_mb > 0:
+                            error_details.append(f"Size: {size_mb:.2f}MB (target: {max_size_mb:.2f}MB)")
+                        if duration_actual != segment_duration_actual:
+                            error_details.append(f"Duration: {duration_actual:.2f}s (requested: {segment_duration_actual:.2f}s)")
+                        error_details.append(f"Time range: {segment_start:.2f}s - {segment_start + duration_actual:.2f}s")
+                        
+                        error_msg = "; ".join(error_details)
+                        logger.warning(f"Failed to create segment {i+1}/{num_segments}: {error_msg}")
+                        
+                        # Log additional context if available
+                        if 'GIF generation failed and segmentation is disabled' in err:
+                            logger.warning(
+                                f"Segment {i+1}: Single-file optimization failed and nested segmentation is disabled. "
+                                f"This segment may be too complex or long for single-file processing. "
+                                f"Consider reducing segment duration or adjusting quality settings."
+                            )
+                        
                         return (False, 0.0, segment_name)
                 
                 except Exception as e:
-                    logger.warning(f"Exception in segment {i+1}: {e}")
+                    import traceback
+                    error_trace = traceback.format_exc()
+                    logger.warning(
+                        f"Exception in segment {i+1}/{num_segments}: {e}\n"
+                        f"Segment: {segment_name}, Time range: {segment_start:.2f}s - {segment_start + segment_duration_actual:.2f}s\n"
+                        f"Traceback: {error_trace}"
+                    )
                     return (False, 0.0, f"{safe_base_name}_segment_{i+1:02d}.gif")
             
             # Execute in parallel
@@ -380,7 +454,22 @@ class GifSegmenter:
                     'method': 'segmentation'
                 }
             else:
-                return {'success': False, 'error': 'Failed to create any segments'}
+                # Build detailed error message with segment failure information
+                failed_segments = [name for ok, _, name in results if not ok]
+                error_parts = [f'Failed to create any segments ({num_segments} attempted)']
+                if failed_segments:
+                    error_parts.append(f'Failed segments: {", ".join(failed_segments[:5])}')
+                    if len(failed_segments) > 5:
+                        error_parts.append(f'... and {len(failed_segments) - 5} more')
+                error_parts.append(f'Total duration: {duration:.1f}s, Segment duration: {segment_duration:.1f}s')
+                error_parts.append('All segment creation attempts failed. This may indicate:')
+                error_parts.append('  - Video is too complex for GIF conversion')
+                error_parts.append('  - Quality settings are too high for target size')
+                error_parts.append('  - Individual segments are still too large')
+                
+                error_msg = '; '.join(error_parts)
+                logger.error(error_msg)
+                return {'success': False, 'error': error_msg, 'segments_attempted': num_segments, 'segments_created': 0}
         
         except Exception as e:
             logger.error(f"Error creating segmented GIFs: {e}", exc_info=True)
@@ -424,7 +513,8 @@ class GifSegmenter:
     def _should_retry_due_to_size(error: str) -> bool:
         """Return True if error indicates the GIF exceeded size limits."""
         err = (error or '').lower()
-        return 'exceeds limit' in err or 'size' in err
+        return ('exceeds limit' in err or 'size' in err or 
+                'segmentation is disabled' in err)
     
     def _should_force_segment_guardrails(self, segment_duration: float, settings: Dict[str, Any]) -> bool:
         """Determine whether guardrails should be forced for this segment before the first encode."""

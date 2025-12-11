@@ -142,6 +142,32 @@ class GifOptimizer:
         predicted_bytes = base_bytes * color_factor * lossy_factor
         return predicted_bytes / (1024 * 1024)
     
+    def _is_converged(self, current_size_mb: float, previous_size_mb: Optional[float], 
+                      target_size_mb: float, threshold_percent: float = 2.0) -> bool:
+        """
+        Check if optimizer has converged (result within threshold of previous attempt).
+        
+        Args:
+            current_size_mb: Current optimization result size in MB
+            previous_size_mb: Previous optimization result size in MB (None if first attempt)
+            target_size_mb: Target size in MB
+            threshold_percent: Percentage threshold for convergence detection (default 2.0%)
+        
+        Returns:
+            True if optimizer has converged (result within threshold of previous attempt)
+        """
+        if previous_size_mb is None:
+            return False
+        size_diff = abs(current_size_mb - previous_size_mb)
+        size_diff_percent = (size_diff / max(previous_size_mb, 1e-6)) * 100
+        converged = size_diff_percent <= threshold_percent
+        if converged:
+            logger.info(
+                f"Optimizer converged: current={current_size_mb:.2f}MB, previous={previous_size_mb:.2f}MB, "
+                f"diff={size_diff_percent:.2f}% (threshold={threshold_percent}%)"
+            )
+        return converged
+    
     def _calculate_required_parameters(self, current_size_mb: float, target_size_mb: float,
                                       current_params: Dict[str, Any], gif_info: Dict[str, Any],
                                       gif_path: Optional[str] = None) -> Dict[str, Any]:
@@ -280,7 +306,8 @@ class GifOptimizer:
         }
     
     def optimize_gif(self, gif_path: str, max_size_mb: float, source_video: Optional[str] = None,
-                     force_guardrails: bool = False) -> bool:
+                     force_guardrails: bool = False, previous_result_size_mb: Optional[float] = None,
+                     skip_stage2: bool = False) -> Tuple[bool, float, bool]:
         """
         Optimize GIF file to meet size target using stage-based pipeline.
         
@@ -289,17 +316,21 @@ class GifOptimizer:
             max_size_mb: Maximum target size in MB
             source_video: Optional path to source video for re-encoding (preferred over GIF re-encoding)
             force_guardrails: Force guardrail heuristics even if clip duration/frame budget is low
+            previous_result_size_mb: Optional previous optimization result size for convergence detection
         
         Returns:
-            True if optimization succeeded and file is under target, False otherwise
+            Tuple of (success: bool, final_size_mb: float, converged: bool)
+            - success: True if optimization succeeded and file is under target
+            - final_size_mb: Final file size in MB after optimization
+            - converged: True if optimizer has converged (result within 2% of previous attempt)
         """
         try:
             if self._shutdown_checker():
-                return False
+                return False, 0.0, False
             
             if not os.path.exists(gif_path):
                 logger.error(f"GIF file not found: {gif_path}")
-                return False
+                return False, 0.0, False
             
             target_bytes = int(max_size_mb * 1024 * 1024)
             original_bytes = os.path.getsize(gif_path)
@@ -311,7 +342,7 @@ class GifOptimizer:
             # Early exit if already under target
             if original_bytes <= target_bytes:
                 logger.info(f"GIF already under target: {original_size_mb:.2f}MB <= {target_size_mb:.2f}MB")
-                return True
+                return True, original_size_mb, False
             
             # Backup original (best-effort, in temp dir)
             backup_path = None
@@ -322,13 +353,14 @@ class GifOptimizer:
                 backup_path = None
             
             # Run optimization stages
-            success = self._run_optimization_stages(
+            success, converged = self._run_optimization_stages(
                 gif_path,
                 target_bytes,
                 target_size_mb,
                 original_size_mb,
-                source_video,
-                force_guardrails=force_guardrails
+                source_video if not skip_stage2 else None,  # Skip Stage 2 if flag is set
+                force_guardrails=force_guardrails,
+                previous_result_size_mb=previous_result_size_mb
             )
             
             # Cleanup backup
@@ -338,12 +370,21 @@ class GifOptimizer:
                 except Exception:
                     pass
             
+            final_size_mb = os.path.getsize(gif_path) / 1024 / 1024
+            
+            # Check for convergence if we have a previous result
+            if not converged and previous_result_size_mb is not None:
+                converged = self._is_converged(final_size_mb, previous_result_size_mb, target_size_mb)
+            
             if success:
-                final_size_mb = os.path.getsize(gif_path) / 1024 / 1024
                 logger.info(f"GIF optimization succeeded: {final_size_mb:.2f}MB <= {target_size_mb:.2f}MB")
             else:
-                final_size_mb = os.path.getsize(gif_path) / 1024 / 1024
                 logger.warning(f"GIF optimization did not meet target: {final_size_mb:.2f}MB > {target_size_mb:.2f}MB")
+                if converged:
+                    logger.warning(
+                        f"Optimizer has converged (result within 2% of previous attempt). "
+                        f"Further optimization attempts unlikely to improve result."
+                    )
                 
                 # Log detailed specs of best result for debugging and segmentation consideration
                 try:
@@ -358,16 +399,17 @@ class GifOptimizer:
                 except Exception as e:
                     logger.debug(f"Could not get GIF info: {e}")
             
-            return success
+            return success, final_size_mb, converged
             
         except Exception as e:
             logger.error(f"Error optimizing GIF: {e}", exc_info=True)
-            return False
+            return False, 0.0, False
     
     def _run_optimization_stages(self, gif_path: str, target_bytes: int, 
                                  target_size_mb: float, original_size_mb: float,
                                  source_video: Optional[str] = None,
-                                 force_guardrails: bool = False) -> bool:
+                                 force_guardrails: bool = False,
+                                 previous_result_size_mb: Optional[float] = None) -> Tuple[bool, bool]:
         """
         Run optimization stages in sequence.
         
@@ -377,9 +419,13 @@ class GifOptimizer:
             target_size_mb: Target size in MB
             original_size_mb: Original size in MB
             source_video: Optional source video path for re-encoding
+            force_guardrails: Force guardrail heuristics
+            previous_result_size_mb: Optional previous optimization result size for convergence detection
         
         Returns:
-            True if target met, False otherwise
+            Tuple of (success: bool, converged: bool)
+            - success: True if target met
+            - converged: True if optimizer has converged (result within 2% of previous attempt)
         """
         current_bytes = os.path.getsize(gif_path)
         current_size_mb = current_bytes / 1024 / 1024
@@ -389,7 +435,7 @@ class GifOptimizer:
         
         # Stage 1: Lossless optimization (try even if far over target - it might still help)
         if self._shutdown_checker():
-            return False
+            return False, False
         
         over_ratio = (current_bytes - target_bytes) / float(target_bytes) if target_bytes > 0 else 1.0
         logger.debug(f"Stage 1 (lossless): over_ratio={over_ratio:.2%}, threshold={self.skip_gifsicle_far_over_ratio:.2%}")
@@ -404,7 +450,7 @@ class GifOptimizer:
                 logger.info(f"Stage 1 completed: {current_size_mb:.2f}MB")
                 if current_bytes <= target_bytes:
                     logger.info("Target met after Stage 1")
-                    return True
+                    return True, False
             else:
                 logger.debug("Stage 1: Lossless optimization skipped or failed")
         else:
@@ -412,68 +458,147 @@ class GifOptimizer:
         
         # Stage 2: Source re-encoding (if source available - preferred over GIF re-encoding)
         # IMPROVED: Keep Stage 2 result as baseline for Stage 3 if it's better than original
+        # FIX: Add retry limits, convergence checking, and early exit conditions
         if self._shutdown_checker():
-            return False
+            return False, False
         
         if source_video and os.path.exists(source_video):
-            logger.info(f"Stage 2: Attempting re-encoding from source video: {source_video}")
-            
-            # Create temp backup of current state before Stage 2
-            with temp_file_context("stage2_backup", ".gif", self.temp_dir) as stage2_backup:
-                try:
-                    safe_file_operation(shutil.copy2, gif_path, stage2_backup)
-                    backup_size = os.path.getsize(stage2_backup)
-                except Exception as e:
-                    logger.debug(f"Could not create Stage 2 backup: {e}")
-                    stage2_backup = None
-                    backup_size = os.path.getsize(gif_path)
-                
-                if self._reencode_from_source(
-                    source_video,
-                    gif_path,
-                    target_size_mb,
-                    force_guardrails=force_guardrails
-                ):
-                    current_bytes = os.path.getsize(gif_path)
-                    current_size_mb = current_bytes / 1024 / 1024
-                    logger.info(f"Stage 2 completed: {current_size_mb:.2f}MB")
-                    
-                    if current_bytes <= target_bytes:
-                        logger.info("Target met after Stage 2")
-                        return True
-                    
-                    # NEW: Check if Stage 2 result is better and within chaining range
-                    over_ratio = (current_bytes - target_bytes) / target_bytes
-                    if current_bytes < backup_size and over_ratio <= 0.30:  # Within 30% of target and improved
-                        logger.info(
-                            f"Stage 2 result ({current_size_mb:.2f}MB, {over_ratio*100:.1f}% over target) "
-                            f"is close to target and better than before. Using as baseline for Stage 3."
-                        )
-                        # Continue with this improved baseline - don't restore backup
-                    elif current_bytes < backup_size:
-                        logger.info(
-                            f"Stage 2 result ({current_size_mb:.2f}MB) improved size but still far over target "
-                            f"({over_ratio*100:.1f}%). Keeping for subsequent stages."
-                        )
-                    else:
-                        # Stage 2 made it worse - restore backup
-                        if stage2_backup and os.path.exists(stage2_backup):
-                            logger.debug("Stage 2 increased size, restoring pre-Stage-2 state")
-                            safe_file_operation(shutil.copy2, stage2_backup, gif_path)
+            # Check convergence before Stage 2 - if converged, skip Stage 2
+            skip_stage2_converged = False
+            if previous_result_size_mb is not None:
+                if self._is_converged(current_size_mb, previous_result_size_mb, target_size_mb):
+                    logger.info(
+                        f"Stage 2: Skipping (converged: {current_size_mb:.2f}MB vs previous {previous_result_size_mb:.2f}MB)"
+                    )
+                    skip_stage2_converged = True
                 else:
-                    logger.debug("Stage 2: Source re-encoding failed or did not improve")
-                    # Restore backup if Stage 2 failed and file was modified
-                    if stage2_backup and os.path.exists(stage2_backup):
-                        current_size = os.path.getsize(gif_path) if os.path.exists(gif_path) else float('inf')
-                        if current_size > backup_size:
-                            safe_file_operation(shutil.copy2, stage2_backup, gif_path)
-                            logger.debug("Restored pre-Stage-2 state (Stage 2 increased size)")
+                    logger.debug(
+                        f"Stage 2: Not converged (current: {current_size_mb:.2f}MB, previous: {previous_result_size_mb:.2f}MB)"
+                    )
+            
+            if not skip_stage2_converged:
+                logger.info(f"Stage 2: Attempting re-encoding from source video: {source_video}")
+                
+                # Create temp backup of current state before Stage 2
+                with temp_file_context("stage2_backup", ".gif", self.temp_dir) as stage2_backup:
+                    try:
+                        safe_file_operation(shutil.copy2, gif_path, stage2_backup)
+                        backup_size = os.path.getsize(stage2_backup)
+                    except Exception as e:
+                        logger.debug(f"Could not create Stage 2 backup: {e}")
+                        stage2_backup = None
+                        backup_size = os.path.getsize(gif_path)
+                    
+                    # Track Stage 2 attempts and results for retry limits and progress detection
+                    stage2_max_attempts = 3
+                    stage2_attempt = 0
+                    stage2_previous_size_mb = current_size_mb
+                    stage2_seen_sizes = set()  # Track seen result sizes to detect no progress
+                    size_tolerance_mb = 1.0  # Consider results within 1MB as identical
+                    
+                    while stage2_attempt < stage2_max_attempts:
+                        stage2_attempt += 1
+                        logger.info(f"Stage 2 attempt {stage2_attempt}/{stage2_max_attempts}")
+                        
+                        # Early exit: if result is identical to input (within tolerance), skip to Stage 3
+                        if abs(current_size_mb - backup_size / 1024 / 1024) < size_tolerance_mb:
+                            logger.info(
+                                f"Stage 2: Result identical to input ({current_size_mb:.2f}MB), skipping to Stage 3"
+                            )
+                            break
+                        
+                        # Early exit: if we've seen this size before, no progress is being made
+                        current_size_rounded = round(current_size_mb / size_tolerance_mb) * size_tolerance_mb
+                        if current_size_rounded in stage2_seen_sizes:
+                            logger.warning(
+                                f"Stage 2: No progress detected (seen size {current_size_mb:.2f}MB before), "
+                                f"skipping to Stage 3 after {stage2_attempt - 1} attempts"
+                            )
+                            break
+                        stage2_seen_sizes.add(current_size_rounded)
+                        
+                        if self._reencode_from_source(
+                            source_video,
+                            gif_path,
+                            target_size_mb,
+                            force_guardrails=force_guardrails,
+                            previous_result_size_mb=stage2_previous_size_mb,
+                            seen_sizes=stage2_seen_sizes
+                        ):
+                            current_bytes = os.path.getsize(gif_path)
+                            current_size_mb = current_bytes / 1024 / 1024
+                            logger.info(f"Stage 2 attempt {stage2_attempt} completed: {current_size_mb:.2f}MB")
+                            
+                            if current_bytes <= target_bytes:
+                                logger.info("Target met after Stage 2")
+                                return True, False
+                            
+                            # Check if result is identical to previous attempt (no progress)
+                            if abs(current_size_mb - stage2_previous_size_mb) < size_tolerance_mb:
+                                logger.warning(
+                                    f"Stage 2: No progress made (result {current_size_mb:.2f}MB same as previous "
+                                    f"{stage2_previous_size_mb:.2f}MB), stopping Stage 2"
+                                )
+                                break
+                            
+                            # Check if result is worse than previous attempt
+                            if current_size_mb > stage2_previous_size_mb + size_tolerance_mb:
+                                logger.warning(
+                                    f"Stage 2: Result worse than previous ({current_size_mb:.2f}MB > "
+                                    f"{stage2_previous_size_mb:.2f}MB), stopping Stage 2"
+                                )
+                                # Restore to previous best
+                                if stage2_backup and os.path.exists(stage2_backup):
+                                    safe_file_operation(shutil.copy2, stage2_backup, gif_path)
+                                    current_bytes = backup_size
+                                    current_size_mb = backup_size / 1024 / 1024
+                                break
+                            
+                            # Update previous size for next iteration
+                            stage2_previous_size_mb = current_size_mb
+                        else:
+                            logger.debug(f"Stage 2 attempt {stage2_attempt}: Source re-encoding failed or did not improve")
+                            # If this is not the first attempt, break to avoid infinite retries
+                            if stage2_attempt > 1:
+                                logger.info("Stage 2: Multiple failures, stopping retries")
+                                break
+                    
+                    # Final check: if Stage 2 result is better and within chaining range
+                    if os.path.exists(gif_path):
+                        final_bytes = os.path.getsize(gif_path)
+                        final_size_mb = final_bytes / 1024 / 1024
+                        
+                        if final_bytes < backup_size:
+                            over_ratio = (final_bytes - target_bytes) / target_bytes if target_bytes > 0 else 1.0
+                            if over_ratio <= 0.30:  # Within 30% of target and improved
+                                logger.info(
+                                    f"Stage 2 result ({final_size_mb:.2f}MB, {over_ratio*100:.1f}% over target) "
+                                    f"is close to target and better than before. Using as baseline for Stage 3."
+                                )
+                            else:
+                                logger.info(
+                                    f"Stage 2 result ({final_size_mb:.2f}MB) improved size but still far over target "
+                                    f"({over_ratio*100:.1f}%). Keeping for subsequent stages."
+                                )
+                        elif final_bytes > backup_size:
+                            # Stage 2 made it worse - restore backup
+                            if stage2_backup and os.path.exists(stage2_backup):
+                                logger.debug("Stage 2 increased size, restoring pre-Stage-2 state")
+                                safe_file_operation(shutil.copy2, stage2_backup, gif_path)
+                                current_bytes = backup_size
+                                current_size_mb = backup_size / 1024 / 1024
+                        else:
+                            # Same size - update current_size_mb
+                            current_bytes = final_bytes
+                            current_size_mb = final_size_mb
+            else:
+                logger.debug("Stage 2: Skipped (converged or no source video)")
         else:
             logger.debug("Stage 2: No source video available, skipping")
         
         # Stage 3: Gifsicle lossy compression (ALWAYS attempt this for files over target)
         if self._shutdown_checker():
-            return False
+            return False, False
         
         logger.info(
             "Stage 3: Attempting gifsicle lossy compression (%.2fMB -> %.2fMB target)...",
@@ -490,6 +615,7 @@ class GifOptimizer:
             # the target, but it may still reduce size even when it returns False. We therefore
             # treat the boolean as \"made a successful under-target attempt\" and always re-stat
             # the file afterwards to determine actual size and improvement.
+            logger.debug(f"Stage 3: Starting gifsicle lossy compression on {os.path.basename(gif_path)} ({size_before_gifsicle / (1024*1024):.2f}MB -> {target_size_mb:.2f}MB target)")
             self._stage_gifsicle_lossy_compression(gif_path, target_bytes, target_size_mb)
             gifsicle_attempted = True
             
@@ -497,6 +623,7 @@ class GifOptimizer:
                 current_bytes = os.path.getsize(gif_path)
                 current_size_mb = current_bytes / 1024 / 1024
                 gifsicle_improved = current_bytes < size_before_gifsicle
+                logger.debug(f"Stage 3: After gifsicle, file {os.path.basename(gif_path)} is {current_size_mb:.2f}MB (was {size_before_gifsicle / (1024*1024):.2f}MB, improved: {gifsicle_improved})")
                 
                 if gifsicle_improved:
                     logger.info(
@@ -512,46 +639,76 @@ class GifOptimizer:
                 
                 if current_bytes <= target_bytes:
                     logger.info("Target met after Stage 3 (gifsicle)")
-                    return True
+                    return True, False
             else:
                 logger.warning("Stage 3: GIF file missing after gifsicle compression")
-                return False
+                return False, False
         else:
             logger.warning("Stage 3: gifsicle not available, will try FFmpeg and other fallbacks")
         
         # Stage 3b: Near-target bounded search (when gifsicle got close but not under)
-        current_bytes = os.path.getsize(gif_path)
-        current_size_mb = current_bytes / 1024 / 1024
-        over_ratio = (current_bytes - target_bytes) / float(target_bytes) if target_bytes > 0 else 1.0
-        
-        # Get near-target config (shared with later stages)
-        optimization_cfg = self.config_helper.get_optimization_config()
-        near_target_config = optimization_cfg.get('near_target', {})
-        near_threshold = near_target_config.get('threshold_percent', 15) / 100.0
-        mode = near_target_config.get('mode', 'both')
-        abs_threshold_mb = float(near_target_config.get('absolute_mb_threshold', 0.0) or 0.0)
-        
-        gifsicle_near_target = gifsicle_attempted and gifsicle_improved and 0 < over_ratio <= near_threshold
-        
-        if gifsicle_near_target and self._is_tool_available("gifsicle") and mode in ['bounded_search', 'both']:
-            logger.info(
-                "Stage 3b: Gifsicle got close (over by %.1f%%), attempting bounded search...",
-                over_ratio * 100,
-            )
-            if self._stage_adaptive_search(gif_path, target_bytes):
-                current_bytes = os.path.getsize(gif_path)
-                current_size_mb = current_bytes / 1024 / 1024
-                logger.info("Stage 3b (bounded search) completed: %.2fMB", current_size_mb)
-                if current_bytes <= target_bytes:
-                    logger.info("Target met after Stage 3b (bounded search)")
-                    return True
+        # Verify file exists and get current size
+        if not os.path.exists(gif_path):
+            logger.warning(f"Stage 3b: GIF file does not exist: {gif_path}")
+            current_bytes = 0
+            current_size_mb = 0.0
+        else:
+            current_bytes = os.path.getsize(gif_path)
+            current_size_mb = current_bytes / 1024 / 1024
+            over_ratio = (current_bytes - target_bytes) / float(target_bytes) if target_bytes > 0 else 1.0
+            
+            # Verify we're using the optimized file, not the original
+            # If gifsicle improved, the file should be smaller than original_size_mb
+            if gifsicle_improved and current_size_mb > original_size_mb * 0.9:
+                logger.warning(
+                    f"Stage 3b: File size ({current_size_mb:.2f}MB) suggests we may be using original file "
+                    f"instead of optimized. Expected < {original_size_mb * 0.9:.2f}MB. "
+                    f"Verifying file replacement succeeded..."
+                )
+                # Re-check file to ensure it's the optimized version
+                if os.path.exists(gif_path):
+                    recheck_size = os.path.getsize(gif_path)
+                    recheck_size_mb = recheck_size / 1024 / 1024
+                    if abs(recheck_size - current_bytes) > 1024:  # More than 1KB difference
+                        logger.warning(f"Stage 3b: File size changed between checks: {current_size_mb:.2f}MB -> {recheck_size_mb:.2f}MB")
+                        current_bytes = recheck_size
+                        current_size_mb = recheck_size_mb
+                        over_ratio = (current_bytes - target_bytes) / float(target_bytes) if target_bytes > 0 else 1.0
+            
+            # Get near-target config (shared with later stages)
+            optimization_cfg = self.config_helper.get_optimization_config()
+            near_target_config = optimization_cfg.get('near_target', {})
+            near_threshold = near_target_config.get('threshold_percent', 15) / 100.0
+            mode = near_target_config.get('mode', 'both')
+            abs_threshold_mb = float(near_target_config.get('absolute_mb_threshold', 0.0) or 0.0)
+            
+            gifsicle_near_target = gifsicle_attempted and gifsicle_improved and 0 < over_ratio <= near_threshold
+            
+            if gifsicle_near_target and self._is_tool_available("gifsicle") and mode in ['bounded_search', 'both']:
+                logger.info(
+                    "Stage 3b: Gifsicle got close (over by %.1f%%), attempting bounded search on %.2fMB file...",
+                    over_ratio * 100,
+                    current_size_mb
+                )
+                if self._stage_adaptive_search(gif_path, target_bytes):
+                    current_bytes = os.path.getsize(gif_path)
+                    current_size_mb = current_bytes / 1024 / 1024
+                    logger.info("Stage 3b (bounded search) completed: %.2fMB", current_size_mb)
+                    if current_bytes <= target_bytes:
+                        logger.info("Target met after Stage 3b (bounded search)")
+                        return True, False
         
         # Stage 3c: FFmpeg fallback when gifsicle fails, makes no progress, or file is still far over target
         if self._shutdown_checker():
-            return False
+            return False, False
         
-        current_bytes = os.path.getsize(gif_path)
-        current_size_mb = current_bytes / 1024 / 1024
+        # Ensure we have current file size for Stage 3c
+        if os.path.exists(gif_path):
+            current_bytes = os.path.getsize(gif_path)
+            current_size_mb = current_bytes / 1024 / 1024
+        else:
+            logger.warning("Stage 3c: GIF file does not exist")
+            return False, False
         
         if current_bytes > target_bytes:
             over_ratio = (current_bytes - target_bytes) / float(target_bytes) if target_bytes > 0 else 1.0
@@ -566,6 +723,8 @@ class GifOptimizer:
             )
             
             # Decide whether FFmpeg fallback should be attempted
+            # Strategy: Skip FFmpeg fallback when gifsicle just optimized the GIF and result is close to target,
+            # since re-encoding from an already-optimized GIF often increases file size rather than reducing it.
             use_ffmpeg = False
             if not gifsicle_available or not gifsicle_attempted:
                 # Never ran gifsicle: FFmpeg is our main option
@@ -576,6 +735,8 @@ class GifOptimizer:
             else:
                 # Gifsicle improved the file but it is still over target. Only use FFmpeg
                 # if we are still significantly over the target (beyond near-threshold band).
+                # Note: _stage_ffmpeg_fallback_compression will do additional checks to skip
+                # when gifsicle_just_applied=True and result is close to target (<20% over).
                 if over_ratio > near_threshold:
                     use_ffmpeg = True
                 elif absolute_trigger:
@@ -608,13 +769,16 @@ class GifOptimizer:
                     current_size_mb,
                     target_size_mb,
                 )
-                if self._stage_ffmpeg_fallback_compression(gif_path, target_bytes, target_size_mb):
+                # Pass information about whether gifsicle was just applied
+                gifsicle_just_applied = gifsicle_attempted and gifsicle_improved
+                if self._stage_ffmpeg_fallback_compression(gif_path, target_bytes, target_size_mb,
+                                                           gifsicle_just_applied=gifsicle_just_applied):
                     current_bytes = os.path.getsize(gif_path)
                     current_size_mb = current_bytes / 1024 / 1024
                     logger.info("Stage 3c (FFmpeg fallback) completed: %.2fMB", current_size_mb)
                     if current_bytes <= target_bytes:
                         logger.info("Target met after Stage 3c (FFmpeg fallback)")
-                        return True
+                        return True, False
                 else:
                     logger.warning("Stage 3c: FFmpeg fallback compression failed")
                     # Try progressive resolution reduction as additional fallback, but only when
@@ -641,7 +805,7 @@ class GifOptimizer:
                                 )
                                 if current_bytes <= target_bytes:
                                     logger.info("Target met after Stage 3c.1 (progressive resolution)")
-                                    return True
+                                    return True, False
                         else:
                             logger.debug(
                                 "Stage 3c.1: Skipping progressive resolution reduction "
@@ -652,7 +816,7 @@ class GifOptimizer:
         
         # Stage 3d: PIL-based compression (when still over target)
         if self._shutdown_checker():
-            return False
+            return False, False
         
         current_bytes = os.path.getsize(gif_path)
         if current_bytes > target_bytes:
@@ -668,7 +832,7 @@ class GifOptimizer:
                     logger.info(f"Stage 3d (PIL compression) completed: {current_size_mb:.2f}MB")
                     if current_bytes <= target_bytes:
                         logger.info("Target met after Stage 3d (PIL compression)")
-                        return True
+                        return True, False
                 else:
                     logger.debug("Stage 3d: PIL compression failed or did not reduce size sufficiently")
         
@@ -677,6 +841,20 @@ class GifOptimizer:
         current_bytes = os.path.getsize(gif_path)
         final_size_mb = current_bytes / 1024 / 1024
         success = current_bytes <= target_bytes
+        
+        # Check for convergence if we have a previous result
+        converged = False
+        if previous_result_size_mb is not None:
+            converged = self._is_converged(final_size_mb, previous_result_size_mb, target_size_mb)
+            # Also check if we're within 2% of target but still over (optimizer reached its limit)
+            if not success and not converged:
+                over_ratio = (current_bytes - target_bytes) / float(target_bytes) if target_bytes > 0 else 1.0
+                if over_ratio <= 0.02:  # Within 2% of target
+                    converged = True
+                    logger.info(
+                        f"Optimizer reached limit: result ({final_size_mb:.2f}MB) is within 2% of target "
+                        f"({target_size_mb:.2f}MB) but still over. Further optimization unlikely to help."
+                    )
         
         if not success:
             # Log detailed warning when optimization exhausts all methods
@@ -687,8 +865,8 @@ class GifOptimizer:
                 f"Consider segmentation for this file."
             )
         
-        logger.info(f"Optimization stages complete: {final_size_mb:.2f}MB, target met: {success}")
-        return success
+        logger.info(f"Optimization stages complete: {final_size_mb:.2f}MB, target met: {success}, converged: {converged}")
+        return success, converged
     
     def _stage_lossless_optimization(self, gif_path: str, target_bytes: int) -> bool:
         """
@@ -738,12 +916,24 @@ class GifOptimizer:
         if not self._is_tool_available("gifsicle"):
             return False
         
+        # Verify input file exists and log its size for debugging
+        if not os.path.exists(gif_path):
+            logger.warning(f"Adaptive search: Input file does not exist: {gif_path}")
+            return False
+        
+        input_size = os.path.getsize(gif_path)
+        input_size_mb = input_size / (1024 * 1024)
+        target_mb = target_bytes / (1024 * 1024)
+        logger.debug(f"Adaptive search: Starting from {input_size_mb:.2f}MB file (target: {target_mb:.2f}MB), path: {os.path.basename(gif_path)}")
+        
         with temp_file_context("adaptive_search", ".gif", self.temp_dir) as temp_output:
             if self._bounded_gifsicle_near_target(gif_path, temp_output, target_bytes):
                 if os.path.exists(temp_output):
                     try:
                         safe_file_operation(os.replace, temp_output, gif_path)
-                        logger.debug(f"Adaptive search succeeded")
+                        final_size = os.path.getsize(gif_path)
+                        final_size_mb = final_size / (1024 * 1024)
+                        logger.debug(f"Adaptive search succeeded: {final_size_mb:.2f}MB")
                         return True
                     except Exception as e:
                         logger.debug(f"Failed to replace with adaptive search result: {e}")
@@ -821,7 +1011,8 @@ class GifOptimizer:
             return False
     
     def _reencode_from_source(self, source_video: str, output_gif: str, target_size_mb: float,
-                              force_guardrails: bool = False) -> bool:
+                              force_guardrails: bool = False, previous_result_size_mb: Optional[float] = None,
+                              seen_sizes: Optional[set] = None) -> bool:
         """
         Re-encode GIF from source video with multiple parallel strategies to find best result.
         This is preferred over re-encoding an already-compressed GIF.
@@ -831,6 +1022,8 @@ class GifOptimizer:
             output_gif: Path to output GIF file
             target_size_mb: Target size in MB
             force_guardrails: Force guardrail heuristics even if clip duration is short
+            previous_result_size_mb: Optional previous result size for progress detection
+            seen_sizes: Optional set of seen result sizes (rounded) to detect no progress
         
         Returns:
             True if re-encoding succeeded and file is under or reasonably close to target
@@ -883,6 +1076,20 @@ class GifOptimizer:
                 )
             
             # IMPROVED: Create 3 parameter strategies for parallel execution
+            # FIX: Adapt parameters if previous attempt produced identical results
+            size_tolerance_mb = 1.0
+            adapt_aggressively = False
+            
+            # Check if we need more aggressive parameters (previous result was identical)
+            if previous_result_size_mb is not None:
+                size_diff = abs(current_size_mb - previous_result_size_mb)
+                if size_diff < size_tolerance_mb:
+                    logger.debug(
+                        f"Previous result identical to current ({current_size_mb:.2f}MB), "
+                        f"using more aggressive parameters"
+                    )
+                    adapt_aggressively = True
+            
             strategies = [
                 {
                     'name': 'balanced',
@@ -893,16 +1100,16 @@ class GifOptimizer:
                 },
                 {
                     'name': 'conservative',
-                    'width': int(base_params['width'] * 1.1),  # Slightly larger
-                    'fps': min(base_params['fps'] + 2, 30),
-                    'colors': min(base_params['colors'] + 32, 256),
+                    'width': int(base_params['width'] * (1.1 if not adapt_aggressively else 1.05)),  # Less conservative if adapting
+                    'fps': min(base_params['fps'] + (2 if not adapt_aggressively else 1), 30),
+                    'colors': min(base_params['colors'] + (32 if not adapt_aggressively else 16), 256),
                     'lossy': base_params.get('lossy', 0),
                 },
                 {
                     'name': 'aggressive',
-                    'width': int(base_params['width'] * 0.9),  # Smaller
-                    'fps': max(base_params['fps'] - 2, 10),
-                    'colors': max(base_params['colors'] - 32, 64),
+                    'width': int(base_params['width'] * (0.9 if not adapt_aggressively else 0.85)),  # More aggressive if adapting
+                    'fps': max(base_params['fps'] - (2 if not adapt_aggressively else 3), 10),
+                    'colors': max(base_params['colors'] - (32 if not adapt_aggressively else 48), 64),
                     'lossy': base_params.get('lossy', 0),
                 },
             ]
@@ -947,8 +1154,28 @@ class GifOptimizer:
                         logger.debug(f"Strategy {name} failed: {e}")
             
             # Pick best result: closest to target without going too far under (prefer quality)
+            # FIX: Filter out results that are identical to previous or seen sizes
             best = None
+            # FIX: Get original size before we overwrite the file
+            original_size_mb = os.path.getsize(output_gif) / 1024 / 1024 if os.path.exists(output_gif) else float('inf')
+            
+            # Track seen sizes for this call
+            if seen_sizes is None:
+                seen_sizes = set()
+            
             for temp_path, size_mb, name in results:
+                # Skip results that are identical to previous attempt or seen sizes
+                size_rounded = round(size_mb / size_tolerance_mb) * size_tolerance_mb
+                if previous_result_size_mb is not None:
+                    prev_rounded = round(previous_result_size_mb / size_tolerance_mb) * size_tolerance_mb
+                    if abs(size_rounded - prev_rounded) < size_tolerance_mb:
+                        logger.debug(f"Strategy '{name}': Skipping (identical to previous: {size_mb:.2f}MB)")
+                        continue
+                
+                if size_rounded in seen_sizes:
+                    logger.debug(f"Strategy '{name}': Skipping (seen size before: {size_mb:.2f}MB)")
+                    continue
+                
                 if size_mb <= target_size_mb:
                     # Meets target - prefer largest (best quality) that still meets target
                     if not best or size_mb > best[1]:
@@ -959,10 +1186,24 @@ class GifOptimizer:
             
             # Apply best result
             if best:
+                # Check if best result is identical to previous (no progress)
+                best_size_rounded = round(best[1] / size_tolerance_mb) * size_tolerance_mb
+                if previous_result_size_mb is not None:
+                    prev_rounded = round(previous_result_size_mb / size_tolerance_mb) * size_tolerance_mb
+                    if abs(best_size_rounded - prev_rounded) < size_tolerance_mb:
+                        logger.warning(
+                            f"Best strategy '{best[2]}' produced identical result ({best[1]:.2f}MB), "
+                            f"no progress made"
+                        )
+                        # Still apply it, but caller will detect this and stop retrying
+                
                 try:
                     safe_file_operation(shutil.copy2, best[0], output_gif)
                     logger.info(f"Selected '{best[2]}' strategy: {best[1]:.2f}MB (target: {target_size_mb:.2f}MB)")
                     success = best[1] <= target_size_mb
+                    
+                    # Add to seen sizes
+                    seen_sizes.add(best_size_rounded)
                     
                     # Cleanup all temp files
                     for temp_file in temp_files:
@@ -971,6 +1212,16 @@ class GifOptimizer:
                                 os.remove(temp_file)
                         except Exception:
                             pass
+                    
+                    # FIX: If result is better than original but still over target, return True
+                    # to allow Stage 3 optimization to continue. Only return False if result
+                    # is worse than original or doesn't exist.
+                    if not success:
+                        # Check if this is an improvement over the original
+                        if best[1] < original_size_mb:
+                            # Improved but still over target - allow Stage 3 to optimize further
+                            logger.debug(f"Stage 2 improved size ({best[1]:.2f}MB < {original_size_mb:.2f}MB) but still over target, continuing to Stage 3")
+                            return True
                     
                     return success
                 except Exception as e:
@@ -1198,11 +1449,24 @@ class GifOptimizer:
             # Use best result if available and better than current
             if best_result and os.path.exists(best_result) and best_size < current_bytes:
                 try:
+                    # Verify file replacement will work
+                    if not os.path.exists(gif_path):
+                        logger.warning(f"Stage 3: Target file does not exist for replacement: {gif_path}")
+                        return False
+                    
                     safe_file_operation(os.replace, best_result, gif_path)
+                    
+                    # Verify replacement succeeded
+                    if os.path.exists(gif_path):
+                        actual_size = os.path.getsize(gif_path)
+                        if abs(actual_size - best_size) > 1024:  # Allow 1KB tolerance
+                            logger.warning(f"Stage 3: File replacement size mismatch: expected {best_size}, got {actual_size}")
+                    
                     best_size_mb = best_size / 1024 / 1024
                     reduction_mb = (current_bytes - best_size) / 1024 / 1024
                     reduction_pct = ((current_bytes - best_size) / current_bytes * 100) if current_bytes > 0 else 0
                     logger.info(f"Applied best gifsicle lossy compression: {best_size_mb:.2f}MB (reduced by {reduction_mb:.2f}MB, {reduction_pct:.1f}%)")
+                    logger.debug(f"Stage 3: File replaced at {gif_path}, new size: {best_size_mb:.2f}MB")
                     # Cleanup remaining temp files
                     for tf in temp_files_to_cleanup:
                         if tf != best_result:
@@ -1367,10 +1631,17 @@ class GifOptimizer:
             logger.debug(f"Progressive resolution reduction exception: {e}")
             return False
     
-    def _stage_ffmpeg_fallback_compression(self, gif_path: str, target_bytes: int, target_size_mb: float) -> bool:
+    def _stage_ffmpeg_fallback_compression(self, gif_path: str, target_bytes: int, target_size_mb: float,
+                                          gifsicle_just_applied: bool = False) -> bool:
         """
         Stage 3b: FFmpeg fallback compression when gifsicle fails or is unavailable.
         Uses aggressive re-encoding with calculated parameters to meet target size.
+        
+        Args:
+            gif_path: Path to GIF file
+            target_bytes: Target size in bytes
+            target_size_mb: Target size in MB
+            gifsicle_just_applied: True if gifsicle lossy compression was just applied
         
         Returns:
             True if compression was applied and file size reduced
@@ -1384,6 +1655,20 @@ class GifOptimizer:
             
             if current_size_mb <= target_size_mb:
                 return True
+            
+            # Skip FFmpeg fallback if gifsicle was just applied and result is close to target
+            # Re-encoding from an already-optimized GIF often increases file size
+            if gifsicle_just_applied:
+                over_ratio = (current_bytes - target_bytes) / float(target_bytes) if target_bytes > 0 else 1.0
+                if over_ratio < 0.20:  # Less than 20% over target
+                    logger.info(
+                        "Stage 3c: Skipping FFmpeg fallback - GIF was just optimized by gifsicle "
+                        "and is close to target (%.2fMB, %.1f%% over). "
+                        "Re-encoding from already-optimized GIF would likely increase file size.",
+                        current_size_mb,
+                        over_ratio * 100
+                    )
+                    return False
             
             # Get GIF info to calculate parameters
             try:
@@ -1624,114 +1909,288 @@ class GifOptimizer:
             return False
     
     def _bounded_gifsicle_near_target(self, input_path: str, best_output_path: str, target_bytes: int) -> bool:
-        """Bounded gifsicle search for near-target cases"""
+        """Bounded gifsicle search for near-target cases - optimized with adaptive search"""
         try:
             # Get configuration
             near_target_config = self.config_helper.get_optimization_config().get('near_target', {})
             max_runs = near_target_config.get('max_attempts', self.near_target_max_runs)
             fine_tune_threshold = near_target_config.get('fine_tune_threshold_percent', 10) / 100.0
             
+            # Verify input file exists and log details
+            if not os.path.exists(input_path):
+                logger.warning(f"Bounded search: Input file does not exist: {input_path}")
+                return False
+            
             current_size = os.path.getsize(input_path)
+            current_size_mb = current_size / (1024 * 1024)
+            target_mb = target_bytes / (1024 * 1024)
             over_ratio = (current_size - target_bytes) / float(target_bytes) if target_bytes > 0 else 1.0
             
-            # Use finer-grained search when very close
-            if 0 < over_ratio <= fine_tune_threshold:
-                color_steps = [256, 240, 224, 208, 192, 176, 160]
-                lossy_steps = [20, 30, 40, 50, 60]
-                scale_steps = [1.0, 0.98, 0.96, 0.94, 0.92, 0.90]
-                logger.info(f"Using fine-grained search ({over_ratio*100:.1f}% over target)")
-            # Conservative ladders for fast mode or larger gaps
-            elif self.fast_mode:
-                color_steps = [256, 192]
-                lossy_steps = [0, 20]
-                scale_steps = [1.0, 0.96]
-            else:
-                # Original coarser steps
-                color_steps = [256, 224, 192, 160, 128, 96, 64]
-                lossy_steps = [20, 40, 60, 80, 100]
-                scale_steps = [1.0, 0.95, 0.90, 0.85, 0.80]
+            logger.debug(f"Bounded search: Input file {os.path.basename(input_path)} is {current_size_mb:.2f}MB (target: {target_mb:.2f}MB, {over_ratio*100:.1f}% over)")
             
-            original_size = os.path.getsize(input_path)
+            original_size = current_size
             best: Tuple[int, str] = (original_size, '')
-            
-            # Try quick color-only first
             temp_files_to_cleanup = []
+            runs = 0
+            
+            # Track results to avoid redundant tests: (scale, lossy) -> size
+            # When lossy > 0, colors have no effect, so we only track scale+lossy
+            result_cache: Dict[Tuple[float, int], int] = {}
+            
             try:
-                for colors in color_steps:
-                    if self._shutdown_checker():
-                        break
-                    
-                    temp = create_unique_temp_filename(f"near_c{colors}", ".gif", self.temp_dir)
-                    temp_files_to_cleanup.append(temp)
-                    
-                    if self._run_gifsicle(input_path, temp, colors=colors, lossy=0, scale=1.0):
-                        size = os.path.getsize(temp)
-                        if size <= target_bytes:
-                            safe_file_operation(shutil.copy2, temp, best_output_path)
-                            # Cleanup all temp files
-                            for tf in temp_files_to_cleanup:
-                                try:
-                                    if os.path.exists(tf):
-                                        os.remove(tf)
-                                except Exception:
-                                    pass
-                            return True
-                        if size < best[0]:
-                            # Remove previous best from cleanup list if exists
-                            if best[1] and best[1] in temp_files_to_cleanup:
-                                temp_files_to_cleanup.remove(best[1])
-                                try:
-                                    if os.path.exists(best[1]):
-                                        os.remove(best[1])
-                                except Exception:
-                                    pass
-                            best = (size, temp)
+                # Skip color-only attempts when we're close to target (≤15% over) since:
+                # 1. We'll need lossy compression anyway to get under target
+                # 2. When lossy > 0, colors have no effect
+                # 3. Color-only attempts on already-optimized files often produce identical results
+                skip_color_only = over_ratio <= 0.15
                 
-                # Small grid over lossy and scale
-                runs = 0
+                if not skip_color_only:
+                    # Quick color-only test (max 2 attempts to detect redundancy) - only for files far from target
+                    color_only_sizes = []
+                    for colors in [256, 224]:  # Only test 2 colors to detect redundancy
+                        if self._shutdown_checker() or runs >= max_runs:
+                            break
+                        
+                        runs += 1
+                        temp = create_unique_temp_filename(f"near_c{colors}", ".gif", self.temp_dir)
+                        temp_files_to_cleanup.append(temp)
+                        
+                        if self._run_gifsicle(input_path, temp, colors=colors, lossy=0, scale=1.0):
+                            size = os.path.getsize(temp)
+                            size_mb = size / (1024 * 1024)
+                            
+                            status = "✓ under target" if size < target_bytes else f"{((size - target_bytes) / target_bytes * 100):.1f}% over"
+                            logger.debug(f"Attempt {runs}: colors={colors}, lossy=0, scale=1.0 → {size_mb:.2f}MB ({status}, target: {target_mb:.2f}MB)")
+                            
+                            if size < target_bytes:
+                                safe_file_operation(shutil.copy2, temp, best_output_path)
+                                for tf in temp_files_to_cleanup:
+                                    try:
+                                        if os.path.exists(tf):
+                                            os.remove(tf)
+                                    except Exception:
+                                        pass
+                                logger.debug(f"Bounded search succeeded in color-only phase after {runs} attempts")
+                                return True
+                            
+                            if size < best[0]:
+                                if best[1] and best[1] in temp_files_to_cleanup:
+                                    temp_files_to_cleanup.remove(best[1])
+                                    try:
+                                        if os.path.exists(best[1]):
+                                            os.remove(best[1])
+                                    except Exception:
+                                        pass
+                                best = (size, temp)
+                            
+                            color_only_sizes.append(size)
+                            if len(color_only_sizes) >= 2 and color_only_sizes[0] == color_only_sizes[1]:
+                                logger.debug("Color-only attempts producing identical sizes, skipping remaining")
+                                break
+                else:
+                    logger.debug(f"Skipping color-only attempts (file is {over_ratio*100:.1f}% over target, will use lossy compression)")
                 
+                # Adaptive search: Generate combinations ordered by effectiveness
+                # Key insight: When lossy > 0, colors have no effect, so skip color variations
+                # When starting from an already-optimized file (close to target), use conservative adjustments
+                if 0 < over_ratio <= fine_tune_threshold:
+                    # Very close (≤10%): Use targeted adjustments to get just under target
+                    # Since we're starting from an already-optimized file, we need small but effective changes
+                    # Try slightly more aggressive lossy first, then adjust scale if needed
+                    lossy_steps = [70, 75, 65, 80, 60]  # Higher lossy values to reduce size
+                    scale_steps = [0.88, 0.89, 0.87, 0.90, 0.86]  # Small scale reductions
+                    max_runs = min(max_runs, 10)  # Reduce max attempts for fine-grained
+                    logger.info(f"Using targeted fine-grained search ({over_ratio*100:.1f}% over target, starting from optimized file)")
+                elif 0 < over_ratio <= 0.15:
+                    # Close (10-15%): Moderate adjustments
+                    lossy_steps = [65, 70, 60, 75, 55]
+                    scale_steps = [0.89, 0.90, 0.88, 0.91, 0.87, 0.92]
+                    logger.info(f"Using moderate search ({over_ratio*100:.1f}% over target)")
+                elif 0 < over_ratio <= 0.25:
+                    # Moderately over (15-25%): More aggressive settings
+                    lossy_steps = [70, 75, 65, 80, 60]
+                    scale_steps = [0.88, 0.87, 0.89, 0.86, 0.90, 0.85]
+                    logger.info(f"Using aggressive search ({over_ratio*100:.1f}% over target)")
+                else:
+                    # Way over (>25%): Most aggressive settings
+                    lossy_steps = [75, 80, 70, 85, 65]
+                    scale_steps = [0.85, 0.84, 0.86, 0.83, 0.87, 0.82]
+                    logger.info(f"Using most aggressive search ({over_ratio*100:.1f}% over target)")
+                
+                # Generate combinations ordered by effectiveness (most aggressive first)
+                # Skip color variations when lossy > 0 (colors have no effect)
+                combinations = []
                 for scale in scale_steps:
-                    for colors in color_steps:
-                        for lossy in lossy_steps:
-                            if runs >= max_runs or self._shutdown_checker():
+                    for lossy in lossy_steps:
+                        # Only test one color value when lossy > 0 (256 is default, others produce same size)
+                        combinations.append((scale, 256, lossy))
+                
+                # Limit to remaining attempts
+                remaining_attempts = max_runs - runs
+                if remaining_attempts > 0:
+                    combinations = combinations[:remaining_attempts]
+                
+                if combinations:
+                    from concurrent.futures import ThreadPoolExecutor, as_completed
+                    
+                    # Use fewer workers for better early stopping
+                    max_workers = min(3, len(combinations), max(2, (os.cpu_count() or 4) // 2))
+                    logger.debug(f"Running {len(combinations)} optimized parameter combinations with {max_workers} parallel workers")
+                    
+                    indexed_combinations = [(i, params) for i, params in enumerate(combinations)]
+                    found_solution = False
+                    executor_shutdown = False
+                    
+                    def run_combination(indexed_item):
+                        """Run a single gifsicle combination and return result"""
+                        if executor_shutdown or self._shutdown_checker():
+                            return None
+                        
+                        idx, (scale, colors, lossy) = indexed_item
+                        attempt_num = runs + idx + 1
+                        
+                        # Check cache: if we've tested this scale+lossy combo, skip
+                        cache_key = (scale, lossy)
+                        if cache_key in result_cache:
+                            return {
+                                'success': True,
+                                'size': result_cache[cache_key],
+                                'temp': None,  # Cached result, no temp file
+                                'scale': scale,
+                                'colors': colors,
+                                'lossy': lossy,
+                                'attempt': attempt_num,
+                                'cached': True
+                            }
+                        
+                        temp = create_unique_temp_filename(f"near_s{int(scale*100)}_l{lossy}", ".gif", self.temp_dir)
+                        
+                        if self._run_gifsicle(input_path, temp, colors=colors, lossy=lossy, scale=scale):
+                            if os.path.exists(temp):
+                                size = os.path.getsize(temp)
+                                result_cache[cache_key] = size  # Cache result
+                                return {
+                                    'success': True,
+                                    'size': size,
+                                    'temp': temp,
+                                    'scale': scale,
+                                    'colors': colors,
+                                    'lossy': lossy,
+                                    'attempt': attempt_num,
+                                    'cached': False
+                                }
+                        return {
+                            'success': False,
+                            'temp': temp,
+                            'scale': scale,
+                            'colors': colors,
+                            'lossy': lossy,
+                            'attempt': attempt_num,
+                            'cached': False
+                        }
+                    
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        # Submit tasks in batches for better early stopping
+                        future_to_params = {}
+                        submitted = 0
+                        batch_size = max_workers * 2  # Submit 2 batches ahead
+                        
+                        # Process results as they complete
+                        while submitted < len(indexed_combinations) or future_to_params:
+                            # Submit next batch if not all submitted and solution not found
+                            if not found_solution and submitted < len(indexed_combinations):
+                                for i in range(submitted, min(submitted + batch_size, len(indexed_combinations))):
+                                    if self._shutdown_checker():
+                                        break
+                                    item = indexed_combinations[i]
+                                    future = executor.submit(run_combination, item)
+                                    future_to_params[future] = item
+                                    submitted += 1
+                            
+                            if not future_to_params:
                                 break
                             
-                            temp = create_unique_temp_filename(f"near_s{int(scale*100)}_c{colors}_l{lossy}", ".gif", self.temp_dir)
-                            temp_files_to_cleanup.append(temp)
+                            # Wait for at least one to complete
+                            for future in as_completed(future_to_params):
+                                if found_solution or self._shutdown_checker():
+                                    executor_shutdown = True
+                                    # Cancel all remaining
+                                    for f in list(future_to_params.keys()):
+                                        f.cancel()
+                                    future_to_params.clear()
+                                    break
+                                
+                                result = future.result()
+                                if result is None:
+                                    future_to_params.pop(future, None)
+                                    continue
+                                
+                                # Only process if not cached (cached results are for reference only)
+                                if not result.get('cached', False):
+                                    if result['temp']:
+                                        temp_files_to_cleanup.append(result['temp'])
+                                    runs += 1
+                                
+                                if result['success']:
+                                    size = result['size']
+                                    size_mb = size / (1024 * 1024)
+                                    target_mb = target_bytes / (1024 * 1024)
+                                    
+                                    # Only extract metadata for final result or when logging important milestones
+                                    metadata_str = ""
+                                    if size < target_bytes or (size < best[0] and size < target_bytes * 1.1):
+                                        try:
+                                            temp_path = result['temp'] if result['temp'] else None
+                                            if temp_path and os.path.exists(temp_path):
+                                                gif_info = get_gif_info(temp_path)
+                                                width = gif_info.get('width', 0)
+                                                height = gif_info.get('height', 0)
+                                                frame_count = gif_info.get('frame_count', 0)
+                                                fps = gif_info.get('fps', 0.0)
+                                                duration = gif_info.get('duration', 0.0)
+                                                metadata_str = f", {width}x{height}, {frame_count} frames, {fps:.1f}fps, {duration:.2f}s"
+                                        except Exception:
+                                            pass
+                                    
+                                    status = "✓ under target" if size < target_bytes else f"{((size - target_bytes) / target_bytes * 100):.1f}% over"
+                                    logger.debug(
+                                        f"Attempt {result['attempt']}: scale={result['scale']:.2f}, lossy={result['lossy']} → "
+                                        f"{size_mb:.2f}MB ({status}, target: {target_mb:.2f}MB){metadata_str}"
+                                    )
+                                    
+                                    # STRICT: Only accept results strictly under target
+                                    if size < target_bytes:
+                                        if result['temp'] and os.path.exists(result['temp']):
+                                            safe_file_operation(shutil.copy2, result['temp'], best_output_path)
+                                        # Cancel all remaining tasks immediately
+                                        executor_shutdown = True
+                                        for f in list(future_to_params.keys()):
+                                            f.cancel()
+                                        future_to_params.clear()
+                                        found_solution = True
+                                        logger.debug(f"Bounded search succeeded after {result['attempt']} attempts")
+                                        break
+                                    
+                                    if size < best[0] and result['temp']:
+                                        # Remove previous best from cleanup list
+                                        if best[1] and best[1] in temp_files_to_cleanup:
+                                            temp_files_to_cleanup.remove(best[1])
+                                            try:
+                                                if os.path.exists(best[1]):
+                                                    os.remove(best[1])
+                                            except Exception:
+                                                pass
+                                        best = (size, result['temp'])
+                                
+                                future_to_params.pop(future, None)
+                                
+                                if found_solution:
+                                    break
                             
-                            if self._run_gifsicle(input_path, temp, colors=colors, lossy=lossy, scale=scale):
-                                runs += 1
-                                size = os.path.getsize(temp)
-                                if size <= target_bytes:
-                                    safe_file_operation(shutil.copy2, temp, best_output_path)
-                                    # Cleanup all temp files
-                                    for tf in temp_files_to_cleanup:
-                                        try:
-                                            if os.path.exists(tf):
-                                                os.remove(tf)
-                                        except Exception:
-                                            pass
-                                    return True
-                                if size < best[0]:
-                                    # Remove previous best from cleanup list
-                                    if best[1] and best[1] in temp_files_to_cleanup:
-                                        temp_files_to_cleanup.remove(best[1])
-                                        try:
-                                            if os.path.exists(best[1]):
-                                                os.remove(best[1])
-                                        except Exception:
-                                            pass
-                                    best = (size, temp)
-                        
-                        if runs >= max_runs:
-                            break
-                    if runs >= max_runs:
-                        break
-            
-                # Use best if within 5% of target
-                if best[1] and os.path.exists(best[1]):
-                    if best[0] <= int(target_bytes * 1.05):
-                        safe_file_operation(shutil.copy2, best[1], best_output_path)
+                            if found_solution:
+                                break
+                    
+                    if found_solution:
                         # Cleanup all temp files
                         for tf in temp_files_to_cleanup:
                             try:
@@ -1740,6 +2199,34 @@ class GifOptimizer:
                             except Exception:
                                 pass
                         return True
+                
+                # NO TOLERANCE: Only return best if it's strictly under target
+                if best[1] and os.path.exists(best[1]):
+                    if best[0] < target_bytes:
+                        safe_file_operation(shutil.copy2, best[1], best_output_path)
+                        # Extract metadata only for final result
+                        try:
+                            gif_info = get_gif_info(best[1])
+                            width = gif_info.get('width', 0)
+                            height = gif_info.get('height', 0)
+                            frame_count = gif_info.get('frame_count', 0)
+                            fps = gif_info.get('fps', 0.0)
+                            duration = gif_info.get('duration', 0.0)
+                            logger.debug(f"Bounded search found acceptable result ({best[0] / (1024*1024):.2f}MB) after {runs} attempts, {width}x{height}, {frame_count} frames, {fps:.1f}fps, {duration:.2f}s")
+                        except Exception:
+                            logger.debug(f"Bounded search found acceptable result ({best[0] / (1024*1024):.2f}MB) after {runs} attempts")
+                        # Cleanup all temp files
+                        for tf in temp_files_to_cleanup:
+                            try:
+                                if os.path.exists(tf):
+                                    os.remove(tf)
+                            except Exception:
+                                pass
+                        return True
+                
+                # Log if we exhausted attempts without success
+                if runs >= max_runs:
+                    logger.debug(f"Bounded search exhausted {max_runs} attempts, best result: {best[0] / (1024*1024):.2f}MB (target: {target_bytes / (1024*1024):.2f}MB)")
                 
                 # Cleanup all temp files
                 for tf in temp_files_to_cleanup:
@@ -1932,6 +2419,10 @@ class GifOptimizer:
             
             input_size_mb = os.path.getsize(input_path) / 1024 / 1024 if os.path.exists(input_path) else 0
             
+            # Detect if input is a GIF (not source video) - GIF inputs need more aggressive compression
+            # since they're already optimized and re-encoding often increases size
+            is_gif_input = input_path.lower().endswith('.gif')
+            
             # Determine mpdecimate frac
             if mpdecimate_frac is None:
                 try:
@@ -1939,6 +2430,22 @@ class GifOptimizer:
                     mpdecimate_frac = similarity_analysis.get('optimal_frac', 0.3)
                 except Exception:
                     mpdecimate_frac = 0.3
+            
+            # For GIF inputs, use more aggressive compression parameters
+            # since we're re-encoding from an already-optimized GIF
+            adjusted_max_colors = max_colors
+            adjusted_fps = fps
+            original_width = new_width
+            if is_gif_input:
+                # FIX: Much more aggressive parameters for GIF-to-GIF re-encoding
+                # Re-encoding already-optimized GIFs often increases size, so be very conservative
+                mpdecimate_frac = max(0.3, min(0.5, mpdecimate_frac * 1.5))  # More aggressive duplicate removal
+                # Reduce colors much more aggressively for GIF inputs
+                adjusted_max_colors = min(max_colors, int(max_colors * 0.6))  # Reduce colors by 40% (was 20%)
+                # Reduce FPS more aggressively
+                adjusted_fps = max(6, int(fps * 0.75))  # Reduce FPS by 25% (was 10%)
+                # Also reduce width more aggressively
+                new_width = int(new_width * 0.9)  # Reduce width by 10%
             
             mpdecimate_frac = max(0.1, min(0.5, mpdecimate_frac))
             
@@ -1964,9 +2471,28 @@ class GifOptimizer:
             if dither not in valid_dithers:
                 dither = 'sierra2_4a'
             
-            # Get palette path
+            # Early detection: if input is a GIF and parameters won't reduce size significantly, skip
+            if is_gif_input:
+                # Estimate if re-encoding will help based on current parameters
+                # GIF-to-GIF re-encoding often increases size, so be conservative
+                # FIX: Improved estimation formula that accounts for width reduction and more aggressive parameters
+                width_reduction_factor = (new_width / 360.0) if new_width < 360 else 1.0  # Assume 360 is original
+                estimated_reduction = (
+                    (mpdecimate_frac * 0.4) +  # mpdecimate contribution (increased from 0.3)
+                    ((256 - adjusted_max_colors) / 256 * 0.3) +  # Color reduction contribution (increased from 0.2)
+                    ((1.0 - width_reduction_factor) * 0.3)  # Width reduction contribution (new)
+                )
+                # FIX: Increased threshold from 15% to 25% - GIF-to-GIF re-encoding is risky
+                if estimated_reduction < 0.25:  # Less than 25% estimated reduction (was 15%)
+                    logger.debug(
+                        f"Skipping FFmpeg re-encode from GIF input - estimated reduction too small "
+                        f"(frac={mpdecimate_frac:.2f}, colors={adjusted_max_colors}, width={new_width}, estimated={estimated_reduction:.1%})"
+                    )
+                    return False
+            
+            # Get palette path (use adjusted parameters for GIF inputs)
             palette_path = self._get_palette_cache_key(
-                input_path, 'reencode', new_width, -1, fps, max_colors,
+                input_path, 'reencode', new_width, -1, adjusted_fps, adjusted_max_colors,
                 mpdecimate_frac, stats_mode, dither
             )
             
@@ -1980,10 +2506,10 @@ class GifOptimizer:
                 
                 pre = [
                     f'mpdecimate=hi=512:lo=256:frac={mpdecimate_frac:.2f}',
-                    f'fps={fps}',
+                    f'fps={adjusted_fps}',
                     self._build_scale_filter(new_width, -1)
                 ]
-                vf_palette = ','.join(pre + [f'palettegen=max_colors={int(max_colors)}:stats_mode={stats_mode}'])
+                vf_palette = ','.join(pre + [f'palettegen=max_colors={int(adjusted_max_colors)}:stats_mode={stats_mode}'])
                 
                 cmd1 = [
                     'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
@@ -2002,10 +2528,10 @@ class GifOptimizer:
                         pass
                     return False
             
-            # Apply palette
+            # Apply palette (use adjusted parameters for GIF inputs)
             pre = [
                 f'mpdecimate=hi=512:lo=256:frac={mpdecimate_frac:.2f}',
-                f'fps={fps}',
+                f'fps={adjusted_fps}',
                 self._build_scale_filter(new_width, -1)
             ]
             lavfi = ','.join(pre) + f' [x]; [x][1:v] paletteuse=dither={dither}:diff_mode=rectangle'
@@ -2026,7 +2552,13 @@ class GifOptimizer:
             if success:
                 output_size_mb = os.path.getsize(output_path) / 1024 / 1024
                 if output_size_mb > input_size_mb * 1.1:
-                    logger.warning(f"Output {output_size_mb:.2f}MB is >10% larger than input {input_size_mb:.2f}MB")
+                    logger.warning(f"FFmpeg palette re-encode output {output_size_mb:.2f}MB is >10% larger than input {input_size_mb:.2f}MB. "
+                                  f"Skipping re-encode to avoid increasing file size.")
+                    # Clean up the oversized output
+                    try:
+                        os.remove(output_path)
+                    except Exception:
+                        pass
                     return False
             
             return success

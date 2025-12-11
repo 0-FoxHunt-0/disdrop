@@ -112,6 +112,9 @@ class GifConfigHelper:
             'reencode_strategy_limit': int(cfg.get('reencode_strategy_limit', defaults['reencode_strategy_limit'])),
             'segment_duration_ratio': float(cfg.get('segment_duration_ratio', defaults['segment_duration_ratio'])),
             'segment_frame_budget_ratio': float(cfg.get('segment_frame_budget_ratio', defaults['segment_frame_budget_ratio'])),
+            # NEW: Parallel palette control settings
+            'disable_parallel_palette_over': float(cfg.get('disable_parallel_palette_over', 0) or 0),
+            'parallel_palette_workload_threshold': float(cfg.get('parallel_palette_workload_threshold', 324000) or 324000),
         }
     
     def get_quality_optimization_config(self) -> Dict[str, Any]:
