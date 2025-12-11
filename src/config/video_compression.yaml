@@ -37,14 +37,14 @@ video_compression:
       width: 1280
       height: 720
     # Minimum FPS constraint
-    min_fps: 20
+    min_fps: 25
     guardrail_override:
       enabled: true
       bpp_ratio_threshold: 0.7
       min_resolution:
         width: 640
         height: 360
-      min_fps: 12
+      min_fps: 25
     # FPS reduction steps (as ratios of original FPS)
     fps_reduction_steps: [0.8, 0.6, 0.5]
     # Prefer quality/resolution reduction over aggressive FPS reduction
@@ -180,6 +180,27 @@ video_compression:
         enable_outlier_detection: true # Enable statistical outlier detection
         min_samples_for_outlier_detection: 4 # Minimum samples needed for outlier detection
         iqr_multiplier: 1.5 # IQR multiplier for outlier bounds
+
+    # Artifact detection configuration
+    artifact_detection:
+      # Base thresholds (used when SSIM is not available or SSIM-relative adjustment is disabled)
+      base_thresholds:
+        blockiness: 0.65 # Base blockiness threshold (increased from 0.12 to reduce false positives)
+        banding: 0.50 # Base banding threshold (increased from 0.10 to reduce false positives)
+      
+      # SSIM-relative threshold adjustment
+      # When SSIM is high (>0.94), artifact thresholds are relaxed proportionally
+      # This prevents false positives when quality metrics indicate good quality
+      ssim_relative_adjustment:
+        enabled: true # Enable SSIM-relative threshold adjustment
+        ssim_reference: 0.94 # SSIM score above which we trust quality and relax artifact thresholds
+        adjustment_factor: 5.0 # Multiplier for threshold adjustment (higher = more lenient at high SSIM)
+        max_adjustment: 10.0 # Maximum threshold multiplier (prevents unlimited relaxation)
+      
+      # Frame sampling configuration
+      frame_sampling:
+        num_keyframes: 5 # Number of evenly-spaced keyframes to sample
+        num_random: 3 # Number of random frames to sample
 
     # VMAF parsing configuration
     vmaf_parsing:

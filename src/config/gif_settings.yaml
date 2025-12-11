@@ -28,6 +28,29 @@ gif_settings:
     # Threading for single GIF path
     single_gif_parallel:
       precompute_palette: true
+    # Palette generation performance optimizations
+    palette_generation:
+      max_frames: 300  # Maximum frames to process for palette (0 = unlimited)
+      max_duration_seconds: 45  # Maximum duration to process for palette (0 = unlimited)
+      sample_long_videos: true  # Enable sampling for videos >60s
+      long_video_threshold: 60  # Duration threshold for sampling
+      long_video_sample_duration: 20  # Reduced from 30s to 20s for 60-90s videos
+      # NEW: Tiered sampling for very long videos
+      very_long_video_threshold: 90  # New tier for 90-120s videos
+      very_long_sample_duration: 15  # 15s for 90-120s videos
+      extreme_long_video_threshold: 120  # New tier for 120-180s videos
+      extreme_long_sample_duration: 10  # 10s for 120-180s videos
+      # NEW: Tiered frame limits
+      long_video_frame_limit: 120  # Reduced from 150 for 60-90s videos
+      very_long_frame_limit: 100  # For 90-120s videos
+      extreme_long_frame_limit: 80  # For 120-180s videos
+      # NEW: Multi-point sampling for better palette quality
+      enable_multi_point_sampling: true  # Sample multiple points instead of just start
+    # Primary method settings (formerly feasibility check)
+    primary_method:
+      use_full_quality: true  # Use full quality settings (not harsh feasibility settings)
+      enable_quick_optimization: true  # Enable quick optimization pass in primary method
+      fallback_to_full_optimizer: true  # Fall back to full optimizer if primary fails
     timeouts:
       palette:
         min_seconds: 30 # Hard floor to avoid extremely small budgets
@@ -48,13 +71,17 @@ gif_settings:
     # Guardrails to prevent very long clips from overloading FFmpeg
     long_clip_guardrails:
       enabled: true
-      duration_seconds: 45 # Minimum duration before applying guardrails
-      frame_budget: 900 # duration * fps threshold before applying guardrails
+      duration_seconds: 35 # Reduced from 45 to catch videos earlier
+      frame_budget: 700 # Reduced from 900 to catch videos earlier
       segment_duration_ratio: 0.5 # Apply guardrails to segments once they exceed 50% of duration threshold
       segment_frame_budget_ratio: 0.6 # Apply guardrails to segments once they exceed 60% of frame budget
       palette_fps_cap: 14 # Cap palette/GIF FPS for long clips
-      palette_stats_mode: "diff" # Use diff stats mode when guardrails active
+      palette_stats_mode: "single" # Changed from "diff" to "single" for speed (3-5x faster)
       palette_max_colors: 208 # Limit palette size to speed up processing
+      # NEW: Disable parallel palette for long videos to avoid resource contention
+      disable_parallel_palette_over: 60  # Disable parallel for videos >60s
+      # NEW: Workload-based parallel palette decision
+      parallel_palette_workload_threshold: 324000  # workload = duration * fps * (width/360)
       mpdecimate:
         hi: 768
         lo: 64

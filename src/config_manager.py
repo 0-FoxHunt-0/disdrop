@@ -16,6 +16,7 @@ class ConfigManager:
         self.config_dir = config_dir
         self.config = {}
         self._config_file_timestamps = {}  # Track file modification times
+        self._missing_key_cache = set()  # Cache of missing keys to reduce log noise
         self._load_all_configs()
     
     def _load_all_configs(self):
@@ -71,6 +72,8 @@ class ConfigManager:
         """
         Get configuration value using dot notation
         Example: get('video_compression.quality.crf')
+        
+        Missing keys are logged once per key to reduce log noise.
         """
         keys = key_path.split('.')
         value = self.config
@@ -80,7 +83,10 @@ class ConfigManager:
                 value = value[key]
             return value
         except (KeyError, TypeError):
-            logger.debug(f"Configuration key '{key_path}' not found, using default: {default}")
+            # Only log missing keys once to reduce noise
+            if key_path not in self._missing_key_cache:
+                logger.debug(f"Configuration key '{key_path}' not found, using default: {default}")
+                self._missing_key_cache.add(key_path)
             return default
     
     def get_platform_config(self, platform: str, config_type: str = 'video_compression') -> Dict[str, Any]:
