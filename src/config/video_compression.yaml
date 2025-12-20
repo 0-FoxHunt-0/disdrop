@@ -95,6 +95,8 @@ video_compression:
     # Finalization policy
     reject_oversize_on_finalize: true
     adapt_resolution: true
+    # Prefer fast seek for segment creation (faster but potentially less accurate)
+    prefer_fast_seek: true
 
     # Concurrency settings for parallel processing
     max_concurrent_segments: 4 # Max segments to process in parallel
@@ -287,6 +289,37 @@ video_compression:
         fps_factor: 0.0005
         codec_bonus: 0.02
         duration_penalty: -0.0001
+
+  # Quality predictor settings
+  # Theoretical limits: confidence_thresholds (0.0-1.0), max_sample_duration >= 1, max_historical_results >= 1, boolean flags
+  quality_predictor:
+    confidence_threshold: 0.7 # Minimum confidence for predictions
+    skip_full_evaluation_threshold: 0.8 # Confidence threshold for skipping evaluation
+    max_sample_duration: 30.0 # Maximum duration for sampling (seconds)
+    enable_content_analysis: true # Enable video content analysis for prediction
+    max_historical_results: 100 # Maximum historical results to keep
+    
+    # VMAF prediction weights for characteristics-based prediction
+    vmaf_char_weights:
+      baseline: 75.0
+      resolution_factor: 0.015
+      bitrate_factor: 0.008
+      complexity_penalty: -15.0
+      motion_penalty: -10.0
+      fps_factor: 0.1
+      codec_bonus: 5.0
+      duration_penalty: -0.05
+    
+    # SSIM prediction weights for characteristics-based prediction
+    ssim_char_weights:
+      baseline: 0.92
+      resolution_factor: 0.00008
+      bitrate_factor: 0.000005
+      complexity_penalty: -0.08
+      motion_penalty: -0.05
+      fps_factor: 0.0005
+      codec_bonus: 0.02
+      duration_penalty: -0.0001
 
   # Comprehensive debug logging configuration
   # Theoretical limits: boolean flags (true/false), no numeric constraints

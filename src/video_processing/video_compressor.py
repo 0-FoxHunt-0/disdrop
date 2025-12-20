@@ -1237,6 +1237,41 @@ class DynamicVideoCompressor:
             logger.warning(f"Final single-file refinement failed: {e}")
         return None
     
+    def _return_cae_best_effort_candidate(self,
+                                          input_path: str,
+                                          output_path: str,
+                                          video_info: Dict[str, Any],
+                                          best_candidate: Dict[str, Any],
+                                          acceptance_limit_mb: float) -> Optional[Dict[str, Any]]:
+        """
+        Restore a previously captured under-limit CAE candidate and mark the result as best-effort.
+        """
+        candidate_path = best_candidate.get('path')
+        size_mb = best_candidate.get('size_mb')
+        if not candidate_path or not os.path.exists(candidate_path):
+            return None
+        if size_mb is None or size_mb > acceptance_limit_mb:
+            return None
+        try:
+            shutil.copy2(candidate_path, output_path)
+            logger.info(
+                "Returning best-effort CAE result from pass %s (size %.2fMB, reason=%s)",
+                best_candidate.get('pass_index'),
+                size_mb,
+                best_candidate.get('reason')
+            )
+            result = self._get_compression_results(
+                input_path, output_path, video_info, "cae_discord_10mb_best_effort"
+            )
+            result['best_effort'] = True
+            result['best_effort_pass'] = best_candidate.get('pass_index')
+            result['best_effort_reason'] = best_candidate.get('reason')
+            result['best_effort_size_mb'] = size_mb
+            return result
+        except Exception as e:
+            logger.error(f"Failed to restore best-effort CAE candidate: {e}")
+            return None
+    
     # ===== Content-Adaptive Encoding (CAE) for Discord 10MB =====
     
     def _compress_with_cae_discord_10mb(self, input_path: str, output_path: str,
@@ -2164,25 +2199,20 @@ class DynamicVideoCompressor:
                 _cleanup_best_candidate()
                 return self._get_compression_results(input_path, output_path, video_info, "cae_discord_10mb_compromised")
             else:
-                logger.error(f"CAE output rejected for size: {output_size_mb:.6f}MB > acceptance {effective_limit:.6f}MB")
+                if best_candidate.get('path'):
+                    logger.warning(f"CAE output rejected for size: {output_size_mb:.6f}MB > acceptance {effective_limit:.6f}MB")
+                else:
+                    logger.error(f"CAE output rejected for size: {output_size_mb:.6f}MB > acceptance {effective_limit:.6f}MB")
         
+        best_effort_result = self._return_cae_best_effort_candidate(
+            input_path, output_path, video_info, best_candidate, acceptance_limit_mb
+        )
+        if best_effort_result:
+            _cleanup_best_candidate()
+            return best_effort_result
+
         logger.error("CAE pipeline failed after all refine passes")
 
-        if best_candidate['path'] and os.path.exists(best_candidate['path']):
-            try:
-                shutil.copy2(best_candidate['path'], output_path)
-                logger.warning(f"Returning best-effort CAE result from pass {best_candidate['pass_index']} "
-                               f"(size {best_candidate['size_mb']:.2f}MB, reason={best_candidate['reason']})")
-                result = self._get_compression_results(input_path, output_path, video_info, "cae_discord_10mb_best_effort")
-                result['best_effort'] = True
-                result['best_effort_pass'] = best_candidate['pass_index']
-                result['best_effort_reason'] = best_candidate['reason']
-                result['best_effort_size_mb'] = best_candidate['size_mb']
-                _cleanup_best_candidate()
-                return result
-            except Exception as e:
-                logger.error(f"Failed to restore best-effort CAE candidate: {e}")
-        
         # Enhanced segmentation fallback handling
         encoder = initial_params.get('encoder', 'libx264')
         
