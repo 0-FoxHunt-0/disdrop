@@ -84,9 +84,28 @@ class PILCompressor:
                     composite.paste(frame_rgb, (0, y_offset))
                     y_offset += frame.size[1]
                 
-                # Generate optimized palette from composite
-                quantized_composite = composite.quantize(colors=max_colors, method=quantize_method, dither=Image.Dither.NONE)
-                palette = quantized_composite.getpalette()
+                # Generate optimized palette from composite; fall back to per-frame quantization on failure
+                palette_img = None
+                try:
+                    quantized_composite = composite.quantize(colors=max_colors, method=quantize_method, dither=Image.Dither.NONE)
+                    palette = quantized_composite.getpalette()
+                except Exception as e:
+                    palette = None
+                    logger.debug(f"Composite palette quantization failed ({e}); falling back to per-frame adaptive quantization")
+
+                if palette:
+                    palette_list = [int(v) for v in palette]
+                    if len(palette_list) < 768:
+                        palette_list += [0] * (768 - len(palette_list))
+                    elif len(palette_list) > 768:
+                        palette_list = palette_list[:768]
+                    
+                    try:
+                        palette_img = Image.new('P', (1, 1))
+                        palette_img.putpalette(palette_list)
+                    except Exception as e:
+                        palette_img = None
+                        logger.debug(f"Failed to apply palette to palette image: {e}")
                 
                 # Apply palette to all frames
                 optimized_frames = []
@@ -97,11 +116,30 @@ class PILCompressor:
                     else:
                         frame_rgb = frame
                     
-                    # Quantize with the shared palette
-                    # Create a temporary image with the palette to use as reference
-                    palette_img = Image.new('P', (1, 1))
-                    palette_img.putpalette(palette)
-                    quantized = frame_rgb.quantize(palette=palette_img, dither=Image.Dither.FLOYDSTEINBERG)
+                    # Quantize with the shared palette when available; otherwise fall back to per-frame adaptive quantize
+                    if palette_img:
+                        try:
+                            quantized = frame_rgb.quantize(palette=palette_img, dither=Image.Dither.FLOYDSTEINBERG)
+                        except TypeError as e:
+                            logger.debug(f"Palette quantization failed ({e}); falling back to direct quantize")
+                            quantized = frame_rgb.quantize(
+                                colors=max_colors,
+                                method=quantize_method,
+                                dither=Image.Dither.FLOYDSTEINBERG
+                            )
+                        except Exception as e:
+                            logger.debug(f"PIL frame quantization failed: {e}")
+                            return False
+                    else:
+                        try:
+                            quantized = frame_rgb.quantize(
+                                colors=max_colors,
+                                method=quantize_method,
+                                dither=Image.Dither.FLOYDSTEINBERG
+                            )
+                        except Exception as e:
+                            logger.debug(f"PIL frame quantization failed without shared palette: {e}")
+                            return False
                     optimized_frames.append(quantized)
                 
                 # Save optimized GIF
@@ -175,7 +213,7 @@ class PILCompressor:
             return False
     
     @staticmethod
-    def remove_duplicate_frames(gif_path: str, output_path: str, similarity_threshold: float = 0.95) -> bool:
+    def remove_duplicate_frames(gif_path: str, output_path: str, similarity_threshold: float = 0.98) -> bool:
         """
         Remove duplicate or very similar frames using PIL.
         
@@ -223,7 +261,8 @@ class PILCompressor:
                             
                             if similarity >= similarity_threshold:
                                 # Skip this frame (duplicate)
-                                # Add its duration to the previous frame
+                                # Preserve timing by adding the duplicate frame's duration to the previous frame
+                                # This maintains the overall animation timing while removing redundant visual content
                                 if frames:
                                     durations[-1] += frame_copy.info.get('duration', 100)
                                 continue
@@ -297,7 +336,8 @@ class PILCompressor:
     
     @staticmethod
     def compress_gif(gif_path: str, output_path: str, max_colors: Optional[int] = None,
-                    remove_duplicates: bool = True, optimize_disposal: bool = True) -> Tuple[bool, float]:
+                    remove_duplicates: bool = True, optimize_disposal: bool = True,
+                    similarity_threshold: float = 0.98) -> Tuple[bool, float]:
         """
         Comprehensive PIL-based GIF compression.
         
@@ -307,6 +347,7 @@ class PILCompressor:
             max_colors: Optional maximum colors for quantization
             remove_duplicates: Whether to remove duplicate frames
             optimize_disposal: Whether to optimize disposal methods
+            similarity_threshold: Threshold for duplicate frame detection (0.0-1.0, higher = more conservative)
         
         Returns:
             Tuple of (success, size_reduction_percent)
@@ -318,7 +359,7 @@ class PILCompressor:
             temp_path1 = output_path
             if remove_duplicates:
                 temp_path1 = output_path + '.dedup.gif'
-                if not PILCompressor.remove_duplicate_frames(gif_path, temp_path1):
+                if not PILCompressor.remove_duplicate_frames(gif_path, temp_path1, similarity_threshold=similarity_threshold):
                     temp_path1 = gif_path  # Fallback to original
             
             # Step 2: Optimize disposal methods if requested

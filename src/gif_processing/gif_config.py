@@ -67,13 +67,60 @@ class GifConfigHelper:
         
         fast_mode = bool(gifsicle_perf.get('fast_mode', True))
         
+        # Get parameter presets
+        presets = gifsicle_perf.get('parameter_presets', {}) or {}
+        conservative = presets.get('conservative', {}) or {}
+        balanced = presets.get('balanced', {}) or {}
+        aggressive = presets.get('aggressive', {}) or {}
+        
+        # Get advanced options
+        advanced = gifsicle_perf.get('advanced_options', {}) or {}
+        
         return {
             'fast_mode': fast_mode,
             'gifsicle_time_budget_seconds': int(gifsicle_perf.get('gifsicle_time_budget_seconds', 25 if fast_mode else 45)),
             'gifsicle_max_candidates': int(gifsicle_perf.get('gifsicle_max_candidates', 48 if fast_mode else 120)),
             'gifsicle_optimize_level': int(gifsicle_perf.get('gifsicle_optimize_level', 2 if fast_mode else 3)),
             'skip_gifsicle_far_over_ratio': float(gifsicle_perf.get('skip_gifsicle_far_over_ratio', 0.35 if fast_mode else 0.5)),
-            'near_target_max_runs': int(gifsicle_perf.get('near_target_max_runs', 12 if fast_mode else 24))
+            'near_target_max_runs': int(gifsicle_perf.get('near_target_max_runs', 6 if fast_mode else 24)),  # Reduced from 12 to 6 for faster processing
+            # Advanced optimization strategies
+            'multi_pass_enabled': bool(gifsicle_perf.get('multi_pass_enabled', True)),
+            'adaptive_strategy': bool(gifsicle_perf.get('adaptive_strategy', True)),
+            'progressive_refinement': bool(gifsicle_perf.get('progressive_refinement', True)),
+            'content_aware': bool(gifsicle_perf.get('content_aware', True)),
+            # Parameter presets
+            'parameter_presets': {
+                'conservative': {
+                    'optimize': int(conservative.get('optimize', 3)),
+                    'colors_range': list(conservative.get('colors_range', [256, 224, 192])),
+                    'lossy_range': list(conservative.get('lossy_range', [20, 40, 60])),
+                    'scale_range': list(conservative.get('scale_range', [0.98, 0.95, 0.92])),
+                    'resize_method': str(conservative.get('resize_method', 'lanczos3'))
+                },
+                'balanced': {
+                    'optimize': int(balanced.get('optimize', 2)),
+                    'colors_range': list(balanced.get('colors_range', [192, 160, 128])),
+                    'lossy_range': list(balanced.get('lossy_range', [40, 60, 80, 100])),
+                    'scale_range': list(balanced.get('scale_range', [0.95, 0.92, 0.88, 0.85])),
+                    'resize_method': str(balanced.get('resize_method', 'mix'))
+                },
+                'aggressive': {
+                    'optimize': int(aggressive.get('optimize', 2)),
+                    'colors_range': list(aggressive.get('colors_range', [128, 96, 64])),
+                    'lossy_range': list(aggressive.get('lossy_range', [80, 100, 120, 150])),
+                    'scale_range': list(aggressive.get('scale_range', [0.88, 0.85, 0.80, 0.75])),
+                    'resize_method': str(aggressive.get('resize_method', 'sample'))
+                }
+            },
+            # Advanced gifsicle options
+            'advanced_options': {
+                'resize_method': str(advanced.get('resize_method', 'mix')),
+                'resize_colors': bool(advanced.get('resize_colors', True)),
+                'resize_dither': bool(advanced.get('resize_dither', True)),
+                'interlace': bool(advanced.get('interlace', False)),
+                'optimize_disposal': bool(advanced.get('optimize_disposal', True)),
+                'optimize_background': bool(advanced.get('optimize_background', True))
+            }
         }
     
     def get_long_clip_guardrails(self) -> Dict[str, Any]:
@@ -200,6 +247,21 @@ class GifConfigHelper:
             'min_fps_aggressive': int(floors.get('min_fps_aggressive', 15))
         }
     
+    def get_quality_guardrails(self) -> Dict[str, Any]:
+        """
+        Get quality guardrails configuration.
+        
+        Returns:
+            Dictionary with quality guardrail settings
+        """
+        qg_cfg = self.config.get('gif_settings.quality_guardrails', {}) or {}
+        
+        return {
+            'min_quality_threshold': float(qg_cfg.get('min_quality_threshold', 3.0)),
+            'enable_early_exit': bool(qg_cfg.get('enable_early_exit', True)),
+            'feasibility_quality_check': bool(qg_cfg.get('feasibility_quality_check', True))
+        }
+    
     def get_segmentation_config(self) -> Dict[str, Any]:
         """
         Get segmentation configuration.
@@ -218,6 +280,7 @@ class GifConfigHelper:
             'fallback_duration_limit': float(seg_cfg.get('fallback_duration_limit', 180)),
             'min_segment_duration': float(seg_cfg.get('min_segment_duration', 12)),
             'max_segment_duration': float(seg_cfg.get('max_segment_duration', 35)),
+            'quality_threshold': float(seg_cfg.get('quality_threshold', 3.0)),  # Quality threshold for segmentation
             'base_durations': {
                 'short_video_max': float(base_durations.get('short_video_max', 40)),
                 'short_segment_duration': float(base_durations.get('short_segment_duration', 18)),

@@ -33,7 +33,8 @@ class GifSegmenter:
         self.gif_generator = gif_generator
         self._shutdown_checker = shutdown_checker or (lambda: False)
     
-    def should_segment(self, input_video: str, duration: float, settings: Dict[str, Any]) -> bool:
+    def should_segment(self, input_video: str, duration: float, settings: Dict[str, Any], 
+                      quality_estimate: Optional[float] = None) -> bool:
         """
         Determine if video should be segmented.
         
@@ -41,6 +42,7 @@ class GifSegmenter:
             input_video: Path to input video
             duration: Video duration in seconds
             settings: Settings dictionary with max_duration, max_size_mb, etc.
+            quality_estimate: Optional quality score estimate from feasibility check
         
         Returns:
             True if segmentation should be used
@@ -67,6 +69,14 @@ class GifSegmenter:
             
             # Estimate GIF size
             estimated_size = self._estimate_gif_size(input_video, duration, settings)
+            
+            # Quality-based segmentation trigger: if quality < threshold and size > target * 2.0
+            quality_threshold = seg_config.get('quality_threshold', 3.0)
+            if quality_estimate is not None and quality_estimate < quality_threshold:
+                if estimated_size > max_size_mb * 2.0:
+                    logger.debug(f"Segmentation recommended: quality {quality_estimate:.1f} < {quality_threshold} and estimated size {estimated_size:.2f}MB > {max_size_mb * 2.0:.2f}MB")
+                    return True
+            
             if estimated_size > max_size_mb * size_threshold_multiplier:
                 logger.debug(f"Segmentation recommended: estimated size {estimated_size:.2f}MB > {max_size_mb * size_threshold_multiplier:.2f}MB")
                 return True
