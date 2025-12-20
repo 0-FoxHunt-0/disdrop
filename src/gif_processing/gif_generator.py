@@ -95,19 +95,7 @@ class GifGenerator:
             fps_multiplier = float(guardrails.get('fps_multiplier', 0.5))
             reduced_fps = base_fps * fps_multiplier
             profile['fps'] = max(1.0, min(reduced_fps, palette_fps_cap))
-            
-            # Adaptive stats mode: use "single" for videos >90s (3-5x faster), "diff" for shorter videos
-            # This provides significant speedup for long videos with minimal quality loss
-            configured_stats_mode = guardrails.get('palette_stats_mode', 'diff')
-            if duration > 90:
-                # For videos >90s, prefer "single" mode for speed (3-5x faster)
-                # "single" mode uses full-frame analysis vs "diff" which analyzes frame-to-frame differences
-                profile['palette_stats_mode'] = 'single'
-                logger.debug(f"Using 'single' stats mode for long video (duration={duration:.1f}s > 90s) for 3-5x speedup")
-            else:
-                # For shorter videos, use configured mode (typically "diff" for better quality)
-                profile['palette_stats_mode'] = configured_stats_mode
-            
+            profile['palette_stats_mode'] = guardrails.get('palette_stats_mode', profile['palette_stats_mode'])
             palette_cap = self._clamp_palette_colors(guardrails.get('palette_max_colors', profile['max_colors']) or profile['max_colors'])
             color_multiplier = float(guardrails.get('palette_color_multiplier', 0.7))
             reduced_colors = int(base_colors * color_multiplier)
@@ -136,63 +124,6 @@ class GifGenerator:
             profile['mpdecimate']['lo'],
             profile['mpdecimate']['frac']
         )
-    
-    def _validate_gif_quality(self, gif_path: str, duration: float, size_mb: float, filter_profile: Dict[str, Any]) -> None:
-        """
-        Validate GIF quality after creation and log warnings for potential issues.
-        
-        This helps detect when aggressive optimizations may have produced poor quality output.
-        
-        Args:
-            gif_path: Path to the created GIF file
-            duration: Video duration in seconds
-            size_mb: GIF file size in MB
-            filter_profile: Filter profile used (contains optimization settings)
-        """
-        try:
-            from .gif_utils import get_gif_info
-            
-            # Check if aggressive optimizations were used
-            guardrails_active = filter_profile.get('guardrails_active', False)
-            stats_mode = filter_profile.get('palette_stats_mode', 'full')
-            fps = filter_profile.get('fps', 20)
-            
-            if not os.path.exists(gif_path):
-                return
-            
-            # Check for suspiciously small file size for long videos
-            if duration >= 60 and size_mb < 1.0:
-                logger.warning(
-                    f"Quality warning: GIF size ({size_mb:.2f}MB) is suspiciously small for {duration:.1f}s video. "
-                    f"This may indicate quality loss from aggressive optimizations."
-                )
-            
-            # Check frame count (if available)
-            try:
-                gif_info = get_gif_info(gif_path)
-                frame_count = gif_info.get('frame_count', 0)
-                
-                if frame_count > 0:
-                    # Check if frame count is too low (less than 5 fps equivalent)
-                    min_expected_frames = duration * 5
-                    if frame_count < min_expected_frames:
-                        logger.warning(
-                            f"Quality warning: GIF has {frame_count} frames for {duration:.1f}s video "
-                            f"(expected at least {min_expected_frames:.0f} frames, ~{frame_count/duration:.1f} fps). "
-                            f"This may indicate excessive frame reduction."
-                        )
-                    
-                    # Log when aggressive optimizations were used
-                    if guardrails_active:
-                        logger.info(
-                            f"GIF created with guardrails active: stats_mode={stats_mode}, fps={fps:.1f}, "
-                            f"frames={frame_count}, size={size_mb:.2f}MB"
-                        )
-            except Exception as e:
-                logger.debug(f"Could not validate GIF frame count: {e}")
-                
-        except Exception as e:
-            logger.debug(f"Quality validation failed: {e}")
     
     @staticmethod
     def _format_mpdecimate(mp_settings: Dict[str, Any]) -> str:
@@ -264,15 +195,12 @@ class GifGenerator:
                 'disable_parallel_palette': disable_parallel_palette,
                 'palette_timeout_override': palette_timeout_override
             }
+            cached_palette_path: Optional[str] = None
             guardrail_retry_attempted = False
 
-            def _attempt_guardrail_retry(last_result: Optional[Dict[str, Any]], previous_size_mb: Optional[float] = None) -> Optional[Dict[str, Any]]:
+            def _attempt_guardrail_retry(last_result: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
                 nonlocal guardrail_retry_attempted
                 if guardrail_retry_attempted:
-                    return None
-                # Skip if optimizer has converged
-                if last_result and last_result.get('converged', False):
-                    logger.info("Skipping guardrail retry: optimizer has converged")
                     return None
                 if not self._should_guardrail_retry(last_result, base_single_settings, duration):
                     return None
@@ -284,8 +212,7 @@ class GifGenerator:
                     base_single_settings,
                     start_time,
                     duration,
-                    runtime_options=single_runtime_options,
-                    previous_result_size_mb=previous_size_mb
+                    runtime_options=single_runtime_options
                 )
             
             # Get video info
@@ -297,47 +224,67 @@ class GifGenerator:
             if duration is None:
                 duration = min(settings['max_duration'], video_info.get('duration', settings['max_duration']))
             
-            # Primary GIF generation method (formerly feasibility check)
-            # Skip for short videos if configured, or if segmentation is disabled, or if already segmented
+            # Quick feasibility pre-check to avoid long attempts when single-file is impossible
             try:
                 quick_enabled = bool(self.config.get('gif_settings.single_gif.quick_feasibility.enabled', True))
-                skip_under_duration = float(self.config.get('gif_settings.single_gif.quick_feasibility.skip_under_duration', 0.0) or 0.0)
             except Exception:
                 quick_enabled = True
-                skip_under_duration = 0.0
-            
-            should_skip_primary = (skip_under_duration > 0 and duration < skip_under_duration)
-            
-            if (not disable_segmentation) and quick_enabled and (not self._is_segmented_video(input_video)) and (not should_skip_primary):
-                logger.info("Generating GIF with optimized settings...")
-                print("    🎨 Generating GIF with optimized settings...")
-                feasible, feas_size_mb, feas_path, converged = self._quick_single_feasibility_check(
+            if (not disable_segmentation) and quick_enabled and (not self._is_segmented_video(input_video)):
+                logger.info("Starting quick single-GIF feasibility check before full optimization")
+                print("    🧪 Quick feasibility check: testing harsh single-file settings...")
+                feasible, feas_size_mb, quality_estimate, feas_path, feas_palette_path = self._quick_single_feasibility_check(
                     input_video, settings, start_time, duration, force_guardrails=force_guardrails
                 )
+                # Store feasibility palette path for potential reuse if parameters match
+                cached_palette_path = feas_palette_path if feas_palette_path and os.path.exists(feas_palette_path) else None
                 if feasible:
                     try:
                         target_mb = float(settings.get('max_size_mb', 10.0) or 10.0)
                     except Exception:
                         target_mb = 10.0
-                    logger.info(f"GIF generation succeeded: size={feas_size_mb:.2f}MB <= target {target_mb:.2f}MB")
-                    # Adopt primary GIF artifact if present to skip duplicate work
+                    # Early segmentation: if feasibility size > target×1.5, trigger segmentation upfront
+                    EARLY_SEGMENTATION_THRESHOLD = 1.5  # 150% of target
+                    if feas_size_mb > target_mb * EARLY_SEGMENTATION_THRESHOLD:
+                        logger.info(f"Early segmentation triggered: feasibility size {feas_size_mb:.2f}MB > target×{EARLY_SEGMENTATION_THRESHOLD} ({target_mb * EARLY_SEGMENTATION_THRESHOLD:.2f}MB)")
+                        print(f"    ↩️  Early segmentation: feasibility {feas_size_mb:.2f}MB > {target_mb * EARLY_SEGMENTATION_THRESHOLD:.2f}MB (target×{EARLY_SEGMENTATION_THRESHOLD})")
+                        # Clean up feasibility temp file
+                        if feas_path and os.path.exists(feas_path):
+                            try:
+                                import time as time_module
+                                max_retries = 3
+                                retry_delay = 0.1
+                                for attempt in range(max_retries):
+                                    try:
+                                        os.remove(feas_path)
+                                        logger.debug(f"Cleaned up feasibility temp file after early segmentation: {os.path.basename(feas_path)}")
+                                        break
+                                    except (OSError, PermissionError) as e:
+                                        if attempt < max_retries - 1:
+                                            time_module.sleep(retry_delay * (attempt + 1))
+                                        else:
+                                            logger.warning(f"Could not clean up feasibility temp file after early segmentation: {os.path.basename(feas_path)}: {e}")
+                            except Exception as cleanup_e:
+                                logger.debug(f"Error cleaning up feasibility temp file after early segmentation: {cleanup_e}")
+                        return self.segmenter.create_segments(input_video, output_path, settings, start_time, duration)
+                    logger.info(f"Feasibility check PASSED: size={feas_size_mb:.2f}MB <= target {target_mb:.2f}MB; attempting single-file")
+                    # Adopt feasibility artifact if present to skip duplicate work
                     if feas_path and os.path.exists(feas_path):
                         try:
                             out_dir = os.path.dirname(output_path)
                             if out_dir and not os.path.exists(out_dir):
                                 os.makedirs(out_dir)
                             shutil.move(feas_path, output_path)
-                            print(f"    ✅ GIF generated successfully: {feas_size_mb:.2f}MB <= target {target_mb:.2f}MB")
+                            print(f"    ✅ Feasibility artifact adopted: {feas_size_mb:.2f}MB <= target {target_mb:.2f}MB")
                             return {
                                 'success': True,
                                 'size_mb': feas_size_mb,
                                 'duration': duration,
                                 'fps': settings['fps'],
                                 'scale': settings.get('scale') or settings.get('width'),
-                                'method': 'primary_gif_adopted'
+                                'method': 'single_feasibility_adopted'
                             }
                         except Exception as adopt_e:
-                            logger.debug(f"Could not adopt primary GIF artifact: {adopt_e}")
+                            logger.debug(f"Could not adopt feasibility artifact, proceeding to full encode: {adopt_e}")
                             # Clean up temp file if adoption failed
                             try:
                                 import time as time_module
@@ -346,29 +293,28 @@ class GifGenerator:
                                 for attempt in range(max_retries):
                                     try:
                                         os.remove(feas_path)
-                                        logger.debug(f"Cleaned up primary GIF temp file after adoption failure: {os.path.basename(feas_path)}")
+                                        logger.debug(f"Cleaned up feasibility temp file after adoption failure: {os.path.basename(feas_path)}")
                                         break
                                     except (OSError, PermissionError) as e:
                                         if attempt < max_retries - 1:
                                             time_module.sleep(retry_delay * (attempt + 1))
                                         else:
-                                            logger.warning(f"Could not clean up primary GIF temp file after adoption failure: {os.path.basename(feas_path)}: {e}")
+                                            logger.warning(f"Could not clean up feasibility temp file after adoption failure: {os.path.basename(feas_path)}: {e}")
                             except Exception as cleanup_e:
-                                logger.debug(f"Error cleaning up primary GIF temp file after adoption failure: {cleanup_e}")
-                    # If adoption failed, log warning and fall through to guardrail retry or segmentation
-                    logger.warning(f"Primary GIF generation succeeded but file adoption failed, proceeding to guardrail retry or segmentation...")
+                                logger.debug(f"Error cleaning up feasibility temp file after adoption failure: {cleanup_e}")
+                    print(f"    ✅ Feasibility check passed: {feas_size_mb:.2f}MB <= target {target_mb:.2f}MB; attempting single-file GIF first")
                 else:
-                    logger.info("GIF generation failed, proceeding to guardrail retry or segmentation...")
+                    logger.info("Feasibility check FAILED: falling back to segmentation to save time")
                     try:
                         max_size_mb = float(settings.get('max_size_mb', 10.0) or 10.0)
                     except Exception:
                         max_size_mb = 10.0
                     if feas_size_mb is not None:
-                        print(f"    ↩️  GIF generation failed: {feas_size_mb:.2f}MB > target {max_size_mb:.2f}MB; trying guardrail retry or segmentation...")
+                        print(f"    ↩️  Feasibility check failed: {feas_size_mb:.2f}MB > target {max_size_mb:.2f}MB; falling back to segmentation")
                     else:
-                        print("    ↩️  GIF generation failed; trying guardrail retry or segmentation...")
+                        print("    ↩️  Feasibility check failed: falling back to segmentation")
                     
-                    # Clean up primary GIF temp file if it exists (not adopted since check failed)
+                    # Clean up feasibility temp file if it exists (not adopted since check failed)
                     if feas_path and os.path.exists(feas_path):
                         try:
                             import time as time_module
@@ -380,7 +326,7 @@ class GifGenerator:
                             for attempt in range(max_retries):
                                 try:
                                     os.remove(feas_path)
-                                    logger.debug(f"Cleaned up primary GIF temp file: {os.path.basename(feas_path)}")
+                                    logger.debug(f"Cleaned up feasibility temp file: {os.path.basename(feas_path)}")
                                     break
                                 except (OSError, PermissionError) as e:
                                     if attempt < max_retries - 1:
@@ -389,37 +335,105 @@ class GifGenerator:
                                         # Last attempt failed, log but don't raise
                                         logger.warning(f"Could not clean up {os.path.basename(feas_path)}: {e}")
                         except Exception as e:
-                            logger.debug(f"Error cleaning up primary GIF temp file {feas_path}: {e}")
+                            logger.debug(f"Error cleaning up feasibility temp file {feas_path}: {e}")
                     
-                    # Try guardrail retry if close to target and optimizer hasn't converged
-                    if feas_size_mb is not None and not converged:
-                        # Create a mock result for guardrail retry check
-                        mock_result = {'success': False, 'size_mb': feas_size_mb, 'converged': converged}
-                        guardrail_result = _attempt_guardrail_retry(mock_result, feas_size_mb)
-                        if guardrail_result and guardrail_result.get('success', False):
-                            logger.info("Guardrail retry succeeded after primary method failed")
-                            return guardrail_result
-                    elif converged:
-                        logger.info("Skipping guardrail retry: optimizer has converged (result within 2% of previous attempt)")
-                    
-                    # If guardrail retry didn't work, fall through to segmentation
-            elif should_skip_primary:
-                # Primary method was skipped (e.g., very short video), proceed to segmentation
-                logger.debug(f"Primary method skipped (duration={duration:.1f}s < {skip_under_duration:.1f}s), proceeding to segmentation")
-            # Note: If primary method was skipped, we fall through to segmentation
-            
-            # Final fallback: Segmentation
-            if not disable_segmentation and (not self._is_segmented_video(input_video)):
-                logger.info("All single-file attempts failed; falling back to segmentation")
-                print("    ↩️  All single-file attempts failed; falling back to segmentation")
+                    return self.segmenter.create_segments(input_video, output_path, settings, start_time, duration)
+
+            # Propagate cached palette (if any) to downstream attempts to avoid regenerating identical palettes
+            if cached_palette_path:
+                single_runtime_options['cached_palette_path'] = cached_palette_path
+            else:
+                single_runtime_options.pop('cached_palette_path', None)
+
+            # Prefer single file before splitting: attempt single-GIF first
+            # Pass quality estimate if available from feasibility check
+            quality_est = quality_estimate if 'quality_estimate' in locals() else None
+            if not disable_segmentation and self._should_split_video(input_video, duration, settings, quality_estimate=quality_est):
+                logger.info(
+                    f"Segmentation suggested (duration {duration:.1f}s or estimated size). Trying single-file creation first."
+                )
+                single_result = self._invoke_single_with_runtime_options(
+                    input_video=input_video,
+                    output_path=output_path,
+                    settings=settings,
+                    start_time=start_time,
+                    duration=duration,
+                    force_guardrails=force_guardrails,
+                    runtime_opts=single_runtime_options
+                )
+                if single_result and single_result.get('success', False):
+                    logger.info("Single-file GIF succeeded; skipping segmentation")
+                    return single_result
+                guardrail_result = _attempt_guardrail_retry(single_result)
+                if guardrail_result:
+                    if guardrail_result.get('success', False):
+                        logger.info("Guardrail retry succeeded; skipping segmentation")
+                        return guardrail_result
+                    single_result = guardrail_result
+                logger.info("Single-file attempt failed or not under target; proceeding with segmentation as fallback")
+                print("    ↩️  Single-file attempt failed/not under target; proceeding with segmentation")
                 return self.segmenter.create_segments(input_video, output_path, settings, start_time, duration)
             
-            # If we get here and segmentation is disabled, return failure
-            return {'success': False, 'error': 'GIF generation failed and segmentation is disabled'}
+            # Create single GIF with robust fallback
+            logger.info(f"Creating single GIF: {self._safe_text_for_logging(str(input_video))} -> {self._safe_text_for_logging(str(output_path))}")
+            single_result = None
+            try:
+                single_result = self._invoke_single_with_runtime_options(
+                    input_video=input_video,
+                    output_path=output_path,
+                    settings=settings,
+                    start_time=start_time,
+                    duration=duration,
+                    force_guardrails=force_guardrails,
+                    runtime_opts=single_runtime_options
+                )
+            except Exception as e:
+                logger.warning(f"Single-file GIF generation threw exception: {e}")
+                single_result = {'success': False, 'error': str(e)}
+            if single_result and single_result.get('success', False):
+                return single_result
+            guardrail_result = _attempt_guardrail_retry(single_result)
+            if guardrail_result:
+                if guardrail_result.get('success', False):
+                    return guardrail_result
+                single_result = guardrail_result
+            # If single-file failed and segmentation is allowed, fallback to segmentation even if split wasn't suggested
+            if not disable_segmentation and (not self._is_segmented_video(input_video)):
+                logger.info("Single-file GIF failed; falling back to segmentation")
+                print("    ↩️  Single-file GIF failed; falling back to segmentation")
+                return self.segmenter.create_segments(input_video, output_path, settings, start_time, duration)
+            return single_result
             
         except Exception as e:
             logger.error(f"Error creating GIF: {e}")
             return {'success': False, 'error': str(e)}
+    
+    def _invoke_single_with_runtime_options(
+        self,
+        input_video: str,
+        output_path: str,
+        settings: Dict[str, Any],
+        start_time: float,
+        duration: float,
+        force_guardrails: bool,
+        runtime_opts: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """
+        Helper to call _create_single_gif while de-duping cached_palette_path
+        when supplied via runtime options.
+        """
+        opts = dict(runtime_opts or {})
+        cached_palette_opt = opts.pop('cached_palette_path', None)
+        return self._create_single_gif(
+            input_video,
+            output_path,
+            settings,
+            start_time,
+            duration,
+            force_guardrails=force_guardrails,
+            cached_palette_path=cached_palette_opt,
+            **opts
+        )
     
     def _calculate_optimal_scale(self, video_info: Dict[str, Any], target_width: int, max_size_mb: float) -> Tuple[int, int]:
         """
@@ -545,22 +559,17 @@ class GifGenerator:
     
     @classmethod
     def _build_guardrail_overrides(cls, settings: Dict[str, Any]) -> Dict[str, Any]:
-        """Build per-call overrides to reduce width/fps/colors when guardrails need stricter settings.
-        
-        Increased reduction from 15% to 35% to make retry more meaningful when optimizer hasn't converged.
-        """
+        """Build per-call overrides to reduce width/fps/colors when guardrails need stricter settings."""
         try:
             width = int(settings.get('width', 360))
             fps = int(settings.get('fps', 20))
             colors = cls._clamp_palette_colors(settings.get('colors', settings.get('palette_max_colors', 256)))
         except Exception:
             width, fps, colors = 360, 20, 256
-        # Increased reduction from 0.8 (20%) to 0.65 (35%) for colors
-        reduced_colors = cls._clamp_palette_colors(max(64, int(colors * 0.65)))
-        # Increased reduction from 0.85 (15%) to 0.65 (35%) for width and fps
+        reduced_colors = cls._clamp_palette_colors(max(64, int(colors * 0.8)))
         return {
-            'width': max(160, int(width * 0.65)),
-            'fps': max(8, int(fps * 0.65)),
+            'width': max(160, int(width * 0.85)),
+            'fps': max(8, int(fps * 0.85)),
             'palette_max_colors': reduced_colors,
             'colors': reduced_colors,
         }
@@ -589,8 +598,9 @@ class GifGenerator:
     
     def _guardrail_retry_single(self, input_video: str, output_path: str, base_settings: Dict[str, Any],
                                 start_time: float, duration: float,
-                                runtime_options: Optional[Dict[str, Any]] = None,
-                                previous_result_size_mb: Optional[float] = None) -> Optional[Dict[str, Any]]:
+                                runtime_options: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        options = dict(runtime_options or {})
+        cached_palette = options.pop('cached_palette_path', None)
         overrides = self._build_guardrail_overrides(base_settings)
         if not overrides:
             return None
@@ -608,8 +618,8 @@ class GifGenerator:
             start_time,
             duration,
             force_guardrails=True,
-            previous_result_size_mb=previous_result_size_mb,
-            **(runtime_options or {})
+            cached_palette_path=cached_palette,
+            **options
         )
     
     def _is_guardrail_candidate(self, duration: float, fps: Optional[float]) -> bool:
@@ -631,7 +641,7 @@ class GifGenerator:
             return True
         return False
     
-    def _should_split_video(self, input_video: str, duration: float, settings: Dict[str, Any]) -> bool:
+    def _should_split_video(self, input_video: str, duration: float, settings: Dict[str, Any], quality_estimate: Optional[float] = None) -> bool:
         """Determine if video should be split into segments"""
         # Check if this is already a segmented video (from video segmentation)
         # If so, disable GIF segmentation entirely
@@ -640,7 +650,7 @@ class GifGenerator:
             return False
         
         # Use segmenter's should_segment method
-        return self.segmenter.should_segment(input_video, duration, settings)
+        return self.segmenter.should_segment(input_video, duration, settings, quality_estimate=quality_estimate)
     
     def _is_segmented_video(self, input_video: str) -> bool:
         """Check if the video is from a segmented video folder"""
@@ -716,7 +726,7 @@ class GifGenerator:
                           skip_optimizer: bool = False, force_guardrails: bool = False,
                           disable_parallel_palette: bool = False,
                           palette_timeout_override: Optional[int] = None,
-                          previous_result_size_mb: Optional[float] = None) -> Dict[str, Any]:
+                          cached_palette_path: Optional[str] = None) -> Dict[str, Any]:
         """
         Create a single GIF, optionally skipping automatic optimization.
         
@@ -732,6 +742,7 @@ class GifGenerator:
             force_guardrails: Force guardrail profile even for short clips.
             disable_parallel_palette: Skip background palette generation (reduces FFmpeg fan-out).
             palette_timeout_override: Explicit FFmpeg timeout (seconds) for palette + split runs.
+            cached_palette_path: Optional precomputed palette to reuse (skips new palette runs when compatible).
         """
         try:
             # Check if input video still exists
@@ -747,23 +758,9 @@ class GifGenerator:
                     pass
             
             # Optionally precompute palette in parallel while running split-palette encode
-            # Use workload-based decision unless explicitly disabled
-            base_enable_parallel = bool(self.config.get('gif_settings.performance.single_gif_parallel.precompute_palette', True))
+            enable_parallel_palette = bool(self.config.get('gif_settings.performance.single_gif_parallel.precompute_palette', True))
             if disable_parallel_palette:
                 enable_parallel_palette = False
-            else:
-                # Get video info for workload calculation
-                try:
-                    video_info = self.ffmpeg_utils.get_video_info(input_video)
-                    video_width = int(video_info.get('width', settings.get('width', 360)) or 360)
-                    video_fps = float(video_info.get('fps', settings.get('fps', 20)) or 20)
-                    # Use workload-based decision
-                    enable_parallel_palette = base_enable_parallel and self._should_use_parallel_palette(
-                        duration, video_fps, video_width
-                    )
-                except Exception as e:
-                    logger.debug(f"Could not calculate workload for parallel palette decision: {e}, using base setting")
-                    enable_parallel_palette = base_enable_parallel
             palette_future = None
             palette_tmp_path: Optional[str] = None
             palette_cancel_event: Optional[threading.Event] = None
@@ -772,7 +769,17 @@ class GifGenerator:
             filter_profile = self._build_filter_profile(settings, duration, force_guardrails)
             effective_fps = filter_profile['fps']
 
-            if enable_parallel_palette:
+            # Fast path: reuse a compatible cached palette when provided
+            if cached_palette_path and os.path.exists(cached_palette_path):
+                logger.debug(f"Reusing cached palette for single GIF: {cached_palette_path}")
+                success = self._create_gif_with_palette(
+                    input_video, output_path, cached_palette_path, settings, start_time, duration, filter_profile,
+                    force_guardrails, timeout_override=palette_timeout_override
+                )
+                if not success:
+                    logger.debug("Cached palette reuse failed, falling back to fresh palette generation")
+
+            if not success and enable_parallel_palette:
                 try:
                     palette_cancel_event = threading.Event()
                     # Use a dedicated generator so we can cancel only the palette run without affecting main encode
@@ -860,7 +867,7 @@ class GifGenerator:
                                 os.unlink(palette_tmp_path)
                     except Exception:
                         pass
-            else:
+            elif not success:
                 # Non-parallel original flow
                 split_success = self._create_gif_split_palette(
                     input_video, output_path, settings, start_time, duration, filter_profile, force_guardrails,
@@ -899,79 +906,78 @@ class GifGenerator:
                     # If still over limit, use optimizer to target size precisely (unless explicitly skipped)
                     if size_mb > settings['max_size_mb']:
                         if skip_optimizer:
-                            # When skip_optimizer=True, do NOT call the optimizer to prevent recursive loops.
-                            # The caller (e.g., Stage 2 re-encoding) handles optimization separately.
                             logger.info(
-                                "GIF size (%.2fMB) exceeds limit (%.2fMB), but optimizer is skipped (skip_optimizer=True). "
-                                "Returning result as-is for caller to handle optimization.",
+                                "GIF size (%.2fMB) exceeds limit (%.2fMB), but optimizer is skipped (skip_optimizer=True)",
                                 size_mb,
                                 settings['max_size_mb']
                             )
-                            # Return the result even if over target - the caller will handle optimization
-                        else:
-                            logger.info(f"GIF size ({size_mb:.2f}MB) exceeds limit ({settings['max_size_mb']:.2f}MB), optimizing...")
-                            optimization_succeeded = False
-                            try:
-                                # Use optimizer to optimize the existing GIF file
-                                # Pass source video if available for better re-encoding
-                                optimization_succeeded, final_size_mb_opt, converged = self.optimizer.optimize_gif(
-                                    output_path,
-                                    settings['max_size_mb'], 
-                                    source_video=input_video if os.path.exists(input_video) else None,
-                                    force_guardrails=force_guardrails,
-                                    previous_result_size_mb=previous_result_size_mb,
-                                    skip_stage2=False  # Normal optimization, not a recursive call
-                                )
-                                if optimization_succeeded:
-                                    # Verify final size and update size_mb to reflect optimized file
+                            return {
+                                'success': True,
+                                'size_mb': size_mb,
+                                'duration': duration,
+                                'fps': effective_fps,
+                                'scale': settings.get('scale') or settings.get('width', 360)
+                            }
+                        logger.info(f"GIF size ({size_mb:.2f}MB) exceeds limit ({settings['max_size_mb']:.2f}MB), optimizing...")
+                        optimization_succeeded = False
+                        try:
+                            # Use optimizer to optimize the existing GIF file
+                            # Pass source video if available for better re-encoding
+                            optimization_succeeded = self.optimizer.optimize_gif(
+                                output_path,
+                                settings['max_size_mb'], 
+                                source_video=input_video if os.path.exists(input_video) else None,
+                                force_guardrails=force_guardrails
+                            )
+                            if optimization_succeeded:
+                                # Verify final size and update size_mb to reflect optimized file
+                                try:
+                                    final_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+                                    logger.info(f"Optimization completed: {final_size_mb:.2f}MB <= {settings['max_size_mb']:.2f}MB")
+                                    # Update size_mb to reflect the optimized file size
+                                    size_mb = final_size_mb
+                                except Exception as size_e:
+                                    logger.warning(f"Failed to verify final size: {size_e}")
+                                    # Fallback: re-stat the file to get current size
                                     try:
-                                        final_size_mb = os.path.getsize(output_path) / (1024 * 1024)
-                                        logger.info(f"Optimization completed: {final_size_mb:.2f}MB <= {settings['max_size_mb']:.2f}MB")
-                                        # Update size_mb to reflect the optimized file size
-                                        size_mb = final_size_mb
-                                    except Exception as size_e:
-                                        logger.warning(f"Failed to verify final size: {size_e}")
-                                        # Fallback: re-stat the file to get current size
-                                        try:
-                                            if os.path.exists(output_path):
-                                                size_mb = os.path.getsize(output_path) / (1024 * 1024)
-                                        except Exception:
-                                            pass
-                            except Exception as e:
-                                logger.warning(f"Optimization failed: {e}")
-                                optimization_succeeded = False
+                                        if os.path.exists(output_path):
+                                            size_mb = os.path.getsize(output_path) / (1024 * 1024)
+                                    except Exception:
+                                        pass
+                        except Exception as e:
+                            logger.warning(f"Optimization failed: {e}")
+                            optimization_succeeded = False
+                        
+                        if not optimization_succeeded:
+                            # Get the actual final size from the file that exists
+                            final_size_mb = None
+                            try:
+                                if os.path.exists(output_path):
+                                    final_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+                            except Exception:
+                                pass
                             
-                            if not optimization_succeeded:
-                                # Get the actual final size from the file that exists
-                                final_size_mb = None
-                                try:
-                                    if os.path.exists(output_path):
-                                        final_size_mb = os.path.getsize(output_path) / (1024 * 1024)
-                                except Exception:
-                                    pass
-                                
-                                # Fallback to original size_mb if we can't get file size
-                                if final_size_mb is None:
-                                    final_size_mb = size_mb
-                                
-                                logger.error(f"Final GIF exceeds limit after optimization attempts: {final_size_mb:.2f}MB > {settings['max_size_mb']:.2f}MB")
-                                
-                                # Clean up output file if it exists and is over target
-                                try:
-                                    if os.path.exists(output_path):
-                                        # Check if file is actually over target before deleting
-                                        current_size = os.path.getsize(output_path) / (1024 * 1024)
-                                        if current_size > settings['max_size_mb']:
-                                            os.remove(output_path)
-                                except Exception as cleanup_e:
-                                    logger.warning(f"Failed to clean up oversized output file: {cleanup_e}")
-                                
-                                return {
-                                    'success': False,
-                                    'error': f"Final GIF size ({final_size_mb:.2f}MB) exceeds limit ({settings['max_size_mb']:.2f}MB)",
-                                    'size_mb': final_size_mb,
-                                    'converged': converged
-                                }
+                            # Fallback to original size_mb if we can't get file size
+                            if final_size_mb is None:
+                                final_size_mb = size_mb
+                            
+                            logger.error(f"Final GIF exceeds limit after optimization attempts: {final_size_mb:.2f}MB > {settings['max_size_mb']:.2f}MB")
+                            
+                            # Clean up output file if it exists and is over target
+                            try:
+                                if os.path.exists(output_path):
+                                    # Check if file is actually over target before deleting
+                                    current_size = os.path.getsize(output_path) / (1024 * 1024)
+                                    if current_size > settings['max_size_mb']:
+                                        os.remove(output_path)
+                            except Exception as cleanup_e:
+                                logger.warning(f"Failed to clean up oversized output file: {cleanup_e}")
+                            
+                            return {
+                                'success': False,
+                                'error': f"Final GIF size ({final_size_mb:.2f}MB) exceeds limit ({settings['max_size_mb']:.2f}MB)",
+                                'size_mb': final_size_mb
+                            }
                     
                     # Re-stat the file to ensure we have the most current size before returning
                     # This handles cases where optimization succeeded but size_mb wasn't updated
@@ -983,16 +989,12 @@ class GifGenerator:
                         # If we can't re-stat, use existing size_mb value
                         pass
                     
-                    # Quality validation: check for potential quality issues after aggressive optimizations
-                    self._validate_gif_quality(output_path, duration, size_mb, filter_profile)
-                    
                     return {
                         'success': True,
                         'size_mb': size_mb,
                         'duration': duration,
                         'fps': effective_fps,
-                        'scale': settings.get('scale') or settings.get('width', 360),
-                        'converged': False  # Success means we met target, so not converged
+                        'scale': settings.get('scale') or settings.get('width', 360)
                     }
                 else:
                     return {'success': False, 'error': 'GIF file not created'}
@@ -1010,160 +1012,7 @@ class GifGenerator:
         except Exception:
             cfg = {}
         return cfg
-    
-    def _should_use_parallel_palette(self, duration: float, fps: float, width: int) -> bool:
-        """
-        Determine whether to use parallel palette generation based on workload.
-        
-        For long videos or high-resolution videos, parallel palette generation can cause
-        resource contention. This method calculates workload and disables parallel processing
-        when the workload exceeds a threshold.
-        
-        Args:
-            duration: Video duration in seconds
-            fps: Frames per second
-            width: Video width in pixels
-            
-        Returns:
-            True if parallel palette generation should be used, False otherwise
-        """
-        try:
-            # Check if parallel palette is disabled for long videos
-            guardrails = getattr(self, 'long_clip_guardrails', {}) or {}
-            disable_parallel_over = float(guardrails.get('disable_parallel_palette_over', 0) or 0)
-            if disable_parallel_over > 0 and duration > disable_parallel_over:
-                logger.debug(f"Disabling parallel palette: duration {duration:.1f}s > {disable_parallel_over}s")
-                return False
-            
-            # Calculate workload: duration * fps * (width / 360.0) normalized to 360px
-            # This catches short high-res videos and allows long low-res videos
-            workload = duration * fps * (width / 360.0)
-            workload_threshold = float(guardrails.get('parallel_palette_workload_threshold', 324000) or 324000)
-            # Default threshold: 60s @ 15fps @ 360px = 324,000
-            
-            should_use = workload < workload_threshold
-            if not should_use:
-                logger.debug(
-                    f"Disabling parallel palette: workload {workload:.0f} >= threshold {workload_threshold:.0f} "
-                    f"(duration={duration:.1f}s, fps={fps:.1f}, width={width})"
-                )
-            return should_use
-        except Exception as e:
-            logger.debug(f"Error calculating parallel palette decision: {e}, defaulting to enabled")
-            # Default to enabled for short videos
-            return duration < 60
 
-    def _calculate_palette_frame_limit(self, duration: float, fps: float) -> Optional[int]:
-        """
-        Calculate maximum frames to process for palette generation based on duration.
-        
-        This dramatically speeds up palette generation for long videos while maintaining
-        palette quality. FFmpeg's palettegen can create good palettes from a sample of frames.
-        Uses tiered frame limits based on original video duration (before sampling).
-        
-        Args:
-            duration: Original video duration in seconds (before sampling)
-            fps: Frames per second
-            
-        Returns:
-            Maximum frames to process, or None for unlimited
-        """
-        try:
-            cfg = self.config.get('gif_settings.performance.palette_generation', {}) or {}
-            max_frames = int(cfg.get('max_frames', 300))
-            long_video_frame_limit = int(cfg.get('long_video_frame_limit', 120))
-            very_long_frame_limit = int(cfg.get('very_long_frame_limit', 100))
-            extreme_long_frame_limit = int(cfg.get('extreme_long_frame_limit', 80))
-            
-            if max_frames <= 0:
-                return None  # Unlimited
-            
-            # Tiered frame limits based on original video duration
-            # Note: duration here is the original full duration, not the sampled duration
-            if duration > 120:
-                # 120-180s: very aggressive limit (80 frames)
-                return min(max_frames, extreme_long_frame_limit)
-            elif duration > 90:
-                # 90-120s: aggressive limit (100 frames)
-                return min(max_frames, very_long_frame_limit)
-            elif duration > 60:
-                # 60-90s: moderate limit (120 frames)
-                return min(max_frames, long_video_frame_limit)
-            elif duration > 30:
-                # 30-60s: moderate limit (200-250 frames)
-                return min(max_frames, 250)
-            else:
-                # Short videos: use full limit (up to max_frames)
-                return max_frames
-        except Exception:
-            # Fallback to tiered defaults
-            if duration > 120:
-                return 80
-            elif duration > 90:
-                return 100
-            elif duration > 60:
-                return 120
-            elif duration > 30:
-                return 250
-            return 300
-    
-    def _calculate_palette_duration_limit(self, duration: float) -> Optional[float]:
-        """
-        Calculate maximum duration to process for palette generation.
-        
-        For long videos, limit palette generation to a sample of the video
-        to dramatically reduce processing time. Uses tiered sampling based on duration.
-        
-        Args:
-            duration: Full video duration in seconds
-            
-        Returns:
-            Maximum duration to process, or None for full duration
-        """
-        try:
-            cfg = self.config.get('gif_settings.performance.palette_generation', {}) or {}
-            sample_long_videos = bool(cfg.get('sample_long_videos', True))
-            long_video_threshold = float(cfg.get('long_video_threshold', 60.0))
-            long_video_sample_duration = float(cfg.get('long_video_sample_duration', 20.0))
-            very_long_video_threshold = float(cfg.get('very_long_video_threshold', 90.0))
-            very_long_sample_duration = float(cfg.get('very_long_sample_duration', 15.0))
-            extreme_long_video_threshold = float(cfg.get('extreme_long_video_threshold', 120.0))
-            extreme_long_sample_duration = float(cfg.get('extreme_long_sample_duration', 10.0))
-            max_duration_seconds = float(cfg.get('max_duration_seconds', 45.0))
-            
-            if not sample_long_videos:
-                return None
-            
-            # Tiered sampling based on duration
-            if duration > extreme_long_video_threshold:
-                # 120-180s: sample 10s
-                sample_duration = min(extreme_long_sample_duration, duration)
-            elif duration > very_long_video_threshold:
-                # 90-120s: sample 15s
-                sample_duration = min(very_long_sample_duration, duration)
-            elif duration > long_video_threshold:
-                # 60-90s: sample 20s
-                sample_duration = min(long_video_sample_duration, duration)
-            else:
-                # For medium-length videos, apply max duration limit if configured
-                if max_duration_seconds > 0 and duration > max_duration_seconds:
-                    return max_duration_seconds
-                return None  # Process full duration
-            
-            # Apply max duration limit if configured (caps the sample duration)
-            if max_duration_seconds > 0:
-                sample_duration = min(sample_duration, max_duration_seconds)
-            return sample_duration
-        except Exception:
-            # Fallback: tiered sampling
-            if duration > 120:
-                return 10.0
-            elif duration > 90:
-                return 15.0
-            elif duration > 60:
-                return 20.0
-            return None
-    
     def _compute_palette_timeout(self, duration: float, width: int, fps: float,
                                  guardrails_active: bool, timeout_override: Optional[int] = None) -> Tuple[int, Dict[str, Any]]:
         """
@@ -1206,6 +1055,9 @@ class GifGenerator:
             calculated += guardrail_extra
 
         clamped = int(max(min_seconds, min(max_seconds, math.ceil(calculated))))
+        # The calculated timeout already respects min_seconds and max_seconds from config,
+        # so we use it directly. The previous hardcoded 12-second cap was causing premature
+        # timeouts on longer videos where the adaptive calculation legitimately requires more time.
         meta = {
             'source': 'heuristic',
             'duration_component': round(duration_component, 2),
@@ -1315,56 +1167,17 @@ class GifGenerator:
                 logger.debug(f"Using cached palette: {palette_path}")
                 return palette_path
             
-            # Calculate performance optimizations: frame limiting and duration sampling
-            effective_duration = duration
-            duration_limit = self._calculate_palette_duration_limit(duration)
-            if duration_limit is not None:
-                effective_duration = min(duration_limit, duration)
-                logger.debug(f"Palette generation: limiting to first {effective_duration:.1f}s of {duration:.1f}s video")
-            
-            # Calculate frame limit
-            frame_limit = self._calculate_palette_frame_limit(effective_duration, profile['fps'])
-            if frame_limit is not None:
-                logger.debug(f"Palette generation: limiting to {frame_limit} frames (duration={effective_duration:.1f}s, fps={profile['fps']:.1f})")
-            
-            # Update cache key to include sampling parameters for accurate cache matching
-            # This ensures palettes generated with different sampling strategies are cached separately
-            if duration_limit is not None or frame_limit is not None:
-                # Update duration in key to reflect effective duration used for generation
-                key_payload['duration'] = float(effective_duration)
-                key_payload['duration_limit'] = duration_limit
-                key_payload['frame_limit'] = frame_limit
-                key_str = json.dumps(key_payload, sort_keys=True, separators=(',', ':'))
-                digest = hashlib.sha1(key_str.encode('utf-8')).hexdigest()
-                palette_path = os.path.join(cache_dir, f"pal_{digest}.png")
-                
-                # Check cache again with updated key
-                if os.path.exists(palette_path):
-                    logger.debug(f"Using cached palette (with sampling): {palette_path}")
-                    return palette_path
-            
-            # Build FFmpeg command for palette generation
-            # Use -update 1 to allow FFmpeg to update the same file when using -f image2
-            # This is required because palettegen processes multiple frames but outputs a single palette
+            # Build FFmpeg command for palette generation over the selected duration
             cmd = [
                 'ffmpeg', '-y',
                 '-ss', str(start_time),
-                '-t', str(effective_duration),
+                '-t', str(duration),
                 '-i', safe_input_path,
                 '-vf', vf,
-            ]
-            
-            # Add frame limit if specified (must come before -f image2)
-            if frame_limit is not None:
-                cmd.extend(['-frames:v', str(frame_limit)])
-            
-            # Complete the command with output format and file
-            cmd.extend([
                 '-f', 'image2',
-                '-update', '1',
+                '-frames:v', '1',
                 palette_path
-            ])
-            
+            ]
             # Add performance flags
             FFmpegUtils.add_ffmpeg_perf_flags(cmd)
             
@@ -1373,18 +1186,16 @@ class GifGenerator:
             
             logger.debug(f"Generating palette: {' '.join(cmd)}")
             
-            # Use effective_duration for timeout calculation (may be limited by sampling)
             timeout_seconds, timeout_meta = self._compute_palette_timeout(
-                duration=effective_duration,
+                duration=duration,
                 width=optimal_width,
                 fps=profile['fps'],
                 guardrails_active=profile.get('guardrails_active', False) or force_guardrails,
                 timeout_override=timeout_override
             )
             logger.debug(
-                "Palette generation timeout: %ss (effective_duration=%.2fs, original_duration=%.2fs, width=%d fps=%.1f guardrails=%s meta=%s)",
+                "Palette generation timeout: %ss (duration=%.2fs width=%d fps=%.1f guardrails=%s meta=%s)",
                 timeout_seconds,
-                effective_duration,
                 duration,
                 optimal_width,
                 profile['fps'],
@@ -1414,25 +1225,17 @@ class GifGenerator:
             except Exception:
                 pass
 
-            # Retry with same parameters (digest may be from full-duration or sampled key)
             retry_path = os.path.join(cache_dir, f"pal_{digest}_r1.png")
             retry_cmd = [
                 'ffmpeg', '-y',
                 '-ss', str(start_time),
-                '-t', str(effective_duration),  # Use effective_duration (may be sampled)
+                '-t', str(duration),
                 '-i', safe_input_path,
                 '-vf', vf,
-            ]
-            # Add frame limit if specified (must come before -f image2)
-            if frame_limit is not None:
-                retry_cmd.extend(['-frames:v', str(frame_limit)])
-            
-            # Complete the retry command with output format and file
-            retry_cmd.extend([
                 '-f', 'image2',
-                '-update', '1',
+                '-frames:v', '1',
                 retry_path
-            ])
+            ]
             FFmpegUtils.add_ffmpeg_perf_flags(retry_cmd)
             logger.debug(f"Palette generation retry: {' '.join(retry_cmd)}")
             # Use the same calculated timeout for retry
@@ -1619,7 +1422,27 @@ class GifGenerator:
             FFmpegUtils.add_ffmpeg_perf_flags(cmd)
 
             logger.debug(f"Split-palette GIF creation: {' '.join(cmd)}")
-            result = self._run_ffmpeg(cmd, timeout=(timeout_override if timeout_override is not None else 180))
+            # Use adaptive timeout calculation if no override provided
+            if timeout_override is not None:
+                timeout_limit = timeout_override
+            else:
+                # Calculate adaptive timeout using the same mechanism as palette generation
+                # This ensures consistency and prevents premature timeouts on longer videos
+                # Reuse video_info already retrieved above (line 1375) to avoid redundant call
+                if video_info:
+                    video_width = video_info.get('width', 360)
+                    video_fps = video_info.get('fps', 20)
+                else:
+                    # Fallback to defaults if video_info is None or empty
+                    video_width = 360
+                    video_fps = 20
+                timeout_limit, _ = self._compute_palette_timeout(
+                    duration, video_width, video_fps, force_guardrails, timeout_override=None
+                )
+                # Fallback to 180 if calculation fails
+                if timeout_limit <= 0:
+                    timeout_limit = 180
+            result = self._run_ffmpeg(cmd, timeout=timeout_limit)
             return result.returncode == 0 and os.path.exists(output_path)
         except Exception as e:
             logger.debug(f"Split-palette creation failed: {e}")
@@ -2011,84 +1834,86 @@ class GifGenerator:
         return sanitize_segments_base_name(filename)
     
     def _quick_single_feasibility_check(self, input_video: str, settings: Dict[str, Any], 
-                                       start_time: float, duration: float, force_guardrails: bool = False) -> Tuple[bool, Optional[float], Optional[str], bool]:
-        """Primary GIF generation method: creates optimized GIF with performance optimizations.
+                                       start_time: float, duration: float, force_guardrails: bool = False) -> Tuple[bool, Optional[float], Optional[float], Optional[str], Optional[str]]:
+        """Fast pre-check: try an aggressively compressed single GIF to test feasibility.
 
-        This is now the primary method for GIF generation. It uses full quality settings
-        (not harsh feasibility settings) but applies performance optimizations like frame
-        limiting and duration sampling to dramatically speed up processing.
-
-        Returns (True, size_mb, path, converged) if GIF can be kept under the size target.
-        Returns (False, size_mb, path, converged) if GIF exceeds target (suggest segmentation). When
-        an early error occurs before size is measurable, returns (False, None, None, False).
-        converged indicates if optimizer has converged (result within 2% of previous attempt).
+        Returns (feasible: bool, size_mb: float, quality_estimate: float, temp_gif: str, palette_path: str) if successful.
+        Returns (False, size_mb, quality_estimate, temp_gif, palette_path) if even harsh settings cannot meet the size target (suggest segmentation).
+        When an early error occurs before size is measurable, returns (False, None, None, None, None).
         """
         try:
             if self._is_shutdown_requested():
-                return False, None, None, False
-            
-            # Use full quality settings directly (not harsh feasibility settings)
-            # Check if we should use full quality or fall back to harsh settings
+                return False, None, None, None, None
+            # Derive harsh settings from config, with safe defaults
             try:
-                use_full_quality = bool(self.config.get('gif_settings.performance.primary_method.use_full_quality', True))
+                target_width = int(self.config.get('gif_settings.single_gif.quick_feasibility.width', 240))
             except Exception:
-                use_full_quality = True
-            
+                target_width = 240
+            try:
+                target_fps = int(self.config.get('gif_settings.single_gif.quick_feasibility.fps', 12))
+            except Exception:
+                target_fps = 12
             max_size_mb = float(settings.get('max_size_mb', 10.0) or 10.0)
-            
-            if use_full_quality:
-                # Use settings as-is (full quality)
-                feas_settings = dict(settings)
-                logger.info(f"GIF generation settings: width={feas_settings.get('width', 360)}, fps={feas_settings.get('fps', 22)}, target={max_size_mb:.2f}MB, duration={duration:.1f}s")
-            else:
-                # Fallback to harsh settings for compatibility
-                try:
-                    target_width = int(self.config.get('gif_settings.single_gif.quick_feasibility.width', 240))
-                except Exception:
-                    target_width = 240
-                try:
-                    target_fps = int(self.config.get('gif_settings.single_gif.quick_feasibility.fps', 12))
-                except Exception:
-                    target_fps = 12
-                feas_settings = dict(settings)
-                feas_settings['fps'] = int(settings.get('fps', target_fps) or target_fps)
-                feas_settings['width'] = int(settings.get('width', target_width) or target_width)
-                logger.info(f"GIF generation settings (harsh): width={feas_settings['width']}, fps={feas_settings['fps']}, target={max_size_mb:.2f}MB, duration={duration:.1f}s")
-            
-            # Ensure height is preserved
+            logger.info(f"Feasibility settings: width={target_width}, fps={target_fps}, target={max_size_mb:.2f}MB, duration={duration:.1f}s")
+
+            # Construct settings overlay that mirrors the real encode parameters
+            feas_settings = dict(settings)
+            # Use exact fps/width/height/scale as real path for accurate prediction
+            feas_settings['fps'] = int(settings.get('fps', target_fps) or target_fps)
+            feas_settings['width'] = int(settings.get('width', target_width) or target_width)
             feas_settings['height'] = int(settings.get('height', -1) or -1)
-            # Keep default palette and dither consistent
+            # Keep default palette and dither consistent with the main encode path
             feas_settings['palette_max_colors'] = self._clamp_palette_colors(settings.get('palette_max_colors', 256))
             feas_settings['dither'] = settings.get('dither', 'sierra2_4a')
             feas_settings.pop('mpdecimate_aggressive', None)
             feas_profile = self._build_filter_profile(feas_settings, duration, force_guardrails)
             
+            # Estimate quality score from initial parameters before full optimization
+            # Use optimizer's quality calculation method
+            estimated_colors = feas_settings.get('palette_max_colors', 256)
+            estimated_lossy = settings.get('lossy', 60)
+            estimated_scale = 1.0  # Assume no scaling initially
+            # Estimate quality using optimizer's method
+            quality_estimate = self.optimizer._calculate_quality_score(
+                {'colors': estimated_colors}, estimated_colors, estimated_lossy, estimated_scale
+            )
+            
 
             # Generate palette and GIF to temp dir
             temp_dir = self.config.get_temp_dir()
             base = os.path.splitext(os.path.basename(input_video))[0]
-            temp_gif = os.path.join(temp_dir, f"{base}.primary.gif.tmp")
+            temp_gif = os.path.join(temp_dir, f"{base}.feasibility.gif.tmp")
             palette_path = None
             try:
-                # Generate palette with performance optimizations (frame limiting, duration sampling)
-                # These optimizations are applied automatically in _generate_palette()
+                # Use longer timeout for palette generation in feasibility check to handle complex videos
                 palette_path = self._generate_palette(
                     input_video, feas_settings, start_time, duration, feas_profile, force_guardrails, timeout_override=90
                 )
                 if not palette_path:
-                    return False, None, None, False
+                    return False, None, None, None, None
+                # Return palette_path for potential reuse if parameters match in final attempt
                 ok = self._create_gif_with_palette(
                     input_video, temp_gif, palette_path, feas_settings, start_time, duration, feas_profile, force_guardrails
                 )
                 if not ok or not os.path.exists(temp_gif):
-                    return False, None, None, False
+                    return False, None, None, None, None
                 size_mb = os.path.getsize(temp_gif) / (1024 * 1024)
                 fits = size_mb <= max_size_mb
+                
+                # Check quality threshold - if quality < 3.0 and size > target * 2.0, recommend segmentation
+                quality_guardrails = self.config_helper.get_quality_guardrails()
+                min_quality_threshold = quality_guardrails.get('min_quality_threshold', 3.0)
+                feasibility_quality_check = quality_guardrails.get('feasibility_quality_check', True)
+                
+                if feasibility_quality_check and quality_estimate < min_quality_threshold and size_mb > max_size_mb * 2.0:
+                    logger.info(f"Feasibility: Quality {quality_estimate:.1f} < {min_quality_threshold} and size {size_mb:.2f}MB > {max_size_mb * 2.0:.2f}MB, recommending segmentation")
+                    return False, size_mb, quality_estimate, temp_gif, palette_path
+                
                 if fits:
-                    logger.info(f"GIF generation result: size={size_mb:.2f}MB <= target {max_size_mb:.2f}MB")
-                    return True, size_mb, temp_gif, False
+                    logger.info(f"Feasibility result: size={size_mb:.2f}MB <= target {max_size_mb:.2f}MB, quality={quality_estimate:.1f}")
+                    return True, size_mb, quality_estimate, temp_gif, palette_path
                 else:
-                    logger.info(f"Initial GIF size: {size_mb:.2f}MB > target {max_size_mb:.2f}MB (exceeds by {size_mb - max_size_mb:.2f}MB)")
+                    logger.info(f"Feasibility initial: size={size_mb:.2f}MB > target {max_size_mb:.2f}MB (exceeds by {size_mb - max_size_mb:.2f}MB), quality={quality_estimate:.1f}")
                     # Try a very fast optimization pass to approximate final outcome and avoid false negatives
                     try:
                         prev = {
@@ -2096,14 +1921,16 @@ class GifGenerator:
                             'gifsicle_optimize_level': getattr(self.optimizer, 'gifsicle_optimize_level', 2),
                             'skip_gifsicle_far_over_ratio': getattr(self.optimizer, 'skip_gifsicle_far_over_ratio', 0.35),
                             'near_target_max_runs': getattr(self.optimizer, 'near_target_max_runs', 12),
+                            'progressive_refinement': getattr(self.optimizer, 'progressive_refinement', True),
                         }
-                        # Quick mode: tighter budgets
+                        # Quick mode: tighter budgets, faster optimization
                         self.optimizer.fast_mode = True
                         self.optimizer.gifsicle_optimize_level = 2
                         self.optimizer.skip_gifsicle_far_over_ratio = 0.35
-                        self.optimizer.near_target_max_runs = 8
+                        self.optimizer.near_target_max_runs = 4  # Reduced from 8 to 4 for faster feasibility check
+                        self.optimizer.progressive_refinement = False  # Skip progressive refinement in feasibility check
                         # Pass source video for better re-encoding in feasibility check
-                        ok, final_size_mb_opt, converged_opt = self.optimizer.optimize_gif(
+                        ok = self.optimizer.optimize_gif(
                             temp_gif,
                             max_size_mb,
                             source_video=input_video if os.path.exists(input_video) else None,
@@ -2112,32 +1939,44 @@ class GifGenerator:
                     except Exception as opt_e:
                         logger.debug(f"Feasibility quick-opt failed: {opt_e}")
                         ok = False
-                        converged_opt = False
                     finally:
                         try:
                             self.optimizer.fast_mode = prev['fast_mode']
                             self.optimizer.gifsicle_optimize_level = prev['gifsicle_optimize_level']
                             self.optimizer.skip_gifsicle_far_over_ratio = prev['skip_gifsicle_far_over_ratio']
                             self.optimizer.near_target_max_runs = prev['near_target_max_runs']
+                            self.optimizer.progressive_refinement = prev['progressive_refinement']
                         except Exception:
                             pass
-                    # Recalculate size after quick optimization
+                    # Recalculate size and quality after quick optimization
                     try:
                         if os.path.exists(temp_gif):
                             size_mb = os.path.getsize(temp_gif) / (1024 * 1024)
+                            # Recalculate quality estimate from optimized GIF if possible
+                            try:
+                                from .gif_utils import get_gif_info
+                                gif_info = get_gif_info(temp_gif)
+                                optimized_colors = gif_info.get('colors', estimated_colors)
+                                optimized_lossy = estimated_lossy  # May need to estimate from optimization
+                                optimized_scale = 1.0  # May need to estimate from optimization
+                                quality_estimate = self.optimizer._calculate_quality_score(
+                                    gif_info, optimized_colors, optimized_lossy, optimized_scale
+                                )
+                            except Exception:
+                                pass  # Keep original estimate if recalculation fails
                             fits = size_mb <= max_size_mb
                             if fits:
-                                logger.info(f"Optimized GIF result: size={size_mb:.2f}MB <= target {max_size_mb:.2f}MB")
-                                return True, size_mb, temp_gif, converged_opt
+                                logger.info(f"Feasibility quick-opt result: size={size_mb:.2f}MB <= target {max_size_mb:.2f}MB, quality={quality_estimate:.1f}")
+                                return True, size_mb, quality_estimate, temp_gif, palette_path
                             else:
-                                logger.info(f"Optimized GIF result: size={size_mb:.2f}MB > target {max_size_mb:.2f}MB")
-                                return False, size_mb, temp_gif, converged_opt
+                                logger.info(f"Feasibility quick-opt result: size={size_mb:.2f}MB > target {max_size_mb:.2f}MB, quality={quality_estimate:.1f}")
+                                return False, size_mb, quality_estimate, temp_gif, palette_path
                     except Exception as size_e:
                         logger.debug(f"Failed to get size after quick optimization: {size_e}")
                         # If we can't get size, return with None size but keep temp_gif for caller cleanup
-                        return False, None, temp_gif, False
+                        return False, None, quality_estimate, temp_gif, palette_path
                     # If temp_gif doesn't exist, return with None
-                    return False, None, None, False
+                    return False, None, quality_estimate, None, palette_path
             finally:
                 # Clean up palette file (always safe to delete - not cached if from feasibility check)
                 try:
@@ -2151,7 +1990,7 @@ class GifGenerator:
                 # Note: temp_gif is not deleted here - caller is responsible for cleanup
                 # If caller doesn't adopt it, caller must clean it up
         except Exception as e:
-            logger.debug(f"Primary GIF generation failed with exception: {e}")
+            logger.debug(f"Feasibility check failed with exception, assuming not feasible: {e}")
             # Clean up temp_gif if it exists and we're returning early due to exception
             try:
                 if 'temp_gif' in locals() and temp_gif and os.path.exists(temp_gif):
@@ -2170,7 +2009,7 @@ class GifGenerator:
                                 logger.warning(f"Could not clean up feasibility temp file after exception: {os.path.basename(temp_gif)}: {cleanup_e}")
             except Exception:
                 pass
-            return False, None, None
+            return False, None, None, None, None
     
     def optimize_existing_gif(self, gif_path: str, max_size_mb: float) -> bool:
         """
@@ -2183,8 +2022,7 @@ class GifGenerator:
         Returns:
             True if optimization succeeded, False otherwise
         """
-        success, _, _ = self.optimizer.optimize_gif(gif_path, max_size_mb)
-        return success
+        return self.optimizer.optimize_gif(gif_path, max_size_mb)
     
     def get_gif_info(self, gif_path: str) -> Dict[str, Any]:
         """Get information about a GIF file"""

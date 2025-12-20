@@ -79,6 +79,28 @@ class GifOptimizer:
         self.near_target_max_runs = perf_cfg['near_target_max_runs']
         self.long_clip_guardrails = self.config_helper.get_long_clip_guardrails()
         
+        # Quality guardrails config
+        quality_guardrails = self.config_helper.get_quality_guardrails()
+        self.min_quality_threshold = quality_guardrails.get('min_quality_threshold', 3.0)
+        self.enable_early_exit = quality_guardrails.get('enable_early_exit', True)
+        
+        # Advanced gifsicle config
+        self.multi_pass_enabled = perf_cfg.get('multi_pass_enabled', True)
+        self.adaptive_strategy = perf_cfg.get('adaptive_strategy', True)
+        self.progressive_refinement = perf_cfg.get('progressive_refinement', True)
+        self.content_aware = perf_cfg.get('content_aware', True)
+        self.parameter_presets = perf_cfg.get('parameter_presets', {})
+        self.advanced_options = perf_cfg.get('advanced_options', {})
+        # Stage-level time budgets (seconds) to prevent runaway processing; honour config
+        gifsicle_budget = int(perf_cfg.get('gifsicle_time_budget_seconds', 25 if self.fast_mode else 45))
+        stage_budget_cfg = perf_cfg.get('stage_time_budgets', {}) or {}
+        self.stage_time_budgets = {
+            'lossless': max(1, int(stage_budget_cfg.get('lossless', 8))),
+            'gifsicle': max(1, int(stage_budget_cfg.get('gifsicle', gifsicle_budget))),
+            'palette': max(1, int(stage_budget_cfg.get('palette', 12))),
+        }
+        self.last_gifsicle_timeout = False
+        
         # Palette cache directory
         self.palette_cache_dir = os.path.join(self.temp_dir, 'palette_cache')
         try:
@@ -192,11 +214,12 @@ class GifOptimizer:
         # Content-aware analysis for better parameter selection
         motion_level = 'medium'
         complexity_level = 'medium'
+        frame_count = gif_info.get('frame_count', 0)
+        has_transparency = gif_info.get('has_transparency', False)
         
-        if gif_path and os.path.exists(gif_path):
+        if self.content_aware and gif_path and os.path.exists(gif_path):
             try:
                 # Analyze motion to adjust FPS intelligently
-                from .gif_analysis import analyze_motion, analyze_scene_complexity
                 motion_analysis = analyze_motion(gif_path, current_params.get('fps', 20), self.temp_dir)
                 motion_level = motion_analysis.get('motion_level', 'medium')
                 
@@ -204,17 +227,82 @@ class GifOptimizer:
                 complexity_analysis = analyze_scene_complexity(gif_path, self.temp_dir)
                 complexity_level = complexity_analysis.get('complexity_level', 'medium')
                 
-                logger.debug(f"Content analysis: motion={motion_level}, complexity={complexity_level}")
+                # Get frame count for frame-aware optimization
+                frame_count = gif_info.get('frame_count', 0)
+                
+                logger.debug(f"Content analysis: motion={motion_level}, complexity={complexity_level}, frames={frame_count}")
             except Exception as e:
                 logger.debug(f"Content analysis failed, using defaults: {e}")
         
-        # Get current values
+        # Get current values (needed for both adaptive and fallback paths)
         current_width = current_params.get('width', gif_info.get('width', 360))
         current_height = current_params.get('height', gif_info.get('height', 360))
         current_fps = current_params.get('fps', gif_info.get('fps', 20))
         current_colors = current_params.get('colors', 256)
         current_lossy = current_params.get('lossy', 0)
         duration = gif_info.get('duration', 10.0)
+        
+        # Use adaptive strategy if enabled
+        if self.adaptive_strategy:
+            strategy = self._adaptive_gifsicle_strategy(current_size_mb, target_size_mb, gif_info)
+            # Use strategy-based parameter selection
+            # Select initial parameters from strategy ranges based on reduction needed
+            if reduction_ratio < 0.5:
+                # Large reduction needed - use more aggressive strategy values
+                colors_idx = min(2, len(strategy['colors_range']) - 1)
+                lossy_idx = min(2, len(strategy['lossy_range']) - 1)
+                scale_idx = min(2, len(strategy['scale_range']) - 1)
+            elif reduction_ratio < 0.7:
+                # Moderate reduction - use balanced strategy values
+                colors_idx = min(1, len(strategy['colors_range']) - 1)
+                lossy_idx = min(1, len(strategy['lossy_range']) - 1)
+                scale_idx = min(1, len(strategy['scale_range']) - 1)
+            else:
+                # Small reduction - use conservative strategy values
+                colors_idx = 0
+                lossy_idx = 0
+                scale_idx = 0
+            
+            # Adjust based on content analysis
+            if motion_level == 'high' and lossy_idx > 0:
+                lossy_idx = max(0, lossy_idx - 1)  # Use less lossy for high motion
+            if complexity_level == 'high' and colors_idx > 0:
+                colors_idx = max(0, colors_idx - 1)  # Preserve more colors for high complexity
+            
+            # Get values from strategy
+            target_colors = strategy['colors_range'][colors_idx] if colors_idx < len(strategy['colors_range']) else 192
+            target_lossy = strategy['lossy_range'][lossy_idx] if lossy_idx < len(strategy['lossy_range']) else 60
+            target_scale = strategy['scale_range'][scale_idx] if scale_idx < len(strategy['scale_range']) else 0.92
+            
+            # Calculate target width from scale
+            target_width = int(current_width * target_scale)
+            
+            # Enforce quality floors even in adaptive strategy path
+            quality_floors = self.config_helper.get_quality_floors()
+            allow_aggressive = self.config_helper.get_optimization_config().get('allow_aggressive_compression', False)
+            
+            if not allow_aggressive and quality_floors.get('enforce', True):
+                min_width = quality_floors.get('min_width', 360)
+                min_fps = quality_floors.get('min_fps', 15)
+                target_width = max(target_width, min_width)
+                # Note: FPS is handled separately in FFmpeg stage, but we ensure it's at least min_fps
+            else:
+                # Aggressive mode: still honor floors to prevent unreadable outputs
+                min_width_aggressive = quality_floors.get('min_width_aggressive', 360)
+                target_width = max(target_width, min_width_aggressive)
+            
+            # Note: GIF-only specific floors (min 160 colors, max 100 lossy, min 0.85 scale)
+            # are applied in _stage_gifsicle_lossy_compression where we have source_video context.
+            # Here we only apply general quality floors.
+            
+            return {
+                'width': max(64, target_width),
+                'height': int(current_height * target_scale),
+                'fps': current_fps,  # FPS handled separately in FFmpeg stage
+                'colors': target_colors,
+                'lossy': target_lossy,
+                'dither': 'floyd_steinberg' if target_colors >= 192 else 'sierra2_4a'  # Default dither for quality
+            }
         
         # Calculate required reductions with content-aware adjustments
         # Width reduction: use cube root since area is width^2
@@ -431,30 +519,44 @@ class GifOptimizer:
         current_size_mb = current_bytes / 1024 / 1024
         
         logger.info(f"Starting optimization stages: {current_size_mb:.2f}MB -> {target_size_mb:.2f}MB target")
+        stage_start_time = time.time()
         gif_info_cache: Optional[Dict[str, Any]] = None
         
         # Stage 1: Lossless optimization (try even if far over target - it might still help)
         if self._shutdown_checker():
+            elapsed = time.time() - stage_start_time
+            logger.info(f"Optimization stages cancelled (shutdown requested) after {elapsed:.2f}s")
             return False, False
         
+        stage1_start = time.time()
         over_ratio = (current_bytes - target_bytes) / float(target_bytes) if target_bytes > 0 else 1.0
         logger.debug(f"Stage 1 (lossless): over_ratio={over_ratio:.2%}, threshold={self.skip_gifsicle_far_over_ratio:.2%}")
         
+        # Fast-fail: Skip lossless optimization when over_ratio is extreme (>250%)
+        # Lossless optimization is unlikely to help when file is 2.5x+ over target
+        EXTREME_OVER_RATIO_THRESHOLD = 2.5  # 250%
+        if over_ratio > EXTREME_OVER_RATIO_THRESHOLD:
+            elapsed = time.time() - stage1_start
+            logger.info(f"Stage 1: Skipping lossless optimization (over_ratio={over_ratio:.2%} > {EXTREME_OVER_RATIO_THRESHOLD:.0%} threshold) [exit_reason=fast_fail, elapsed={elapsed:.2f}s]")
         # Try lossless optimization even if far over target - it can still reduce size
-        # Only skip if gifsicle is not available
-        if self._is_tool_available("gifsicle"):
+        # Only skip if gifsicle is not available or extreme over_ratio
+        elif self._is_tool_available("gifsicle"):
             logger.info("Stage 1: Attempting lossless gifsicle optimization...")
             if self._stage_lossless_optimization(gif_path, target_bytes):
                 current_bytes = os.path.getsize(gif_path)
                 current_size_mb = current_bytes / 1024 / 1024
-                logger.info(f"Stage 1 completed: {current_size_mb:.2f}MB")
+                elapsed = time.time() - stage1_start
+                logger.info(f"Stage 1 completed: {current_size_mb:.2f}MB [exit_reason=success, elapsed={elapsed:.2f}s]")
                 if current_bytes <= target_bytes:
-                    logger.info("Target met after Stage 1")
+                    total_elapsed = time.time() - stage_start_time
+                    logger.info(f"Target met after Stage 1 [total_elapsed={total_elapsed:.2f}s]")
                     return True, False
             else:
-                logger.debug("Stage 1: Lossless optimization skipped or failed")
+                elapsed = time.time() - stage1_start
+                logger.debug(f"Stage 1: Lossless optimization skipped or failed [exit_reason=failed, elapsed={elapsed:.2f}s]")
         else:
-            logger.warning("Stage 1: gifsicle not available, skipping lossless optimization")
+            elapsed = time.time() - stage1_start
+            logger.warning(f"Stage 1: gifsicle not available, skipping lossless optimization [exit_reason=tool_unavailable, elapsed={elapsed:.2f}s]")
         
         # Stage 2: Source re-encoding (if source available - preferred over GIF re-encoding)
         # IMPROVED: Keep Stage 2 result as baseline for Stage 3 if it's better than original
@@ -465,6 +567,7 @@ class GifOptimizer:
         if source_video and os.path.exists(source_video):
             # Check convergence before Stage 2 - if converged, skip Stage 2
             skip_stage2_converged = False
+            skip_stage2_projection = False
             if previous_result_size_mb is not None:
                 if self._is_converged(current_size_mb, previous_result_size_mb, target_size_mb):
                     logger.info(
@@ -475,106 +578,165 @@ class GifOptimizer:
                     logger.debug(
                         f"Stage 2: Not converged (current: {current_size_mb:.2f}MB, previous: {previous_result_size_mb:.2f}MB)"
                     )
-            
+
+            # Projection guard: skip Stage 2 when predicted result is not materially better
             if not skip_stage2_converged:
-                logger.info(f"Stage 2: Attempting re-encoding from source video: {source_video}")
-                
-                # Create temp backup of current state before Stage 2
-                with temp_file_context("stage2_backup", ".gif", self.temp_dir) as stage2_backup:
+                if gif_info_cache is None:
                     try:
-                        safe_file_operation(shutil.copy2, gif_path, stage2_backup)
-                        backup_size = os.path.getsize(stage2_backup)
-                    except Exception as e:
-                        logger.debug(f"Could not create Stage 2 backup: {e}")
-                        stage2_backup = None
-                        backup_size = os.path.getsize(gif_path)
+                        gif_info_cache = get_gif_info(gif_path)
+                    except Exception:
+                        gif_info_cache = {}
+                duration_val = float(gif_info_cache.get('duration', 0.0) or 0.0)
+                fps_val = float(gif_info_cache.get('fps', 0.0) or 0.0)
+                if (not fps_val or fps_val <= 0) and duration_val > 0:
+                    try:
+                        frame_count_val = float(gif_info_cache.get('frame_count', 0.0) or 0.0)
+                        if frame_count_val > 0:
+                            fps_val = frame_count_val / duration_val
+                    except Exception:
+                        fps_val = 0.0
+                current_params = {
+                    'width': gif_info_cache.get('width', 360),
+                    'height': gif_info_cache.get('height', gif_info_cache.get('width', 360)),
+                    'fps': max(fps_val, 1.0) if fps_val else 20.0,
+                    'colors': gif_info_cache.get('colors', 256),
+                    'lossy': gif_info_cache.get('lossy', 0),
+                }
+                try:
+                    projected_params = self._calculate_required_parameters(
+                        current_size_mb,
+                        target_size_mb,
+                        current_params,
+                        gif_info_cache,
+                        gif_path=gif_path
+                    )
+                    predicted_size_mb = self._predict_gif_size(
+                        int(projected_params.get('width', current_params['width'] or 360)),
+                        int(projected_params.get('height', current_params['height'] or current_params['width'] or 360)),
+                        float(projected_params.get('fps', current_params['fps'] or 20.0)),
+                        float(duration_val or gif_info_cache.get('duration', 0.0) or 0.0),
+                        int(projected_params.get('colors', current_params['colors'] or 256)),
+                        int(projected_params.get('lossy', current_params['lossy'] or 0)),
+                    )
+                    if predicted_size_mb >= current_size_mb * 0.9:
+                        skip_stage2_projection = True
+                        logger.info(
+                            "Stage 2: Skipping re-encode (projected %.2fMB >= 90%% of current %.2fMB) [exit_reason=projection_skip]",
+                            predicted_size_mb,
+                            current_size_mb,
+                        )
+                except Exception as projection_e:
+                    logger.debug(f"Stage 2 projection check failed, proceeding with re-encode: {projection_e}")
+            
+            if not skip_stage2_converged and not skip_stage2_projection:
+                # Fast-fail: Skip Stage 2 re-encoding when over_ratio is extreme (>250%)
+                # Re-encoding is unlikely to help when file is 2.5x+ over target
+                stage2_start = time.time()
+                current_over_ratio = (current_bytes - target_bytes) / float(target_bytes) if target_bytes > 0 else 1.0
+                EXTREME_OVER_RATIO_THRESHOLD = 2.5  # 250%
+                if current_over_ratio > EXTREME_OVER_RATIO_THRESHOLD:
+                    elapsed = time.time() - stage2_start
+                    logger.info(f"Stage 2: Skipping re-encoding (over_ratio={current_over_ratio:.2%} > {EXTREME_OVER_RATIO_THRESHOLD:.0%} threshold, will try Stage 3 lossy compression) [exit_reason=fast_fail, elapsed={elapsed:.2f}s]")
+                else:
+                    logger.info(f"Stage 2: Attempting re-encoding from source video: {source_video}")
                     
-                    # Track Stage 2 attempts and results for retry limits and progress detection
-                    stage2_max_attempts = 3
-                    stage2_attempt = 0
-                    stage2_previous_size_mb = current_size_mb
-                    stage2_seen_sizes = set()  # Track seen result sizes to detect no progress
-                    size_tolerance_mb = 1.0  # Consider results within 1MB as identical
-                    
-                    while stage2_attempt < stage2_max_attempts:
-                        stage2_attempt += 1
-                        logger.info(f"Stage 2 attempt {stage2_attempt}/{stage2_max_attempts}")
+                    # Create temp backup of current state before Stage 2
+                    with temp_file_context("stage2_backup", ".gif", self.temp_dir) as stage2_backup:
+                        try:
+                            safe_file_operation(shutil.copy2, gif_path, stage2_backup)
+                            backup_size = os.path.getsize(stage2_backup)
+                        except Exception as e:
+                            logger.debug(f"Could not create Stage 2 backup: {e}")
+                            stage2_backup = None
+                            backup_size = os.path.getsize(gif_path)
                         
-                        # Early exit: if result is identical to input (within tolerance), skip to Stage 3
-                        if abs(current_size_mb - backup_size / 1024 / 1024) < size_tolerance_mb:
-                            logger.info(
-                                f"Stage 2: Result identical to input ({current_size_mb:.2f}MB), skipping to Stage 3"
-                            )
-                            break
+                        # Track Stage 2 attempts and results for retry limits and progress detection
+                        stage2_max_attempts = 3
+                        stage2_attempt = 0
+                        stage2_previous_size_mb = current_size_mb
+                        stage2_seen_sizes = set()  # Track seen result sizes to detect no progress
+                        size_tolerance_mb = 1.0  # Consider results within 1MB as identical
                         
-                        # Early exit: if we've seen this size before, no progress is being made
-                        current_size_rounded = round(current_size_mb / size_tolerance_mb) * size_tolerance_mb
-                        if current_size_rounded in stage2_seen_sizes:
-                            logger.warning(
-                                f"Stage 2: No progress detected (seen size {current_size_mb:.2f}MB before), "
-                                f"skipping to Stage 3 after {stage2_attempt - 1} attempts"
-                            )
-                            break
-                        stage2_seen_sizes.add(current_size_rounded)
-                        
-                        if self._reencode_from_source(
-                            source_video,
-                            gif_path,
-                            target_size_mb,
-                            force_guardrails=force_guardrails,
-                            previous_result_size_mb=stage2_previous_size_mb,
-                            seen_sizes=stage2_seen_sizes
-                        ):
-                            current_bytes = os.path.getsize(gif_path)
-                            current_size_mb = current_bytes / 1024 / 1024
-                            logger.info(f"Stage 2 attempt {stage2_attempt} completed: {current_size_mb:.2f}MB")
+                        while stage2_attempt < stage2_max_attempts:
+                            stage2_attempt += 1
+                            logger.info(f"Stage 2 attempt {stage2_attempt}/{stage2_max_attempts}")
                             
-                            if current_bytes <= target_bytes:
-                                logger.info("Target met after Stage 2")
-                                return True, False
-                            
-                            # Check if result is identical to previous attempt (no progress)
-                            if abs(current_size_mb - stage2_previous_size_mb) < size_tolerance_mb:
-                                logger.warning(
-                                    f"Stage 2: No progress made (result {current_size_mb:.2f}MB same as previous "
-                                    f"{stage2_previous_size_mb:.2f}MB), stopping Stage 2"
-                                )
-                                break
-                            
-                            # Check if result is worse than previous attempt
-                            if current_size_mb > stage2_previous_size_mb + size_tolerance_mb:
-                                logger.warning(
-                                    f"Stage 2: Result worse than previous ({current_size_mb:.2f}MB > "
-                                    f"{stage2_previous_size_mb:.2f}MB), stopping Stage 2"
-                                )
-                                # Restore to previous best
-                                if stage2_backup and os.path.exists(stage2_backup):
-                                    safe_file_operation(shutil.copy2, stage2_backup, gif_path)
-                                    current_bytes = backup_size
-                                    current_size_mb = backup_size / 1024 / 1024
-                                break
-                            
-                            # Update previous size for next iteration
-                            stage2_previous_size_mb = current_size_mb
-                        else:
-                            logger.debug(f"Stage 2 attempt {stage2_attempt}: Source re-encoding failed or did not improve")
-                            # If this is not the first attempt, break to avoid infinite retries
-                            if stage2_attempt > 1:
-                                logger.info("Stage 2: Multiple failures, stopping retries")
-                                break
-                    
-                    # Final check: if Stage 2 result is better and within chaining range
-                    if os.path.exists(gif_path):
-                        final_bytes = os.path.getsize(gif_path)
-                        final_size_mb = final_bytes / 1024 / 1024
-                        
-                        if final_bytes < backup_size:
-                            over_ratio = (final_bytes - target_bytes) / target_bytes if target_bytes > 0 else 1.0
-                            if over_ratio <= 0.30:  # Within 30% of target and improved
+                            # Early exit: if result is identical to input (within tolerance), skip to Stage 3
+                            if abs(current_size_mb - backup_size / 1024 / 1024) < size_tolerance_mb:
                                 logger.info(
-                                    f"Stage 2 result ({final_size_mb:.2f}MB, {over_ratio*100:.1f}% over target) "
-                                    f"is close to target and better than before. Using as baseline for Stage 3."
+                                    f"Stage 2: Result identical to input ({current_size_mb:.2f}MB), skipping to Stage 3"
                                 )
+                                break
+                            
+                            # Early exit: if we've seen this size before, no progress is being made
+                            current_size_rounded = round(current_size_mb / size_tolerance_mb) * size_tolerance_mb
+                            if current_size_rounded in stage2_seen_sizes:
+                                logger.warning(
+                                    f"Stage 2: No progress detected (seen size {current_size_mb:.2f}MB before), "
+                                    f"skipping to Stage 3 after {stage2_attempt - 1} attempts"
+                                )
+                                break
+                            stage2_seen_sizes.add(current_size_rounded)
+                            
+                            if self._reencode_from_source(
+                                source_video,
+                                gif_path,
+                                target_size_mb,
+                                force_guardrails=force_guardrails,
+                                previous_result_size_mb=stage2_previous_size_mb,
+                                seen_sizes=stage2_seen_sizes
+                            ):
+                                current_bytes = os.path.getsize(gif_path)
+                                current_size_mb = current_bytes / 1024 / 1024
+                                logger.info(f"Stage 2 attempt {stage2_attempt} completed: {current_size_mb:.2f}MB")
+                                
+                                if current_bytes <= target_bytes:
+                                    logger.info("Target met after Stage 2")
+                                    return True, False
+                                
+                                # Check if result is identical to previous attempt (no progress)
+                                if abs(current_size_mb - stage2_previous_size_mb) < size_tolerance_mb:
+                                    logger.warning(
+                                        f"Stage 2: No progress made (result {current_size_mb:.2f}MB same as previous "
+                                        f"{stage2_previous_size_mb:.2f}MB), stopping Stage 2"
+                                    )
+                                    break
+                                
+                                # Check if result is worse than previous attempt
+                                if current_size_mb > stage2_previous_size_mb + size_tolerance_mb:
+                                    logger.warning(
+                                        f"Stage 2: Result worse than previous ({current_size_mb:.2f}MB > "
+                                        f"{stage2_previous_size_mb:.2f}MB), stopping Stage 2"
+                                    )
+                                    # Restore to previous best
+                                    if stage2_backup and os.path.exists(stage2_backup):
+                                        safe_file_operation(shutil.copy2, stage2_backup, gif_path)
+                                        current_bytes = backup_size
+                                        current_size_mb = backup_size / 1024 / 1024
+                                    break
+                                
+                                # Update previous size for next iteration
+                                stage2_previous_size_mb = current_size_mb
+                            else:
+                                logger.debug(f"Stage 2 attempt {stage2_attempt}: Source re-encoding failed or did not improve")
+                                # If this is not the first attempt, break to avoid infinite retries
+                                if stage2_attempt > 1:
+                                    logger.info("Stage 2: Multiple failures, stopping retries")
+                                    break
+                        
+                        # Final check: if Stage 2 result is better and within chaining range
+                        stage2_elapsed = time.time() - stage2_start
+                        if os.path.exists(gif_path):
+                            final_bytes = os.path.getsize(gif_path)
+                            final_size_mb = final_bytes / 1024 / 1024
+                            
+                            if final_bytes < backup_size:
+                                over_ratio = (final_bytes - target_bytes) / target_bytes if target_bytes > 0 else 1.0
+                                if over_ratio <= 0.30:  # Within 30% of target and improved
+                                    logger.info(
+                                        f"Stage 2 result ({final_size_mb:.2f}MB, {over_ratio*100:.1f}% over target) "
+                                        f"is close to target and better than before. Using as baseline for Stage 3. [exit_reason=success, elapsed={stage2_elapsed:.2f}s]"
+                                    )
                             else:
                                 logger.info(
                                     f"Stage 2 result ({final_size_mb:.2f}MB) improved size but still far over target "
@@ -616,7 +778,7 @@ class GifOptimizer:
             # treat the boolean as \"made a successful under-target attempt\" and always re-stat
             # the file afterwards to determine actual size and improvement.
             logger.debug(f"Stage 3: Starting gifsicle lossy compression on {os.path.basename(gif_path)} ({size_before_gifsicle / (1024*1024):.2f}MB -> {target_size_mb:.2f}MB target)")
-            self._stage_gifsicle_lossy_compression(gif_path, target_bytes, target_size_mb)
+            self._stage_gifsicle_lossy_compression(gif_path, target_bytes, target_size_mb, source_video=source_video)
             gifsicle_attempted = True
             
             if os.path.exists(gif_path):
@@ -1282,10 +1444,16 @@ class GifOptimizer:
             return True
         return False
     
-    def _stage_gifsicle_lossy_compression(self, gif_path: str, target_bytes: int, target_size_mb: float) -> bool:
+    def _stage_gifsicle_lossy_compression(self, gif_path: str, target_bytes: int, target_size_mb: float, source_video: Optional[str] = None) -> bool:
         """
         Stage 3: Gifsicle lossy compression with calculated parameters.
         This replaces FFmpeg re-encoding which often makes files larger.
+        
+        Args:
+            gif_path: Path to GIF file
+            target_bytes: Target size in bytes
+            target_size_mb: Target size in MB
+            source_video: Optional source video path (None for GIF-only inputs)
         
         Returns:
             True if target met
@@ -1312,69 +1480,284 @@ class GifOptimizer:
         
         logger.info(f"Calculated compression parameters: colors={required_params['colors']}, lossy={required_params['lossy']}, width={required_params['width']}")
         
-        # Try multiple parameter combinations
-        param_combinations = []
         over_ratio = (current_size_mb / target_size_mb) if target_size_mb > 0 else float('inf')
         
+        # Detect GIF-only early so we can enforce floors in all optimization paths
+        is_gif_only = source_video is None or not os.path.exists(source_video)
+        quality_floors = self.config_helper.get_quality_floors()
+        allow_aggressive = self.config_helper.get_optimization_config().get('allow_aggressive_compression', False)
+        
+        # Enforce GIF-only floors on required_params BEFORE any optimization strategies
+        if is_gif_only:
+            min_width = quality_floors.get('min_width', 360) if quality_floors.get('enforce', True) else quality_floors.get('min_width_aggressive', 360)
+            min_colors = 160  # Minimum colors for GIF-only to prevent banding
+            max_lossy = 100  # Cap lossy for GIF-only
+            min_scale = 0.85  # Don't scale below 85% for GIF-only
+            
+            # Adjust required_params to respect floors
+            if required_params['width'] < min_width:
+                required_params['width'] = min_width
+                required_params['height'] = int(current_params['height'] * (min_width / current_params['width']))
+            if required_params['colors'] < min_colors:
+                required_params['colors'] = min_colors
+            if required_params['lossy'] > max_lossy:
+                required_params['lossy'] = max_lossy
+            # Ensure scale respects minimum
+            calculated_scale = required_params['width'] / float(current_params['width'])
+            if calculated_scale < min_scale:
+                required_params['width'] = int(current_params['width'] * min_scale)
+                required_params['height'] = int(current_params['height'] * min_scale)
+                # Re-apply width floor after scale adjustment
+                if required_params['width'] < min_width:
+                    required_params['width'] = min_width
+                    required_params['height'] = int(current_params['height'] * (min_width / current_params['width']))
+            
+            logger.info(f"GIF-only floors applied: colors={required_params['colors']}, lossy={required_params['lossy']}, width={required_params['width']}")
+        
+        # For GIF-only inputs (no source video) that are heavily over target (>15%), 
+        # try FFmpeg palette re-encode fallback before aggressive gifsicle compression
+        if is_gif_only and over_ratio > 1.15:
+            logger.info(f"GIF-only input {over_ratio*100:.1f}% over target, attempting FFmpeg palette re-encode fallback...")
+            # Use quality-preserving parameters for the fallback
+            quality_floors = self.config_helper.get_quality_floors()
+            min_width = quality_floors.get('min_width', 360) if quality_floors.get('enforce', True) else quality_floors.get('min_width_aggressive', 360)
+            min_fps = quality_floors.get('min_fps', 15) if quality_floors.get('enforce', True) else quality_floors.get('min_fps_aggressive', 15)
+            
+            # Calculate conservative parameters that preserve quality
+            fallback_width = max(min_width, int(current_params['width'] * 0.92))  # Max 8% reduction
+            fallback_fps = max(min_fps, int(current_params['fps'] * 0.95))  # Max 5% FPS reduction
+            fallback_colors = max(192, required_params.get('colors', 256))  # Preserve more colors
+            
+            temp_output = create_unique_temp_filename("ffmpeg_fallback", ".gif", self.temp_dir)
+            if self._ffmpeg_palette_reencode(
+                gif_path, temp_output, fallback_width, fallback_fps, 
+                max_colors=fallback_colors, mpdecimate_frac=0.3,
+                stats_mode='diff', dither='floyd_steinberg'
+            ):
+                if os.path.exists(temp_output):
+                    fallback_size = os.path.getsize(temp_output)
+                    fallback_size_mb = fallback_size / 1024 / 1024
+                    if fallback_size <= target_bytes:
+                        try:
+                            safe_file_operation(os.replace, temp_output, gif_path)
+                            logger.info(f"✓ Target met with FFmpeg palette fallback: {fallback_size_mb:.2f}MB")
+                            return True
+                        except Exception as e:
+                            logger.warning(f"Failed to replace file after FFmpeg fallback: {e}")
+                    elif fallback_size < current_bytes:
+                        # Improved but still over target - use as baseline for further optimization
+                        try:
+                            safe_file_operation(os.replace, temp_output, gif_path)
+                            current_bytes = fallback_size
+                            current_size_mb = fallback_size_mb
+                            logger.info(f"FFmpeg fallback improved to {fallback_size_mb:.2f}MB, continuing with gifsicle...")
+                        except Exception as e:
+                            logger.warning(f"Failed to replace file after FFmpeg fallback: {e}")
+                    else:
+                        # Fallback made it worse, clean up and continue with gifsicle
+                        try:
+                            os.remove(temp_output)
+                        except:
+                            pass
+                        logger.debug("FFmpeg fallback did not improve size, continuing with gifsicle...")
+        
+        # Try advanced strategies first if enabled
+        if self.multi_pass_enabled and over_ratio > 1.2:
+            logger.info("Attempting multi-pass optimization...")
+            result = self._gifsicle_multi_pass_optimize(gif_path, target_bytes, target_size_mb)
+            if result and os.path.exists(result):
+                result_size = os.path.getsize(result)
+                if result_size <= target_bytes:
+                    try:
+                        safe_file_operation(os.replace, result, gif_path)
+                        logger.info("✓ Target met with multi-pass optimization!")
+                        return True
+                    except Exception as e:
+                        logger.warning(f"Failed to replace file after multi-pass: {e}")
+                elif result_size < current_bytes:
+                    # Use as starting point for further optimization
+                    try:
+                        safe_file_operation(os.replace, result, gif_path)
+                        current_bytes = result_size
+                        current_size_mb = current_bytes / 1024 / 1024
+                        # Note: gif_path remains unchanged since os.replace moves file to gif_path
+                        logger.info(f"Multi-pass improved file to {current_size_mb:.2f}MB, continuing...")
+                    except Exception as e:
+                        logger.warning(f"Failed to replace file after multi-pass: {e}")
+        
+        if self.progressive_refinement and over_ratio > 1.15:
+            logger.info("Attempting progressive refinement...")
+            # Note: Progressive refinement uses strategy ranges which may include values below GIF-only floors,
+            # but it's quality-aware and typically produces good results. The param combinations below will
+            # enforce floors if progressive refinement doesn't meet the target.
+            result = self._gifsicle_progressive_refine(gif_path, target_bytes, target_size_mb)
+            if result and os.path.exists(result):
+                result_size = os.path.getsize(result)
+                if result_size <= target_bytes:
+                    try:
+                        safe_file_operation(os.replace, result, gif_path)
+                        logger.info("✓ Target met with progressive refinement!")
+                        return True
+                    except Exception as e:
+                        logger.warning(f"Failed to replace file after progressive refinement: {e}")
+        
+        # Use adaptive strategy to generate parameter combinations
+        strategy = self._adaptive_gifsicle_strategy(current_size_mb, target_size_mb, gif_info)
+        
+        # Initialize GIF-only floor variables (used in param combination generation)
+        # Note: is_gif_only, quality_floors, and allow_aggressive are already set above
+        min_colors = 128  # Default minimum colors
+        max_lossy = 120  # Default max lossy
+        min_scale = 0.7  # Default minimum scale
+        min_width = quality_floors.get('min_width', 360) if quality_floors.get('enforce', True) else quality_floors.get('min_width_aggressive', 360)
+        
+        if is_gif_only:
+            # For GIF-only inputs, enforce stricter quality floors
+            min_colors = 160  # Minimum colors for GIF-only to prevent banding
+            max_lossy = 100  # Cap lossy for GIF-only
+            min_scale = 0.85  # Don't scale below 85% for GIF-only
+            # required_params already adjusted above, but ensure they're still correct
+            if required_params['width'] < min_width:
+                required_params['width'] = min_width
+                required_params['height'] = int(current_params['height'] * (min_width / current_params['width']))
+            if required_params['colors'] < min_colors:
+                required_params['colors'] = min_colors
+            if required_params['lossy'] > max_lossy:
+                required_params['lossy'] = max_lossy
+        
+        # Try multiple parameter combinations using adaptive strategy
+        param_combinations = []
+        
         # Primary: use calculated parameters
+        primary_scale = required_params['width'] / float(current_params['width'])
+        if is_gif_only and primary_scale < min_scale:
+            primary_scale = min_scale
+            required_params['width'] = int(current_params['width'] * primary_scale)
+            required_params['height'] = int(current_params['height'] * primary_scale)
+            # Re-apply width floor after scale adjustment
+            if required_params['width'] < min_width:
+                required_params['width'] = min_width
+                required_params['height'] = int(current_params['height'] * (min_width / current_params['width']))
+                primary_scale = required_params['width'] / float(current_params['width'])
+        
         param_combinations.append({
             'colors': required_params['colors'],
             'lossy': required_params['lossy'],
-            'scale': required_params['width'] / float(current_params['width']),
+            'scale': primary_scale,
+            'optimize': strategy['optimize'],
+            'resize_method': strategy['resize_method'],
             'name': 'primary'
         })
         
-        # Near-target fine tuning (within 5-15% over target)
-        # Use less aggressive settings to preserve quality
-        near_target_lower = 1.05
-        near_target_upper = 1.15
-        if target_size_mb > 0 and near_target_lower <= over_ratio <= near_target_upper:
-            base_scale = required_params['width'] / float(max(1, current_params['width']))
-            fine_tune_scale = max(0.7, min(1.0, base_scale * 0.95))  # Prevent scaling below 0.7
-            param_combinations.append({
-                'colors': max(128, required_params['colors'] - 24),  # Increased from 32 to 128
-                'lossy': min(120, required_params['lossy'] + 15),  # Reduced from 200 to 120
-                'scale': fine_tune_scale,
-                'name': 'near-target fine-tune'
-            })
-            logger.info(
-                "  Scheduling near-target gifsicle compression (%.1f%% over target)",
-                (over_ratio - 1.0) * 100
-            )
-        
-        # Fill the gap: 15-35% over target - reduced to single attempt
-        if 1.15 < over_ratio <= 1.35:
-            param_combinations.append({
-                'colors': max(128, required_params['colors'] - 20),  # Increased minimum
-                'lossy': min(120, required_params['lossy'] + 15),  # Reduced max lossy
-                'scale': required_params['width'] / float(current_params['width']) * 0.94,
-                'name': 'moderate'
-            })
-        
-        # Fill the gap: 35-50% over target - reduced to single attempt
-        if 1.35 < over_ratio <= 1.50:
-            param_combinations.append({
-                'colors': max(128, required_params['colors'] - 32),  # Preserve more colors
-                'lossy': min(120, required_params['lossy'] + 20),  # Limit lossy
-                'scale': required_params['width'] / float(current_params['width']) * 0.90,
-                'name': 'moderate-aggressive'
-            })
-        
-        # Only use more aggressive settings for files significantly over target (>2x)
-        # Removed tertiary option to avoid over-optimization
-        if current_size_mb > target_size_mb * 2.0:
-            param_combinations.append({
-                'colors': max(128, required_params['colors'] - 48),  # Still preserve quality
-                'lossy': min(120, required_params['lossy'] + 30),  # Limited lossy
-                'scale': max(0.75, required_params['width'] / float(current_params['width']) * 0.85),  # Prevent extreme scaling
-                'name': 'aggressive (for large files)'
-            })
+        # Generate smart parameter combinations based on adaptive strategy
+        # Use orthogonal combinations: test independent parameter axes
+        if self.adaptive_strategy:
+            # Near-target fine tuning (within 5-15% over target)
+            near_target_lower = 1.05
+            near_target_upper = 1.15
+            if target_size_mb > 0 and near_target_lower <= over_ratio <= near_target_upper:
+                base_scale = required_params['width'] / float(max(1, current_params['width']))
+                # Try correlated combinations (known-good pairs)
+                for colors in strategy['colors_range'][:2]:  # First 2 colors
+                    for lossy in strategy['lossy_range'][:2]:  # First 2 lossy
+                        fine_tune_scale = max(0.7, min(1.0, base_scale * 0.95))
+                        # Enforce floors for GIF-only
+                        if is_gif_only:
+                            colors = max(colors, min_colors)
+                            lossy = min(lossy, max_lossy)
+                            fine_tune_scale = max(fine_tune_scale, min_scale)
+                        param_combinations.append({
+                            'colors': colors,
+                            'lossy': lossy,
+                            'scale': fine_tune_scale,
+                            'optimize': strategy['optimize'],
+                            'resize_method': strategy['resize_method'],
+                            'name': f'near-target ({strategy["strategy"]})'
+                        })
+                logger.info(
+                    "  Scheduling near-target gifsicle compression (%.1f%% over target)",
+                    (over_ratio - 1.0) * 100
+                )
+            else:
+                # For other over-ratios, use strategy-based combinations
+                # Test key combinations from the strategy
+                for i, colors in enumerate(strategy['colors_range'][:3]):  # Top 3
+                    for j, lossy in enumerate(strategy['lossy_range'][:3]):  # Top 3
+                        if i + j < 4:  # Limit combinations
+                            scale_idx = min(i + j, len(strategy['scale_range']) - 1)
+                            scale = strategy['scale_range'][scale_idx]
+                            # Enforce floors for GIF-only
+                            if is_gif_only:
+                                colors = max(colors, min_colors)
+                                lossy = min(lossy, max_lossy)
+                                scale = max(scale, min_scale)
+                            param_combinations.append({
+                                'colors': colors,
+                                'lossy': lossy,
+                                'scale': scale,
+                                'optimize': strategy['optimize'],
+                                'resize_method': strategy['resize_method'],
+                                'name': f'{strategy["strategy"]} combo'
+                            })
+        else:
+            # Fallback to original logic if adaptive strategy disabled
+            if 1.15 < over_ratio <= 1.35:
+                moderate_colors = max(128, required_params['colors'] - 20)
+                moderate_lossy = min(120, required_params['lossy'] + 15)
+                moderate_scale = required_params['width'] / float(current_params['width']) * 0.94
+                if is_gif_only:
+                    moderate_colors = max(moderate_colors, min_colors)
+                    moderate_lossy = min(moderate_lossy, max_lossy)
+                    moderate_scale = max(moderate_scale, min_scale)
+                param_combinations.append({
+                    'colors': moderate_colors,
+                    'lossy': moderate_lossy,
+                    'scale': moderate_scale,
+                    'optimize': strategy['optimize'],
+                    'resize_method': strategy['resize_method'],
+                    'name': 'moderate'
+                })
+            
+            if 1.35 < over_ratio <= 1.50:
+                mod_agg_colors = max(128, required_params['colors'] - 32)
+                mod_agg_lossy = min(120, required_params['lossy'] + 20)
+                mod_agg_scale = required_params['width'] / float(current_params['width']) * 0.90
+                if is_gif_only:
+                    mod_agg_colors = max(mod_agg_colors, min_colors)
+                    mod_agg_lossy = min(mod_agg_lossy, max_lossy)
+                    mod_agg_scale = max(mod_agg_scale, min_scale)
+                param_combinations.append({
+                    'colors': mod_agg_colors,
+                    'lossy': mod_agg_lossy,
+                    'scale': mod_agg_scale,
+                    'optimize': strategy['optimize'],
+                    'resize_method': strategy['resize_method'],
+                    'name': 'moderate-aggressive'
+                })
+            
+            if current_size_mb > target_size_mb * 2.0:
+                agg_colors = max(128, required_params['colors'] - 48)
+                agg_lossy = min(120, required_params['lossy'] + 30)
+                agg_scale = max(0.75, required_params['width'] / float(current_params['width']) * 0.85)
+                if is_gif_only:
+                    agg_colors = max(agg_colors, min_colors)
+                    agg_lossy = min(agg_lossy, max_lossy)
+                    agg_scale = max(agg_scale, min_scale)
+                param_combinations.append({
+                    'colors': agg_colors,
+                    'lossy': agg_lossy,
+                    'scale': agg_scale,
+                    'optimize': strategy['optimize'],
+                    'resize_method': strategy['resize_method'],
+                    'name': 'aggressive (for large files)'
+                })
         
         logger.info(f"Trying {len(param_combinations)} compression parameter combination(s)...")
         
         best_result = None
         best_size = current_bytes
         temp_files_to_cleanup = []
+        timeout_failures = 0
         
         try:
             for i, params in enumerate(param_combinations):
@@ -1387,12 +1770,17 @@ class GifOptimizer:
                 temp_output = create_unique_temp_filename(f"gifsicle_lossy_{i}", ".gif", self.temp_dir)
                 temp_files_to_cleanup.append(temp_output)
                 
-                if self._run_gifsicle(
+                run_success = self._run_gifsicle(
                     gif_path, temp_output,
-                    colors=params['colors'],
-                    lossy=params['lossy'],
-                    scale=params['scale']
-                ):
+                    colors=params.get('colors'),
+                    lossy=params.get('lossy'),
+                    scale=params.get('scale'),
+                    optimize=params.get('optimize'),
+                    resize_method=params.get('resize_method')
+                )
+                
+                if run_success:
+                    timeout_failures = 0
                     if os.path.exists(temp_output):
                         temp_size = os.path.getsize(temp_output)
                         temp_size_mb = temp_size / 1024 / 1024
@@ -1444,6 +1832,14 @@ class GifOptimizer:
                     else:
                         logger.warning(f"  Result {i+1}: gifsicle completed but output file not found")
                 else:
+                    if self.last_gifsicle_timeout:
+                        timeout_failures += 1
+                        logger.warning(f"  Result {i+1}: gifsicle timed out (consecutive timeouts: {timeout_failures})")
+                        if timeout_failures >= 2:
+                            logger.warning("  Aborting gifsicle lossy search after repeated timeouts")
+                            break
+                    else:
+                        timeout_failures = 0
                     logger.warning(f"  Result {i+1}: gifsicle compression failed")
             
             # Use best result if available and better than current
@@ -1784,6 +2180,13 @@ class GifOptimizer:
             if current_size_mb <= target_size_mb:
                 return True
             
+            # Calculate how much over target the file is
+            over_ratio = (current_bytes - target_bytes) / float(target_bytes) if target_bytes > 0 else 1.0
+            
+            # Only enable duplicate removal when file is significantly over target (>50% over)
+            # This prevents framerate degradation for files that are only moderately over target
+            remove_duplicates = over_ratio > 0.5
+            
             # Calculate target colors based on size reduction needed
             size_ratio = target_size_mb / current_size_mb
             # Estimate colors needed: more aggressive reduction = fewer colors
@@ -1801,7 +2204,7 @@ class GifOptimizer:
                 success, reduction_pct = PILCompressor.compress_gif(
                     gif_path, temp_output,
                     max_colors=target_colors,
-                    remove_duplicates=True,
+                    remove_duplicates=remove_duplicates,
                     optimize_disposal=True
                 )
                 
@@ -1895,6 +2298,10 @@ class GifOptimizer:
                 output_path,
             ]
             timeout_sec = 30 if self.fast_mode else 60
+            try:
+                timeout_sec = min(timeout_sec, int(max(1, self.stage_time_budgets.get('lossless', timeout_sec))))
+            except Exception:
+                timeout_sec = min(timeout_sec, 30 if self.fast_mode else 60)
             result = subprocess.run(
                 cmd,
                 capture_output=True,
@@ -2022,8 +2429,78 @@ class GifOptimizer:
                 combinations = []
                 for scale in scale_steps:
                     for lossy in lossy_steps:
+                        # Check cache first
+                        cache_key = (scale, lossy)
+                        if cache_key in result_cache:
+                            cached_size = result_cache[cache_key]
+                            if cached_size < target_bytes:
+                                # Found a cached result that meets target
+                                logger.debug(f"Cache hit: scale={scale:.2f}, lossy={lossy} → {cached_size/(1024*1024):.2f}MB")
+                                # We'd need to regenerate, but for now just skip
+                                continue
                         # Only test one color value when lossy > 0 (256 is default, others produce same size)
                         combinations.append((scale, 256, lossy))
+                
+                # Binary search refinement for fine-tuning near target
+                def binary_search_refine(best_scale: float, best_lossy: int, best_size: int) -> Optional[Tuple[float, int, str]]:
+                    """Binary search to fine-tune parameters near target"""
+                    if best_size >= target_bytes * 1.05:  # Only refine if >5% over
+                        return None
+                    
+                    # Binary search on scale
+                    scale_low = best_scale * 0.98
+                    scale_high = best_scale * 1.02
+                    scale_mid = best_scale
+                    
+                    # Binary search on lossy
+                    lossy_low = max(0, best_lossy - 5)
+                    lossy_high = min(200, best_lossy + 5)
+                    lossy_mid = best_lossy
+                    
+                    best_refined = None
+                    best_refined_size = best_size
+                    
+                    for _ in range(3):  # Max 3 binary search iterations
+                        if self._shutdown_checker() or runs >= max_runs:
+                            break
+                        
+                        # Test midpoint
+                        temp_refine = create_unique_temp_filename(f"bs_refine_s{scale_mid:.3f}_l{lossy_mid}", ".gif", self.temp_dir)
+                        temp_files_to_cleanup.append(temp_refine)
+                        runs += 1
+                        
+                        if self._run_gifsicle(input_path, temp_refine, lossy=lossy_mid, scale=scale_mid):
+                            size_refine = os.path.getsize(temp_refine)
+                            result_cache[(scale_mid, lossy_mid)] = size_refine
+                            
+                            if size_refine < best_refined_size:
+                                if best_refined:
+                                    try:
+                                        os.remove(best_refined)
+                                    except:
+                                        pass
+                                best_refined = temp_refine
+                                best_refined_size = size_refine
+                            
+                            if size_refine <= target_bytes:
+                                return (scale_mid, lossy_mid, temp_refine)
+                            
+                            # Adjust search range
+                            if size_refine > target_bytes:
+                                # Need more compression
+                                scale_low = scale_mid
+                                lossy_low = lossy_mid
+                            else:
+                                # Can use less compression
+                                scale_high = scale_mid
+                                lossy_high = lossy_mid
+                            
+                            scale_mid = (scale_low + scale_high) / 2
+                            lossy_mid = (lossy_low + lossy_high) // 2
+                    
+                    if best_refined and best_refined_size < best_size:
+                        return (scale_mid, lossy_mid, best_refined)
+                    return None
                 
                 # Limit to remaining attempts
                 remaining_attempts = max_runs - runs
@@ -2200,6 +2677,32 @@ class GifOptimizer:
                                 pass
                         return True
                 
+                # Binary search refinement if we're close to target
+                if best[0] < original_size and best[0] > target_bytes and best[0] <= target_bytes * 1.1:
+                    # Extract best parameters from the result
+                    # We need to find which combination produced the best result
+                    # For now, use a reasonable estimate based on over_ratio
+                    best_scale_estimate = 0.90 if over_ratio > 0.15 else 0.95
+                    best_lossy_estimate = 70 if over_ratio > 0.15 else 60
+                    
+                    logger.debug(f"Attempting binary search refinement (best: {best[0]/(1024*1024):.2f}MB, target: {target_bytes/(1024*1024):.2f}MB)")
+                    refine_result = binary_search_refine(best_scale_estimate, best_lossy_estimate, best[0])
+                    if refine_result:
+                        refined_scale, refined_lossy, refined_temp = refine_result
+                        refined_size = os.path.getsize(refined_temp)
+                        if refined_size < best[0]:
+                            # Remove old best
+                            if best[1] and best[1] in temp_files_to_cleanup:
+                                temp_files_to_cleanup.remove(best[1])
+                                try:
+                                    if os.path.exists(best[1]):
+                                        os.remove(best[1])
+                                except:
+                                    pass
+                            best = (refined_size, refined_temp)
+                            temp_files_to_cleanup.append(refined_temp)
+                            logger.debug(f"Binary search refinement improved result to {refined_size/(1024*1024):.2f}MB")
+                
                 # NO TOLERANCE: Only return best if it's strictly under target
                 if best[1] and os.path.exists(best[1]):
                     if best[0] < target_bytes:
@@ -2250,10 +2753,36 @@ class GifOptimizer:
             logger.debug(f"Bounded gifsicle search failed: {e}")
             return False
     
-    def _run_gifsicle(self, input_path: str, output_path: str, colors: int, lossy: int, scale: float) -> bool:
-        """Execute gifsicle with given parameters"""
+    def _run_gifsicle(self, input_path: str, output_path: str, colors: int = None, lossy: int = None, 
+                     scale: float = None, optimize: int = None, resize_method: str = None,
+                     resize_colors: bool = None, resize_dither: bool = None, interlace: bool = None,
+                     optimize_disposal: bool = None, optimize_background: bool = None) -> bool:
+        """
+        Execute gifsicle with given parameters.
+        
+        Args:
+            input_path: Input GIF file path
+            output_path: Output GIF file path
+            colors: Number of colors (2-256)
+            lossy: Lossy compression level (0-200)
+            scale: Scale factor (0.0-1.0)
+            optimize: Optimization level (1-3)
+            resize_method: Resize method (sample, mix, scale, lanczos3)
+            resize_colors: Enable color reduction during resize
+            resize_dither: Enable dithering during resize
+            interlace: Enable interlacing
+            optimize_disposal: Optimize frame disposal methods
+            optimize_background: Optimize background color
+        """
         timeout_sec = 45 if self.fast_mode else 120
         try:
+            gifsicle_budget = int(max(1, self.stage_time_budgets.get('gifsicle', timeout_sec)))
+            timeout_sec = min(timeout_sec, gifsicle_budget)
+        except Exception:
+            timeout_sec = 45 if self.fast_mode else 120
+        try:
+            # Track timeout status so callers can react (e.g., bail out after repeated timeouts)
+            self.last_gifsicle_timeout = False
             # Verify input file exists
             if not os.path.exists(input_path):
                 logger.warning(f"gifsicle: Input file does not exist: {input_path}")
@@ -2264,21 +2793,51 @@ class GifOptimizer:
                 logger.warning("gifsicle: Tool not available or not working")
                 return False
             
+            # Get defaults from config
+            default_optimize = optimize if optimize is not None else max(1, min(3, self.gifsicle_optimize_level))
+            default_resize_method = resize_method if resize_method is not None else self.advanced_options.get('resize_method', 'mix')
+            default_resize_colors = resize_colors if resize_colors is not None else self.advanced_options.get('resize_colors', True)
+            default_resize_dither = resize_dither if resize_dither is not None else self.advanced_options.get('resize_dither', True)
+            default_interlace = interlace if interlace is not None else self.advanced_options.get('interlace', False)
+            default_optimize_disposal = optimize_disposal if optimize_disposal is not None else self.advanced_options.get('optimize_disposal', True)
+            default_optimize_background = optimize_background if optimize_background is not None else self.advanced_options.get('optimize_background', True)
+            
             cmd = [
                 "gifsicle",
-                f"--optimize={max(1, min(3, self.gifsicle_optimize_level))}",
+                f"--optimize={default_optimize}",
                 "--careful",
                 "--no-comments",
                 "--no-extensions",
                 "--no-names",
             ]
+            
+            # Scale with optional resize method
             if scale and abs(scale - 1.0) > 1e-6:
+                if default_resize_method and default_resize_method in ['sample', 'mix', 'scale', 'lanczos3']:
+                    cmd.extend(["--resize-method", default_resize_method])
+                # --resize-colors requires an integer argument (number of colors)
+                # Use the colors parameter if available, otherwise skip this option
+                if default_resize_colors and colors and colors < 256:
+                    cmd.extend(["--resize-colors", str(max(2, min(256, colors)))])
+                # Note: --resize-dither is not a valid gifsicle option, removed
                 cmd.extend(["--scale", f"{scale:.4f}"])
+            
+            # Color reduction
             if colors and colors < 256:
                 cmd.extend(["--colors", str(max(2, min(256, colors)))])
+            
+            # Lossy compression
             if lossy and lossy > 0:
-                lossy_value = max(1, min(150, int(lossy)))
+                lossy_value = max(1, min(200, int(lossy)))
                 cmd.append(f"--lossy={lossy_value}")
+            
+            # Interlacing
+            if default_interlace:
+                cmd.append("--interlace")
+            
+            # Note: Frame disposal and background optimization are handled by --optimize
+            # Additional disposal/background flags would require more complex gifsicle usage
+            
             cmd.extend([input_path, "--output", output_path])
             
             logger.debug(f"gifsicle command: {' '.join(cmd)}")
@@ -2315,6 +2874,7 @@ class GifOptimizer:
             
             return True
         except subprocess.TimeoutExpired:
+            self.last_gifsicle_timeout = True
             logger.warning(f"gifsicle: Command timed out after {timeout_sec}s")
             return False
         except FileNotFoundError:
@@ -2323,6 +2883,946 @@ class GifOptimizer:
         except Exception as e:
             logger.warning(f"gifsicle run failed: {e}", exc_info=True)
             return False
+    
+    def _adaptive_gifsicle_strategy(self, current_size_mb: float, target_size_mb: float, 
+                                   gif_info: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Select adaptive parameter strategy based on file characteristics.
+        
+        Args:
+            current_size_mb: Current file size in MB
+            target_size_mb: Target file size in MB
+            gif_info: GIF information dictionary
+        
+        Returns:
+            Dictionary with strategy parameters
+        """
+        if target_size_mb <= 0:
+            target_size_mb = 10.0
+        
+        over_ratio = (current_size_mb / target_size_mb) if target_size_mb > 0 else 1.0
+        file_size_mb = current_size_mb
+        
+        # Determine strategy based on over-ratio and file size
+        if over_ratio <= 1.1:
+            # Very close to target - conservative approach
+            strategy_name = 'conservative'
+        elif over_ratio <= 1.5:
+            # Moderate overage - balanced approach
+            strategy_name = 'balanced'
+        else:
+            # Far over target - aggressive approach
+            strategy_name = 'aggressive'
+        
+        # Adjust based on file size
+        if file_size_mb < 5.0:
+            # Small files - can be more conservative
+            if strategy_name == 'aggressive':
+                strategy_name = 'balanced'
+        elif file_size_mb > 15.0:
+            # Large files - may need more aggressive
+            if strategy_name == 'conservative':
+                strategy_name = 'balanced'
+        
+        # Get preset from config
+        preset = self.parameter_presets.get(strategy_name, self.parameter_presets.get('balanced', {}))
+        
+        return {
+            'strategy': strategy_name,
+            'optimize': preset.get('optimize', 2),
+            'colors_range': preset.get('colors_range', [192, 160, 128]),
+            'lossy_range': preset.get('lossy_range', [40, 60, 80, 100]),
+            'scale_range': preset.get('scale_range', [0.95, 0.92, 0.88, 0.85]),
+            'resize_method': preset.get('resize_method', 'mix')
+        }
+    
+    def _gifsicle_multi_pass_optimize(self, gif_path: str, target_bytes: int, 
+                                     target_size_mb: float) -> Optional[str]:
+        """
+        Multi-pass optimization pipeline for gifsicle.
+        
+        Pass 1: Lossless optimization
+        Pass 2: Color reduction
+        Pass 3: Lossy compression
+        Pass 4: Resolution scaling
+        Pass 5: Combined optimization
+        
+        Returns:
+            Path to optimized file if successful, None otherwise
+        """
+        if not self.multi_pass_enabled:
+            return None
+        
+        if not self._is_tool_available("gifsicle"):
+            return None
+        
+        current_bytes = os.path.getsize(gif_path)
+        current_size_mb = current_bytes / 1024 / 1024
+        gif_info = get_gif_info(gif_path)
+        
+        temp_files = []
+        best_result = None
+        best_size = current_bytes
+        
+        # Cap multi-pass attempts and track failures/regressions
+        MAX_MULTI_PASS_ATTEMPTS = 3  # Total attempts across all passes
+        attempt_count = 0
+        consecutive_failures = 0
+        consecutive_regressions = 0
+        MAX_CONSECUTIVE_FAILURES = 2  # Break after 2 consecutive failures
+        seen_parameter_combos = set()  # Track parameter combinations to avoid repeats
+        abort_multi_pass = False
+        mp_start = time.monotonic()
+        mp_budget = int(max(1, self.stage_time_budgets.get('gifsicle', 10)))
+
+        def _should_stop(reason: str) -> bool:
+            if self._shutdown_checker():
+                logger.info(f"Multi-pass: Stopping due to shutdown [{reason}]")
+                return True
+            if time.monotonic() - mp_start > mp_budget:
+                logger.warning(f"Multi-pass: Time budget exceeded ({mp_budget}s) [{reason}]")
+                return True
+            return False
+
+        def _cleanup_and_return() -> Optional[str]:
+            for tf in temp_files:
+                if tf != best_result:
+                    try:
+                        if os.path.exists(tf):
+                            os.remove(tf)
+                    except Exception:
+                        pass
+            return best_result if best_result and best_size < current_bytes else None
+        
+        try:
+            # Pass 1: Lossless optimization
+            logger.debug("Multi-pass: Pass 1 - Lossless optimization")
+            if abort_multi_pass or _should_stop("pass1_start") or attempt_count >= MAX_MULTI_PASS_ATTEMPTS:
+                abort_multi_pass = True
+            else:
+                attempt_count += 1
+                temp1 = create_unique_temp_filename("mp1_lossless", ".gif", self.temp_dir)
+                temp_files.append(temp1)
+                if self._run_gifsicle(gif_path, temp1, optimize=3, resize_method='lanczos3'):
+                    size1 = os.path.getsize(temp1)
+                    consecutive_failures = 0  # Reset on success
+                    regressed = size1 > best_size
+                    if size1 < best_size:
+                        best_size = size1
+                        best_result = temp1
+                    consecutive_regressions = 0 if size1 <= best_size else consecutive_regressions + int(regressed)
+                    if size1 <= target_bytes:
+                        logger.info("Multi-pass: Target met in Pass 1 (lossless)")
+                        return temp1
+                    if consecutive_regressions >= 2:
+                        logger.warning("Multi-pass: Stopping after consecutive regressions in Pass 1")
+                        abort_multi_pass = True
+                else:
+                    consecutive_failures += 1
+                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                        logger.warning(f"Multi-pass: {consecutive_failures} consecutive failures, breaking")
+                        abort_multi_pass = True
+            if abort_multi_pass:
+                return _cleanup_and_return()
+            
+            # Pass 2: Progressive color reduction (reduced from 5 to 3 attempts)
+            logger.debug("Multi-pass: Pass 2 - Color reduction")
+            input_for_pass2 = best_result if best_result else gif_path
+            pass4_met_target = False
+            for colors in [256, 192, 128]:  # Reduced from [256, 224, 192, 160, 128] to 3 attempts
+                if abort_multi_pass or _should_stop("pass2") or attempt_count >= MAX_MULTI_PASS_ATTEMPTS:
+                    abort_multi_pass = True
+                    break
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    logger.warning(f"Multi-pass Pass 2: Too many consecutive failures, breaking")
+                    break
+                # Track parameter combo to avoid repeats
+                param_key = ('colors', colors)
+                if param_key in seen_parameter_combos:
+                    logger.debug(f"Multi-pass Pass 2: Skipping duplicate parameter combo colors={colors}")
+                    continue
+                attempt_count += 1
+                seen_parameter_combos.add(param_key)
+                temp2 = create_unique_temp_filename(f"mp2_c{colors}", ".gif", self.temp_dir)
+                temp_files.append(temp2)
+                if self._run_gifsicle(input_for_pass2, temp2, colors=colors, optimize=3):
+                    size2 = os.path.getsize(temp2)
+                    consecutive_failures = 0  # Reset on success
+                    regressed = size2 > best_size
+                    # Check quality if early exit is enabled
+                    if self.enable_early_exit:
+                        temp_gif_info = get_gif_info(temp2)
+                        quality_score = self._calculate_quality_score(temp_gif_info, colors, 0, 1.0)
+                        if quality_score < self.min_quality_threshold:
+                            logger.warning(f"Multi-pass Pass 2: Rejecting colors={colors}, quality {quality_score:.1f} < threshold {self.min_quality_threshold}")
+                            try:
+                                os.remove(temp2)
+                            except:
+                                pass
+                            consecutive_failures += 1
+                            continue
+                    # Break if size worsens significantly (avoid repeating same grid)
+                    if size2 > best_size * 1.1:  # >10% worse
+                        logger.debug(f"Multi-pass Pass 2: Size worsened ({size2/(1024*1024):.2f}MB > {best_size/(1024*1024):.2f}MB), skipping remaining colors")
+                        consecutive_failures += 1
+                        regressed = True
+                        abort_multi_pass = abort_multi_pass or consecutive_failures >= MAX_CONSECUTIVE_FAILURES
+                        break
+                    if size2 < best_size:
+                        if best_result and best_result != input_for_pass2:
+                            try:
+                                os.remove(best_result)
+                            except:
+                                pass
+                        best_size = size2
+                        best_result = temp2
+                    consecutive_regressions = 0 if size2 <= best_size else consecutive_regressions + int(regressed)
+                    if consecutive_regressions >= 2:
+                        logger.warning("Multi-pass: Stopping after consecutive regressions in Pass 2")
+                        abort_multi_pass = True
+                    if size2 <= target_bytes:
+                        logger.info(f"Multi-pass: Target met in Pass 2 (colors={colors})")
+                        return temp2
+                else:
+                    consecutive_failures += 1
+                    abort_multi_pass = abort_multi_pass or consecutive_failures >= MAX_CONSECUTIVE_FAILURES
+
+                if abort_multi_pass:
+                    break
+            
+            if abort_multi_pass:
+                return _cleanup_and_return()
+            
+            # Pass 3: Incremental lossy compression (reduced from 6 to 4 attempts)
+            logger.debug("Multi-pass: Pass 3 - Lossy compression")
+            input_for_pass3 = best_result if best_result else gif_path
+            for lossy in [20, 60, 100, 120]:  # Reduced from [20, 40, 60, 80, 100, 120] to 4 attempts
+                if abort_multi_pass or _should_stop("pass3") or attempt_count >= MAX_MULTI_PASS_ATTEMPTS:
+                    abort_multi_pass = True
+                    break
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    logger.warning(f"Multi-pass Pass 3: Too many consecutive failures, breaking")
+                    break
+                # Track parameter combo to avoid repeats
+                param_key = ('lossy', lossy)
+                if param_key in seen_parameter_combos:
+                    logger.debug(f"Multi-pass Pass 3: Skipping duplicate parameter combo lossy={lossy}")
+                    continue
+                attempt_count += 1
+                seen_parameter_combos.add(param_key)
+                temp3 = create_unique_temp_filename(f"mp3_l{lossy}", ".gif", self.temp_dir)
+                temp_files.append(temp3)
+                if self._run_gifsicle(input_for_pass3, temp3, lossy=lossy, optimize=2):
+                    size3 = os.path.getsize(temp3)
+                    consecutive_failures = 0  # Reset on success
+                    regressed = size3 > best_size
+                    # Check quality if early exit is enabled
+                    if self.enable_early_exit:
+                        temp_gif_info = get_gif_info(temp3)
+                        colors_used = temp_gif_info.get('colors', 256)
+                        quality_score = self._calculate_quality_score(temp_gif_info, colors_used, lossy, 1.0)
+                        if quality_score < self.min_quality_threshold:
+                            logger.warning(f"Multi-pass Pass 3: Rejecting lossy={lossy}, quality {quality_score:.1f} < threshold {self.min_quality_threshold}")
+                            try:
+                                os.remove(temp3)
+                            except:
+                                pass
+                            consecutive_failures += 1
+                            continue
+                    # Break if size worsens significantly (avoid repeating same grid)
+                    if size3 > best_size * 1.1:  # >10% worse
+                        logger.debug(f"Multi-pass Pass 3: Size worsened ({size3/(1024*1024):.2f}MB > {best_size/(1024*1024):.2f}MB), skipping remaining lossy values")
+                        consecutive_failures += 1
+                        regressed = True
+                        abort_multi_pass = abort_multi_pass or consecutive_failures >= MAX_CONSECUTIVE_FAILURES
+                        break
+                    if size3 < best_size:
+                        if best_result and best_result != input_for_pass3:
+                            try:
+                                os.remove(best_result)
+                            except:
+                                pass
+                        best_size = size3
+                        best_result = temp3
+                    consecutive_regressions = 0 if size3 <= best_size else consecutive_regressions + int(regressed)
+                    if consecutive_regressions >= 2:
+                        logger.warning("Multi-pass: Stopping after consecutive regressions in Pass 3")
+                        abort_multi_pass = True
+                    if size3 <= target_bytes:
+                        logger.info(f"Multi-pass: Target met in Pass 3 (lossy={lossy})")
+                        return temp3
+                else:
+                    consecutive_failures += 1
+                    abort_multi_pass = abort_multi_pass or consecutive_failures >= MAX_CONSECUTIVE_FAILURES
+
+                if abort_multi_pass:
+                    break
+            
+            if abort_multi_pass:
+                return _cleanup_and_return()
+            
+            # Pass 4: Progressive resolution scaling
+            logger.debug("Multi-pass: Pass 4 - Resolution scaling")
+            input_for_pass4 = best_result if best_result else gif_path
+            for scale in [0.98, 0.95, 0.92, 0.88, 0.85]:
+                if abort_multi_pass or _should_stop("pass4") or attempt_count >= MAX_MULTI_PASS_ATTEMPTS:
+                    abort_multi_pass = True
+                    break
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    logger.warning(f"Multi-pass Pass 4: Too many consecutive failures, breaking")
+                    break
+                # Track parameter combo to avoid repeats
+                param_key = ('scale', scale)
+                if param_key in seen_parameter_combos:
+                    logger.debug(f"Multi-pass Pass 4: Skipping duplicate parameter combo scale={scale:.2f}")
+                    continue
+                attempt_count += 1
+                seen_parameter_combos.add(param_key)
+                temp4 = create_unique_temp_filename(f"mp4_s{scale:.2f}", ".gif", self.temp_dir)
+                temp_files.append(temp4)
+                if self._run_gifsicle(input_for_pass4, temp4, scale=scale, resize_method='lanczos3', optimize=2):
+                    size4 = os.path.getsize(temp4)
+                    consecutive_failures = 0  # Reset on success
+                    regressed = size4 > best_size
+                    # Check quality if early exit is enabled
+                    if self.enable_early_exit:
+                        temp_gif_info = get_gif_info(temp4)
+                        colors_used = temp_gif_info.get('colors', 256)
+                        lossy_used = 0  # Pass 4 doesn't use lossy
+                        quality_score = self._calculate_quality_score(temp_gif_info, colors_used, lossy_used, scale)
+                        if quality_score < self.min_quality_threshold:
+                            logger.warning(f"Multi-pass Pass 4: Rejecting scale={scale:.2f}, quality {quality_score:.1f} < threshold {self.min_quality_threshold}")
+                            try:
+                                os.remove(temp4)
+                            except:
+                                pass
+                            consecutive_failures += 1
+                            continue
+                    # Break if size worsens significantly (avoid repeating same grid)
+                    if size4 > best_size * 1.1:  # >10% worse
+                        logger.debug(f"Multi-pass Pass 4: Size worsened ({size4/(1024*1024):.2f}MB > {best_size/(1024*1024):.2f}MB), skipping remaining scales")
+                        consecutive_failures += 1
+                        regressed = True
+                        abort_multi_pass = abort_multi_pass or consecutive_failures >= MAX_CONSECUTIVE_FAILURES
+                        break
+                    if size4 < best_size:
+                        if best_result and best_result != input_for_pass4:
+                            try:
+                                os.remove(best_result)
+                            except:
+                                pass
+                        best_size = size4
+                        best_result = temp4
+                    consecutive_regressions = 0 if size4 <= best_size else consecutive_regressions + int(regressed)
+                    if consecutive_regressions >= 2:
+                        logger.warning("Multi-pass: Stopping after consecutive regressions in Pass 4")
+                        abort_multi_pass = True
+                    if size4 <= target_bytes:
+                        logger.info(f"Multi-pass: Target met in Pass 4 (scale={scale})")
+                        pass4_met_target = True
+                        # Skip Pass 5 if Pass 4 met target
+                        break
+                else:
+                    consecutive_failures += 1
+                    abort_multi_pass = abort_multi_pass or consecutive_failures >= MAX_CONSECUTIVE_FAILURES
+                
+                if abort_multi_pass:
+                    break
+            
+            if abort_multi_pass:
+                return _cleanup_and_return()
+            
+            # Pass 5: Combined optimization with best parameters from previous passes
+            # Skip if Pass 4 already met target or too many attempts/failures
+            if pass4_met_target:
+                logger.debug("Multi-pass: Skipping Pass 5 (target already met in Pass 4)")
+            elif abort_multi_pass or _should_stop("pass5") or attempt_count >= MAX_MULTI_PASS_ATTEMPTS or consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                logger.debug(f"Multi-pass: Skipping Pass 5 (attempts={attempt_count}/{MAX_MULTI_PASS_ATTEMPTS}, failures={consecutive_failures})")
+            elif best_result:
+                logger.debug("Multi-pass: Pass 5 - Combined optimization")
+                attempt_count += 1
+                strategy = self._adaptive_gifsicle_strategy(best_size / 1024 / 1024, target_size_mb, gif_info)
+                temp5 = create_unique_temp_filename("mp5_combined", ".gif", self.temp_dir)
+                temp_files.append(temp5)
+                
+                # Try best combination
+                best_colors = strategy['colors_range'][0] if strategy['colors_range'] else 192
+                best_lossy = strategy['lossy_range'][1] if len(strategy['lossy_range']) > 1 else 60
+                best_scale = strategy['scale_range'][1] if len(strategy['scale_range']) > 1 else 0.92
+                
+                if self._run_gifsicle(best_result, temp5, colors=best_colors, lossy=best_lossy, 
+                                     scale=best_scale, optimize=strategy['optimize'],
+                                     resize_method=strategy['resize_method']):
+                    size5 = os.path.getsize(temp5)
+                    consecutive_failures = 0  # Reset on success
+                    # Check quality if early exit is enabled
+                    if self.enable_early_exit:
+                        temp_gif_info = get_gif_info(temp5)
+                        quality_score = self._calculate_quality_score(temp_gif_info, best_colors, best_lossy, best_scale)
+                        if quality_score < self.min_quality_threshold:
+                            logger.warning(f"Multi-pass Pass 5: Rejecting combined optimization, quality {quality_score:.1f} < threshold {self.min_quality_threshold}")
+                            try:
+                                os.remove(temp5)
+                            except:
+                                pass
+                        else:
+                            if size5 < best_size:
+                                if best_result:
+                                    try:
+                                        os.remove(best_result)
+                                    except:
+                                        pass
+                                best_size = size5
+                                best_result = temp5
+                            consecutive_regressions = 0 if size5 <= best_size else consecutive_regressions + 1
+                            if consecutive_regressions >= 2:
+                                logger.warning("Multi-pass: Stopping after consecutive regressions in Pass 5 (quality-aware)")
+                                abort_multi_pass = True
+                            if size5 <= target_bytes:
+                                logger.info("Multi-pass: Target met in Pass 5 (combined)")
+                                return temp5
+                    else:
+                        if size5 < best_size:
+                            if best_result:
+                                try:
+                                    os.remove(best_result)
+                                except:
+                                    pass
+                            best_size = size5
+                            best_result = temp5
+                            consecutive_regressions = 0 if size5 <= best_size else consecutive_regressions + 1
+                            if consecutive_regressions >= 2:
+                                logger.warning("Multi-pass: Stopping after consecutive regressions in Pass 5")
+                                abort_multi_pass = True
+                        if size5 <= target_bytes:
+                            logger.info("Multi-pass: Target met in Pass 5 (combined)")
+                            return temp5
+                else:
+                    consecutive_failures += 1
+            
+            if abort_multi_pass:
+                return _cleanup_and_return()
+            
+            # Cleanup temp files except best result
+            for tf in temp_files:
+                if tf != best_result:
+                    try:
+                        if os.path.exists(tf):
+                            os.remove(tf)
+                    except:
+                        pass
+            
+            return best_result if best_result and best_size < current_bytes else None
+            
+        except Exception as e:
+            logger.debug(f"Multi-pass optimization failed: {e}")
+            # Cleanup on error
+            for tf in temp_files:
+                try:
+                    if os.path.exists(tf):
+                        os.remove(tf)
+                except:
+                    pass
+            return None
+    
+    def _gifsicle_progressive_refine(self, gif_path: str, target_bytes: int, 
+                                    target_size_mb: float) -> Optional[str]:
+        """
+        Progressive refinement strategy: coarse search then fine search.
+        
+        Returns:
+            Path to optimized file if successful, None otherwise
+        """
+        if not self.progressive_refinement:
+            return None
+        
+        if not self._is_tool_available("gifsicle"):
+            return None
+        
+        # Check if file exists before trying to get its size
+        if not os.path.exists(gif_path):
+            logger.warning(f"GIF file does not exist for progressive refinement: {gif_path}")
+            return None
+        
+        current_bytes = os.path.getsize(gif_path)
+        current_size_mb = current_bytes / 1024 / 1024
+        gif_info = get_gif_info(gif_path)
+        
+        if current_bytes <= target_bytes:
+            return gif_path
+        
+        over_ratio = (current_size_mb / target_size_mb) if target_size_mb > 0 else 1.0
+        
+        # Step 1: Coarse search - try broad parameter ranges
+        logger.debug("Progressive refine: Coarse search phase")
+        strategy = self._adaptive_gifsicle_strategy(current_size_mb, target_size_mb, gif_info)
+        
+        temp_files = []
+        best_result = None
+        best_size = current_bytes
+        promising_params = []
+        
+        # Cap progressive refine attempts and track failures
+        MAX_PROGRESSIVE_REFINE_ATTEMPTS = 10  # Total attempts across coarse and fine search
+        attempt_count = 0
+        consecutive_failures = 0
+        MAX_CONSECUTIVE_FAILURES = 2  # Break after 2 consecutive failures
+        seen_parameter_combos = set()  # Track parameter combinations to avoid repeats
+        pr_start = time.monotonic()
+        pr_budget = int(max(1, self.stage_time_budgets.get('gifsicle', 10)))
+        stop_refine = False
+
+        def _refine_should_stop(reason: str) -> bool:
+            if self._shutdown_checker():
+                logger.info(f"Progressive refine: stopping due to shutdown [{reason}]")
+                return True
+            if time.monotonic() - pr_start > pr_budget:
+                logger.warning(f"Progressive refine: time budget exceeded ({pr_budget}s) [{reason}]")
+                return True
+            return False
+        
+        try:
+            # Coarse search: test wide parameter ranges (reduced combinations)
+            # Use every 3rd value instead of every 2nd to reduce attempts
+            colors_step = max(1, len(strategy['colors_range']) // 3) if len(strategy['colors_range']) > 3 else 2
+            lossy_step = max(1, len(strategy['lossy_range']) // 3) if len(strategy['lossy_range']) > 3 else 2
+            scale_step = max(1, len(strategy['scale_range']) // 3) if len(strategy['scale_range']) > 3 else 2
+            
+            best_quality_score = 0.0
+            
+            for colors in strategy['colors_range'][::colors_step]:
+                for lossy in strategy['lossy_range'][::lossy_step]:
+                    for scale in strategy['scale_range'][::scale_step]:
+                        if _refine_should_stop("coarse") or attempt_count >= MAX_PROGRESSIVE_REFINE_ATTEMPTS:
+                            stop_refine = True
+                            break
+                        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                            logger.warning(f"Progressive refine: Too many consecutive failures ({consecutive_failures}), breaking coarse search")
+                            stop_refine = True
+                            break
+                        # Track parameter combo to avoid repeats
+                        param_key = (colors, lossy, scale)
+                        if param_key in seen_parameter_combos:
+                            logger.debug(f"Progressive refine: Skipping duplicate parameter combo c={colors} l={lossy} s={scale:.2f}")
+                            continue
+                        attempt_count += 1
+                        seen_parameter_combos.add(param_key)
+                        
+                        temp = create_unique_temp_filename(f"pr_coarse_c{colors}_l{lossy}_s{scale:.2f}", ".gif", self.temp_dir)
+                        temp_files.append(temp)
+                        
+                        if self._run_gifsicle(gif_path, temp, colors=colors, lossy=lossy, 
+                                            scale=scale, optimize=strategy['optimize'],
+                                            resize_method=strategy['resize_method']):
+                            size = os.path.getsize(temp)
+                            consecutive_failures = 0  # Reset on success
+                            
+                            # Check quality if early exit is enabled
+                            quality_score = None
+                            if self.enable_early_exit:
+                                temp_gif_info = get_gif_info(temp)
+                                quality_score = self._calculate_quality_score(temp_gif_info, colors, lossy, scale)
+                                if quality_score < self.min_quality_threshold:
+                                    logger.warning(f"Progressive refine coarse: Rejecting c={colors} l={lossy} s={scale:.2f}, quality {quality_score:.1f} < threshold {self.min_quality_threshold}")
+                                    try:
+                                        os.remove(temp)
+                                    except:
+                                        pass
+                                    consecutive_failures += 1
+                                    continue
+                                best_quality_score = max(best_quality_score, quality_score)
+                            
+                            # Break if size worsens significantly (avoid repeating same grid)
+                            if size > best_size * 1.15:  # >15% worse
+                                logger.debug(f"Progressive refine: Size worsened ({size/(1024*1024):.2f}MB > {best_size/(1024*1024):.2f}MB), skipping remaining combinations")
+                                consecutive_failures += 1
+                                # Don't break here, continue to find better combinations
+                            
+                            if size < best_size:
+                                if best_result:
+                                    try:
+                                        os.remove(best_result)
+                                    except:
+                                        pass
+                                best_size = size
+                                best_result = temp
+                            
+                            # Track promising parameters (within 20% of best)
+                            if size <= best_size * 1.2:
+                                promising_params.append({
+                                    'colors': colors,
+                                    'lossy': lossy,
+                                    'scale': scale,
+                                    'size': size,
+                                    'quality': quality_score if quality_score is not None else 10.0
+                                })
+                            
+                            if size <= target_bytes:
+                                logger.info("Progressive refine: Target met in coarse search")
+                                # Cleanup
+                                for tf in temp_files:
+                                    if tf != temp:
+                                        try:
+                                            os.remove(tf)
+                                        except:
+                                            pass
+                                return temp
+                        else:
+                            consecutive_failures += 1
+                        if stop_refine:
+                            break
+                    if stop_refine:
+                        break
+                if stop_refine:
+                    break
+            
+            # Step 2: Fine search - narrow down to promising region
+            # Check quality before fine search - skip if best quality < threshold
+            if self.enable_early_exit and best_quality_score < self.min_quality_threshold:
+                logger.warning(f"Progressive refine: Skipping fine search, best quality {best_quality_score:.1f} < threshold {self.min_quality_threshold}")
+                return best_result if best_result and best_size < current_bytes else None
+            
+            if promising_params and best_result and attempt_count < MAX_PROGRESSIVE_REFINE_ATTEMPTS and consecutive_failures < MAX_CONSECUTIVE_FAILURES:
+                logger.debug("Progressive refine: Fine search phase")
+                # Sort by size and take top 2 (reduced from 3)
+                promising_params.sort(key=lambda x: x['size'])
+                top_params = promising_params[:2]
+                
+                for params in top_params:
+                    if _refine_should_stop("fine_start") or attempt_count >= MAX_PROGRESSIVE_REFINE_ATTEMPTS:
+                        stop_refine = True
+                        break
+                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                        logger.warning(f"Progressive refine fine: Too many consecutive failures ({consecutive_failures}), breaking")
+                        break
+                    
+                    # Try variations around promising parameters
+                    for color_delta in [-16, 0, 16]:
+                        for lossy_delta in [-10, 0, 10]:
+                            for scale_delta in [-0.02, 0, 0.02]:
+                                if _refine_should_stop("fine_loop") or attempt_count >= MAX_PROGRESSIVE_REFINE_ATTEMPTS or consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                                    stop_refine = True
+                                    break
+                                colors = max(64, min(256, params['colors'] + color_delta))
+                                lossy = max(0, min(200, params['lossy'] + lossy_delta))
+                                scale = max(0.7, min(1.0, params['scale'] + scale_delta))
+                                
+                                # Track parameter combo to avoid repeats
+                                param_key = (colors, lossy, scale)
+                                if param_key in seen_parameter_combos:
+                                    continue
+                                attempt_count += 1
+                                seen_parameter_combos.add(param_key)
+                                
+                                temp = create_unique_temp_filename(f"pr_fine_c{colors}_l{lossy}_s{scale:.2f}", ".gif", self.temp_dir)
+                                temp_files.append(temp)
+                                
+                                if self._run_gifsicle(best_result, temp, colors=colors, lossy=lossy,
+                                                    scale=scale, optimize=strategy['optimize'],
+                                                    resize_method=strategy['resize_method']):
+                                    size = os.path.getsize(temp)
+                                    consecutive_failures = 0  # Reset on success
+                                    
+                                    # Check quality if early exit is enabled
+                                    if self.enable_early_exit:
+                                        temp_gif_info = get_gif_info(temp)
+                                        quality_score = self._calculate_quality_score(temp_gif_info, colors, lossy, scale)
+                                        if quality_score < self.min_quality_threshold:
+                                            logger.warning(f"Progressive refine fine: Rejecting c={colors} l={lossy} s={scale:.2f}, quality {quality_score:.1f} < threshold {self.min_quality_threshold}")
+                                            try:
+                                                os.remove(temp)
+                                            except:
+                                                pass
+                                            consecutive_failures += 1
+                                            continue
+                                    
+                                    # Break if size worsens significantly (avoid repeating same grid)
+                                    if size > best_size * 1.15:  # >15% worse
+                                        consecutive_failures += 1
+                                        continue
+                                    
+                                    if size < best_size:
+                                        if best_result:
+                                            try:
+                                                os.remove(best_result)
+                                            except:
+                                                pass
+                                        best_size = size
+                                        best_result = temp
+                                else:
+                                    consecutive_failures += 1
+                                    
+                                    if size <= target_bytes:
+                                        logger.info("Progressive refine: Target met in fine search")
+                                        # Cleanup
+                                        for tf in temp_files:
+                                            if tf != temp:
+                                                try:
+                                                    os.remove(tf)
+                                                except:
+                                                    pass
+                                        return temp
+                                
+                                if stop_refine:
+                                    break
+                            if stop_refine:
+                                break
+                        if stop_refine:
+                            break
+            
+            # Cleanup
+            for tf in temp_files:
+                if tf != best_result:
+                    try:
+                        if os.path.exists(tf):
+                            os.remove(tf)
+                    except:
+                        pass
+            
+            return best_result if best_result and best_size < current_bytes else None
+            
+        except Exception as e:
+            logger.debug(f"Progressive refinement failed: {e}")
+            # Cleanup on error
+            for tf in temp_files:
+                try:
+                    if os.path.exists(tf):
+                        os.remove(tf)
+                except:
+                    pass
+            return None
+    
+    def _calculate_quality_score(self, gif_info: Dict[str, Any], colors: int, lossy: int, 
+                                 scale: float) -> float:
+        """
+        Calculate quality score for a parameter combination.
+        Higher score = better quality.
+        
+        Returns:
+            Quality score (0-10)
+        """
+        # Base score from resolution (scale)
+        resolution_score = scale * 5.0  # 0-5 points
+        
+        # Color score
+        color_score = (colors / 256.0) * 3.0  # 0-3 points
+        
+        # Lossy penalty (lower lossy = better quality)
+        lossy_penalty = (lossy / 200.0) * 2.0  # 0-2 points penalty
+        lossy_score = 2.0 - lossy_penalty  # 2-0 points
+        
+        total_score = resolution_score + color_score + lossy_score
+        return min(10.0, max(0.0, total_score))
+    
+    def _gifsicle_quality_aware_optimize(self, gif_path: str, target_bytes: int,
+                                        target_size_mb: float, min_quality: float = 5.0) -> Optional[str]:
+        """
+        Quality-aware optimization that prefers higher quality when multiple results meet target.
+        
+        Args:
+            gif_path: Input GIF path
+            target_bytes: Target size in bytes
+            target_size_mb: Target size in MB
+            min_quality: Minimum quality score threshold
+        
+        Returns:
+            Path to optimized file if successful, None otherwise
+        """
+        if not self._is_tool_available("gifsicle"):
+            return None
+        
+        current_bytes = os.path.getsize(gif_path)
+        gif_info = get_gif_info(gif_path)
+        strategy = self._adaptive_gifsicle_strategy(current_bytes / 1024 / 1024, target_size_mb, gif_info)
+        
+        temp_files = []
+        candidates = []  # List of (path, size, quality_score)
+        
+        try:
+            # Generate parameter combinations
+            for colors in strategy['colors_range']:
+                for lossy in strategy['lossy_range']:
+                    for scale in strategy['scale_range']:
+                        if self._shutdown_checker():
+                            break
+                        
+                        quality = self._calculate_quality_score(gif_info, colors, lossy, scale)
+                        if quality < min_quality:
+                            continue  # Skip low quality combinations
+                        
+                        temp = create_unique_temp_filename(f"qa_c{colors}_l{lossy}_s{scale:.2f}", ".gif", self.temp_dir)
+                        temp_files.append(temp)
+                        
+                        if self._run_gifsicle(gif_path, temp, colors=colors, lossy=lossy,
+                                            scale=scale, optimize=strategy['optimize'],
+                                            resize_method=strategy['resize_method']):
+                            size = os.path.getsize(temp)
+                            
+                            # Only consider candidates that meet target or are close
+                            if size <= target_bytes * 1.1:  # Within 10% of target
+                                candidates.append({
+                                    'path': temp,
+                                    'size': size,
+                                    'quality': quality,
+                                    'colors': colors,
+                                    'lossy': lossy,
+                                    'scale': scale
+                                })
+            
+            if not candidates:
+                # Cleanup
+                for tf in temp_files:
+                    try:
+                        if os.path.exists(tf):
+                            os.remove(tf)
+                    except:
+                        pass
+                return None
+            
+            # Sort candidates: first by meeting target, then by quality
+            candidates.sort(key=lambda x: (x['size'] > target_bytes, -x['quality'], x['size']))
+            
+            best = candidates[0]
+            
+            # Cleanup other candidates
+            for candidate in candidates[1:]:
+                try:
+                    if os.path.exists(candidate['path']):
+                        os.remove(candidate['path'])
+                except:
+                    pass
+            
+            # Cleanup other temp files
+            for tf in temp_files:
+                if tf != best['path']:
+                    try:
+                        if os.path.exists(tf):
+                            os.remove(tf)
+                    except:
+                        pass
+            
+            logger.info(f"Quality-aware: Selected params (colors={best['colors']}, lossy={best['lossy']}, "
+                       f"scale={best['scale']:.2f}) with quality={best['quality']:.2f}")
+            
+            return best['path'] if best['size'] < current_bytes else None
+            
+        except Exception as e:
+            logger.debug(f"Quality-aware optimization failed: {e}")
+            # Cleanup on error
+            for tf in temp_files:
+                try:
+                    if os.path.exists(tf):
+                        os.remove(tf)
+                except:
+                    pass
+            return None
+    
+    def _gifsicle_multi_resolution(self, gif_path: str, target_bytes: int,
+                                  target_size_mb: float) -> Optional[str]:
+        """
+        Multi-resolution strategy: test multiple resolution targets simultaneously.
+        
+        Returns:
+            Path to optimized file if successful, None otherwise
+        """
+        if not self._is_tool_available("gifsicle"):
+            return None
+        
+        gif_info = get_gif_info(gif_path)
+        current_width = gif_info.get('width', 360)
+        current_height = gif_info.get('height', 360)
+        
+        # Test multiple resolution targets
+        resolution_targets = [
+            (int(current_width * 0.95), int(current_height * 0.95)),  # 95%
+            (int(current_width * 0.90), int(current_height * 0.90)),  # 90%
+            (int(current_width * 0.85), int(current_height * 0.85)),  # 85%
+            (int(current_width * 0.80), int(current_height * 0.80)),  # 80%
+        ]
+        
+        temp_files = []
+        candidates = []
+        
+        try:
+            strategy = self._adaptive_gifsicle_strategy(
+                os.path.getsize(gif_path) / 1024 / 1024, target_size_mb, gif_info
+            )
+            
+            for target_width, target_height in resolution_targets:
+                if self._shutdown_checker():
+                    break
+                
+                # Calculate scale factor
+                scale = min(target_width / current_width, target_height / current_height)
+                
+                # Try with moderate compression
+                colors = strategy['colors_range'][1] if len(strategy['colors_range']) > 1 else 160
+                lossy = strategy['lossy_range'][1] if len(strategy['lossy_range']) > 1 else 60
+                
+                temp = create_unique_temp_filename(f"mr_w{target_width}_h{target_height}", ".gif", self.temp_dir)
+                temp_files.append(temp)
+                
+                if self._run_gifsicle(gif_path, temp, colors=colors, lossy=lossy,
+                                    scale=scale, optimize=strategy['optimize'],
+                                    resize_method=strategy['resize_method']):
+                    size = os.path.getsize(temp)
+                    if size <= target_bytes * 1.1:  # Within 10% of target
+                        quality = self._calculate_quality_score(gif_info, colors, lossy, scale)
+                        candidates.append({
+                            'path': temp,
+                            'size': size,
+                            'quality': quality,
+                            'width': target_width,
+                            'height': target_height
+                        })
+            
+            if not candidates:
+                # Cleanup
+                for tf in temp_files:
+                    try:
+                        if os.path.exists(tf):
+                            os.remove(tf)
+                    except:
+                        pass
+                return None
+            
+            # Prefer higher resolution when multiple meet target
+            candidates.sort(key=lambda x: (x['size'] > target_bytes, -x['width'], -x['quality'], x['size']))
+            
+            best = candidates[0]
+            
+            # Cleanup other candidates
+            for candidate in candidates[1:]:
+                try:
+                    if os.path.exists(candidate['path']):
+                        os.remove(candidate['path'])
+                except:
+                    pass
+            
+            # Cleanup other temp files
+            for tf in temp_files:
+                if tf != best['path']:
+                    try:
+                        if os.path.exists(tf):
+                            os.remove(tf)
+                    except:
+                        pass
+            
+            logger.info(f"Multi-resolution: Selected {best['width']}x{best['height']} "
+                       f"(quality={best['quality']:.2f}, size={best['size']/1024/1024:.2f}MB)")
+            
+            return best['path']
+            
+        except Exception as e:
+            logger.debug(f"Multi-resolution optimization failed: {e}")
+            # Cleanup on error
+            for tf in temp_files:
+                try:
+                    if os.path.exists(tf):
+                        os.remove(tf)
+                except:
+                    pass
+            return None
     
     def _gifsicle_squeeze_small_overage(self, gif_path: str, output_path: str) -> bool:
         """Tiny gifsicle squeeze for small overages"""
